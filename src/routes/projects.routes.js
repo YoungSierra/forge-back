@@ -6,14 +6,37 @@ const router = express.Router()
 const { db, TEST_MEMBER_ID, calculateCost } = require('../services/supabase.service')
 const { ensureProjectDir, getAssetUrl, slugify, STORAGE_BASE } = require('../services/storage.service')
 
-// GET /api/projects
+// GET /api/projects?auth_user_id=xxx
 router.get('/', async (req, res, next) => {
   try {
-    const { data: projects, error } = await db()
+    const { auth_user_id } = req.query
+
+    // Resolve member_id from auth_user_id, fallback to TEST_MEMBER_ID
+    let memberId = TEST_MEMBER_ID
+    if (auth_user_id) {
+      const { data: member } = await db().from('members').select('id').eq('auth_user_id', auth_user_id).single()
+      if (member) memberId = member.id
+    }
+
+    // Get project_ids where user is a project_member (not owner)
+    const { data: memberRows } = await db()
+      .from('project_members')
+      .select('project_id')
+      .eq('member_id', memberId)
+    const memberProjectIds = (memberRows || []).map(r => r.project_id)
+
+    let query = db()
       .from('projects')
       .select('*, assets(id, review_status), generation_jobs(id, current_step, status)')
-      .eq('owner_member_id', TEST_MEMBER_ID)
       .order('created_at', { ascending: false })
+
+    if (memberProjectIds.length > 0) {
+      query = query.or(`owner_member_id.eq.${memberId},id.in.(${memberProjectIds.join(',')})`)
+    } else {
+      query = query.eq('owner_member_id', memberId)
+    }
+
+    const { data: projects, error } = await query
 
     if (error) {
       return res.status(500).json({ success: false, error: 'Database error', code: 'SUPABASE_ERROR', ...(process.env.NODE_ENV === 'development' && { details: error }) })
@@ -850,6 +873,60 @@ router.patch('/:id/invalidate-from-step', async (req, res, next) => {
   } catch (err) {
     next(err)
   }
+})
+
+// GET /api/projects/:id/members
+router.get('/:id/members', async (req, res, next) => {
+  try {
+    const { id } = req.params
+    const { data, error } = await db()
+      .from('project_members')
+      .select('id, project_role, discipline, joined_at, members(id, display_name, avatar_url, role)')
+      .eq('project_id', id)
+      .order('joined_at', { ascending: true })
+
+    if (error) return res.status(500).json({ success: false, error: error.message })
+    res.json({ success: true, members: data || [] })
+  } catch (err) { next(err) }
+})
+
+// POST /api/projects/:id/members
+router.post('/:id/members', async (req, res, next) => {
+  try {
+    const { id } = req.params
+    const { member_id, project_role = 'reviewer', discipline } = req.body
+
+    if (!member_id || !discipline) {
+      return res.status(400).json({ success: false, error: 'member_id and discipline are required' })
+    }
+
+    const { data, error } = await db()
+      .from('project_members')
+      .insert({ project_id: id, member_id, project_role, discipline })
+      .select('id, project_role, discipline, joined_at, members(id, display_name, avatar_url, role)')
+      .single()
+
+    if (error) {
+      if (error.code === '23505') return res.status(409).json({ success: false, error: 'Member already in project' })
+      return res.status(500).json({ success: false, error: error.message })
+    }
+    res.json({ success: true, member: data })
+  } catch (err) { next(err) }
+})
+
+// DELETE /api/projects/:id/members/:memberId
+router.delete('/:id/members/:memberId', async (req, res, next) => {
+  try {
+    const { id, memberId } = req.params
+    const { error } = await db()
+      .from('project_members')
+      .delete()
+      .eq('project_id', id)
+      .eq('member_id', memberId)
+
+    if (error) return res.status(500).json({ success: false, error: error.message })
+    res.json({ success: true })
+  } catch (err) { next(err) }
 })
 
 module.exports = router
