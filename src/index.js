@@ -1,5 +1,11 @@
 require('dotenv').config()
 
+console.log('[FORGE] ENV CHECK:', {
+  GEMINI_API_KEY: process.env.GEMINI_API_KEY ? 'SET' : 'MISSING',
+  SUPABASE_URL: process.env.SUPABASE_URL ? 'SET' : 'MISSING',
+  SUPABASE_SERVICE_ROLE_KEY: process.env.SUPABASE_SERVICE_ROLE_KEY ? 'SET' : 'MISSING',
+})
+
 const { validateEnv, PORT, FRONTEND_URL, STORAGE_PATH } = require('./config/env')
 validateEnv()
 
