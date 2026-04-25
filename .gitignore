@@ -1,0 +1,10 @@
+node_modules/
+.env
+.env.local
+.env.production
+storage/forge-assets/
+*.log
+.DS_Store
+
+# claude code local settings
+.claude/

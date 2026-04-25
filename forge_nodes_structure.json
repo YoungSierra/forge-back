@@ -1,0 +1,256 @@
+{
+    "id": "root",
+    "type": "root",
+    "children": [
+        {
+            "id": "gdd",
+            "type": "node",
+            "label": "GDD",
+            "floating": true
+        },
+        {
+            "id": "art",
+            "type": "group",
+            "label": "ART",
+            "children": [
+                {
+                    "id": "art_2d",
+                    "label": "2D ART",
+                    "children": [
+                        {
+                            "id": "sprites",
+                            "label": "Sprites",
+                            "type": "node"
+                        },
+                        {
+                            "id": "backgrounds",
+                            "label": "Backgrounds",
+                            "type": "node"
+                        },
+                        {
+                            "id": "uiux",
+                            "label": "UI/UX",
+                            "type": "node"
+                        },
+                        {
+                            "id": "icons",
+                            "label": "Icons",
+                            "type": "node"
+                        },
+                        {
+                            "id": "hud",
+                            "label": "HUD",
+                            "type": "node"
+                        }
+                    ]
+                },
+                {
+                    "id": "art_3d",
+                    "label": "3D ART",
+                    "children": [
+                        {
+                            "id": "modeling",
+                            "label": "Modeling",
+                            "type": "node"
+                        },
+                        {
+                            "id": "texturing",
+                            "label": "Texturing",
+                            "type": "node"
+                        },
+                        {
+                            "id": "lighting",
+                            "label": "Lighting",
+                            "type": "node"
+                        }
+                    ]
+                },
+                {
+                    "id": "animation",
+                    "label": "ANIMATION",
+                    "children": [
+                        {
+                            "id": "charaters",
+                            "label": "Characters",
+                            "type": "node"
+                        },
+                        {
+                            "id": "cinematics",
+                            "label": "Cinematics",
+                            "type": "node"
+                        },
+                        {
+                            "id": "vfx",
+                            "label": "VFX",
+                            "type": "node"
+                        }
+                    ]
+                },
+                {
+                    "id": "concept_art",
+                    "label": "CONCEPT ART",
+                    "children": [
+                        {
+                            "id": "visual_guide",
+                            "label": "Visual Guide",
+                            "type": "node"
+                        },
+                        {
+                            "id": "worldbuilding",
+                            "label": "Worldbuilding",
+                            "type": "node"
+                        }
+                    ]
+                },
+                {
+                    "id": "audio",
+                    "label": "AUDIO",
+                    "children": [
+                        {
+                            "id": "sfx",
+                            "label": "SFX",
+                            "type": "node"
+                        },
+                        {
+                            "id": "music",
+                            "label": "Music",
+                            "type": "node"
+                        },
+                        {
+                            "id": "voice",
+                            "label": "Voice",
+                            "type": "node"
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "id": "programming",
+            "type": "group",
+            "label": "PROGRAMMING",
+            "children": [
+                {
+                    "id": "gameplay",
+                    "label": "GAMEPLAY",
+                    "children": [
+                        {
+                            "id": "mechanics",
+                            "label": "Mechanics",
+                            "type": "node"
+                        },
+                        {
+                            "id": "ai_enemy",
+                            "label": "Enemy AI",
+                            "type": "node"
+                        },
+                        {
+                            "id": "physics",
+                            "label": "Physics",
+                            "type": "node"
+                        },
+                        {
+                            "id": "input",
+                            "label": "Input",
+                            "type": "node"
+                        }
+                    ]
+                },
+                {
+                    "id": "engine_core",
+                    "label": "ENGINE CORE",
+                    "children": [
+                        {
+                            "id": "rendering",
+                            "label": "Rendering",
+                            "type": "node"
+                        },
+                        {
+                            "id": "audio_engine",
+                            "label": "Audio Engine",
+                            "type": "node"
+                        },
+                        {
+                            "id": "physics_engine",
+                            "label": "Physics Engine",
+                            "type": "node"
+                        },
+                        {
+                            "id": "ecs",
+                            "label": "ECS",
+                            "type": "node"
+                        }
+                    ]
+                },
+                {
+                    "id": "systems",
+                    "label": "SYSTEMS",
+                    "children": [
+                        {
+                            "id": "inventory",
+                            "label": "Inventory",
+                            "type": "node"
+                        },
+                        {
+                            "id": "saving",
+                            "label": "Saving",
+                            "type": "node"
+                        },
+                        {
+                            "id": "ui_menus",
+                            "label": "UI Menus",
+                            "type": "node"
+                        },
+                        {
+                            "id": "events",
+                            "label": "Events",
+                            "type": "node"
+                        }
+                    ]
+                },
+                {
+                    "id": "networking",
+                    "label": "NETWORKING",
+                    "children": [
+                        {
+                            "id": "multiplayer",
+                            "label": "Multiplayer",
+                            "type": "node"
+                        },
+                        {
+                            "id": "synchronization",
+                            "label": "Synchronization",
+                            "type": "node"
+                        },
+                        {
+                            "id": "servers",
+                            "label": "Servers",
+                            "type": "node"
+                        }
+                    ]
+                },
+                {
+                    "id": "tools",
+                    "label": "TOOLS",
+                    "children": [
+                        {
+                            "id": "editor",
+                            "label": "Editor",
+                            "type": "node"
+                        },
+                        {
+                            "id": "debugging",
+                            "label": "Debugging",
+                            "type": "node"
+                        },
+                        {
+                            "id": "pipelines",
+                            "label": "Pipelines",
+                            "type": "node"
+                        }
+                    ]
+                }
+            ]
+        }
+    ]
+}

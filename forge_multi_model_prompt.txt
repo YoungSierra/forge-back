@@ -1,0 +1,566 @@
+# FORGE BACKEND — MULTI-MODEL LLM SERVICE
+# Refactor the existing LLM service to support multiple free models
+# Read this entire file before writing any code.
+# Do not modify any existing routes or endpoints.
+
+## ─────────────────────────────────────────────
+## 1. CONTEXT
+## ─────────────────────────────────────────────
+
+Refactor the existing gemini.service.js into a unified llm.service.js
+that supports multiple free AI models. Each wizard step can be configured
+to use a specific model via environment variables.
+
+This allows the team to:
+- Switch models per step without changing code
+- Use cheap/fast models for validation, powerful models for code generation
+- Fall back to alternative models when quota is exhausted
+- Test different models for quality comparison
+
+Do NOT modify any existing routes. Only refactor the service layer.
+
+## ─────────────────────────────────────────────
+## 2. SUPPORTED FREE MODELS
+## ─────────────────────────────────────────────
+
+Support these models (all have free tiers):
+
+GOOGLE GEMINI (existing):
+  gemini-2.5-flash        → Best quality, 250 RPD free
+  gemini-2.5-flash-lite   → Fastest, 1000 RPD free
+  gemini-2.5-pro          → Most capable, 100 RPD free
+
+GROQ (new — extremely fast, free tier):
+  llama-3.3-70b-versatile → Best quality on Groq, 14,400 RPD free
+  llama-3.1-8b-instant    → Fastest, 14,400 RPD free
+  mixtral-8x7b-32768      → Good for long contexts, free
+
+TOGETHER AI (new — generous free tier):
+  meta-llama/Llama-3.3-70B-Instruct-Turbo-Free → Free forever
+  meta-llama/Llama-3.2-90B-Vision-Instruct-Turbo → Free forever
+
+OPENROUTER (new — routes to multiple free models):
+  meta-llama/llama-3.3-70b-instruct:free → Free
+  google/gemini-2.0-flash-exp:free       → Free
+  mistralai/mistral-7b-instruct:free     → Free
+
+## ─────────────────────────────────────────────
+## 3. NEW FILE STRUCTURE
+## ─────────────────────────────────────────────
+
+Replace/create these files:
+
+src/services/
+├── llm.service.js          ← unified entry point (replaces gemini.service.js)
+├── providers/
+│   ├── gemini.provider.js  ← existing Gemini logic moved here
+│   ├── groq.provider.js    ← new Groq provider
+│   ├── together.provider.js ← new Together AI provider
+│   └── openrouter.provider.js ← new OpenRouter provider
+
+Keep gemini.service.js as a re-export alias for backward compatibility:
+  // gemini.service.js
+  const { callLLM } = require('./llm.service')
+  module.exports = { callGemini: callLLM }
+
+This ensures existing routes that import callGemini continue to work.
+
+## ─────────────────────────────────────────────
+## 4. ENVIRONMENT VARIABLES
+## ─────────────────────────────────────────────
+
+Add to .env.example:
+
+# LLM Provider API Keys
+GEMINI_API_KEY=your_gemini_key_here
+GROQ_API_KEY=your_groq_key_here
+TOGETHER_API_KEY=your_together_key_here
+OPENROUTER_API_KEY=your_openrouter_key_here
+
+# Model configuration per wizard step
+# Format: provider:model_name
+# Leave empty to use DEFAULT_MODEL
+
+DEFAULT_MODEL=gemini:gemini-2.5-flash
+
+STEP_1_GDD_MODEL=gemini:gemini-2.5-flash
+STEP_2_SPRITES_MODEL=gemini:gemini-2.5-flash-lite
+STEP_3_LEVELS_MODEL=gemini:gemini-2.5-flash
+STEP_4_CODE_MODEL=groq:llama-3.3-70b-versatile
+STEP_5_AUDIO_MODEL=gemini:gemini-2.5-flash-lite
+VALIDATION_MODEL=gemini:gemini-2.5-flash-lite
+
+## ─────────────────────────────────────────────
+## 5. LLM SERVICE (llm.service.js)
+## ─────────────────────────────────────────────
+
+Main unified service:
+
+```javascript
+const { callGemini } = require('./providers/gemini.provider')
+const { callGroq } = require('./providers/groq.provider')
+const { callTogether } = require('./providers/together.provider')
+const { callOpenRouter } = require('./providers/openrouter.provider')
+
+// Parse model string "provider:model_name" → { provider, model }
+function parseModelString(modelString) {
+  if (!modelString) return { provider: 'gemini', model: 'gemini-2.5-flash' }
+  const [provider, ...modelParts] = modelString.split(':')
+  return { provider, model: modelParts.join(':') }
+}
+
+// Get model config for a specific step
+function getStepModel(step) {
+  const envMap = {
+    'step_1_gdd':       process.env.STEP_1_GDD_MODEL,
+    'step_2_sprites':   process.env.STEP_2_SPRITES_MODEL,
+    'step_3_levels':    process.env.STEP_3_LEVELS_MODEL,
+    'step_4_code':      process.env.STEP_4_CODE_MODEL,
+    'step_5_audio':     process.env.STEP_5_AUDIO_MODEL,
+    'validation':       process.env.VALIDATION_MODEL,
+  }
+  return parseModelString(envMap[step] || process.env.DEFAULT_MODEL)
+}
+
+// Main unified call function
+async function callLLM(systemPrompt, userMessage, options = {}) {
+  const step = options.step || null
+  const { provider, model } = step
+    ? getStepModel(step)
+    : parseModelString(options.model || process.env.DEFAULT_MODEL)
+
+  const callOptions = {
+    ...options,
+    model,
+    maxOutputTokens: options.maxOutputTokens || 8192,
+    temperature: options.temperature || 0.8
+  }
+
+  console.log(`[LLM] Step: ${step || 'default'} | Provider: ${provider} | Model: ${model}`)
+
+  switch (provider) {
+    case 'groq':        return callGroq(systemPrompt, userMessage, callOptions)
+    case 'together':    return callTogether(systemPrompt, userMessage, callOptions)
+    case 'openrouter':  return callOpenRouter(systemPrompt, userMessage, callOptions)
+    case 'gemini':
+    default:            return callGemini(systemPrompt, userMessage, callOptions)
+  }
+}
+
+module.exports = { callLLM, getStepModel, parseModelString }
+```
+
+## ─────────────────────────────────────────────
+## 6. GEMINI PROVIDER (providers/gemini.provider.js)
+## ─────────────────────────────────────────────
+
+Move existing gemini.service.js logic here.
+Keep the same logic but accept model as parameter:
+
+```javascript
+const { GoogleGenerativeAI } = require('@google/generative-ai')
+
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY)
+
+async function callGemini(systemPrompt, userMessage, options = {}) {
+  const model = options.model || 'gemini-2.5-flash'
+  const startTime = Date.now()
+
+  const geminiModel = genAI.getGenerativeModel({
+    model,
+    systemInstruction: systemPrompt,
+    generationConfig: {
+      responseMimeType: 'application/json',
+      temperature: options.temperature || 0.8,
+      maxOutputTokens: options.maxOutputTokens || 8192
+    }
+  })
+
+  const result = await geminiModel.generateContent(userMessage)
+  const response = result.response
+  const text = response.text()
+
+  // Clean markdown if present
+  const cleaned = text
+    .replace(/^```json\s*/i, '')
+    .replace(/^```\s*/i, '')
+    .replace(/```\s*$/i, '')
+    .trim()
+
+  const parsed = JSON.parse(cleaned)
+  const usage = response.usageMetadata || {}
+
+  return {
+    data: parsed,
+    meta: {
+      provider: 'gemini',
+      model,
+      tokens_used: {
+        input: usage.promptTokenCount || 0,
+        output: usage.candidatesTokenCount || 0,
+        cached: usage.cachedContentTokenCount || 0
+      },
+      duration_ms: Date.now() - startTime
+    }
+  }
+}
+
+module.exports = { callGemini }
+```
+
+## ─────────────────────────────────────────────
+## 7. GROQ PROVIDER (providers/groq.provider.js)
+## ─────────────────────────────────────────────
+
+Groq is extremely fast (tokens/second much faster than Gemini).
+Uses OpenAI-compatible API. Install: npm install groq-sdk
+
+```javascript
+const Groq = require('groq-sdk')
+
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY })
+
+async function callGroq(systemPrompt, userMessage, options = {}) {
+  const model = options.model || 'llama-3.3-70b-versatile'
+  const startTime = Date.now()
+
+  const response = await groq.chat.completions.create({
+    model,
+    temperature: options.temperature || 0.8,
+    max_tokens: options.maxOutputTokens || 8192,
+    response_format: { type: 'json_object' },
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userMessage }
+    ]
+  })
+
+  const text = response.choices[0].message.content
+  const cleaned = text
+    .replace(/^```json\s*/i, '')
+    .replace(/^```\s*/i, '')
+    .replace(/```\s*$/i, '')
+    .trim()
+
+  const parsed = JSON.parse(cleaned)
+
+  return {
+    data: parsed,
+    meta: {
+      provider: 'groq',
+      model,
+      tokens_used: {
+        input: response.usage?.prompt_tokens || 0,
+        output: response.usage?.completion_tokens || 0,
+        cached: 0
+      },
+      duration_ms: Date.now() - startTime
+    }
+  }
+}
+
+module.exports = { callGroq }
+```
+
+## ─────────────────────────────────────────────
+## 8. TOGETHER AI PROVIDER (providers/together.provider.js)
+## ─────────────────────────────────────────────
+
+Together AI has models that are free forever (not just free tier).
+Uses OpenAI-compatible API. Install: npm install together-ai
+
+```javascript
+const Together = require('together-ai')
+
+const together = new Together({ apiKey: process.env.TOGETHER_API_KEY })
+
+async function callTogether(systemPrompt, userMessage, options = {}) {
+  const model = options.model || 'meta-llama/Llama-3.3-70B-Instruct-Turbo-Free'
+  const startTime = Date.now()
+
+  const response = await together.chat.completions.create({
+    model,
+    temperature: options.temperature || 0.8,
+    max_tokens: options.maxOutputTokens || 8192,
+    response_format: { type: 'json_object' },
+    messages: [
+      { role: 'system', content: systemPrompt + '\n\nIMPORTANT: Return ONLY valid JSON. No markdown, no explanation.' },
+      { role: 'user', content: userMessage }
+    ]
+  })
+
+  const text = response.choices[0].message.content
+  const cleaned = text
+    .replace(/^```json\s*/i, '')
+    .replace(/^```\s*/i, '')
+    .replace(/```\s*$/i, '')
+    .trim()
+
+  const parsed = JSON.parse(cleaned)
+
+  return {
+    data: parsed,
+    meta: {
+      provider: 'together',
+      model,
+      tokens_used: {
+        input: response.usage?.prompt_tokens || 0,
+        output: response.usage?.completion_tokens || 0,
+        cached: 0
+      },
+      duration_ms: Date.now() - startTime
+    }
+  }
+}
+
+module.exports = { callTogether }
+```
+
+## ─────────────────────────────────────────────
+## 9. OPENROUTER PROVIDER (providers/openrouter.provider.js)
+## ─────────────────────────────────────────────
+
+OpenRouter routes to multiple models with a single API key.
+Has free models marked with :free suffix.
+Uses OpenAI-compatible API. Install: npm install openai (already OpenAI compatible)
+
+```javascript
+const OpenAI = require('openai')
+
+const openrouter = new OpenAI({
+  apiKey: process.env.OPENROUTER_API_KEY,
+  baseURL: 'https://openrouter.ai/api/v1',
+  defaultHeaders: {
+    'HTTP-Referer': 'https://forge.v57studio.com',
+    'X-Title': 'Forge - AI Game Prototype Generator'
+  }
+})
+
+async function callOpenRouter(systemPrompt, userMessage, options = {}) {
+  const model = options.model || 'meta-llama/llama-3.3-70b-instruct:free'
+  const startTime = Date.now()
+
+  const response = await openrouter.chat.completions.create({
+    model,
+    temperature: options.temperature || 0.8,
+    max_tokens: options.maxOutputTokens || 8192,
+    response_format: { type: 'json_object' },
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userMessage }
+    ]
+  })
+
+  const text = response.choices[0].message.content
+  const cleaned = text
+    .replace(/^```json\s*/i, '')
+    .replace(/^```\s*/i, '')
+    .replace(/```\s*$/i, '')
+    .trim()
+
+  const parsed = JSON.parse(cleaned)
+
+  return {
+    data: parsed,
+    meta: {
+      provider: 'openrouter',
+      model,
+      tokens_used: {
+        input: response.usage?.prompt_tokens || 0,
+        output: response.usage?.completion_tokens || 0,
+        cached: 0
+      },
+      duration_ms: Date.now() - startTime
+    }
+  }
+}
+
+module.exports = { callOpenRouter }
+```
+
+## ─────────────────────────────────────────────
+## 10. UPDATE EXISTING ROUTES
+## ─────────────────────────────────────────────
+
+Update each route to pass the step name to callLLM.
+This tells the service which model to use for each step.
+
+In gdd.routes.js update each callGemini call:
+
+// Step 1 — GDD generation
+const { callLLM } = require('../services/llm.service')
+
+// POST /api/generate/gdd
+result = await callLLM(GDD_SYSTEM_PROMPT, userMessage, {
+  step: 'step_1_gdd',
+  maxOutputTokens: 8192
+})
+
+// POST /api/generate/levels
+result = await callLLM(LEVELS_SYSTEM_PROMPT, userMessage, {
+  step: 'step_3_levels',
+  maxOutputTokens: 8192
+})
+
+// POST /api/generate/code
+result = await callLLM(CODE_SYSTEM_PROMPT, userMessage, {
+  step: 'step_4_code',
+  maxOutputTokens: 16000  // code needs more tokens
+})
+
+// POST /api/generate/audio
+result = await callLLM(AUDIO_SYSTEM_PROMPT, userMessage, {
+  step: 'step_5_audio',
+  maxOutputTokens: 4096
+})
+
+// In validation.routes.js
+result = await callLLM(VALIDATION_SYSTEM_PROMPT, userMessage, {
+  step: 'validation',
+  maxOutputTokens: 1024,
+  temperature: 0.1
+})
+
+## ─────────────────────────────────────────────
+## 11. NEW ENDPOINT — GET /api/models
+## ─────────────────────────────────────────────
+
+Add a new endpoint that returns the current model configuration.
+This lets the frontend show which model is being used per step.
+
+GET /api/models
+
+Response:
+{
+  "success": true,
+  "models": {
+    "default": "gemini:gemini-2.5-flash",
+    "step_1_gdd": "gemini:gemini-2.5-flash",
+    "step_2_sprites": "gemini:gemini-2.5-flash-lite",
+    "step_3_levels": "gemini:gemini-2.5-flash",
+    "step_4_code": "groq:llama-3.3-70b-versatile",
+    "step_5_audio": "gemini:gemini-2.5-flash-lite",
+    "validation": "gemini:gemini-2.5-flash-lite"
+  },
+  "available_providers": {
+    "gemini": true,   // true if GEMINI_API_KEY is set
+    "groq": false,    // false if GROQ_API_KEY is not set
+    "together": false,
+    "openrouter": false
+  }
+}
+
+Add this route to src/index.js directly (not a separate file):
+
+app.get('/api/models', (req, res) => {
+  const { getStepModel } = require('./services/llm.service')
+  res.json({
+    success: true,
+    models: {
+      default:        process.env.DEFAULT_MODEL || 'gemini:gemini-2.5-flash',
+      step_1_gdd:     process.env.STEP_1_GDD_MODEL || process.env.DEFAULT_MODEL,
+      step_2_sprites: process.env.STEP_2_SPRITES_MODEL || process.env.DEFAULT_MODEL,
+      step_3_levels:  process.env.STEP_3_LEVELS_MODEL || process.env.DEFAULT_MODEL,
+      step_4_code:    process.env.STEP_4_CODE_MODEL || process.env.DEFAULT_MODEL,
+      step_5_audio:   process.env.STEP_5_AUDIO_MODEL || process.env.DEFAULT_MODEL,
+      validation:     process.env.VALIDATION_MODEL || process.env.DEFAULT_MODEL,
+    },
+    available_providers: {
+      gemini:      !!process.env.GEMINI_API_KEY,
+      groq:        !!process.env.GROQ_API_KEY,
+      together:    !!process.env.TOGETHER_API_KEY,
+      openrouter:  !!process.env.OPENROUTER_API_KEY,
+    }
+  })
+})
+
+## ─────────────────────────────────────────────
+## 12. DEPENDENCIES TO INSTALL
+## ─────────────────────────────────────────────
+
+npm install groq-sdk together-ai openai
+
+Note: openai package is used for OpenRouter (OpenAI-compatible API)
+Note: @google/generative-ai already installed, keep it
+
+## ─────────────────────────────────────────────
+## 13. ERROR HANDLING PER PROVIDER
+## ─────────────────────────────────────────────
+
+Each provider should handle its specific errors and map them
+to a consistent error format:
+
+{
+  provider: 'groq',
+  code: 'RATE_LIMIT' | 'INVALID_KEY' | 'MODEL_UNAVAILABLE' | 'PARSE_ERROR',
+  message: 'human readable message',
+  retry_after_ms: 60000 (if rate limited)
+}
+
+Specific error codes to catch:
+- 429 → RATE_LIMIT, include retry_after from response headers
+- 401 → INVALID_KEY
+- 503 → MODEL_UNAVAILABLE
+- JSON.parse failure → PARSE_ERROR
+
+In gdd.routes.js update error handling:
+  } catch (err) {
+    const code = err.code || 'LLM_ERROR'
+    const isRateLimit = err.status === 429 || code === 'RATE_LIMIT'
+    return res.status(502).json({
+      success: false,
+      error: isRateLimit ? 'Rate limit reached. Try again later or switch models.' : 'LLM API call failed',
+      code: isRateLimit ? 'RATE_LIMIT' : 'LLM_ERROR',
+      retry_after_ms: err.retry_after_ms || null,
+      ...(process.env.NODE_ENV === 'development' && { details: { message: err.message } })
+    })
+  }
+
+## ─────────────────────────────────────────────
+## 14. .env CONFIGURATION EXAMPLES
+## ─────────────────────────────────────────────
+
+Example 1 — All Gemini (current setup):
+  DEFAULT_MODEL=gemini:gemini-2.5-flash
+  STEP_4_CODE_MODEL=gemini:gemini-2.5-flash
+  VALIDATION_MODEL=gemini:gemini-2.5-flash-lite
+
+Example 2 — Mixed, Groq for code (faster):
+  DEFAULT_MODEL=gemini:gemini-2.5-flash
+  STEP_4_CODE_MODEL=groq:llama-3.3-70b-versatile
+  VALIDATION_MODEL=gemini:gemini-2.5-flash-lite
+
+Example 3 — All free models, no Gemini quota needed:
+  DEFAULT_MODEL=groq:llama-3.3-70b-versatile
+  STEP_2_SPRITES_MODEL=groq:llama-3.1-8b-instant
+  STEP_5_AUDIO_MODEL=groq:llama-3.1-8b-instant
+  VALIDATION_MODEL=groq:llama-3.1-8b-instant
+  STEP_4_CODE_MODEL=groq:llama-3.3-70b-versatile
+
+Example 4 — OpenRouter free models only:
+  DEFAULT_MODEL=openrouter:meta-llama/llama-3.3-70b-instruct:free
+  STEP_4_CODE_MODEL=openrouter:google/gemini-2.0-flash-exp:free
+  VALIDATION_MODEL=openrouter:mistralai/mistral-7b-instruct:free
+
+## ─────────────────────────────────────────────
+## 15. AFTER BUILDING — VERIFY
+## ─────────────────────────────────────────────
+
+1. GET /api/models
+   → Shows current model config and which providers have keys
+
+2. GET /api/health
+   → Still works (no regression)
+
+3. POST /api/generate/gdd with DEFAULT_MODEL=gemini:gemini-2.5-flash
+   → GDD generated correctly, meta.provider = 'gemini'
+
+4. Change STEP_1_GDD_MODEL=groq:llama-3.3-70b-versatile in .env
+   → Restart server
+   → POST /api/generate/gdd
+   → meta.provider = 'groq', response still valid JSON GDD
+
+5. POST /api/validate/idea
+   → Uses VALIDATION_MODEL, fast response
+
+6. All existing wizard steps still work with no changes to routes

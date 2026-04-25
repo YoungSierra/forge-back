@@ -1,0 +1,40 @@
+The multi-model LLM service was not built. Please create these files now:
+
+1. src/services/providers/gemini.provider.js
+   - Move existing logic from gemini.service.js here
+   - Accept model as parameter in options
+
+2. src/services/providers/groq.provider.js
+   - Use groq-sdk package
+   - Support llama-3.3-70b-versatile and llama-3.1-8b-instant
+   - response_format: json_object
+
+3. src/services/providers/together.provider.js
+   - Use together-ai package
+   - Support meta-llama/Llama-3.3-70B-Instruct-Turbo-Free
+   - response_format: json_object
+
+4. src/services/providers/openrouter.provider.js
+   - Use openai package with baseURL: https://openrouter.ai/api/v1
+   - Support meta-llama/llama-3.3-70b-instruct:free
+   - response_format: json_object
+
+5. src/services/llm.service.js
+   - Parse model strings like "gemini:gemini-2.5-flash" or "groq:llama-3.3-70b-versatile"
+   - Read step model from env vars: STEP_1_GDD_MODEL, STEP_2_SPRITES_MODEL, etc.
+   - Route to correct provider based on prefix
+   - Export: callLLM(systemPrompt, userMessage, options) and getStepModel(step)
+
+6. Update gemini.service.js to re-export from llm.service.js for backward compatibility
+
+7. Update gdd.routes.js to use callLLM with step parameter:
+   - /api/generate/gdd → step: 'step_1_gdd'
+   - /api/generate/levels → step: 'step_3_levels'
+   - /api/generate/code → step: 'step_4_code', maxOutputTokens: 16000
+   - /api/generate/audio → step: 'step_5_audio'
+
+8. Update validation.routes.js to use callLLM with step: 'validation'
+
+9. Run: npm install groq-sdk together-ai openai
+
+After building, test: GET http://localhost:8000/api/models

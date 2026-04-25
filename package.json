@@ -1,0 +1,26 @@
+{
+  "name": "forge-back",
+  "version": "1.0.0",
+  "description": "FORGE backend API — AI-powered game prototype generator",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js"
+  },
+  "dependencies": {
+    "@google/generative-ai": "^0.21.0",
+    "@supabase/supabase-js": "^2.47.0",
+    "archiver": "^7.0.1",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "groq-sdk": "^1.1.2",
+    "morgan": "^1.10.0",
+    "openai": "^6.34.0",
+    "pngjs": "^7.0.0",
+    "together-ai": "^0.39.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.9"
+  }
+}
