@@ -1,10 +1,8 @@
 require('dotenv').config()
 
-console.log('[FORGE] ENV CHECK:', {
-  GEMINI_API_KEY: process.env.GEMINI_API_KEY ? 'SET' : 'MISSING',
-  SUPABASE_URL: process.env.SUPABASE_URL ? 'SET' : 'MISSING',
-  SUPABASE_SERVICE_ROLE_KEY: process.env.SUPABASE_SERVICE_ROLE_KEY ? 'SET' : 'MISSING',
-})
+console.log('[FORGE] ALL ENV KEYS:', Object.keys(process.env).filter(k => !k.startsWith('npm_')).sort())
+console.log('[FORGE] GEMINI RAW:', JSON.stringify(process.env.GEMINI_API_KEY))
+console.log('[FORGE] SUPABASE_URL RAW:', JSON.stringify(process.env.SUPABASE_URL))
 
 const { validateEnv, PORT, FRONTEND_URL, STORAGE_PATH } = require('./config/env')
 validateEnv()
