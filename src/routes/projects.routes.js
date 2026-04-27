@@ -62,12 +62,24 @@ router.get('/', async (req, res, next) => {
         j.status === 'approved' && stepOrder.includes(j.current_step)
       ).length
 
+      let node_approved_count = null
+      let node_total_count = null
+      const layout = p.canvas_layout
+      if (layout?.nodes?.length) {
+        const approvable = layout.nodes.filter(n => n.type !== 'forgeGroup' && !n.data?.comingSoon)
+        node_total_count    = approvable.length
+        node_approved_count = approvable.filter(n => n.data?.approved).length
+      }
+
       return {
         ...p,
+        canvas_layout: undefined,
         assets: undefined,
         generation_jobs: undefined,
         current_wizard_step,
         approved_wizard_count,
+        node_approved_count,
+        node_total_count,
         approved_asset_count: assets.filter(a => a.review_status === 'approved').length,
         total_asset_count: assets.length
       }
@@ -77,6 +89,19 @@ router.get('/', async (req, res, next) => {
   } catch (err) {
     next(err)
   }
+})
+
+// PUT /api/projects/:id/canvas — save canvas layout
+router.put('/:id/canvas', async (req, res, next) => {
+  try {
+    const { id } = req.params
+    const { canvas_layout } = req.body
+    if (!canvas_layout) return res.status(400).json({ success: false, error: 'canvas_layout is required' })
+
+    const { error } = await db().from('projects').update({ canvas_layout }).eq('id', id)
+    if (error) return res.status(500).json({ success: false, error: error.message })
+    res.json({ success: true })
+  } catch (err) { next(err) }
 })
 
 // GET /api/projects/:id

@@ -21,6 +21,7 @@ const assetsRoutes = require('./routes/assets.routes')
 const validationRoutes = require('./routes/validation.routes')
 const membersRoutes = require('./routes/members.routes')
 const feedbackRoutes = require('./routes/feedback.routes')
+const adminRoutes = require('./routes/admin.routes')
 
 // Ensure base storage dirs exist on startup
 fs.mkdirSync(path.join(STORAGE_PATH, 'projects'), { recursive: true })
@@ -56,6 +57,7 @@ app.use('/api/assets', assetsRoutes)
 app.use('/api/validate', validationRoutes)
 app.use('/api/members', membersRoutes)
 app.use('/api/feedback', feedbackRoutes)
+app.use('/api/admin', adminRoutes)
 
 // Models config
 app.get('/api/models', (req, res) => {

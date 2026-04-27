@@ -33,4 +33,4 @@ function calculateCost(tokens_used) {
   return parseFloat((input_cost + output_cost).toFixed(6))
 }
 
-module.exports = { db, testConnection, TEST_MEMBER_ID, calculateCost }
+module.exports = { db, getClient, testConnection, TEST_MEMBER_ID, calculateCost }
