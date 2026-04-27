@@ -70,6 +70,33 @@ router.post('/users', async (req, res, next) => {
   } catch (err) { next(err) }
 })
 
+// POST /api/admin/users/invite — send invite email
+router.post('/users/invite', async (req, res, next) => {
+  try {
+    const { email, role = 'member' } = req.body
+    if (!email) return res.status(400).json({ success: false, error: 'email is required' })
+
+    const client = getClient()
+    const redirectTo = `${process.env.FRONTEND_URL}/auth/accept`
+
+    const { data: authData, error: authError } = await client.auth.admin.inviteUserByEmail(email, {
+      redirectTo,
+      data: { pending_role: role },
+    })
+
+    if (authError) return res.status(400).json({ success: false, error: authError.message })
+
+    const authUserId = authData.user.id
+
+    // Set role if admin — trigger may have already created the member row
+    if (role === 'admin') {
+      await db().from('members').update({ role: 'admin' }).eq('auth_user_id', authUserId)
+    }
+
+    res.json({ success: true, user: { auth_id: authUserId, email, role } })
+  } catch (err) { next(err) }
+})
+
 // PATCH /api/admin/users/:auth_id — update display_name and/or role
 router.patch('/users/:auth_id', async (req, res, next) => {
   try {
