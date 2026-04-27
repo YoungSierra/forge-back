@@ -29,7 +29,7 @@ router.get('/', async (req, res, next) => {
 
     let query = db()
       .from('feedback')
-      .select('*, members!feedback_member_id_fkey(id, display_name, avatar_url), projects(id, name)')
+      .select('*, members!feedback_member_id_fkey(id, display_name, avatar_url), resolver:members!feedback_resolved_by_fkey(id, display_name), projects(id, name)')
       .order('created_at', { ascending: false })
 
     if (status)   query = query.eq('status', status)
