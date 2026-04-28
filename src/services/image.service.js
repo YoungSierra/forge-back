@@ -1,76 +1,61 @@
-const fs = require('fs')
-const path = require('path')
-const { generatePlaceholderPNG } = require('./storage.service')
+const { generatePlaceholderPNG, uploadToStorage } = require('./storage.service')
 
-const TIMEOUT_MS = 35000
-const RETRY_DELAY_MS = 3000
+const HF_MODEL   = 'black-forest-labs/FLUX.1-schnell'
+const HF_URL     = `https://router.huggingface.co/hf-inference/models/${HF_MODEL}`
+const TIMEOUT_MS = 120000  // HF can be slow while loading model
 
 async function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
 
-async function fetchWithRetry(url, attempt = 1) {
-  const response = await fetch(url, {
-    headers: { 'User-Agent': 'ForgeStudio/1.0' },
-    signal: AbortSignal.timeout(TIMEOUT_MS),
-  })
+const QUALITY_SUFFIX = ', concept art, detailed illustration, professional digital art, sharp focus, vibrant colors, 4k'
 
-  if (response.status === 429 && attempt < 3) {
-    console.warn(`[IMAGE] Pollinations 429 — retrying in ${RETRY_DELAY_MS * attempt}ms (attempt ${attempt}/3)`)
-    await sleep(RETRY_DELAY_MS * attempt)
-    return fetchWithRetry(url, attempt + 1)
-  }
-
-  return response
-}
-
-async function generateImage(prompt, width, height, outputPath) {
-  const encoded = encodeURIComponent(prompt)
-  const seed = Math.abs(hashStr(prompt)) % 999983
-  const url = `https://image.pollinations.ai/prompt/${encoded}?width=${width}&height=${height}&seed=${seed}&nologo=true&model=flux-schnell&enhance=false`
-
+async function generateImage(prompt, width, height, storagePath) {
+  const token = process.env.HF_TOKEN
+  const enhancedPrompt = prompt + QUALITY_SUFFIX
   try {
-    const response = await fetchWithRetry(url)
+    const res = await fetch(HF_URL, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json',
+        'x-wait-for-model': 'true',
+      },
+      body: JSON.stringify({
+        inputs: enhancedPrompt,
+        parameters: { num_inference_steps: 6, width, height },
+      }),
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    })
 
-    if (!response.ok) {
-      throw new Error(`Pollinations returned ${response.status}`)
+    if (!res.ok) {
+      const body = await res.text()
+      throw new Error(`HF ${res.status}: ${body}`)
     }
 
-    const buffer = Buffer.from(await response.arrayBuffer())
-    if (buffer.length < 1000) {
-      throw new Error('Response too small — likely an error page')
-    }
+    const buffer = Buffer.from(await res.arrayBuffer())
+    if (buffer.length < 1000) throw new Error('Response too small')
 
-    fs.mkdirSync(path.dirname(outputPath), { recursive: true })
-    fs.writeFileSync(outputPath, buffer)
-
-    console.log(`[IMAGE] Generated ${path.basename(outputPath)} (${Math.round(buffer.length / 1024)}kb)`)
-    return { path: outputPath, url: null, size_bytes: buffer.length, source: 'pollinations' }
+    const mime      = res.headers.get('content-type') || 'image/jpeg'
+    const publicUrl = await uploadToStorage(buffer, storagePath, mime)
+    console.log(`[IMAGE] Generated ${storagePath} (${Math.round(buffer.length / 1024)}kb) via HuggingFace`)
+    return { url: publicUrl, size_bytes: buffer.length, source: 'huggingface' }
   } catch (err) {
-    console.warn(`[IMAGE] Pollinations failed (${err.message}), using placeholder`)
-    const result = generatePlaceholderPNG(prompt, null, width, height, outputPath)
-    return { ...result, source: 'placeholder' }
+    console.warn(`[IMAGE] HuggingFace failed (${err.message}), using placeholder`)
+    const buffer    = generatePlaceholderPNG(prompt, null, width, height)
+    const publicUrl = await uploadToStorage(buffer, storagePath, 'image/png')
+    return { url: publicUrl, size_bytes: buffer.length, source: 'placeholder' }
   }
 }
 
-// Sequential image generation to avoid rate limiting on parallel requests
 async function generateImagesSequential(tasks) {
   const results = []
-  for (const task of tasks) {
-    const result = await generateImage(task.prompt, task.width, task.height, task.outputPath)
+  for (let i = 0; i < tasks.length; i++) {
+    const result = await generateImage(tasks[i].prompt, tasks[i].width, tasks[i].height, tasks[i].storagePath)
     results.push(result)
-    // Small delay between requests to respect rate limits
-    if (tasks.indexOf(task) < tasks.length - 1) await sleep(800)
+    if (i < tasks.length - 1) await sleep(2000)
   }
   return results
-}
-
-function hashStr(str) {
-  let h = 0
-  for (let i = 0; i < str.length; i++) {
-    h = (Math.imul(31, h) + str.charCodeAt(i)) | 0
-  }
-  return h
 }
 
 module.exports = { generateImage, generateImagesSequential }

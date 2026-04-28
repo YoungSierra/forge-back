@@ -1,8 +1,10 @@
 const fs = require('fs')
 const path = require('path')
 const { PNG } = require('pngjs')
+const { getClient } = require('./supabase.service')
 
 const STORAGE_BASE = process.env.STORAGE_PATH || './storage/forge-assets'
+const BUCKET = 'forge-assets'
 
 function textToColor(text) {
   let hash = 0
@@ -26,7 +28,7 @@ function getAssetUrl(project_id, filename) {
   return `/assets/projects/${project_id}/${filename}`
 }
 
-function generatePlaceholderPNG(text, color, width, height, outputPath) {
+function generatePlaceholderPNG(text, color, width, height) {
   const w = width || 256
   const h = height || 256
   const c = color || textToColor(text)
@@ -36,7 +38,6 @@ function generatePlaceholderPNG(text, color, width, height, outputPath) {
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
       const idx = (w * y + x) * 4
-      // border (8px) is slightly darker
       const border = x < 8 || x >= w - 8 || y < 8 || y >= h - 8
       const factor = border ? 0.6 : 1
       png.data[idx]     = Math.round(c.r * factor)
@@ -46,15 +47,17 @@ function generatePlaceholderPNG(text, color, width, height, outputPath) {
     }
   }
 
-  fs.mkdirSync(path.dirname(outputPath), { recursive: true })
-  const buffer = PNG.sync.write(png)
-  fs.writeFileSync(outputPath, buffer)
+  return PNG.sync.write(png)
+}
 
-  return {
-    path: outputPath,
-    url: null,
-    size_bytes: buffer.length
-  }
+async function uploadToStorage(buffer, storagePath, mimeType = 'image/jpeg') {
+  const supabase = getClient()
+  const { error } = await supabase.storage
+    .from(BUCKET)
+    .upload(storagePath, buffer, { contentType: mimeType, upsert: true })
+  if (error) throw new Error(`Storage upload failed: ${error.message}`)
+  const { data } = supabase.storage.from(BUCKET).getPublicUrl(storagePath)
+  return data.publicUrl
 }
 
 function slugify(text) {
@@ -65,6 +68,7 @@ module.exports = {
   ensureProjectDir,
   getAssetUrl,
   generatePlaceholderPNG,
+  uploadToStorage,
   slugify,
   STORAGE_BASE
 }

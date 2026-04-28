@@ -24,7 +24,7 @@ const { ANIMATION_SYSTEM_PROMPT } = require('../prompts/animation.prompt')
 const { CINEMATICS_SYSTEM_PROMPT } = require('../prompts/cinematics.prompt')
 const { VOICE_SYSTEM_PROMPT } = require('../prompts/voice.prompt')
 const { db, TEST_MEMBER_ID } = require('../services/supabase.service')
-const { ensureProjectDir, generatePlaceholderPNG, getAssetUrl, slugify, STORAGE_BASE } = require('../services/storage.service')
+const { ensureProjectDir, getAssetUrl, slugify, STORAGE_BASE } = require('../services/storage.service')
 const { generateImage, generateImagesSequential } = require('../services/image.service')
 
 function llmErr(err) {
@@ -93,19 +93,18 @@ router.post('/sprites', async (req, res, next) => {
       return res.status(400).json({ success: false, error: 'Project has no characters in concept', code: 'VALIDATION_ERROR' })
     }
 
-    ensureProjectDir(project_id)
-
+    const genId = Date.now().toString(36)
     const tasks = characters.map(char => ({
       prompt: char.sprite_prompt || char.name,
       width: 512, height: 512,
-      outputPath: path.join(STORAGE_BASE, 'projects', project_id, `${slugify(char.name)}.jpg`),
+      storagePath: `projects/${project_id}/${slugify(char.name)}-${genId}.jpg`,
     }))
     const imgResults = await generateImagesSequential(tasks)
     const sprites = characters.map((char, i) => ({
       character_name: char.name,
       character_role: char.role,
       sprite_prompt: char.sprite_prompt,
-      preview_url: getAssetUrl(project_id, `${slugify(char.name)}.jpg`),
+      preview_url: imgResults[i].url,
       placeholder: imgResults[i].source === 'placeholder',
     }))
 
@@ -153,18 +152,17 @@ router.post('/levels', async (req, res, next) => {
       })
     }
 
-    ensureProjectDir(project_id)
-
     const levelList = result.data.levels || []
+    const genId = Date.now().toString(36)
     const levelTasks = levelList.map(level => ({
       prompt: level.background_prompt || level.name,
       width: 1280, height: 640,
-      outputPath: path.join(STORAGE_BASE, 'projects', project_id, `level-${slugify(level.name)}.jpg`),
+      storagePath: `projects/${project_id}/level-${slugify(level.name)}-${genId}.jpg`,
     }))
-    await generateImagesSequential(levelTasks)
-    const expandedLevels = levelList.map(level => ({
+    const levelImgs = await generateImagesSequential(levelTasks)
+    const expandedLevels = levelList.map((level, i) => ({
       ...level,
-      preview_url: getAssetUrl(project_id, `level-${slugify(level.name)}.jpg`),
+      preview_url: levelImgs[i].url,
     }))
 
     res.status(200).json({ success: true, levels: expandedLevels, meta: result.meta })
@@ -403,31 +401,31 @@ Levels/environments: ${JSON.stringify((project.concept?.levels || []).map(l => (
     }
 
     const concepts = promptResult.data
-    ensureProjectDir(project_id)
 
     // Generate images sequentially to avoid Pollinations rate limiting
     const charList = concepts.character_concepts || []
     const envList  = concepts.environment_concepts || []
 
+    const genId = Date.now().toString(36)
     const charTasks = charList.map(c => ({
       prompt: c.prompt, width: 512, height: 512,
-      outputPath: path.join(STORAGE_BASE, 'projects', project_id, `concept-char-${slugify(c.name)}.jpg`),
+      storagePath: `projects/${project_id}/concept-char-${slugify(c.name)}-${genId}.jpg`,
     }))
     const envTasks = envList.map(e => ({
       prompt: e.prompt, width: 768, height: 512,
-      outputPath: path.join(STORAGE_BASE, 'projects', project_id, `concept-env-${slugify(e.name)}.jpg`),
+      storagePath: `projects/${project_id}/concept-env-${slugify(e.name)}-${genId}.jpg`,
     }))
     const charImgs = await generateImagesSequential(charTasks)
     const envImgs  = await generateImagesSequential(envTasks)
 
     const charConcepts = charList.map((c, i) => ({
       ...c,
-      preview_url: getAssetUrl(project_id, `concept-char-${slugify(c.name)}.jpg`),
+      preview_url: charImgs[i].url,
       placeholder: charImgs[i].source === 'placeholder',
     }))
     const envConcepts = envList.map((e, i) => ({
       ...e,
-      preview_url: getAssetUrl(project_id, `concept-env-${slugify(e.name)}.jpg`),
+      preview_url: envImgs[i].url,
       placeholder: envImgs[i].source === 'placeholder',
     }))
 
@@ -509,27 +507,27 @@ Levels: ${JSON.stringify(levels.map(l => ({ name: l.name, environment: l.environ
     }
 
     const bgList = promptResult.data.backgrounds || []
-    ensureProjectDir(project_id)
 
+    const genId = Date.now().toString(36)
     const bgTasks = bgList.map((bg, i) => {
       const level = levels[i] || levels[0]
       const slug = `bg-${slugify(bg.level_name || level.name || `level${i}`)}`
       return {
         prompt: bg.prompt || level.background_prompt || bg.level_name,
         width: 1280, height: 640,
-        outputPath: path.join(STORAGE_BASE, 'projects', project_id, `${slug}.jpg`),
+        storagePath: `projects/${project_id}/${slug}-${genId}.jpg`,
         _meta: { bg, level, slug },
       }
     })
     const bgImgs = await generateImagesSequential(bgTasks)
     const results = bgTasks.map((task, i) => {
-      const { bg, level, slug } = task._meta
+      const { bg, level } = task._meta
       return {
         level_name: bg.level_name || level.name,
         environment: bg.environment || level.environment,
         prompt: task.prompt,
         layers: bg.layers || [],
-        preview_url: getAssetUrl(project_id, `${slug}.jpg`),
+        preview_url: bgImgs[i].url,
         placeholder: bgImgs[i].source === 'placeholder',
       }
     })
