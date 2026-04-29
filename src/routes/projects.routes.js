@@ -91,6 +91,25 @@ router.get('/', async (req, res, next) => {
   }
 })
 
+// GET /api/projects/pending-reviews — jobs pending review for a member
+// MUST be before /:id to avoid Express treating "pending-reviews" as a project id
+router.get('/pending-reviews', async (req, res, next) => {
+  try {
+    const { member_id } = req.query
+    if (!member_id) return res.status(400).json({ success: false, error: 'member_id is required' })
+
+    const { data: jobs, error } = await db()
+      .from('generation_jobs')
+      .select('id, project_id, current_step, review_status, created_at, reviewer_note, projects(id, name)')
+      .eq('reviewer_id', member_id)
+      .eq('review_status', 'pending')
+      .order('created_at', { ascending: false })
+
+    if (error) return res.status(500).json({ success: false, error: error.message })
+    res.json({ success: true, jobs: jobs || [] })
+  } catch (err) { next(err) }
+})
+
 // PUT /api/projects/:id/canvas — save canvas layout
 router.put('/:id/canvas', async (req, res, next) => {
   try {
@@ -834,17 +853,35 @@ router.post('/:id/approve-node', async (req, res, next) => {
       })
     }
 
-    // Register in generation_jobs so it appears in the DB audit trail and the pipeline can detect it
-    const { error: jErr } = await db().from('generation_jobs').insert({
-      project_id: id,
-      triggered_by: TEST_MEMBER_ID,
-      status: 'approved',
-      progress: 100,
-      current_step: stepKey,
-      input_prompt: `Pipeline node approved: ${stepKey}`,
-      started_at: now,
-      completed_at: now,
-    })
+    // If there's an existing review job for this step, update it — otherwise insert fresh
+    const { data: existingJob } = await db()
+      .from('generation_jobs')
+      .select('id')
+      .eq('project_id', id)
+      .eq('current_step', stepKey)
+      .eq('status', 'review')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .single()
+
+    let jErr
+    if (existingJob) {
+      ;({ error: jErr } = await db()
+        .from('generation_jobs')
+        .update({ status: 'approved', completed_at: now })
+        .eq('id', existingJob.id))
+    } else {
+      ;({ error: jErr } = await db().from('generation_jobs').insert({
+        project_id: id,
+        triggered_by: TEST_MEMBER_ID,
+        status: 'approved',
+        progress: 100,
+        current_step: stepKey,
+        input_prompt: `Pipeline node approved: ${stepKey}`,
+        started_at: now,
+        completed_at: now,
+      }))
+    }
 
     if (jErr) {
       console.error(`[APPROVE-NODE] generation_jobs insert error:`, jErr)
@@ -856,6 +893,124 @@ router.post('/:id/approve-node', async (req, res, next) => {
   } catch (err) {
     next(err)
   }
+})
+
+// POST /api/projects/:id/request-node-review
+// Owner assigns a reviewer to a pipeline node — creates a generation_job in 'review' status
+router.post('/:id/request-node-review', async (req, res, next) => {
+  try {
+    const { id } = req.params
+    const { stepKey, reviewer_id, nodeData } = req.body
+
+    if (!stepKey || !reviewer_id) {
+      return res.status(400).json({ success: false, error: 'stepKey and reviewer_id are required', code: 'VALIDATION_ERROR' })
+    }
+
+    // Verify reviewer is a member of this project
+    const { data: membership } = await db()
+      .from('project_members')
+      .select('id')
+      .eq('project_id', id)
+      .eq('member_id', reviewer_id)
+      .single()
+
+    if (!membership) {
+      return res.status(403).json({ success: false, error: 'Reviewer is not a member of this project', code: 'FORBIDDEN' })
+    }
+
+    const now = new Date().toISOString()
+
+    // Store node data in concept.pipeline with approved:false so it's visible but not unlocking children
+    const { data: project, error: pErr } = await db().from('projects').select('id, concept').eq('id', id).single()
+    if (pErr || !project) return res.status(404).json({ success: false, error: 'Project not found' })
+
+    const pipeline = project.concept?.pipeline || {}
+    const updatedConcept = {
+      ...project.concept,
+      pipeline: { ...pipeline, [stepKey]: { ...(nodeData || {}), approved: false, pending_review: true } }
+    }
+    await db().from('projects').update({ concept: updatedConcept, updated_at: now }).eq('id', id)
+
+    // Upsert: reuse existing review job for this step (handles re-send after changes_requested)
+    const { data: existingJob } = await db()
+      .from('generation_jobs')
+      .select('id')
+      .eq('project_id', id)
+      .eq('current_step', stepKey)
+      .eq('status', 'review')
+      .maybeSingle()
+
+    let job, jErr
+    if (existingJob) {
+      ;({ data: job, error: jErr } = await db()
+        .from('generation_jobs')
+        .update({ reviewer_id, review_status: 'pending', started_at: now, completed_at: now, input_prompt: `Review requested: ${stepKey}` })
+        .eq('id', existingJob.id)
+        .select()
+        .single())
+    } else {
+      ;({ data: job, error: jErr } = await db()
+        .from('generation_jobs')
+        .insert({
+          project_id: id,
+          triggered_by: TEST_MEMBER_ID,
+          status: 'review',
+          progress: 100,
+          current_step: stepKey,
+          input_prompt: `Review requested: ${stepKey}`,
+          started_at: now,
+          completed_at: now,
+          review_status: 'pending',
+          reviewer_id,
+        })
+        .select()
+        .single())
+    }
+
+    if (jErr) return res.status(500).json({ success: false, error: jErr.message })
+
+    console.log(`[REVIEW] Review requested for step="${stepKey}" project=${id} reviewer=${reviewer_id}`)
+    res.status(200).json({ success: true, job })
+  } catch (err) { next(err) }
+})
+
+// PATCH /api/jobs/:jobId/submit-review
+// Reviewer marks job as 'reviewed' or 'changes_requested'
+router.patch('/jobs/:jobId/submit-review', async (req, res, next) => {
+  try {
+    const { jobId } = req.params
+    const { review_status, reviewer_note } = req.body
+
+    if (!['reviewed', 'changes_requested'].includes(review_status)) {
+      return res.status(400).json({ success: false, error: 'review_status must be reviewed or changes_requested', code: 'VALIDATION_ERROR' })
+    }
+
+    const { data: job, error: jErr } = await db()
+      .from('generation_jobs')
+      .update({ review_status, reviewer_note: reviewer_note || null })
+      .eq('id', jobId)
+      .select('id, project_id, current_step, review_status')
+      .single()
+
+    if (jErr || !job) return res.status(404).json({ success: false, error: 'Job not found' })
+
+    // If changes requested, clear pending_review flag in concept.pipeline
+    if (review_status === 'changes_requested') {
+      const { data: project } = await db().from('projects').select('id, concept').eq('id', job.project_id).single()
+      if (project) {
+        const pipeline = project.concept?.pipeline || {}
+        const stepData = pipeline[job.current_step] || {}
+        const updatedConcept = {
+          ...project.concept,
+          pipeline: { ...pipeline, [job.current_step]: { ...stepData, pending_review: false } }
+        }
+        await db().from('projects').update({ concept: updatedConcept }).eq('id', job.project_id)
+      }
+    }
+
+    console.log(`[REVIEW] Job ${jobId} marked as ${review_status}`)
+    res.status(200).json({ success: true, job })
+  } catch (err) { next(err) }
 })
 
 // PATCH /api/projects/:id/invalidate-from-step
