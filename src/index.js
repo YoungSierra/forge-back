@@ -17,7 +17,9 @@ const assetsRoutes = require('./routes/assets.routes')
 const validationRoutes = require('./routes/validation.routes')
 const membersRoutes = require('./routes/members.routes')
 const feedbackRoutes = require('./routes/feedback.routes')
-const adminRoutes = require('./routes/admin.routes')
+const adminRoutes        = require('./routes/admin.routes')
+const adminConfigsRoutes = require('./routes/admin.configs.routes')
+const { requireAdmin }   = require('./middleware/requireAdmin')
 
 // Ensure base storage dirs exist on startup
 fs.mkdirSync(path.join(STORAGE_PATH, 'projects'), { recursive: true })
@@ -53,29 +55,34 @@ app.use('/api/assets', assetsRoutes)
 app.use('/api/validate', validationRoutes)
 app.use('/api/members', membersRoutes)
 app.use('/api/feedback', feedbackRoutes)
-app.use('/api/admin', adminRoutes)
+app.use('/api/admin', requireAdmin, adminRoutes)
+app.use('/api/admin', requireAdmin, adminConfigsRoutes)
 
-// Models config
-app.get('/api/models', (req, res) => {
-  const { getStepModel } = require('./services/llm.service')
-  res.json({
-    success: true,
-    models: {
-      default:        process.env.DEFAULT_MODEL || 'gemini:gemini-2.5-flash',
-      step_1_gdd:     process.env.STEP_1_GDD_MODEL || process.env.DEFAULT_MODEL,
-      step_2_sprites: process.env.STEP_2_SPRITES_MODEL || process.env.DEFAULT_MODEL,
-      step_3_levels:  process.env.STEP_3_LEVELS_MODEL || process.env.DEFAULT_MODEL,
-      step_4_code:    process.env.STEP_4_CODE_MODEL || process.env.DEFAULT_MODEL,
-      step_5_audio:   process.env.STEP_5_AUDIO_MODEL || process.env.DEFAULT_MODEL,
-      validation:     process.env.VALIDATION_MODEL || process.env.DEFAULT_MODEL,
-    },
-    available_providers: {
-      gemini:     !!process.env.GEMINI_API_KEY,
-      groq:       !!process.env.GROQ_API_KEY,
-      together:   !!process.env.TOGETHER_API_KEY,
-      openrouter: !!process.env.OPENROUTER_API_KEY,
+// Models config — reads step models from DB via configService
+app.get('/api/models', async (req, res, next) => {
+  try {
+    const { getStepConfigs } = require('./services/config.service')
+    const configs = await getStepConfigs()
+
+    const models = { default: process.env.DEFAULT_MODEL || 'gemini:gemini-2.5-flash' }
+    for (const [stepKey, cfg] of Object.entries(configs)) {
+      if (cfg.integration_type === 'llm' && cfg.model_name) {
+        models[stepKey] = cfg.model_name
+      }
     }
-  })
+
+    res.json({
+      success: true,
+      models,
+      available_providers: {
+        gemini:     !!process.env.GEMINI_API_KEY,
+        groq:       !!process.env.GROQ_API_KEY,
+        together:   !!process.env.TOGETHER_API_KEY,
+        openrouter: !!process.env.OPENROUTER_API_KEY,
+        openai:     !!process.env.OPENAI_API_KEY,
+      },
+    })
+  } catch (err) { next(err) }
 })
 
 
