@@ -7,7 +7,8 @@ const { getPrompt } = require('../services/prompt.service')
 const { db } = require('../services/supabase.service')
 const { ensureProjectDir, getAssetUrl, slugify, clearNodeStorage, STORAGE_BASE } = require('../services/storage.service')
 const { generateImagesSequential, generateImageForNode } = require('../services/image.service')
-const { validateStepConfig, getStepConfig } = require('../services/config.service')
+const { validateStepConfig } = require('../services/config.service')
+const { callN8n } = require('../services/n8n.service')
 
 function llmErr(err) {
   if (err.status === 429 || err.status === 503 || err.code === 'RATE_LIMIT') return { status: 502, error: 'Model is busy — try again in a few seconds.', code: 'RATE_LIMIT' }
@@ -16,24 +17,17 @@ function llmErr(err) {
   return { status: 502, error: 'LLM API call failed', code: 'LLM_ERROR' }
 }
 
-async function callN8n(webhookUrl, payload, timeoutMs = 120_000) {
-  let response
+// Sends project_id + step_key + input_context to n8n and proxies the response.
+// Returns true if response was handled (caller should return immediately).
+async function tryN8n(config, project_id, step_key, input_context, res) {
+  if (config.integration_type !== 'n8n') return false
   try {
-    response = await fetch(webhookUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(timeoutMs),
-    })
+    const data = await callN8n(config.webhook_url, { project_id, step_key, input_context })
+    res.status(200).json(data)
   } catch (err) {
-    const timedOut = err.name === 'TimeoutError' || err.name === 'AbortError'
-    throw Object.assign(new Error(timedOut ? 'n8n webhook timed out' : `n8n webhook unreachable: ${err.message}`), { code: 'N8N_ERROR' })
+    res.status(502).json({ success: false, error: err.message, code: err.code || 'N8N_ERROR' })
   }
-  if (!response.ok) {
-    const body = await response.text().catch(() => '')
-    throw Object.assign(new Error(`n8n webhook returned ${response.status}: ${body}`), { code: 'N8N_ERROR' })
-  }
-  return response.json()
+  return true
 }
 
 // Unified GDD accessor — all node outputs live in concept.pipeline.gdd
@@ -68,9 +62,8 @@ router.post('/gdd', async (req, res, next) => {
     const checkGdd = await validateStepConfig('gdd')
     if (!checkGdd.valid) return res.status(422).json({ success: false, error: checkGdd.error, code: checkGdd.code })
 
-    const config = await getStepConfig('gdd')
+    const config = checkGdd.config
 
-    // ── comfyui — not applicable for text generation ──────────────────────────
     if (config.integration_type === 'comfyui') {
       return res.status(422).json({
         success: false,
@@ -84,7 +77,7 @@ router.post('/gdd', async (req, res, next) => {
 
     if (config.integration_type === 'n8n') {
       try {
-        const data = await callN8n(config.webhook_url, { prompt, project_id })
+        const data = await callN8n(config.webhook_url, { project_id, step_key: 'gdd', input_context: { prompt } })
         gdd = data.gdd || data
         meta = data.meta || {}
       } catch (err) {
@@ -160,6 +153,7 @@ router.post('/sprites', async (req, res, next) => {
 
     const check = await validateStepConfig('sprites')
     if (!check.valid) return res.status(422).json({ success: false, error: check.error, code: check.code })
+    if (await tryN8n(check.config, project_id, 'sprites', input_context, res)) return
 
     const { data: project, error } = await db().from('projects').select('id, name, genre, target_engine, concept').eq('id', project_id).single()
     if (error || !project) {
@@ -205,6 +199,7 @@ router.post('/levels', async (req, res, next) => {
     }
     const checkLevels = await validateStepConfig('levels')
     if (!checkLevels.valid) return res.status(422).json({ success: false, error: checkLevels.error, code: checkLevels.code })
+    if (await tryN8n(checkLevels.config, project_id, 'levels', input_context, res)) return
 
     const { data: project, error } = await db().from('projects').select('id, name, genre, target_engine, concept').eq('id', project_id).single()
     if (error || !project) {
@@ -270,6 +265,7 @@ router.post('/code', async (req, res, next) => {
     }
     const checkCode = await validateStepConfig('code')
     if (!checkCode.valid) return res.status(422).json({ success: false, error: checkCode.error, code: checkCode.code })
+    if (await tryN8n(checkCode.config, project_id, 'code', input_context, res)) return
 
     const { data: project, error } = await db()
       .from('projects').select('id, name, genre, target_engine, concept').eq('id', project_id).single()
@@ -392,6 +388,7 @@ router.post('/audio', async (req, res, next) => {
     }
     const checkAudio = await validateStepConfig('audio')
     if (!checkAudio.valid) return res.status(422).json({ success: false, error: checkAudio.error, code: checkAudio.code })
+    if (await tryN8n(checkAudio.config, project_id, 'audio', input_context, res)) return
 
     const { data: project, error } = await db().from('projects').select('id, name, genre, concept').eq('id', project_id).single()
     if (error || !project) {
@@ -433,6 +430,7 @@ router.post('/visual-guide', async (req, res, next) => {
     }
     const checkVg = await validateStepConfig('visual_guide')
     if (!checkVg.valid) return res.status(422).json({ success: false, error: checkVg.error, code: checkVg.code })
+    if (await tryN8n(checkVg.config, project_id, 'visual_guide', input_context, res)) return
 
     const { data: project, error } = await db().from('projects').select('id, name, genre, concept').eq('id', project_id).single()
     if (error || !project) {
@@ -477,6 +475,7 @@ router.post('/art-direction-intake', async (req, res, next) => {
     }
     const checkAdi = await validateStepConfig('art_direction_intake')
     if (!checkAdi.valid) return res.status(422).json({ success: false, error: checkAdi.error, code: checkAdi.code })
+    if (await tryN8n(checkAdi.config, project_id, 'art_direction_intake', input_context, res)) return
 
     const { data: project, error } = await db().from('projects').select('id, name, concept').eq('id', project_id).single()
     if (error || !project) {
@@ -510,6 +509,7 @@ router.post('/concept-art', async (req, res, next) => {
 
     const check = await validateStepConfig('concept_art')
     if (!check.valid) return res.status(422).json({ success: false, error: check.error, code: check.code })
+    if (await tryN8n(check.config, project_id, 'concept_art', input_context, res)) return
 
     const { data: project, error } = await db().from('projects').select('id, name, genre, concept').eq('id', project_id).single()
     if (error || !project) {
@@ -585,6 +585,7 @@ router.post('/sfx', async (req, res, next) => {
     }
     const checkSfx = await validateStepConfig('sfx')
     if (!checkSfx.valid) return res.status(422).json({ success: false, error: checkSfx.error, code: checkSfx.code })
+    if (await tryN8n(checkSfx.config, project_id, 'sfx', input_context, res)) return
 
     const { data: project, error } = await db().from('projects').select('id, name, genre, concept').eq('id', project_id).single()
     if (error || !project) {
@@ -621,6 +622,7 @@ router.post('/backgrounds', async (req, res, next) => {
     }
     const check = await validateStepConfig('backgrounds')
     if (!check.valid) return res.status(422).json({ success: false, error: check.error, code: check.code })
+    if (await tryN8n(check.config, project_id, 'backgrounds', input_context, res)) return
 
     const { data: project, error } = await db().from('projects').select('id, name, genre, concept').eq('id', project_id).single()
     if (error || !project) {
@@ -690,6 +692,7 @@ router.post('/uiux', async (req, res, next) => {
     if (!project_id) return res.status(400).json({ success: false, error: 'project_id is required', code: 'VALIDATION_ERROR' })
     const checkUiux = await validateStepConfig('uiux')
     if (!checkUiux.valid) return res.status(422).json({ success: false, error: checkUiux.error, code: checkUiux.code })
+    if (await tryN8n(checkUiux.config, project_id, 'uiux', input_context, res)) return
     const { data: project, error } = await db().from('projects').select('id, name, genre, concept').eq('id', project_id).single()
     if (error || !project) return res.status(404).json({ success: false, error: 'Project not found', code: 'NOT_FOUND' })
 
@@ -735,6 +738,7 @@ router.post('/icons', async (req, res, next) => {
     if (!project_id) return res.status(400).json({ success: false, error: 'project_id is required', code: 'VALIDATION_ERROR' })
     const checkIcons = await validateStepConfig('icons')
     if (!checkIcons.valid) return res.status(422).json({ success: false, error: checkIcons.error, code: checkIcons.code })
+    if (await tryN8n(checkIcons.config, project_id, 'icons', input_context, res)) return
     const { data: project, error } = await db().from('projects').select('id, name, genre, concept').eq('id', project_id).single()
     if (error || !project) return res.status(404).json({ success: false, error: 'Project not found', code: 'NOT_FOUND' })
 
@@ -783,6 +787,7 @@ router.post('/hud', async (req, res, next) => {
     if (!project_id) return res.status(400).json({ success: false, error: 'project_id is required', code: 'VALIDATION_ERROR' })
     const checkHud = await validateStepConfig('hud')
     if (!checkHud.valid) return res.status(422).json({ success: false, error: checkHud.error, code: checkHud.code })
+    if (await tryN8n(checkHud.config, project_id, 'hud', input_context, res)) return
     const { data: project, error } = await db().from('projects').select('id, name, genre, concept').eq('id', project_id).single()
     if (error || !project) return res.status(404).json({ success: false, error: 'Project not found', code: 'NOT_FOUND' })
 
@@ -822,6 +827,7 @@ router.post('/splash-art', async (req, res, next) => {
     if (!project_id) return res.status(400).json({ success: false, error: 'project_id is required', code: 'VALIDATION_ERROR' })
     const checkSplash = await validateStepConfig('splash')
     if (!checkSplash.valid) return res.status(422).json({ success: false, error: checkSplash.error, code: checkSplash.code })
+    if (await tryN8n(checkSplash.config, project_id, 'splash_art', input_context, res)) return
     const { data: project, error } = await db().from('projects').select('id, name, genre, concept').eq('id', project_id).single()
     if (error || !project) return res.status(404).json({ success: false, error: 'Project not found', code: 'NOT_FOUND' })
 
@@ -867,6 +873,7 @@ router.post('/marketing', async (req, res, next) => {
     if (!project_id) return res.status(400).json({ success: false, error: 'project_id is required', code: 'VALIDATION_ERROR' })
     const checkMarketing = await validateStepConfig('marketing')
     if (!checkMarketing.valid) return res.status(422).json({ success: false, error: checkMarketing.error, code: checkMarketing.code })
+    if (await tryN8n(checkMarketing.config, project_id, 'marketing', input_context, res)) return
     const { data: project, error } = await db().from('projects').select('id, name, genre, concept').eq('id', project_id).single()
     if (error || !project) return res.status(404).json({ success: false, error: 'Project not found', code: 'NOT_FOUND' })
 
@@ -944,6 +951,9 @@ function makeDocRoute(stepKey, promptKey, buildUserPrompt) {
     try {
       const { project_id, input_context } = req.body
       if (!project_id) return res.status(400).json({ success: false, error: 'project_id is required', code: 'VALIDATION_ERROR' })
+      const check = await validateStepConfig(stepKey)
+      if (!check.valid) return res.status(422).json({ success: false, error: check.error, code: check.code })
+      if (await tryN8n(check.config, project_id, stepKey, input_context, res)) return
       const { data: project, error } = await db().from('projects').select('id, name, genre, target_engine, concept').eq('id', project_id).single()
       if (error || !project) return res.status(404).json({ success: false, error: 'Project not found', code: 'NOT_FOUND' })
       const systemPrompt = await getPrompt(promptKey)

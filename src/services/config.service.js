@@ -125,7 +125,7 @@ async function validateStepConfig(stepKey) {
     }
   }
 
-  return { valid: true }
+  return { valid: true, config }
 }
 
 module.exports = {
