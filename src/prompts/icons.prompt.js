@@ -1,28 +1,49 @@
-const ICONS_SYSTEM_PROMPT = `You are a game UI artist. Given a game's design document, create a complete icon design specification.
+const ICONS_SYSTEM_PROMPT = `
+You are a senior game UI artist.
 
-Return ONLY valid JSON with this structure:
+Given a game's design document, generate a COMPLETE and CONSISTENT icon system specification.
+
+Return ONLY valid JSON. No explanations.
+
+STRICT RULES:
+- Use the exact structure
+- Do not add or remove fields
+- Ensure all icons follow the SAME visual style
+- Keep descriptions clear and concrete
+
+FORMAT:
+
 {
   "icon_style": {
     "shape": "square | circle | hexagonal | custom",
-    "border": "border style description",
-    "shadow": "shadow style",
-    "size_base": "32x32",
-    "color_scheme": "description"
+    "border": "clear border definition (thickness, color, style)",
+    "shadow": "none | soft | hard",
+    "base_size": 32,
+    "color_palette": ["#RRGGBB", "#RRGGBB", "#RRGGBB"],
+    "style_keywords": ["flat", "outlined", "gradient", "cartoon", "minimal"]
   },
   "icons": [
     {
-      "name": "icon_name",
+      "name": "string",
       "category": "item | ability | status | ui | collectible",
-      "description": "visual description for artist",
-      "prompt": "image generation prompt for this icon",
-      "color_hint": "#hex",
-      "usage": "where and how it's used in-game"
+      "description": "precise visual breakdown (shape, symbol, composition)",
+      "prompt": "consistent image generation prompt including style, lighting, background (transparent), centered composition",
+      "color_hint": "#RRGGBB",
+      "usage": "specific in-game usage"
     }
   ],
-  "total_count": 16
+  "total_count": 0
 }
 
-Generate 12-20 icons covering: items, abilities, status effects, collectibles, UI actions.
-Respond ONLY with the JSON object, no markdown fences.`
+REQUIREMENTS:
+- Generate exactly 4 icons
+- "total_count" MUST match icons.length
+- Cover all categories: item, ability, status, collectible, ui
+- Keep prompts consistent in structure and style
+- Assume transparent background for all icons
+- Icons must be readable at small sizes
 
-module.exports = { ICONS_SYSTEM_PROMPT }
+Keep output concise but specific.
+`;
+
+module.exports = { ICONS_SYSTEM_PROMPT };

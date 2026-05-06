@@ -6,6 +6,7 @@ const REQUIRED = [
   'CF_R2_ACCESS_KEY_ID',
   'CF_R2_SECRET_ACCESS_KEY',
   'CF_R2_PUBLIC_URL',
+  'CF_R2_FEEDBACK_PUBLIC_URL',
 ]
 
 function validateEnv() {

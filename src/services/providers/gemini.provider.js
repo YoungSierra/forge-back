@@ -16,7 +16,23 @@ async function callGemini(systemPrompt, userMessage, options = {}) {
     }
   })
 
-  const result = await geminiModel.generateContent(userMessage)
+  let result
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      result = await geminiModel.generateContent(userMessage)
+      break
+    } catch (apiErr) {
+      const status = apiErr.status ?? apiErr.httpStatus
+      console.error(`[Gemini] API error | attempt: ${attempt}/2 | model: ${model} | status: ${status} | message: ${apiErr.message}`)
+      if (status === 503 && attempt < 2) {
+        await new Promise(r => setTimeout(r, 3000))
+        continue
+      }
+      if (status === 429) { const e = new Error('Rate limit'); e.code = 'RATE_LIMIT'; e.status = 429; throw e }
+      if (status === 503) { const e = new Error('Model overloaded'); e.code = 'RATE_LIMIT'; e.status = 503; throw e }
+      throw apiErr
+    }
+  }
   const response = result.response
 
   const finishReason = response.candidates?.[0]?.finishReason

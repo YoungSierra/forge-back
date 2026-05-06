@@ -13,7 +13,7 @@ router.get('/step-configs', async (req, res, next) => {
   try {
     const { data, error } = await db()
       .from('step_configs')
-      .select('*, comfyui_workflows(id, name)')
+      .select('*, comfyui_workflows!comfyui_workflow_id(id, name)')
       .order('step_key')
 
     if (error) return res.status(500).json({ success: false, error: error.message })
@@ -25,7 +25,10 @@ router.get('/step-configs', async (req, res, next) => {
 router.patch('/step-configs/:step_key', async (req, res, next) => {
   try {
     const { step_key } = req.params
-    const { integration_type, model_name, comfyui_workflow_id, webhook_url, extra_params, is_active } = req.body
+    const {
+      integration_type, model_name, comfyui_workflow_id, webhook_url, extra_params, is_active,
+      image_enabled, image_integration_type, image_model, image_workflow_id, image_webhook_url,
+    } = req.body
 
     const updates = { updated_by: req.adminMemberId, updated_at: new Date().toISOString() }
     if (integration_type    !== undefined) updates.integration_type    = integration_type
@@ -44,6 +47,25 @@ router.patch('/step-configs/:step_key', async (req, res, next) => {
     } else if (integration_type === 'n8n') {
       updates.comfyui_workflow_id = null
       updates.model_name          = null
+    }
+
+    // Image generation fields
+    if (image_enabled           !== undefined) updates.image_enabled           = image_enabled
+    if (image_integration_type  !== undefined) updates.image_integration_type  = image_integration_type || null
+    if (image_model             !== undefined) updates.image_model             = image_model || null
+    if (image_workflow_id       !== undefined) updates.image_workflow_id       = image_workflow_id || null
+    if (image_webhook_url       !== undefined) updates.image_webhook_url       = image_webhook_url || null
+
+    // Clear image fields that don't apply to image_integration_type
+    if (image_integration_type === 'llm') {
+      updates.image_workflow_id = null
+      updates.image_webhook_url = null
+    } else if (image_integration_type === 'comfyui') {
+      updates.image_model       = null
+      updates.image_webhook_url = null
+    } else if (image_integration_type === 'n8n') {
+      updates.image_model       = null
+      updates.image_workflow_id = null
     }
 
     const { data, error } = await db()

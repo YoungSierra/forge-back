@@ -19,6 +19,7 @@ const membersRoutes = require('./routes/members.routes')
 const feedbackRoutes = require('./routes/feedback.routes')
 const adminRoutes        = require('./routes/admin.routes')
 const adminConfigsRoutes = require('./routes/admin.configs.routes')
+const adminPromptsRoutes = require('./routes/admin.prompts.routes')
 const { requireAdmin }   = require('./middleware/requireAdmin')
 
 // Ensure base storage dirs exist on startup
@@ -57,6 +58,7 @@ app.use('/api/members', membersRoutes)
 app.use('/api/feedback', feedbackRoutes)
 app.use('/api/admin', requireAdmin, adminRoutes)
 app.use('/api/admin', requireAdmin, adminConfigsRoutes)
+app.use('/api/admin', requireAdmin, adminPromptsRoutes)
 
 // Models config — reads step models from DB via configService
 app.get('/api/models', async (req, res, next) => {

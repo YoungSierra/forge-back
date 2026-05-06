@@ -1,0 +1,224 @@
+{
+  "name": "FORGE_TEST",
+  "nodes": [
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chatTrigger",
+      "typeVersion": 1.4,
+      "position": [
+        0,
+        0
+      ],
+      "id": "b59f3396-86d3-4502-adb8-296c293fde39",
+      "name": "When chat message received",
+      "webhookId": "3da02e36-8707-4c68-92e7-820d657338f7"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": " basado en este lineamiento La idea debe: - Estar en 1 sola frase - Incluir jugador + acción + conflicto + hook único - Ser clara y vendible (tipo elevator pitch)  Luego: - Rankéalas por originalidad y potencial de mercado - Selecciona las 3 mejores y explica por qué",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        176,
+        0
+      ],
+      "id": "0ae3f5fa-0c42-42ca-8038-476ce25da8f2",
+      "name": "AI Agent"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "mode": "list",
+          "value": "gpt-5-mini"
+        },
+        "builtInTools": {},
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.3,
+      "position": [
+        48,
+        208
+      ],
+      "id": "44079422-517f-4922-86dd-22533a1df4bb",
+      "name": "OpenAI Chat Model",
+      "credentials": {
+        "openAiApi": {
+          "id": "pDodn4DyJiiTYcuF",
+          "name": "OpenAI account 3"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "type": "@n8n/n8n-nodes-langchain.memoryBufferWindow",
+      "typeVersion": 1.3,
+      "position": [
+        192,
+        208
+      ],
+      "id": "fa33d0c0-7e24-48cf-8cc3-c6dabb99fa7f",
+      "name": "Simple Memory"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "Expande esta idea en un concept brief:  IDEA: [TOMA EL  ONE-LINER]  Incluye: - Género y plataforma - 3–5 pilares del juego - Target (edad, hábitos, motivaciones) - Loop básico del jugador - Referencias (juegos similares)  Hazlo en formato claro y estructurado (máx 1 página).",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        512,
+        0
+      ],
+      "id": "6b2a474b-3e51-4a01-b429-badb0b91e00a",
+      "name": "AI Agent1"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "Analiza el mercado para este concepto:  CONCEPTO: [PEGA CONCEPT BRIEF]  Entrega: - 5 juegos comparables - Qué hacen bien / mal - Oportunidades no explotadas - Definición de USP (unique selling proposition)  Evita obviedades.",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        880,
+        0
+      ],
+      "id": "21308fe7-9d00-4ec4-b294-da81e4efbc0b",
+      "name": "AI Agent2"
+    },
+    {
+      "parameters": {},
+      "type": "@n8n/n8n-nodes-langchain.memoryBufferWindow",
+      "typeVersion": 1.3,
+      "position": [
+        544,
+        208
+      ],
+      "id": "3e76a441-40be-4cf0-a397-a357f661667d",
+      "name": "Simple Memory1"
+    },
+    {
+      "parameters": {},
+      "type": "@n8n/n8n-nodes-langchain.memoryBufferWindow",
+      "typeVersion": 1.3,
+      "position": [
+        928,
+        208
+      ],
+      "id": "299c6cb5-13de-4d75-8b66-06fcb7d53465",
+      "name": "Simple Memory2"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "When chat message received": {
+      "main": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          },
+          {
+            "node": "AI Agent1",
+            "type": "ai_languageModel",
+            "index": 0
+          },
+          {
+            "node": "AI Agent2",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simple Memory": {
+      "ai_memory": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent": {
+      "main": [
+        [
+          {
+            "node": "AI Agent1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent1": {
+      "main": [
+        [
+          {
+            "node": "AI Agent2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simple Memory1": {
+      "ai_memory": [
+        [
+          {
+            "node": "AI Agent1",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simple Memory2": {
+      "ai_memory": [
+        [
+          {
+            "node": "AI Agent2",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "713e3bec-ebec-453c-ae8b-f5316a6c7885",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "add6e456c1c2319e9152fbf4632a02e8d49acf6b0e814776f952ccb9b54af47c"
+  },
+  "id": "JWcodXaHKGD6GbTc",
+  "tags": []
+}

@@ -12,7 +12,7 @@ let _workflowsAt      = 0
 async function loadStepConfigs() {
   const { data, error } = await db()
     .from('step_configs')
-    .select('step_key, integration_type, model_name, comfyui_workflow_id, webhook_url, extra_params, is_active')
+    .select('step_key, integration_type, model_name, comfyui_workflow_id, webhook_url, extra_params, is_active, image_enabled, image_integration_type, image_model, image_workflow_id, image_webhook_url')
 
   if (error) throw new Error(`[configService] Failed to load step_configs: ${error.message}`)
 
@@ -89,6 +89,45 @@ async function resolveStepModel(stepKey) {
   return parseModelString(modelString)
 }
 
+async function validateStepConfig(stepKey) {
+  const config = await getStepConfig(stepKey)
+
+  if (!config) return {
+    valid: false, code: 'STEP_NOT_CONFIGURED',
+    error: `Step "${stepKey}" has no configuration. Go to Admin → Integrations → Step Configs.`,
+  }
+  if (!config.is_active) return {
+    valid: false, code: 'STEP_DISABLED',
+    error: `Step "${stepKey}" is disabled. Enable it in Admin → Integrations → Step Configs.`,
+  }
+
+  if (config.integration_type === 'comfyui' && !config.comfyui_workflow_id) return {
+    valid: false, code: 'STEP_NOT_CONFIGURED',
+    error: `Step "${stepKey}" uses ComfyUI but no workflow is assigned. Go to Admin → Integrations → Step Configs.`,
+  }
+  if (config.integration_type === 'n8n' && !config.webhook_url) return {
+    valid: false, code: 'STEP_NOT_CONFIGURED',
+    error: `Step "${stepKey}" uses n8n but no webhook URL is configured. Go to Admin → Integrations → Step Configs.`,
+  }
+
+  if (config.image_enabled) {
+    if (!config.image_integration_type) return {
+      valid: false, code: 'STEP_NOT_CONFIGURED',
+      error: `Step "${stepKey}" has image generation enabled but no integration type set.`,
+    }
+    if (config.image_integration_type === 'comfyui' && !config.image_workflow_id) return {
+      valid: false, code: 'STEP_NOT_CONFIGURED',
+      error: `Step "${stepKey}" image generation uses ComfyUI but no workflow is assigned.`,
+    }
+    if (config.image_integration_type === 'n8n' && !config.image_webhook_url) return {
+      valid: false, code: 'STEP_NOT_CONFIGURED',
+      error: `Step "${stepKey}" image generation uses n8n but no webhook URL is configured.`,
+    }
+  }
+
+  return { valid: true }
+}
+
 module.exports = {
   getStepConfig,
   getStepConfigs,
@@ -99,4 +138,5 @@ module.exports = {
   invalidateWorkflows,
   resolveStepModel,
   parseModelString,
+  validateStepConfig,
 }

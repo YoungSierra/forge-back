@@ -1,7 +1,7 @@
 const fs = require('fs')
 const path = require('path')
 const { PNG } = require('pngjs')
-const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3')
+const { S3Client, PutObjectCommand, ListObjectsV2Command, DeleteObjectsCommand } = require('@aws-sdk/client-s3')
 
 const STORAGE_BASE = process.env.STORAGE_PATH || './storage/forge-assets'
 
@@ -106,11 +106,68 @@ function slugify(text) {
   return text.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
 }
 
+// ── Storage cleanup ───────────────────────────────────────────────────────────
+
+async function listStorageKeys(prefix, bucketKey = DEFAULT_BUCKET) {
+  const cfg = BUCKET_CONFIG[bucketKey] || BUCKET_CONFIG[DEFAULT_BUCKET]
+  const client = getR2Client()
+  const keys = []
+  let continuationToken
+
+  do {
+    const res = await client.send(new ListObjectsV2Command({
+      Bucket: cfg.name,
+      Prefix: prefix,
+      ContinuationToken: continuationToken,
+    }))
+    for (const obj of res.Contents || []) keys.push(obj.Key)
+    continuationToken = res.IsTruncated ? res.NextContinuationToken : undefined
+  } while (continuationToken)
+
+  return keys
+}
+
+async function deleteStorageKeys(keys, bucketKey = DEFAULT_BUCKET) {
+  if (keys.length === 0) return
+  const cfg = BUCKET_CONFIG[bucketKey] || BUCKET_CONFIG[DEFAULT_BUCKET]
+  const client = getR2Client()
+  // S3 DeleteObjects supports max 1000 keys per request
+  for (let i = 0; i < keys.length; i += 1000) {
+    const batch = keys.slice(i, i + 1000).map(Key => ({ Key }))
+    await client.send(new DeleteObjectsCommand({
+      Bucket: cfg.name,
+      Delete: { Objects: batch, Quiet: true },
+    }))
+  }
+}
+
+/**
+ * Delete all files under projects/{project_id}/{node}/
+ */
+async function clearNodeStorage(project_id, node, bucketKey = DEFAULT_BUCKET) {
+  const prefix = `projects/${project_id}/${node}/`
+  const keys = await listStorageKeys(prefix, bucketKey)
+  await deleteStorageKeys(keys, bucketKey)
+  return keys.length
+}
+
+/**
+ * Delete all files under projects/{project_id}/{node}/{itemSlug}/
+ */
+async function clearItemStorage(project_id, node, itemSlug, bucketKey = DEFAULT_BUCKET) {
+  const prefix = `projects/${project_id}/${node}/${itemSlug}/`
+  const keys = await listStorageKeys(prefix, bucketKey)
+  await deleteStorageKeys(keys, bucketKey)
+  return keys.length
+}
+
 module.exports = {
   ensureProjectDir,
   getAssetUrl,
   generatePlaceholderPNG,
   uploadToStorage,
+  clearNodeStorage,
+  clearItemStorage,
   slugify,
   STORAGE_BASE,
   BUCKET_CONFIG,

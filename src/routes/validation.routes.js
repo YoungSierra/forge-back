@@ -1,7 +1,7 @@
 const express = require('express')
 const router = express.Router()
 const { callLLM } = require('../services/llm.service')
-const { VALIDATION_SYSTEM_PROMPT } = require('../prompts/validation.prompt')
+const { getPrompt } = require('../services/prompt.service')
 
 // gemini-2.5-flash pricing: $0.30/1M input, $2.50/1M output
 const INPUT_COST_PER_TOKEN = 0.30 / 1_000_000
@@ -24,7 +24,7 @@ router.post('/idea', async (req, res, next) => {
 
     let result
     try {
-      result = await callLLM(VALIDATION_SYSTEM_PROMPT, prompt, {
+      result = await callLLM(await getPrompt('validation'), prompt, {
         step: 'validation',
         maxOutputTokens: 1024,
         temperature: 0.1

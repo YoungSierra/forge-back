@@ -6,6 +6,8 @@ const router = express.Router()
 const { db, TEST_MEMBER_ID, calculateCost } = require('../services/supabase.service')
 const { ensureProjectDir, getAssetUrl, slugify, STORAGE_BASE } = require('../services/storage.service')
 
+const STEP_ORDER = ['step_1_concept', 'sprites', 'levels', 'code', 'audio', 'step_6_export']
+
 // GET /api/projects?auth_user_id=xxx
 router.get('/', async (req, res, next) => {
   try {
@@ -47,8 +49,7 @@ router.get('/', async (req, res, next) => {
       const jobs = p.generation_jobs || []
 
       // Calcular current_wizard_step igual que en GET /:id
-      const stepOrder = ['step_1_concept', 'step_2_sprites', 'step_3_levels',
-        'step_4_code', 'step_5_audio', 'step_6_export']
+      const stepOrder = STEP_ORDER
       let current_wizard_step = 1
       for (let i = stepOrder.length - 1; i >= 0; i--) {
         const job = jobs.find(j => j.current_step === stepOrder[i] && j.status === 'approved')
@@ -145,7 +146,7 @@ router.get('/:id', async (req, res, next) => {
     ])
 
     const jobs = jobsRes.data || []
-    const stepOrder = ['step_1_concept', 'step_2_sprites', 'step_3_levels', 'step_4_code', 'step_5_audio', 'step_6_export']
+    const stepOrder = STEP_ORDER
     let current_step = 1
     for (let i = stepOrder.length - 1; i >= 0; i--) {
       const job = jobs.find(j => j.current_step === stepOrder[i] && j.status === 'approved')
@@ -173,7 +174,8 @@ router.get('/:id', async (req, res, next) => {
 // POST /api/projects/approve-step1
 router.post('/approve-step1', async (req, res, next) => {
   try {
-    const { gdd, prompt, meta } = req.body
+    const { gdd, prompt, meta, member_id } = req.body
+    const actorId = member_id || TEST_MEMBER_ID
 
     if (!gdd || !prompt) {
       return res.status(400).json({ success: false, error: 'gdd and prompt are required', code: 'VALIDATION_ERROR' })
@@ -191,8 +193,8 @@ router.post('/approve-step1', async (req, res, next) => {
         genre: gdd.project?.genre || 'platformer',
         target_engine: (gdd.development?.suggested_engine || 'unity').toLowerCase(),
         status: 'active',
-        owner_member_id: TEST_MEMBER_ID,
-        concept: gdd
+        owner_member_id: actorId,
+        concept: { pipeline: { gdd } }
       })
       .select()
       .single()
@@ -207,7 +209,7 @@ router.post('/approve-step1', async (req, res, next) => {
       .from('generation_jobs')
       .insert({
         project_id: project.id,
-        triggered_by: TEST_MEMBER_ID,
+        triggered_by: actorId,
         status: 'approved',
         progress: 100,
         current_step: 'step_1_concept',
@@ -236,7 +238,8 @@ router.post('/approve-step1', async (req, res, next) => {
 router.post('/:project_id/approve-step2', async (req, res, next) => {
   try {
     const { project_id } = req.params
-    const { approved_sprites } = req.body
+    const { approved_sprites, member_id } = req.body
+    const actorId = member_id || TEST_MEMBER_ID
 
     if (!approved_sprites || !Array.isArray(approved_sprites)) {
       return res.status(400).json({ success: false, error: 'approved_sprites array is required', code: 'VALIDATION_ERROR' })
@@ -251,10 +254,10 @@ router.post('/:project_id/approve-step2', async (req, res, next) => {
       .from('generation_jobs')
       .insert({
         project_id,
-        triggered_by: TEST_MEMBER_ID,
+        triggered_by: actorId,
         status: 'approved',
         progress: 100,
-        current_step: 'step_2_sprites',
+        current_step: 'sprites',
         input_prompt: `Sprites for project ${project_id}`,
         started_at: new Date().toISOString(),
         completed_at: new Date().toISOString()
@@ -277,7 +280,7 @@ router.post('/:project_id/approve-step2', async (req, res, next) => {
           type: 'sprite',
           discipline: 'art',
           review_status: 'approved',
-          reviewed_by: TEST_MEMBER_ID,
+          reviewed_by: actorId,
           reviewed_at: new Date().toISOString()
         })
         .select()
@@ -293,22 +296,30 @@ router.post('/:project_id/approve-step2', async (req, res, next) => {
         storage_bucket: 'local',
         prompt_used: sprite.sprite_prompt,
         model_used: 'placeholder',
-        uploaded_by: TEST_MEMBER_ID,
+        uploaded_by: actorId,
         is_current: true
       })
 
       createdAssets.push(asset)
     }
 
-    // Persist preview_url back into concept.characters so the frontend can display them
-    const enrichedChars = (project.concept?.characters || []).map(char => {
+    const now = new Date().toISOString()
+    const gdd = project.concept?.pipeline?.gdd || {}
+    const enrichedChars = (gdd.characters || []).map(char => {
       const sprite = approved_sprites.find(s => s.character_name === char.name)
       if (!sprite || !sprite.preview_url) return char
       return { ...char, preview_url: sprite.preview_url, asset_type: 'sprite' }
     })
     await db().from('projects').update({
-      concept: { ...project.concept, characters: enrichedChars },
-      updated_at: new Date().toISOString()
+      concept: {
+        ...project.concept,
+        pipeline: {
+          ...(project.concept?.pipeline || {}),
+          gdd: { ...gdd, characters: enrichedChars },
+          sprites: { approved: true, approved_at: now },
+        },
+      },
+      updated_at: now,
     }).eq('id', project_id)
 
     res.status(201).json({ success: true, job_id: job.id, assets: createdAssets })
@@ -321,7 +332,8 @@ router.post('/:project_id/approve-step2', async (req, res, next) => {
 router.post('/:project_id/approve-step3', async (req, res, next) => {
   try {
     const { project_id } = req.params
-    const { approved_levels } = req.body
+    const { approved_levels, member_id } = req.body
+    const actorId = member_id || TEST_MEMBER_ID
 
     if (!approved_levels || !Array.isArray(approved_levels)) {
       return res.status(400).json({ success: false, error: 'approved_levels array is required', code: 'VALIDATION_ERROR' })
@@ -341,10 +353,10 @@ router.post('/:project_id/approve-step3', async (req, res, next) => {
       .from('generation_jobs')
       .insert({
         project_id,
-        triggered_by: TEST_MEMBER_ID,
+        triggered_by: actorId,
         status: 'approved',
         progress: 100,
-        current_step: 'step_3_levels',
+        current_step: 'levels',
         input_prompt: `Levels for project ${project_id}`,
         started_at: new Date().toISOString(),
         completed_at: new Date().toISOString()
@@ -367,7 +379,7 @@ router.post('/:project_id/approve-step3', async (req, res, next) => {
           type: 'background',
           discipline: 'art',
           review_status: 'approved',
-          reviewed_by: TEST_MEMBER_ID,
+          reviewed_by: actorId,
           reviewed_at: new Date().toISOString()
         })
         .select()
@@ -383,7 +395,7 @@ router.post('/:project_id/approve-step3', async (req, res, next) => {
         storage_bucket: 'local',
         prompt_used: level.background_prompt,
         model_used: 'placeholder',
-        uploaded_by: TEST_MEMBER_ID,
+        uploaded_by: actorId,
         is_current: true,
         metadata: {
           background_prompt: level.background_prompt,
@@ -394,25 +406,33 @@ router.post('/:project_id/approve-step3', async (req, res, next) => {
       createdAssets.push(asset)
     }
 
-    // Update concept.levels with expanded data + preview_url
-    const enrichedLevels = (project.concept?.levels || []).map(conceptLevel => {
-      const approved = approved_levels.find(al => al.name === conceptLevel.name)
-      if (!approved) return conceptLevel
+    const now = new Date().toISOString()
+    const gdd = project.concept?.pipeline?.gdd || {}
+    const enrichedLevels = (gdd.levels || []).map(conceptLevel => {
+      const approvedLevel = approved_levels.find(al => al.name === conceptLevel.name)
+      if (!approvedLevel) return conceptLevel
       return {
         ...conceptLevel,
-        preview_url: approved.preview_url || conceptLevel.preview_url,
-        expanded_description: approved.expanded_description,
-        enemy_placements: approved.enemy_placements,
-        collectibles: approved.collectibles,
-        hazards: approved.hazards,
-        background_prompt: approved.background_prompt || conceptLevel.background_prompt,
+        preview_url: approvedLevel.preview_url || conceptLevel.preview_url,
+        expanded_description: approvedLevel.expanded_description,
+        enemy_placements: approvedLevel.enemy_placements,
+        collectibles: approvedLevel.collectibles,
+        hazards: approvedLevel.hazards,
+        background_prompt: approvedLevel.background_prompt || conceptLevel.background_prompt,
         asset_type: 'background',
       }
     })
 
     await db().from('projects').update({
-      concept: { ...project.concept, levels: enrichedLevels },
-      updated_at: new Date().toISOString()
+      concept: {
+        ...project.concept,
+        pipeline: {
+          ...(project.concept?.pipeline || {}),
+          gdd: { ...gdd, levels: enrichedLevels },
+          levels: { approved: true, approved_at: now },
+        },
+      },
+      updated_at: now,
     }).eq('id', project_id)
 
     res.status(201).json({ success: true, job_id: job.id, assets: createdAssets })
@@ -425,7 +445,8 @@ router.post('/:project_id/approve-step3', async (req, res, next) => {
 router.post('/:project_id/approve-step4', async (req, res, next) => {
   try {
     const { project_id } = req.params
-    const { files, architecture_md, engine } = req.body
+    const { files, architecture_md, engine, member_id } = req.body
+    const actorId = member_id || TEST_MEMBER_ID
 
     const isNewFormat = Array.isArray(files)
     const isOldFormat = req.body.code && req.body.code.game_js
@@ -439,7 +460,7 @@ router.post('/:project_id/approve-step4', async (req, res, next) => {
     }
 
     const { data: project, error: pErr } = await db()
-      .from('projects').select('id').eq('id', project_id).single()
+      .from('projects').select('id, concept').eq('id', project_id).single()
     if (pErr || !project) {
       return res.status(404).json({
         success: false, error: 'Project not found', code: 'NOT_FOUND'
@@ -450,10 +471,10 @@ router.post('/:project_id/approve-step4', async (req, res, next) => {
       .from('generation_jobs')
       .insert({
         project_id,
-        triggered_by: TEST_MEMBER_ID,
+        triggered_by: actorId,
         status: 'approved',
         progress: 100,
-        current_step: 'step_4_code',
+        current_step: 'code',
         input_prompt: `Code for project ${project_id}`,
         started_at: new Date().toISOString(),
         completed_at: new Date().toISOString()
@@ -473,7 +494,7 @@ router.post('/:project_id/approve-step4', async (req, res, next) => {
             type: 'code',
             discipline: 'code',
             review_status: 'approved',
-            reviewed_by: TEST_MEMBER_ID,
+            reviewed_by: actorId,
             reviewed_at: new Date().toISOString()
           })
           .select().single()
@@ -486,7 +507,7 @@ router.post('/:project_id/approve-step4', async (req, res, next) => {
             storage_url: getAssetUrl(project_id, `code/${file.filename}`),
             storage_bucket: 'local',
             model_used: `${engine || 'unity'}-generated`,
-            uploaded_by: TEST_MEMBER_ID,
+            uploaded_by: actorId,
             is_current: true,
             metadata: {
               engine: engine || 'unity',
@@ -508,7 +529,7 @@ router.post('/:project_id/approve-step4', async (req, res, next) => {
             type: 'code',
             discipline: 'code',
             review_status: 'approved',
-            reviewed_by: TEST_MEMBER_ID,
+            reviewed_by: actorId,
             reviewed_at: new Date().toISOString()
           })
           .select().single()
@@ -521,7 +542,7 @@ router.post('/:project_id/approve-step4', async (req, res, next) => {
             storage_url: getAssetUrl(project_id, 'code/architecture.md'),
             storage_bucket: 'local',
             model_used: 'ai_generated',
-            uploaded_by: TEST_MEMBER_ID,
+            uploaded_by: actorId,
             is_current: true
           })
           createdAssets.push(archAsset)
@@ -538,7 +559,7 @@ router.post('/:project_id/approve-step4', async (req, res, next) => {
             project_id, job_id: job?.id, name,
             type: 'code', discipline: 'code',
             review_status: 'approved',
-            reviewed_by: TEST_MEMBER_ID,
+            reviewed_by: actorId,
             reviewed_at: new Date().toISOString()
           })
           .select().single()
@@ -548,12 +569,21 @@ router.post('/:project_id/approve-step4', async (req, res, next) => {
             asset_id: asset.id, version_number: 1,
             source: 'ai_generated', storage_url: storageUrl,
             storage_bucket: 'local', model_used: 'phaser-generated',
-            uploaded_by: TEST_MEMBER_ID, is_current: true
+            uploaded_by: actorId, is_current: true
           })
           createdAssets.push(asset)
         }
       }
     }
+
+    const now = new Date().toISOString()
+    await db().from('projects').update({
+      concept: {
+        ...project.concept,
+        pipeline: { ...(project.concept?.pipeline || {}), code: { approved: true, approved_at: now } },
+      },
+      updated_at: now,
+    }).eq('id', project_id)
 
     res.status(201).json({
       success: true, job_id: job?.id, assets: createdAssets
@@ -638,13 +668,14 @@ router.get('/:id/play', async (req, res, next) => {
 router.post('/:project_id/approve-step5', async (req, res, next) => {
   try {
     const { project_id } = req.params
-    const { audio } = req.body
+    const { audio, member_id } = req.body
+    const actorId = member_id || TEST_MEMBER_ID
 
     if (!audio) {
       return res.status(400).json({ success: false, error: 'audio is required', code: 'VALIDATION_ERROR' })
     }
 
-    const { data: project, error: pErr } = await db().from('projects').select('id').eq('id', project_id).single()
+    const { data: project, error: pErr } = await db().from('projects').select('id, concept').eq('id', project_id).single()
     if (pErr || !project) {
       return res.status(404).json({ success: false, error: 'Project not found', code: 'NOT_FOUND' })
     }
@@ -653,10 +684,10 @@ router.post('/:project_id/approve-step5', async (req, res, next) => {
       .from('generation_jobs')
       .insert({
         project_id,
-        triggered_by: TEST_MEMBER_ID,
+        triggered_by: actorId,
         status: 'approved',
         progress: 100,
-        current_step: 'step_5_audio',
+        current_step: 'audio',
         input_prompt: `Audio for project ${project_id}`,
         started_at: new Date().toISOString(),
         completed_at: new Date().toISOString()
@@ -681,7 +712,7 @@ router.post('/:project_id/approve-step5', async (req, res, next) => {
           type: 'audio',
           discipline: 'audio',
           review_status: 'approved',
-          reviewed_by: TEST_MEMBER_ID,
+          reviewed_by: actorId,
           reviewed_at: new Date().toISOString()
         })
         .select()
@@ -696,13 +727,22 @@ router.post('/:project_id/approve-step5', async (req, res, next) => {
           storage_url: `audio://${project_id}/${slugify(name)}`,
           storage_bucket: 'local',
           model_used: 'gemini-2.5-flash',
-          uploaded_by: TEST_MEMBER_ID,
+          uploaded_by: actorId,
           is_current: true,
           metadata: { audio_type: audioType, ...itemMeta }
         })
         createdAssets.push(asset)
       }
     }
+
+    const now = new Date().toISOString()
+    await db().from('projects').update({
+      concept: {
+        ...project.concept,
+        pipeline: { ...(project.concept?.pipeline || {}), audio: { approved: true, approved_at: now } },
+      },
+      updated_at: now,
+    }).eq('id', project_id)
 
     res.status(201).json({ success: true, job_id: job?.id, assets: createdAssets })
   } catch (err) {
@@ -812,10 +852,41 @@ router.post('/:project_id/export', async (req, res, next) => {
 
 // POST /api/projects/:id/approve-node — generic pipeline node approval
 // Stores { data, approved: true } in concept.pipeline.{stepKey}
+// Maps each pipeline stepKey to a function that extracts { name, type, discipline, storage_url, prompt_used } records
+const ASSET_EXTRACTORS = {
+  levels:      d => (d.levels || []).filter(l => l.preview_url).map(l => ({
+    name: l.name || `Level ${l.order}`, type: 'background', discipline: 'art',
+    storage_url: l.preview_url, prompt_used: l.background_prompt || null,
+  })),
+  uiux:        d => (d.screens || []).filter(s => s.image_url).map(s => ({
+    name: s.name, type: 'ui_screen', discipline: 'art',
+    storage_url: s.image_url, prompt_used: s.image_prompt || s.description || null,
+  })),
+  hud:         d => d.image_url ? [{ name: 'HUD Layout', type: 'hud', discipline: 'art', storage_url: d.image_url, prompt_used: d.image_prompt || null }] : [],
+  icons:       d => (d.icons || []).filter(i => i.image_url).map(i => ({
+    name: i.name, type: 'icon', discipline: 'art',
+    storage_url: i.image_url, prompt_used: i.prompt || i.description || null,
+  })),
+  concept_art: d => [
+    ...(d.character_concepts || []).filter(c => c.preview_url).map(c => ({ name: c.name, type: 'concept_art', discipline: 'art', storage_url: c.preview_url, prompt_used: c.prompt || null })),
+    ...(d.environment_concepts || []).filter(e => e.preview_url).map(e => ({ name: e.name, type: 'concept_art', discipline: 'art', storage_url: e.preview_url, prompt_used: e.prompt || null })),
+  ],
+  backgrounds: d => (d.items || []).filter(b => b.preview_url).map(b => ({
+    name: b.level_name, type: 'background', discipline: 'art',
+    storage_url: b.preview_url, prompt_used: b.prompt || null,
+  })),
+  splash_art:  d => d.image_url ? [{ name: 'Splash Art', type: 'splash_art', discipline: 'marketing', storage_url: d.image_url, prompt_used: d.image_prompt || null }] : [],
+  marketing:   d => (d.assets || []).filter(a => a.image_url).map(a => ({
+    name: a.title || a.name || 'Marketing Asset', type: 'marketing', discipline: 'marketing',
+    storage_url: a.image_url, prompt_used: a.image_prompt || null,
+  })),
+}
+
 router.post('/:id/approve-node', async (req, res, next) => {
   try {
     const { id } = req.params
-    const { stepKey, data: nodeData } = req.body
+    const { stepKey, data: nodeData, member_id } = req.body
+    const actorId = member_id || TEST_MEMBER_ID
 
     if (!stepKey) {
       return res.status(400).json({ success: false, error: 'stepKey is required', code: 'VALIDATION_ERROR' })
@@ -827,16 +898,26 @@ router.post('/:id/approve-node', async (req, res, next) => {
       return res.status(404).json({ success: false, error: 'Project not found', code: 'NOT_FOUND' })
     }
 
+    const now = new Date().toISOString()
     const pipeline = project.concept?.pipeline || {}
-    const updatedPipeline = {
+
+    let updatedPipeline = {
       ...pipeline,
-      [stepKey]: { ...(nodeData || {}), approved: true, approved_at: new Date().toISOString() }
+      [stepKey]: { ...(nodeData || {}), approved: true, approved_at: now }
     }
+
+    // levels: also promote expanded levels back into gdd.levels so other nodes can read them
+    if (stepKey === 'levels' && Array.isArray(nodeData?.levels)) {
+      const gdd = pipeline.gdd || {}
+      updatedPipeline = {
+        ...updatedPipeline,
+        gdd: { ...gdd, levels: nodeData.levels }
+      }
+    }
+
     const updatedConcept = { ...project.concept, pipeline: updatedPipeline }
 
     console.log(`[APPROVE-NODE] Saving stepKey="${stepKey}" for project ${id}`)
-
-    const now = new Date().toISOString()
 
     const { error: uErr } = await db()
       .from('projects')
@@ -845,47 +926,72 @@ router.post('/:id/approve-node', async (req, res, next) => {
 
     if (uErr) {
       console.error(`[APPROVE-NODE] Supabase update error for project ${id}:`, uErr)
-      return res.status(500).json({
-        success: false,
-        error: 'Failed to update project',
-        code: 'SUPABASE_ERROR',
-        details: uErr.message,
-      })
+      return res.status(500).json({ success: false, error: 'Failed to update project', code: 'SUPABASE_ERROR', details: uErr.message })
     }
 
-    // If there's an existing review job for this step, update it — otherwise insert fresh
+    // Upsert generation_job for this step
     const { data: existingJob } = await db()
-      .from('generation_jobs')
-      .select('id')
-      .eq('project_id', id)
-      .eq('current_step', stepKey)
-      .eq('status', 'review')
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .single()
+      .from('generation_jobs').select('id')
+      .eq('project_id', id).eq('current_step', stepKey).eq('status', 'review')
+      .order('created_at', { ascending: false }).limit(1).single()
 
-    let jErr
+    let jobId = existingJob?.id || null
     if (existingJob) {
-      ;({ error: jErr } = await db()
-        .from('generation_jobs')
-        .update({ status: 'approved', completed_at: now })
-        .eq('id', existingJob.id))
+      await db().from('generation_jobs').update({ status: 'approved', completed_at: now }).eq('id', existingJob.id)
     } else {
-      ;({ error: jErr } = await db().from('generation_jobs').insert({
-        project_id: id,
-        triggered_by: TEST_MEMBER_ID,
-        status: 'approved',
-        progress: 100,
-        current_step: stepKey,
-        input_prompt: `Pipeline node approved: ${stepKey}`,
-        started_at: now,
-        completed_at: now,
-      }))
+      const { data: newJob } = await db().from('generation_jobs').insert({
+        project_id: id, triggered_by: actorId, status: 'approved', progress: 100,
+        current_step: stepKey, input_prompt: `Pipeline node approved: ${stepKey}`,
+        started_at: now, completed_at: now,
+      }).select('id').single()
+      if (newJob) jobId = newJob.id
     }
 
-    if (jErr) {
-      console.error(`[APPROVE-NODE] generation_jobs insert error:`, jErr)
-      // Non-fatal: project.concept was already updated — still return success
+    // Save assets to assets table
+    const extractor = ASSET_EXTRACTORS[stepKey]
+    if (extractor && nodeData) {
+      const assetItems = extractor(nodeData)
+      if (assetItems.length > 0) {
+        // Remove old assets for this step before inserting new ones
+        await db().from('assets').delete().eq('project_id', id).eq('step_key', stepKey)
+
+        let savedCount = 0
+        for (const item of assetItems) {
+          const { data: asset, error: aErr } = await db().from('assets').insert({
+            project_id: id,
+            job_id: jobId,
+            step_key: stepKey,
+            name: item.name,
+            type: item.type,
+            discipline: item.discipline,
+            review_status: 'approved',
+            reviewed_by: actorId,
+            reviewed_at: now,
+          }).select('id').single()
+
+          if (aErr || !asset) {
+            console.error(`[APPROVE-NODE] asset insert failed for "${item.name}":`, JSON.stringify(aErr))
+            continue
+          }
+
+          if (item.storage_url) {
+            const { error: avErr } = await db().from('asset_versions').insert({
+              asset_id: asset.id,
+              version_number: 1,
+              source: 'ai_generated',
+              storage_url: item.storage_url,
+              storage_bucket: 'local',
+              prompt_used: item.prompt_used,
+              model_used: 'placeholder',
+              uploaded_by: actorId,
+              is_current: true,
+            })
+            if (avErr) console.error(`[APPROVE-NODE] asset_version insert failed:`, JSON.stringify(avErr))
+          }
+          savedCount++
+        }
+        console.log(`[APPROVE-NODE] Saved ${savedCount}/${assetItems.length} assets for stepKey="${stepKey}"`)
+      }
     }
 
     console.log(`[APPROVE-NODE] Saved stepKey="${stepKey}" for project ${id} ✓`)
@@ -1023,8 +1129,7 @@ router.patch('/:id/invalidate-from-step', async (req, res, next) => {
       return res.status(400).json({ success: false, error: 'from_step (number) is required', code: 'VALIDATION_ERROR' })
     }
 
-    const stepOrder = ['step_1_concept', 'step_2_sprites', 'step_3_levels', 'step_4_code', 'step_5_audio', 'step_6_export']
-    const stepsToInvalidate = stepOrder.slice(from_step - 1)
+    const stepsToInvalidate = STEP_ORDER.slice(from_step - 1)
 
     const { data: jobs, error: jErr } = await db()
       .from('generation_jobs')

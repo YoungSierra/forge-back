@@ -1,12 +1,12 @@
 const express = require('express')
 const router = express.Router()
-const { db, TEST_MEMBER_ID } = require('../services/supabase.service')
+const { db } = require('../services/supabase.service')
 
 // PATCH /api/assets/:id/review
 router.patch('/:id/review', async (req, res, next) => {
   try {
     const { id } = req.params
-    const { action, notes } = req.body
+    const { action, notes, member_id } = req.body
 
     if (!action || !['approve', 'reject'].includes(action)) {
       return res.status(400).json({ success: false, error: 'action must be approve or reject', code: 'VALIDATION_ERROR' })
@@ -22,7 +22,7 @@ router.patch('/:id/review', async (req, res, next) => {
 
     const update = {
       review_status: action === 'approve' ? 'approved' : 'rejected',
-      reviewed_by: TEST_MEMBER_ID,
+      reviewed_by: member_id || null,
       reviewed_at: new Date().toISOString()
     }
     if (notes) update.review_notes = notes

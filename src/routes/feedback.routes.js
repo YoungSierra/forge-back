@@ -1,6 +1,7 @@
 const express = require('express')
 const router = express.Router()
 const { db } = require('../services/supabase.service')
+const { uploadToStorage } = require('../services/storage.service')
 const { GoogleGenerativeAI } = require('@google/generative-ai')
 
 // POST /api/feedback
@@ -72,6 +73,21 @@ router.post('/summary', async (req, res, next) => {
     const summary    = result.response.text().trim()
 
     res.json({ success: true, summary, count: data.length })
+  } catch (err) { next(err) }
+})
+
+// POST /api/feedback/upload-screenshot
+router.post('/upload-screenshot', async (req, res, next) => {
+  try {
+    const { data: b64, mimeType } = req.body
+    if (!b64 || !mimeType) return res.status(400).json({ success: false, error: 'data and mimeType are required' })
+
+    const buffer = Buffer.from(b64, 'base64')
+    const ext = mimeType.split('/')[1]?.split('+')[0] || 'png'
+    const storagePath = `feedback/${Date.now()}.${ext}`
+
+    const url = await uploadToStorage(buffer, storagePath, mimeType, 'feedback-screenshots')
+    res.json({ success: true, url })
   } catch (err) { next(err) }
 })
 
