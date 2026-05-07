@@ -110,39 +110,36 @@ router.post('/gdd', async (req, res, next) => {
       }
       gdd  = result.data
       meta = result.meta
+
     }
 
     // ── image generation for characters and levels (if enabled + project exists) ─
     if (config.image_enabled && project_id && gdd) {
       await clearNodeStorage(project_id, 'gdd')
 
-      if (Array.isArray(gdd.characters)) {
-        for (const char of gdd.characters) {
-          if (!char.sprite_prompt) continue
-          const img = await generateImageForNode(
-            'gdd',
-            char.sprite_prompt,
-            512, 512,
-            `projects/${project_id}/gdd/characters/${slugify(char.name || 'char')}.jpg`
-          )
+      // All image tasks in one pool — ComfyUI cloud handles 2 concurrent jobs max
+      const imageTasks = [
+        ...(Array.isArray(gdd.characters) ? gdd.characters.filter(c => c.sprite_prompt).map(char => async () => {
+          const img = await generateImageForNode('gdd', char.sprite_prompt, 1024, 1024, `projects/${project_id}/gdd/characters/${slugify(char.name || 'char')}.jpg`)
           if (img?.url) char.preview_url = img.url
-        }
-        timer.lap(`images characters (${gdd.characters.length})`)
-      }
-
-      if (Array.isArray(gdd.levels)) {
-        for (const level of gdd.levels) {
-          if (!level.background_prompt) continue
-          const img = await generateImageForNode(
-            'gdd',
-            level.background_prompt,
-            1024, 512,
-            `projects/${project_id}/gdd/levels/${slugify(level.name || 'level')}.jpg`
-          )
+        }) : []),
+        ...(Array.isArray(gdd.levels) ? gdd.levels.filter(l => l.background_prompt).map(level => async () => {
+          const img = await generateImageForNode('gdd', level.background_prompt, 1024, 512, `projects/${project_id}/gdd/levels/${slugify(level.name || 'level')}.jpg`)
           if (img?.url) level.preview_url = img.url
+        }) : []),
+      ]
+
+      // Concurrency-limited runner: max 2 parallel to match ComfyUI cloud slot limit
+      const CONCURRENCY = 1
+      let idx = 0
+      async function worker() {
+        while (idx < imageTasks.length) {
+          const task = imageTasks[idx++]
+          await task()
         }
-        timer.lap(`images levels (${gdd.levels.length})`)
       }
+      await Promise.all(Array.from({ length: CONCURRENCY }, worker))
+      timer.lap(`images total (${imageTasks.length})`)
     }
 
     timer.end()

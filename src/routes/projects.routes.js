@@ -180,14 +180,51 @@ router.get('/:id', async (req, res, next) => {
   }
 })
 
-// POST /api/projects/approve-step1
-router.post('/approve-step1', async (req, res, next) => {
+// POST /api/projects — create empty draft project (Step 1 of new project modal)
+router.post('/', async (req, res, next) => {
   try {
-    const { gdd, prompt, meta, member_id } = req.body
+    const { name, member_id } = req.body
     const actorId = member_id || TEST_MEMBER_ID
 
-    if (!gdd || !prompt) {
-      return res.status(400).json({ success: false, error: 'gdd and prompt are required', code: 'VALIDATION_ERROR' })
+    if (!name?.trim()) {
+      return res.status(400).json({ success: false, error: 'name is required', code: 'VALIDATION_ERROR' })
+    }
+
+    const { data: project, error: pErr } = await db()
+      .from('projects')
+      .insert({
+        name: name.trim(),
+        description: '',
+        genre: 'tbd',
+        target_engine: 'unity',
+        status: 'draft',
+        owner_member_id: actorId,
+        concept: { pipeline: {} }
+      })
+      .select()
+      .single()
+
+    if (pErr) {
+      console.error('[create-project] insert error:', JSON.stringify(pErr, null, 2))
+      return res.status(500).json({ success: false, error: 'Failed to create project', code: 'SUPABASE_ERROR' })
+    }
+
+    ensureProjectDir(project.id)
+
+    res.status(201).json({ success: true, project_id: project.id, project })
+  } catch (err) {
+    next(err)
+  }
+})
+
+// POST /api/projects/approve-step1 — attach GDD to existing draft project
+router.post('/approve-step1', async (req, res, next) => {
+  try {
+    const { project_id, gdd, prompt, meta, member_id } = req.body
+    const actorId = member_id || TEST_MEMBER_ID
+
+    if (!project_id || !gdd || !prompt) {
+      return res.status(400).json({ success: false, error: 'project_id, gdd and prompt are required', code: 'VALIDATION_ERROR' })
     }
 
     const tokens_used = meta?.tokens_used || { input: 0, output: 0, cached: 0 }
@@ -196,21 +233,20 @@ router.post('/approve-step1', async (req, res, next) => {
 
     const { data: project, error: pErr } = await db()
       .from('projects')
-      .insert({
-        name: gdd.project?.name || 'Untitled Game',
+      .update({
         description: gdd.project?.description || '',
         genre: gdd.project?.genre || 'platformer',
         target_engine: normalizeEngine(gdd.development?.suggested_engine),
         status: 'active',
-        owner_member_id: actorId,
         concept: { pipeline: { gdd } }
       })
+      .eq('id', project_id)
       .select()
       .single()
 
     if (pErr) {
-      console.error('[approve-step1] project insert error:', JSON.stringify(pErr, null, 2))
-      return res.status(500).json({ success: false, error: 'Failed to create project', code: 'SUPABASE_ERROR', ...(process.env.NODE_ENV === 'development' && { details: pErr }) })
+      console.error('[approve-step1] project update error:', JSON.stringify(pErr, null, 2))
+      return res.status(500).json({ success: false, error: 'Failed to update project', code: 'SUPABASE_ERROR', ...(process.env.NODE_ENV === 'development' && { details: pErr }) })
     }
 
     const startedAt = new Date(Date.now() - duration_ms).toISOString()
@@ -220,9 +256,10 @@ router.post('/approve-step1', async (req, res, next) => {
       .insert({
         project_id: project.id,
         triggered_by: actorId,
-        status: 'approved',
+        status: 'review',
+        review_status: 'pending',
         progress: 100,
-        current_step: 'step_1_concept',
+        current_step: 'gdd',
         input_prompt: prompt,
         total_cost_usd,
         tokens_used,
@@ -236,9 +273,7 @@ router.post('/approve-step1', async (req, res, next) => {
       return res.status(500).json({ success: false, error: 'Failed to create generation job', code: 'SUPABASE_ERROR', ...(process.env.NODE_ENV === 'development' && { details: jErr }) })
     }
 
-    ensureProjectDir(project.id)
-
-    res.status(201).json({ success: true, project_id: project.id, job_id: job.id, project })
+    res.json({ success: true, project_id: project.id, job_id: job.id, project })
   } catch (err) {
     next(err)
   }
@@ -867,6 +902,16 @@ router.post('/:project_id/export', async (req, res, next) => {
 // Stores { data, approved: true } in concept.pipeline.{stepKey}
 // Maps each pipeline stepKey to a function that extracts { name, type, discipline, storage_url, prompt_used } records
 const ASSET_EXTRACTORS = {
+  gdd: d => [
+    ...(d.characters || []).filter(c => c.preview_url).map(c => ({
+      name: c.name, type: 'sprite', discipline: 'art',
+      storage_url: c.preview_url, prompt_used: c.sprite_prompt || null,
+    })),
+    ...(d.levels || []).filter(l => l.preview_url).map(l => ({
+      name: l.name || `Level ${l.order}`, type: 'background', discipline: 'art',
+      storage_url: l.preview_url, prompt_used: l.background_prompt || null,
+    })),
+  ],
   sprites:     d => (d.sprites || d.characters || []).filter(s => s.preview_url).map(s => ({
     name: s.character_name || s.name, type: 'sprite', discipline: 'art',
     storage_url: s.preview_url, prompt_used: s.sprite_prompt || null,
