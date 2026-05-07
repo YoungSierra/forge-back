@@ -8,6 +8,15 @@ const { ensureProjectDir, getAssetUrl, slugify, STORAGE_BASE } = require('../ser
 
 const STEP_ORDER = ['step_1_concept', 'sprites', 'levels', 'code', 'audio', 'step_6_export']
 
+function normalizeEngine(raw) {
+  const s = (raw || '').toLowerCase()
+  if (s.includes('unreal')) return 'unreal'
+  if (s.includes('godot'))  return 'godot'
+  if (s.includes('phaser')) return 'phaser'
+  if (s.includes('unity'))  return 'unity'
+  return 'unity'
+}
+
 // GET /api/projects?auth_user_id=xxx
 router.get('/', async (req, res, next) => {
   try {
@@ -191,7 +200,7 @@ router.post('/approve-step1', async (req, res, next) => {
         name: gdd.project?.name || 'Untitled Game',
         description: gdd.project?.description || '',
         genre: gdd.project?.genre || 'platformer',
-        target_engine: (gdd.development?.suggested_engine || 'unity').toLowerCase(),
+        target_engine: normalizeEngine(gdd.development?.suggested_engine),
         status: 'active',
         owner_member_id: actorId,
         concept: { pipeline: { gdd } }
@@ -200,6 +209,7 @@ router.post('/approve-step1', async (req, res, next) => {
       .single()
 
     if (pErr) {
+      console.error('[approve-step1] project insert error:', JSON.stringify(pErr, null, 2))
       return res.status(500).json({ success: false, error: 'Failed to create project', code: 'SUPABASE_ERROR', ...(process.env.NODE_ENV === 'development' && { details: pErr }) })
     }
 
@@ -276,6 +286,7 @@ router.post('/:project_id/approve-step2', async (req, res, next) => {
         .insert({
           project_id,
           job_id: job.id,
+          step_key: 'sprites',
           name: sprite.character_name,
           type: 'sprite',
           discipline: 'art',
@@ -375,6 +386,7 @@ router.post('/:project_id/approve-step3', async (req, res, next) => {
         .insert({
           project_id,
           job_id: job.id,
+          step_key: 'backgrounds',
           name: level.name,
           type: 'background',
           discipline: 'art',
@@ -708,6 +720,7 @@ router.post('/:project_id/approve-step5', async (req, res, next) => {
         .insert({
           project_id,
           job_id: job?.id,
+          step_key: 'audio',
           name,
           type: 'audio',
           discipline: 'audio',
@@ -854,6 +867,10 @@ router.post('/:project_id/export', async (req, res, next) => {
 // Stores { data, approved: true } in concept.pipeline.{stepKey}
 // Maps each pipeline stepKey to a function that extracts { name, type, discipline, storage_url, prompt_used } records
 const ASSET_EXTRACTORS = {
+  sprites:     d => (d.sprites || d.characters || []).filter(s => s.preview_url).map(s => ({
+    name: s.character_name || s.name, type: 'sprite', discipline: 'art',
+    storage_url: s.preview_url, prompt_used: s.sprite_prompt || null,
+  })),
   levels:      d => (d.levels || []).filter(l => l.preview_url).map(l => ({
     name: l.name || `Level ${l.order}`, type: 'background', discipline: 'art',
     storage_url: l.preview_url, prompt_used: l.background_prompt || null,

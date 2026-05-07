@@ -2,6 +2,29 @@ const express = require('express')
 const router = express.Router()
 const { db } = require('../services/supabase.service')
 
+// GET /api/assets?project_id=&step_key=
+router.get('/', async (req, res, next) => {
+  try {
+    const { project_id, step_key } = req.query
+
+    let query = db()
+      .from('assets')
+      .select('*, asset_versions!asset_versions_asset_id_fkey(*), projects!assets_project_id_fkey(id, name)')
+      .order('created_at', { ascending: false })
+      .limit(300)
+
+    if (project_id) query = query.eq('project_id', project_id)
+    if (step_key)   query = query.eq('step_key', step_key)
+
+    const { data: assets, error } = await query
+    if (error) return res.status(500).json({ success: false, error: 'Failed to fetch assets', code: 'SUPABASE_ERROR' })
+
+    res.json({ success: true, assets: assets || [] })
+  } catch (err) {
+    next(err)
+  }
+})
+
 // PATCH /api/assets/:id/review
 router.patch('/:id/review', async (req, res, next) => {
   try {
