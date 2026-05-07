@@ -9,6 +9,7 @@ const { ensureProjectDir, getAssetUrl, slugify, clearNodeStorage, STORAGE_BASE }
 const { generateImagesSequential, generateImageForNode } = require('../services/image.service')
 const { validateStepConfig } = require('../services/config.service')
 const { callN8n } = require('../services/n8n.service')
+const { makeTimer } = require('../utils/timer')
 
 function llmErr(err) {
   if (err.status === 429 || err.status === 503 || err.code === 'RATE_LIMIT') return { status: 502, error: 'Model is busy — try again in a few seconds.', code: 'RATE_LIMIT' }
@@ -59,8 +60,11 @@ router.post('/gdd', async (req, res, next) => {
       return res.status(400).json({ success: false, error: 'prompt must be 10–1000 characters', code: 'VALIDATION_ERROR' })
     }
 
+    const timer = makeTimer('GDD')
+
     const checkGdd = await validateStepConfig('gdd')
     if (!checkGdd.valid) return res.status(422).json({ success: false, error: checkGdd.error, code: checkGdd.code })
+    timer.lap('validate config')
 
     const config = checkGdd.config
 
@@ -80,6 +84,7 @@ router.post('/gdd', async (req, res, next) => {
         const data = await callN8n(config.webhook_url, { project_id, step_key: 'gdd', input_context: { prompt } })
         gdd = data.gdd || data
         meta = data.meta || {}
+        timer.lap('n8n webhook')
       } catch (err) {
         return res.status(502).json({ success: false, error: err.message, code: err.code || 'N8N_ERROR' })
       }
@@ -88,9 +93,11 @@ router.post('/gdd', async (req, res, next) => {
       try {
         result = await callLLM(await getPrompt('gdd'), `Generate a complete Game Design Document for this game idea: ${prompt}`, {
           step: 'gdd',
-          maxOutputTokens: 8192
+          maxOutputTokens: 32768
         })
+        timer.lap('LLM generation')
       } catch (err) {
+        console.error(`[GDD] LLM error — ${err.message} (status=${err.status} code=${err.code})`)
         const code = err.code || 'LLM_ERROR'
         const isRateLimit = err.status === 429 || code === 'RATE_LIMIT'
         return res.status(502).json({
@@ -120,6 +127,7 @@ router.post('/gdd', async (req, res, next) => {
           )
           if (img?.url) char.preview_url = img.url
         }
+        timer.lap(`images characters (${gdd.characters.length})`)
       }
 
       if (Array.isArray(gdd.levels)) {
@@ -133,9 +141,11 @@ router.post('/gdd', async (req, res, next) => {
           )
           if (img?.url) level.preview_url = img.url
         }
+        timer.lap(`images levels (${gdd.levels.length})`)
       }
     }
 
+    timer.end()
     res.status(201).json({ success: true, gdd, meta })
   } catch (err) {
     next(err)

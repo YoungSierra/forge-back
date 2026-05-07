@@ -2,6 +2,7 @@ const express = require('express')
 const router = express.Router()
 const { callLLM } = require('../services/llm.service')
 const { getPrompt } = require('../services/prompt.service')
+const { makeTimer } = require('../utils/timer')
 
 // gemini-2.5-flash pricing: $0.30/1M input, $2.50/1M output
 const INPUT_COST_PER_TOKEN = 0.30 / 1_000_000
@@ -22,6 +23,7 @@ router.post('/idea', async (req, res, next) => {
       return res.status(400).json({ success: false, error: 'prompt must be 2000 characters or fewer', code: 'VALIDATION_ERROR' })
     }
 
+    const timer = makeTimer('VALIDATE')
     let result
     try {
       result = await callLLM(await getPrompt('validation'), prompt, {
@@ -29,6 +31,7 @@ router.post('/idea', async (req, res, next) => {
         maxOutputTokens: 1024,
         temperature: 0.1
       })
+      timer.lap('LLM validation')
     } catch (err) {
       const code = err.code || 'LLM_ERROR'
       const isRateLimit = err.status === 429 || code === 'RATE_LIMIT'
@@ -44,6 +47,7 @@ router.post('/idea', async (req, res, next) => {
     const { input, output } = result.meta.tokens_used
     const cost_usd = input * INPUT_COST_PER_TOKEN + output * OUTPUT_COST_PER_TOKEN
 
+    timer.end()
     res.status(200).json({
       success: true,
       validation: result.data,

@@ -81,9 +81,13 @@ function ensureLoaded() {
 
 async function getPrompt(key) {
   await ensureLoaded()
-  if (_cache[key]) return _cache[key]
+  if (_cache[key]) {
+    console.log(`[promptService] getPrompt("${key}") → R2 (${_cache[key].length} chars)`)
+    return _cache[key]
+  }
   const fallback = FALLBACK_MAP[key]?.()
   if (!fallback) console.warn(`[promptService] No prompt found for key "${key}"`)
+  else console.log(`[promptService] getPrompt("${key}") → fallback local`)
   return fallback || ''
 }
 
