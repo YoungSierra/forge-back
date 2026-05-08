@@ -7,7 +7,8 @@ const { getPrompt } = require('../services/prompt.service')
 const { db } = require('../services/supabase.service')
 const { ensureProjectDir, getAssetUrl, slugify, clearNodeStorage, STORAGE_BASE } = require('../services/storage.service')
 const { generateImagesSequential, generateImageForNode } = require('../services/image.service')
-const { validateStepConfig } = require('../services/config.service')
+const { validateStepConfig, getWorkflowById } = require('../services/config.service')
+const { generateImageComfyUI } = require('../services/providers/comfyui.provider')
 const { callN8n } = require('../services/n8n.service')
 const { makeTimer } = require('../utils/timer')
 
@@ -91,7 +92,13 @@ router.post('/gdd', async (req, res, next) => {
     } else {
       let result
       try {
-        result = await callLLM(await getPrompt('gdd'), `Generate a complete Game Design Document for this game idea: ${prompt}`, {
+        let projectName = null
+        if (project_id) {
+          const { data: proj } = await db().from('projects').select('name').eq('id', project_id).single()
+          projectName = proj?.name || null
+        }
+        const namePrefix = projectName ? `The game title is "${projectName}". Use this exact name in the GDD. ` : ''
+        result = await callLLM(await getPrompt('gdd'), `${namePrefix}Generate a complete Game Design Document for this game idea: ${prompt}`, {
           step: 'gdd',
           maxOutputTokens: 32768
         })
@@ -980,9 +987,88 @@ makeDocRoute('modeling', 'modeling', (p, ctx) => {
   return `${baseCtx(p, gdd)}\nCharacters: ${JSON.stringify((gdd.characters || []).map(c => ({ name: c.name, role: c.role })))}\nLevels: ${(gdd.levels || []).map(l => l.environment).join(', ')}`
 })
 
-makeDocRoute('charaters', 'charaters', (p, ctx) => {
-  const gdd = ctx?.gdd ?? gddOf(p.concept)
-  return `${baseCtx(p, gdd)}\nCharacters: ${JSON.stringify((gdd.characters || []).map(c => ({ name: c.name, role: c.role, description: c.description })))}`
+// ── charaters — custom route with per-character ComfyUI image generation ──────
+router.post('/charaters', async (req, res, next) => {
+  try {
+    const { project_id, input_context } = req.body
+    if (!project_id) return res.status(400).json({ success: false, error: 'project_id is required', code: 'VALIDATION_ERROR' })
+
+    const check = await validateStepConfig('charaters')
+    if (!check.valid) return res.status(422).json({ success: false, error: check.error, code: check.code })
+    if (await tryN8n(check.config, project_id, 'charaters', input_context, res)) return
+
+    const { data: project, error } = await db().from('projects').select('id, name, genre, target_engine, concept').eq('id', project_id).single()
+    if (error || !project) return res.status(404).json({ success: false, error: 'Project not found', code: 'NOT_FOUND' })
+
+    // Require image_reference to be connected and approved
+    if (!input_context?.image_reference) {
+      return res.status(422).json({
+        success: false,
+        error: 'The "Image Reference" node must be connected to this node in the pipeline.',
+        code: 'DEPENDENCY_NOT_CONNECTED',
+      })
+    }
+    if (!project.concept?.pipeline?.image_reference?.approved) {
+      return res.status(422).json({
+        success: false,
+        error: 'The "Image Reference" node must be approved before generating characters.',
+        code: 'DEPENDENCY_NOT_MET',
+      })
+    }
+
+    const gdd = input_context?.gdd ?? gddOf(project.concept)
+    const userPrompt = `${baseCtx(project, gdd)}\nCharacters: ${JSON.stringify((gdd.characters || []).map(c => ({ name: c.name, role: c.role, description: c.description })))}`
+    const data = await generateDocNode(await getPrompt('charaters'), userPrompt, 'charaters', res)
+    if (!data) return
+
+    // ── per-character ComfyUI image generation ─────────────────────────────
+    const config = check.config
+    if (config.image_enabled && config.image_integration_type === 'comfyui' && config.image_workflow_id) {
+      const workflow = await getWorkflowById(config.image_workflow_id)
+      if (!workflow) {
+        console.warn('[charaters] ComfyUI workflow not found:', config.image_workflow_id)
+        return res.status(200).json({ success: true, charaters: data })
+      }
+
+      const characters  = gdd.characters || []
+      const namesStr    = JSON.stringify(characters.map(c => c.name))
+      const promptsStr  = JSON.stringify(characters.map(c => c.sprite_prompt || c.name))
+
+      for (let i = 0; i < characters.length; i++) {
+        const char    = characters[i]
+        const charKey = char.name.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '')
+
+        // Approved reference images for this character
+        const { data: refs } = await db()
+          .from('character_image_refs')
+          .select('image_url')
+          .eq('project_id', project_id)
+          .eq('character_key', charKey)
+          .eq('selected', true)
+          .order('created_at', { ascending: true })
+          .limit(2)
+
+        const refA = refs?.[0]?.image_url || ''
+        const refB = refs?.[1]?.image_url || refA
+
+        const storagePath = `projects/${project_id}/charaters/${charKey}_${Date.now()}.png`
+        try {
+          const result = await generateImageComfyUI(workflow.name, '', 1024, 1024, storagePath, {
+            char_index:   i,
+            names_list:   namesStr,
+            prompts_list: promptsStr,
+            ref_image_a:  refA,
+            ref_image_b:  refB,
+          })
+          console.log(`[charaters] ${char.name} → ${result.url}`)
+        } catch (e) {
+          console.error(`[charaters] image failed for "${char.name}":`, e.message)
+        }
+      }
+    }
+
+    res.status(200).json({ success: true, charaters: data })
+  } catch (err) { next(err) }
 })
 
 makeDocRoute('vfx', 'vfx', (p, ctx) => {

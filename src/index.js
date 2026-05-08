@@ -19,7 +19,9 @@ const membersRoutes = require('./routes/members.routes')
 const feedbackRoutes = require('./routes/feedback.routes')
 const adminRoutes        = require('./routes/admin.routes')
 const adminConfigsRoutes = require('./routes/admin.configs.routes')
-const adminPromptsRoutes = require('./routes/admin.prompts.routes')
+const adminPromptsRoutes    = require('./routes/admin.prompts.routes')
+const imageReferenceRoutes  = require('./routes/image-reference.routes')
+const charaterRoutes        = require('./routes/charaters.routes')
 const { requireAdmin }   = require('./middleware/requireAdmin')
 
 // Ensure base storage dirs exist on startup
@@ -52,6 +54,8 @@ app.get('/api/health/db', async (req, res) => {
 // Routes
 app.use('/api/generate', gddRoutes)
 app.use('/api/projects', projectsRoutes)
+app.use('/api/projects', imageReferenceRoutes)
+app.use('/api/projects', charaterRoutes)
 app.use('/api/assets', assetsRoutes)
 app.use('/api/validate', validationRoutes)
 app.use('/api/members', membersRoutes)

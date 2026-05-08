@@ -131,4 +131,4 @@ async function generateImageForNode(nodeKey, prompt, width, height, storagePath)
   return { url: null, skipped: true }
 }
 
-module.exports = { generateImage, generateImagesSequential, generateImageForNode }
+module.exports = { generateImage, generateImageFal, generateImagesSequential, generateImageForNode }

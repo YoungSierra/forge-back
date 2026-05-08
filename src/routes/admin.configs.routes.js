@@ -4,7 +4,39 @@ const { db }  = require('../services/supabase.service')
 const {
   invalidateStepConfigs,
   invalidateWorkflows,
+  getWorkflowById,
 } = require('../services/config.service')
+const { submitWorkflow, pollUntilDone, downloadOutput } = require('../services/providers/comfyui.provider')
+const { generateImageOpenAI } = require('../services/providers/openai.image.provider')
+const { generateImageFal     } = require('../services/image.service')
+
+// POST /api/admin/test-image
+router.post('/test-image', async (req, res, next) => {
+  try {
+    const { model, prompt, width = 512, height = 512 } = req.body
+    if (!model)  return res.status(400).json({ success: false, error: 'model is required' })
+    if (!prompt) return res.status(400).json({ success: false, error: 'prompt is required' })
+
+    const [provider, ...parts] = model.split(':')
+    const modelId = parts.join(':')
+    const storagePath = `admin/image-tests/${Date.now()}.jpg`
+
+    let result
+    if (provider === 'openai') {
+      result = await generateImageOpenAI(modelId, prompt, Number(width), Number(height), storagePath)
+    } else if (provider === 'fal') {
+      result = await generateImageFal(prompt, Number(width), Number(height), storagePath)
+    } else {
+      return res.status(400).json({ success: false, error: `Unknown image provider: "${provider}". Use openai or fal.` })
+    }
+
+    console.log(`[admin test-image] model:${model} → ${storagePath}`)
+    res.json({ success: true, image_url: result.url })
+  } catch (err) {
+    console.error(`[admin test-image] error:`, err.message)
+    res.status(500).json({ success: false, error: err.message })
+  }
+})
 
 // ─── Step Configs ─────────────────────────────────────────────────────────────
 
@@ -121,13 +153,6 @@ router.post('/comfyui-workflows', async (req, res, next) => {
     if (!workflow_json) return res.status(400).json({ success: false, error: 'workflow_json is required' })
     if (!inject_config) return res.status(400).json({ success: false, error: 'inject_config is required' })
 
-    // Basic inject_config validation
-    const required = ['prompt', 'width', 'height', 'seed']
-    const missing  = required.filter(k => !inject_config[k]?.node || !inject_config[k]?.field)
-    if (missing.length) {
-      return res.status(400).json({ success: false, error: `inject_config missing fields: ${missing.join(', ')}` })
-    }
-
     const { data, error } = await db()
       .from('comfyui_workflows')
       .insert({ name, description, workflow_json, inject_config, created_by: req.adminMemberId, updated_by: req.adminMemberId })
@@ -156,11 +181,6 @@ router.patch('/comfyui-workflows/:id', async (req, res, next) => {
     if (is_active     !== undefined) updates.is_active     = is_active
 
     if (inject_config !== undefined) {
-      const required = ['prompt', 'width', 'height', 'seed']
-      const missing  = required.filter(k => !inject_config[k]?.node || !inject_config[k]?.field)
-      if (missing.length) {
-        return res.status(400).json({ success: false, error: `inject_config missing fields: ${missing.join(', ')}` })
-      }
       updates.inject_config = inject_config
     }
 
@@ -177,6 +197,70 @@ router.patch('/comfyui-workflows/:id', async (req, res, next) => {
     invalidateWorkflows()
     res.json({ success: true, workflow: data })
   } catch (err) { next(err) }
+})
+
+// POST /api/admin/comfyui-workflows/:id/test
+router.post('/comfyui-workflows/:id/test', async (req, res, next) => {
+  try {
+    const { prompt, width, height, seed, extras = {} } = req.body
+    const entry = await getWorkflowById(req.params.id)
+    if (!entry) return res.status(404).json({ success: false, error: 'Workflow not found' })
+
+    const inject = entry.inject_config || {}
+
+    // Build a clone of the workflow and inject provided values
+    const workflow = JSON.parse(JSON.stringify(entry.workflow_json))
+
+    function injectPoint(point, value) {
+      if (!point?.node || !point?.field) return
+      const node = workflow[point.node]
+      if (!node) return
+      node.inputs[point.field] = value
+    }
+
+    if (prompt  !== undefined) injectPoint(inject.prompt, prompt)
+    if (width   !== undefined) injectPoint(inject.width,  Number(width))
+    if (height  !== undefined) injectPoint(inject.height, Number(height))
+    if (seed !== undefined && seed !== null && seed !== '') injectPoint(inject.seed, Number(seed))
+
+    if (inject.extra) {
+      for (const [key, point] of Object.entries(inject.extra)) {
+        if (!(key in extras)) continue
+        const raw = extras[key]
+        const value = point.type === 'int'   ? Math.round(Number(raw))
+                    : point.type === 'float' ? Number(raw)
+                    : raw
+        injectPoint(point, value)
+      }
+    }
+
+    const BASE_URL = (process.env.COMFYUI_BASE_URL || 'https://cloud.comfy.org').replace(/\/$/, '')
+    const API_KEY  = process.env.COMFYUI_API_KEY
+    const headers  = { 'X-API-Key': API_KEY, 'Content-Type': 'application/json' }
+
+    const extra_data = {}
+    if (process.env.COMFYUI_API_KEY) extra_data.api_key_comfy_org = process.env.COMFYUI_API_KEY
+
+    const submitRes = await fetch(`${BASE_URL}/api/prompt`, {
+      method: 'POST', headers,
+      body: JSON.stringify({ prompt: workflow, ...(Object.keys(extra_data).length ? { extra_data } : {}) }),
+    })
+    if (!submitRes.ok) {
+      const body = await submitRes.text()
+      return res.status(502).json({ success: false, error: `ComfyUI submit failed: ${submitRes.status} ${body}` })
+    }
+    const { prompt_id } = await submitRes.json()
+    if (!prompt_id) return res.status(502).json({ success: false, error: 'ComfyUI: no prompt_id' })
+
+    console.log(`[ComfyUI test] job ${prompt_id} workflow:${entry.name}`)
+    await pollUntilDone(prompt_id)
+    const storagePath = `admin/workflow-tests/${req.params.id}/${Date.now()}.jpg`
+    const result = await downloadOutput(prompt_id, storagePath)
+    res.json({ success: true, image_url: result.url, job_id: prompt_id })
+  } catch (err) {
+    console.error(`[ComfyUI test] error:`, err.message)
+    res.status(500).json({ success: false, error: err.message })
+  }
 })
 
 // DELETE /api/admin/comfyui-workflows/:id

@@ -166,6 +166,7 @@ module.exports = {
   getAssetUrl,
   generatePlaceholderPNG,
   uploadToStorage,
+  deleteStorageKeys,
   clearNodeStorage,
   clearItemStorage,
   slugify,

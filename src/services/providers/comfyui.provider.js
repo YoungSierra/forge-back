@@ -8,22 +8,47 @@ function headers() {
   return { 'X-API-Key': API_KEY(), 'Content-Type': 'application/json' }
 }
 
-async function submitWorkflow(workflowName, prompt, width, height) {
+function injectPoint(workflow, point, value) {
+  if (!point?.node || !point?.field) return
+  const node = workflow[point.node]
+  if (!node) { console.warn(`[ComfyUI] inject: node "${point.node}" not found in workflow`); return }
+  node.inputs[point.field] = value
+}
+
+async function submitWorkflow(workflowName, prompt, width, height, extras = {}) {
   const entry = await getWorkflowByName(workflowName)
   if (!entry) throw new Error(`Unknown ComfyUI workflow: "${workflowName}"`)
 
   const workflow = JSON.parse(JSON.stringify(entry.workflow_json))
   const inject   = entry.inject_config
 
-  workflow[inject.prompt.node].inputs[inject.prompt.field] = prompt
-  workflow[inject.width.node].inputs[inject.width.field]   = width
-  workflow[inject.height.node].inputs[inject.height.field] = height
-  workflow[inject.seed.node].inputs[inject.seed.field]     = Math.floor(Math.random() * 2 ** 32)
+  injectPoint(workflow, inject.prompt, prompt)
+  injectPoint(workflow, inject.width,  width)
+  injectPoint(workflow, inject.height, height)
+  injectPoint(workflow, inject.seed,   Math.floor(Math.random() * 2147483647))
+
+  // Extra injection points (string, int, float, image)
+  if (inject.extra) {
+    for (const [key, point] of Object.entries(inject.extra)) {
+      if (key in extras) {
+        const raw = extras[key]
+        const value = point.type === 'int'   ? Math.round(Number(raw))
+                    : point.type === 'float' ? Number(raw)
+                    : raw
+        injectPoint(workflow, point, value)
+      }
+    }
+  }
+
+  const extra_data = {}
+  if (process.env.COMFYUI_API_KEY) extra_data.api_key_comfy_org = process.env.COMFYUI_API_KEY
+
+  console.log(`[ComfyUI] Payload for /api/prompt (workflow: ${workflowName}):\n${JSON.stringify({ prompt: workflow, ...(Object.keys(extra_data).length ? { extra_data } : {}) }, null, 2)}`)
 
   const res = await fetch(`${BASE_URL()}/api/prompt`, {
     method: 'POST',
     headers: headers(),
-    body: JSON.stringify({ prompt: workflow }),
+    body: JSON.stringify({ prompt: workflow, ...(Object.keys(extra_data).length ? { extra_data } : {}) }),
   })
 
   if (!res.ok) {
@@ -57,7 +82,9 @@ async function pollUntilDone(promptId, timeoutMs = 120000) {
 
     if (status === 'completed' || status === 'success') return
     if (status === 'failed' || status === 'cancelled' || status === 'error') {
-      throw new Error(`ComfyUI job ${promptId} ended with status: ${status}`)
+      const detail = json.error || json.message || json.error_message || JSON.stringify(json)
+      console.error(`[ComfyUI] job ${promptId} failed — ${detail}`)
+      throw new Error(`ComfyUI job failed: ${detail}`)
     }
     console.log(`[ComfyUI] job ${promptId} → ${status}`)
   }
@@ -71,12 +98,16 @@ async function downloadOutput(promptId, storagePath) {
 
   const jobData = await histRes.json()
 
-  // shape: { outputs: { "9": { images: [{filename, subfolder, type}] } } }
+  // Find the first output node that has images (node id varies by workflow)
   const outputs = jobData?.outputs ?? jobData?.[promptId]?.outputs
-  const outputNode = outputs?.['9']
-  const imageEntry = outputNode?.images?.[0]
+  let imageEntry = null
+  for (const node of Object.values(outputs || {})) {
+    const img = node?.images?.[0]
+    if (img?.filename) { imageEntry = img; break }
+  }
 
-  if (!imageEntry?.filename) {
+  if (!imageEntry) {
+    console.error(`[ComfyUI] downloadOutput: outputs dump for job ${promptId}:`, JSON.stringify(outputs))
     throw new Error(`ComfyUI: could not find output image in history for job ${promptId}`)
   }
 
@@ -96,9 +127,38 @@ async function downloadOutput(promptId, storagePath) {
   return { url: publicUrl, size_bytes: buffer.length, source: 'comfyui' }
 }
 
-async function generateImageComfyUI(workflowName, prompt, width, height, storagePath) {
+async function uploadImageToComfyUI(imageUrl) {
+  const imgRes = await fetch(imageUrl)
+  if (!imgRes.ok) throw new Error(`Failed to fetch reference image: ${imgRes.status} ${imageUrl}`)
+  const buffer = Buffer.from(await imgRes.arrayBuffer())
+  const mime   = imgRes.headers.get('content-type') || 'image/png'
+  const ext    = mime.includes('jpeg') ? 'jpg' : 'png'
+  const filename = `ref_${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`
+
+  const form = new FormData()
+  form.append('image', new Blob([buffer], { type: mime }), filename)
+  form.append('type', 'input')
+  form.append('overwrite', 'true')
+
+  const uploadRes = await fetch(`${BASE_URL()}/api/upload/image`, {
+    method: 'POST',
+    headers: { 'X-API-Key': API_KEY() },
+    body: form,
+  })
+  if (!uploadRes.ok) {
+    const body = await uploadRes.text()
+    throw new Error(`ComfyUI upload failed: ${uploadRes.status} ${body}`)
+  }
+  const json = await uploadRes.json()
+  const uploadedName = json.name ?? json.filename
+  if (!uploadedName) throw new Error(`ComfyUI upload: no filename in response: ${JSON.stringify(json)}`)
+  console.log(`[ComfyUI] Uploaded reference image → ${uploadedName}`)
+  return uploadedName
+}
+
+async function generateImageComfyUI(workflowName, prompt, width, height, storagePath, extras = {}) {
   const startTime = Date.now()
-  const promptId = await submitWorkflow(workflowName, prompt, width, height)
+  const promptId = await submitWorkflow(workflowName, prompt, width, height, extras)
   console.log(`[ComfyUI] Submitted job ${promptId} workflow:${workflowName}`)
   await pollUntilDone(promptId)
   const result = await downloadOutput(promptId, storagePath)
@@ -106,4 +166,4 @@ async function generateImageComfyUI(workflowName, prompt, width, height, storage
   return result
 }
 
-module.exports = { generateImageComfyUI }
+module.exports = { generateImageComfyUI, uploadImageToComfyUI, submitWorkflow, pollUntilDone, downloadOutput }

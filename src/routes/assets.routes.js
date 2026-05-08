@@ -7,19 +7,64 @@ router.get('/', async (req, res, next) => {
   try {
     const { project_id, step_key } = req.query
 
-    let query = db()
-      .from('assets')
-      .select('*, asset_versions!asset_versions_asset_id_fkey(*), projects!assets_project_id_fkey(id, name)')
-      .order('created_at', { ascending: false })
-      .limit(300)
+    const includeRefs = !step_key || step_key === 'image_reference'
+    const includeRegular = !step_key || step_key !== 'image_reference'
 
-    if (project_id) query = query.eq('project_id', project_id)
-    if (step_key)   query = query.eq('step_key', step_key)
+    // Regular assets
+    let assets = []
+    if (includeRegular) {
+      let query = db()
+        .from('assets')
+        .select('*, asset_versions!asset_versions_asset_id_fkey(*), projects!assets_project_id_fkey(id, name)')
+        .order('created_at', { ascending: false })
+        .limit(300)
 
-    const { data: assets, error } = await query
-    if (error) return res.status(500).json({ success: false, error: 'Failed to fetch assets', code: 'SUPABASE_ERROR' })
+      if (project_id) query = query.eq('project_id', project_id)
+      if (step_key)   query = query.eq('step_key', step_key)
 
-    res.json({ success: true, assets: assets || [] })
+      const { data, error } = await query
+      if (error) return res.status(500).json({ success: false, error: 'Failed to fetch assets', code: 'SUPABASE_ERROR' })
+      assets = data || []
+    }
+
+    // Image reference assets (selected character refs)
+    let refAssets = []
+    if (includeRefs) {
+      let refQuery = db()
+        .from('character_image_refs')
+        .select('*')
+        .eq('selected', true)
+        .order('created_at', { ascending: false })
+        .limit(200)
+
+      if (project_id) refQuery = refQuery.eq('project_id', project_id)
+
+      const { data: refs } = await refQuery
+      refAssets = (refs || []).map(r => ({
+        id:             `ref_${r.id}`,
+        project_id:     r.project_id,
+        step_key:       'image_reference',
+        name:           r.character_key.replace(/_/g, ' '),
+        type:           'image',
+        discipline:     'reference',
+        review_status:  'approved',
+        created_at:     r.created_at,
+        job_id:         null,
+        projects:       null,
+        asset_versions: [{
+          id:             `ref_v_${r.id}`,
+          asset_id:       `ref_${r.id}`,
+          version_number: 1,
+          source:         'image_reference',
+          storage_url:    r.image_url,
+          is_current:     true,
+          created_at:     r.created_at,
+          metadata:       { character_key: r.character_key, round: r.round },
+        }],
+      }))
+    }
+
+    res.json({ success: true, assets: [...assets, ...refAssets] })
   } catch (err) {
     next(err)
   }

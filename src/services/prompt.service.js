@@ -30,6 +30,7 @@ const FALLBACK_MAP = {
   marketing:            () => require('../prompts/marketing.prompt').MARKETING_SYSTEM_PROMPT,
   modeling:             () => require('../prompts/modeling.prompt').MODELING_SYSTEM_PROMPT,
   charaters:            () => require('../prompts/characters3d.prompt').CHARACTERS3D_SYSTEM_PROMPT,
+  image_reference:      () => require('../prompts/image_reference.prompt').IMAGE_REFERENCE_PROMPT_TEMPLATE,
   vfx:                  () => require('../prompts/vfx.prompt').VFX_SYSTEM_PROMPT,
   texturing:            () => require('../prompts/texturing.prompt').TEXTURING_SYSTEM_PROMPT,
   rigging:              () => require('../prompts/rigging.prompt').RIGGING_SYSTEM_PROMPT,
