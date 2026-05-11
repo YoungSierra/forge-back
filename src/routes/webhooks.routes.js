@@ -234,12 +234,19 @@ const STEP_HANDLERS = {
       const sections = parseGddSections(output)
       return buildGddJson(sections)
     },
-    updateProject: (parsed) => ({
-      description:   parsed.project?.description || parsed.project?.elevator_pitch || '',
-      genre:         parsed.project?.genre        || '',
-      target_engine: parsed.development?.suggested_engine || 'Unity',
-      status:        'active',
-    }),
+    updateProject: (parsed) => {
+      const raw = (parsed.development?.suggested_engine || '').toLowerCase()
+      const engine = raw.includes('unreal') ? 'unreal'
+                   : raw.includes('godot')  ? 'godot'
+                   : raw.includes('phaser') ? 'phaser'
+                   : 'unity'
+      return {
+        description:   parsed.project?.description || parsed.project?.elevator_pitch || '',
+        genre:         parsed.project?.genre        || '',
+        target_engine: engine,
+        status:        'active',
+      }
+    },
   },
   // Futuros steps:
   // n8n_sprites: { pipelineKey: 'sprites', ext: 'txt', parse: (o) => ({ raw: o }) },
