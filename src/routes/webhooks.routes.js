@@ -3,133 +3,228 @@ const router  = express.Router()
 const { db }  = require('../services/supabase.service')
 const { uploadToStorage } = require('../services/storage.service')
 
-// ─── Parser de secciones del markdown GDD ─────────────────────────────────────
+// ─── Normaliza título de sección → snake_case sin tildes ─────────────────────
+
+function normalizeKey(title) {
+  return title
+    .toLowerCase()
+    .normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .replace(/[^a-z0-9\s]/g, '')
+    .trim()
+    .replace(/\s+/g, '_')
+}
+
+// Encabezados de documento que NO son secciones de contenido
+const SKIP_HEADER = /^(\(GDD\)|V57[\s ]+GAME|VERSION\b|Author[\s]+Name|Date[\s]+document|INDEX\b|Template[\s]+Notes)/i
+
+// ─── Parser principal: detecta ## Sección y extrae direct + notes ─────────────
+// Formato esperado por sección:
+//   ## Nombre de Sección
+//   What goes here:
+//   [descripción del template — se ignora]
+//   [blank]
+//   [contenido directo llenado por n8n — se extrae]
+//   ## Template Notes / Ideas:
+//   ## 1. nota
+//   ## 2. nota
 
 function parseGddSections(markdown) {
-  const SEPARATOR = /\n-{40,}\n/
-  const blocks = markdown.split(SEPARATOR).filter(b => b.trim())
+  const lines = markdown.split('\n')
   const sections = {}
+  let currentTitle = null
+  let currentLines = []
 
-  for (const block of blocks) {
-    const lines = block.trim().split('\n')
-    const titleLine = lines.find(l => l.trim() && !l.startsWith('#'))
-    if (!titleLine) continue
-
-    const titleIdx    = lines.indexOf(titleLine)
-    const quevaIdx    = lines.findIndex(l => /qué va aquí/i.test(l))
-    const templateIdx = lines.findIndex(l => /template notes/i.test(l))
-
-    let contentStart = titleIdx + 1
-    if (quevaIdx > titleIdx) {
-      // Saltar "Qué va aquí:" y la línea de descripción siguiente
-      contentStart = quevaIdx + 2
+  function flushSection() {
+    if (!currentTitle) return
+    const key = normalizeKey(currentTitle)
+    if (key) {
+      const content = parseSectionContent(currentLines)
+      if (content.direct || content.notes.length > 0) {
+        sections[key] = content
+      }
     }
-    const contentEnd = templateIdx > contentStart ? templateIdx : lines.length
-    const content = lines.slice(contentStart, contentEnd).join('\n').trim()
-    if (!content) continue
-
-    const key = titleLine.trim()
-      .toLowerCase()
-      .normalize('NFD').replace(/[̀-ͯ]/g, '')  // quitar tildes
-      .replace(/[^a-z0-9\s]/g, '')
-      .trim()
-      .replace(/\s+/g, '_')
-    sections[key] = content
+    currentTitle = null
+    currentLines = []
   }
+
+  for (const line of lines) {
+    const trimmed = line.trim()
+
+    // "## Título" donde el primer char después de "## " es letra o (
+    const headerMatch = trimmed.match(/^## ([A-Za-z(].+)$/)
+    if (headerMatch) {
+      const title = headerMatch[1].trim()
+
+      // Ignorar encabezados de metadatos del documento
+      if (SKIP_HEADER.test(title)) continue
+
+      // "## Template Notes / Ideas:" se pliega en la sección actual, no abre una nueva
+      if (/^Template[\s]+Notes/i.test(title)) {
+        if (currentTitle) currentLines.push(line)
+        continue
+      }
+
+      flushSection()
+      currentTitle = title
+      continue
+    }
+
+    if (currentTitle) currentLines.push(line)
+  }
+  flushSection()
+
   return sections
 }
 
-function extractLine(text, ...prefixes) {
-  for (const prefix of prefixes) {
-    const m = text.match(new RegExp(`${prefix}[:\\s]+([^\\n]+)`, 'i'))
-    if (m?.[1]?.trim()) return m[1].trim()
+// Extrae contenido directo y notas numeradas de las líneas de una sección
+function parseSectionContent(lines) {
+  // Estados: before → what_goes_here_desc → direct → template_notes
+  let state = 'before'
+  const direct = []
+  const notes  = []
+
+  for (const line of lines) {
+    const trimmed = line.trim()
+
+    if (/^what goes here:/i.test(trimmed)) {
+      state = 'what_goes_here_desc'
+      continue
+    }
+
+    if (/^## template[\s]+notes/i.test(trimmed)) {
+      state = 'template_notes'
+      continue
+    }
+
+    if (state === 'what_goes_here_desc') {
+      // Línea en blanco = fin de descripción del template, empieza contenido real
+      if (trimmed === '') state = 'direct'
+      continue
+    }
+
+    if (state === 'direct') {
+      if (trimmed) direct.push(trimmed)
+      continue
+    }
+
+    if (state === 'template_notes') {
+      // "## 1. Contenido de la nota"
+      const m = trimmed.match(/^## \d+\.\s+(.+)/)
+      if (m) notes.push(m[1].trim())
+    }
   }
-  return ''
+
+  return { direct: direct.join('\n').trim(), notes }
 }
 
-function parseNumberedList(text) {
-  return (text.match(/^\d+\.\s+.+$/mg) || [])
-    .map(l => l.replace(/^\d+\.\s+/, '').trim())
-}
+// ─── Helpers de acceso a secciones ───────────────────────────────────────────
 
-// Convierte el markdown completo del GDD → JSON estructurado que espera el resto de la app
+function d(sections, key)  { return sections[key]?.direct || '' }
+function n(sections, key)  { return sections[key]?.notes  || [] }
+function dn(sections, key) { return d(sections, key) || n(sections, key).join('. ') }
+
+// ─── Convierte secciones parseadas → JSON estructurado del GDD ───────────────
+
 function buildGddJson(sections) {
-  // Personajes: "1. Nombre (rol): descripción"
-  const charText = sections['characters'] || sections['main_characters'] || ''
-  const characters = (charText.match(/\d+\.\s+([^(:]+?)(?:\s*\(([^)]+)\))?:\s*([^\n]+)/g) || [])
-    .map(line => {
-      const m = line.match(/\d+\.\s+([^(:]+?)(?:\s*\(([^)]+)\))?:\s*(.+)/)
-      const name = (m?.[1] || '').trim()
-      const role = (m?.[2] || '').trim()
-      return {
-        name,
-        role,
-        description: (m?.[3] || '').trim(),
-        sprite_prompt: name ? `${name}${role ? `, ${role}` : ''}, game character, concept art` : '',
-      }
-    })
-    .filter(c => c.name)
+  // Personajes: notas con patrón "Name – role, description" o "Name - description"
+  const characters = n(sections, 'characters').map(note => {
+    const m = note.match(/^([^–\-]+?)\s*[–\-]\s*(.+)/)
+    const name = (m?.[1] || note).trim()
+    const desc = (m?.[2] || '').trim()
+    const role = desc.split(/[,;]/)[0].trim()
+    return {
+      name,
+      role,
+      description: desc,
+      sprite_prompt: `${name}, ${role}, game character, concept art`,
+    }
+  }).filter(c => c.name)
 
-  // Mecánicas
-  const mechanics = parseNumberedList(sections['game_mechanics'] || '').map(line => {
-    const sep = line.indexOf(':')
-    const name = sep > 0 ? line.slice(0, sep).trim() : line
-    const desc = sep > 0 ? line.slice(sep + 1).trim() : ''
+  // Mecánicas: notas con patrón "Name – description"
+  const mechanics = n(sections, 'game_mechanics').map(note => {
+    const m = note.match(/^([^–\-]+?)\s*[–\-]\s*(.+)/)
+    const name = (m?.[1] || note).trim()
+    const desc = (m?.[2] || '').trim()
     return { name, type: 'gameplay', description: desc || name }
   })
 
-  // Niveles / entornos
-  const levels = parseNumberedList(sections['environments'] || sections['level_design'] || '').map(line => {
-    const sep = line.indexOf(':')
-    const name = sep > 0 ? line.slice(0, sep).trim() : line
-    const env  = sep > 0 ? line.slice(sep + 1).trim() : ''
+  // Niveles: de notas de environments
+  const levels = n(sections, 'environments').map((note, i) => {
+    const m = note.match(/^([^–\-,]+?)\s*[–\-,]\s*(.+)/)
+    const name = (m?.[1] || `Level ${i + 1}`).trim()
+    const env  = (m?.[2] || note).trim()
     return {
       name,
-      environment: env || name,
+      environment: env,
       difficulty: 'medium',
-      background_prompt: `${name} environment, game level, concept art`,
+      background_prompt: `${env}, game level environment, concept art`,
     }
   })
 
-  const gameName  = sections['game_name'] || ''
-  const genreText = sections['genre'] || ''
-  const styleText = sections['art_style'] || sections['technical_form'] || ''
+  // Core loop: notas como pasos del ciclo
+  const coreLoop = d(sections, 'core_loop') || n(sections, 'core_loop').join(' → ')
+
+  // Genre: primera parte antes de la coma
+  const genreRaw = d(sections, 'genre') || n(sections, 'genre')[0] || ''
+  const genre = genreRaw.split(/[,;]/)[0].trim()
+
+  // Art direction
+  const styleNotes     = n(sections, 'art_style')
+  const styleGuideNotes = n(sections, 'style_guide')
+  const palette = styleGuideNotes.find(note => /color|palette|saturat|vibrant/i.test(note)) || ''
+
+  // Audio
+  const audioNotes = n(sections, 'audio')
+
+  // Engine: busca nombre de motor en notas
+  const engineNote = n(sections, 'engine_and_tools')
+    .find(note => /unity|unreal|godot|pygame|cocos/i.test(note)) || ''
+  const engineMatch = engineNote.match(/unity|unreal|godot|pygame|cocos/i)
+  const suggestedEngine = engineMatch ? engineMatch[0] : 'Unity'
+
+  const gameplayText = d(sections, 'game_play')
 
   return {
     project: {
-      name:            extractLine(gameName, 'título oficial', 'official title') || gameName.split('\n')[0],
-      genre:           extractLine(genreText, 'género principal', 'main genre') || genreText.split('\n')[0],
-      core_loop:       sections['core_loop'] || '',
-      tone:            extractLine(sections['design_guidelines'] || '', 'tono', 'tone'),
-      elevator_pitch:  (sections['game_play'] || '').slice(0, 600),
-      target_platform: (sections['platform'] || '').split('\n').find(l => l.trim()) || '',
+      name:            d(sections, 'game_name'),
+      genre,
+      description:     gameplayText.slice(0, 600),
+      elevator_pitch:  gameplayText.slice(0, 600),
+      core_loop:       coreLoop,
+      tone:            '',
+      target_platform: d(sections, 'platform') || n(sections, 'platform')[0] || '',
+      camera:          d(sections, 'view')     || n(sections, 'view')[0]     || '',
+      player_mode:     d(sections, 'player')   || n(sections, 'player')[0]   || '',
+      target_devices:  d(sections, 'device')   || '',
+      lore:            n(sections, 'lore').join('. '),
+      game_play_outline: d(sections, 'game_play_outline'),
     },
     characters,
     levels,
     mechanics,
     art_direction: {
-      style:   styleText.split('\n').find(l => l.trim() && !l.startsWith('-')) || '',
-      palette: extractLine(sections['style_guide'] || '', 'colores primarios', 'primary colors'),
-      mood:    '',
-      references: [],
+      style:          styleNotes[0]          || d(sections, 'art_style') || '',
+      palette,
+      mood:           '',
+      references:     [],
+      technical_form: d(sections, 'technical_form') || '',
     },
     audio_direction: {
-      style: (sections['audio'] || '').split('\n').find(l => l.trim()) || '',
+      style: audioNotes[0] || '',
     },
     development: {
-      suggested_engine: extractLine(
-        sections['language'] || sections['engine_and_tools'] || '',
-        'motor principal', 'main engine', 'motor'
-      ) || 'Unity',
+      suggested_engine: suggestedEngine,
+      target_devices:   d(sections, 'device') || '',
+      language:         n(sections, 'language').join(', '),
     },
     raw_sections: sections,
     _source: 'n8n_webhook',
   }
 }
 
-// ─── Tabla de step_keys soportados ────────────────────────────────────────────
-// step_key recibido → { pipelineKey, parser }
-// pipelineKey: clave en concept.pipeline donde se guarda el resultado
+// ─── Tabla de step_keys soportados ───────────────────────────────────────────
+// Cada entry: { pipelineKey, ext, parse, updateProject? }
+// updateProject: campos extra a actualizar en la tabla projects
 
 const STEP_HANDLERS = {
   n8n_gdd: {
@@ -139,17 +234,21 @@ const STEP_HANDLERS = {
       const sections = parseGddSections(output)
       return buildGddJson(sections)
     },
+    updateProject: (parsed) => ({
+      description:   parsed.project?.description || parsed.project?.elevator_pitch || '',
+      genre:         parsed.project?.genre        || '',
+      target_engine: parsed.development?.suggested_engine || 'Unity',
+      status:        'active',
+    }),
   },
-  // Añadir aquí futuros steps n8n:
+  // Futuros steps:
   // n8n_sprites: { pipelineKey: 'sprites', ext: 'txt', parse: (o) => ({ raw: o }) },
 }
 
-// ─── POST /api/webhooks ────────────────────────────────────────────────────────
-// n8n llama aquí cuando termina un workflow de larga duración
+// ─── POST /api/webhooks ───────────────────────────────────────────────────────
 
 router.post('/', async (req, res) => {
   try {
-    // Validar secreto
     const secret = req.headers['x-forge-secret'] || req.body.secret
     if (process.env.WEBHOOK_SECRET && secret !== process.env.WEBHOOK_SECRET) {
       return res.status(401).json({ success: false, error: 'Unauthorized' })
@@ -162,10 +261,12 @@ router.post('/', async (req, res) => {
 
     const handler = STEP_HANDLERS[step_key]
     if (!handler) {
-      return res.status(400).json({ success: false, error: `Unknown step_key: "${step_key}". Supported: ${Object.keys(STEP_HANDLERS).join(', ')}` })
+      return res.status(400).json({
+        success: false,
+        error: `Unknown step_key: "${step_key}". Supported: ${Object.keys(STEP_HANDLERS).join(', ')}`,
+      })
     }
 
-    // Verificar que el proyecto existe
     const { data: project, error: projErr } = await db()
       .from('projects').select('id, concept').eq('id', project_id).single()
     if (projErr || !project) return res.status(404).json({ success: false, error: 'Project not found' })
@@ -176,17 +277,18 @@ router.post('/', async (req, res) => {
     await uploadToStorage(Buffer.from(raw, 'utf-8'), r2Path, 'text/plain')
     console.log(`[webhook] ${step_key} raw → ${r2Path}`)
 
-    // Parsear output
+    // Parsear y guardar en concept.pipeline
     const parsedData = handler.parse(output)
-
-    // Actualizar concept.pipeline[pipelineKey] en DB
-    const concept  = project.concept  || {}
-    const pipeline = concept.pipeline || {}
+    const concept    = project.concept  || {}
+    const pipeline   = concept.pipeline || {}
     pipeline[handler.pipelineKey] = parsedData
     concept.pipeline = pipeline
 
+    // Campos extra a nivel de proyecto (description, genre, status…)
+    const extraFields = handler.updateProject ? handler.updateProject(parsedData) : {}
+
     const { error: updateErr } = await db()
-      .from('projects').update({ concept }).eq('id', project_id)
+      .from('projects').update({ concept, ...extraFields }).eq('id', project_id)
 
     if (updateErr) {
       console.error(`[webhook] DB update error:`, updateErr.message)
