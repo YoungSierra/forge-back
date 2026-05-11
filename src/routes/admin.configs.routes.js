@@ -38,6 +38,40 @@ router.post('/test-image', async (req, res, next) => {
   }
 })
 
+// POST /api/admin/comfyui-upload — sube imagen a ComfyUI Cloud input folder
+router.post('/comfyui-upload', async (req, res, next) => {
+  try {
+    const { image_base64, filename = `upload-${Date.now()}.png` } = req.body
+    if (!image_base64) return res.status(400).json({ success: false, error: 'image_base64 required' })
+
+    const buffer   = Buffer.from(image_base64, 'base64')
+    const BASE_URL = (process.env.COMFYUI_BASE_URL || '').replace(/\/$/, '')
+    const API_KEY  = process.env.COMFYUI_API_KEY
+
+    const formData = new FormData()
+    formData.append('image', new Blob([buffer], { type: 'image/png' }), filename)
+    formData.append('overwrite', 'true')
+
+    const uploadRes = await fetch(`${BASE_URL}/api/upload/image`, {
+      method: 'POST',
+      headers: { 'X-API-Key': API_KEY },
+      body: formData,
+    })
+
+    if (!uploadRes.ok) {
+      const text = await uploadRes.text()
+      return res.status(502).json({ success: false, error: `ComfyUI upload failed: ${uploadRes.status} ${text}` })
+    }
+
+    const result = await uploadRes.json()
+    console.log(`[ComfyUI upload] ${filename} → ${result.name}`)
+    res.json({ success: true, filename: result.name })
+  } catch (err) {
+    console.error('[ComfyUI upload] error:', err.message)
+    next(err)
+  }
+})
+
 // ─── Step Configs ─────────────────────────────────────────────────────────────
 
 // GET /api/admin/step-configs
@@ -122,7 +156,7 @@ router.get('/comfyui-workflows', async (req, res, next) => {
   try {
     const { data, error } = await db()
       .from('comfyui_workflows')
-      .select('id, name, description, inject_config, is_active, created_at, updated_at')
+      .select('id, name, description, inject_config, is_active, refinement_capable, mask_capable, created_at, updated_at')
       .order('name')
 
     if (error) return res.status(500).json({ success: false, error: error.message })
@@ -147,7 +181,7 @@ router.get('/comfyui-workflows/:id', async (req, res, next) => {
 // POST /api/admin/comfyui-workflows
 router.post('/comfyui-workflows', async (req, res, next) => {
   try {
-    const { name, description, workflow_json, inject_config } = req.body
+    const { name, description, workflow_json, inject_config, refinement_capable = false, mask_capable = false } = req.body
 
     if (!name)          return res.status(400).json({ success: false, error: 'name is required' })
     if (!workflow_json) return res.status(400).json({ success: false, error: 'workflow_json is required' })
@@ -155,8 +189,8 @@ router.post('/comfyui-workflows', async (req, res, next) => {
 
     const { data, error } = await db()
       .from('comfyui_workflows')
-      .insert({ name, description, workflow_json, inject_config, created_by: req.adminMemberId, updated_by: req.adminMemberId })
-      .select('id, name, description, inject_config, is_active, created_at, updated_at')
+      .insert({ name, description, workflow_json, inject_config, refinement_capable, mask_capable, created_by: req.adminMemberId, updated_by: req.adminMemberId })
+      .select('id, name, description, inject_config, is_active, refinement_capable, mask_capable, created_at, updated_at')
       .single()
 
     if (error) {
@@ -172,23 +206,22 @@ router.post('/comfyui-workflows', async (req, res, next) => {
 // PATCH /api/admin/comfyui-workflows/:id
 router.patch('/comfyui-workflows/:id', async (req, res, next) => {
   try {
-    const { name, description, workflow_json, inject_config, is_active } = req.body
+    const { name, description, workflow_json, inject_config, is_active, refinement_capable, mask_capable } = req.body
 
     const updates = { updated_by: req.adminMemberId, updated_at: new Date().toISOString() }
-    if (name          !== undefined) updates.name          = name
-    if (description   !== undefined) updates.description   = description
-    if (workflow_json !== undefined) updates.workflow_json = workflow_json
-    if (is_active     !== undefined) updates.is_active     = is_active
-
-    if (inject_config !== undefined) {
-      updates.inject_config = inject_config
-    }
+    if (name                !== undefined) updates.name                = name
+    if (description         !== undefined) updates.description         = description
+    if (workflow_json       !== undefined) updates.workflow_json       = workflow_json
+    if (is_active           !== undefined) updates.is_active           = is_active
+    if (inject_config       !== undefined) updates.inject_config       = inject_config
+    if (refinement_capable  !== undefined) updates.refinement_capable  = refinement_capable
+    if (mask_capable        !== undefined) updates.mask_capable        = mask_capable
 
     const { data, error } = await db()
       .from('comfyui_workflows')
       .update(updates)
       .eq('id', req.params.id)
-      .select('id, name, description, inject_config, is_active, updated_at')
+      .select('id, name, description, inject_config, is_active, refinement_capable, mask_capable, updated_at')
       .single()
 
     if (error) return res.status(500).json({ success: false, error: error.message })
@@ -256,7 +289,7 @@ router.post('/comfyui-workflows/:id/test', async (req, res, next) => {
     await pollUntilDone(prompt_id)
     const storagePath = `admin/workflow-tests/${req.params.id}/${Date.now()}.jpg`
     const result = await downloadOutput(prompt_id, storagePath)
-    res.json({ success: true, image_url: result.url, job_id: prompt_id })
+    res.json({ success: true, image_url: result.url, job_id: prompt_id, prepared_workflow: workflow })
   } catch (err) {
     console.error(`[ComfyUI test] error:`, err.message)
     res.status(500).json({ success: false, error: err.message })

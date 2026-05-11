@@ -9,7 +9,7 @@ const { ensureProjectDir, getAssetUrl, slugify, clearNodeStorage, STORAGE_BASE }
 const { generateImagesSequential, generateImageForNode } = require('../services/image.service')
 const { validateStepConfig, getWorkflowById } = require('../services/config.service')
 const { generateImageComfyUI } = require('../services/providers/comfyui.provider')
-const { callN8n } = require('../services/n8n.service')
+const { callN8n, fireN8n } = require('../services/n8n.service')
 const { makeTimer } = require('../utils/timer')
 
 function llmErr(err) {
@@ -81,14 +81,9 @@ router.post('/gdd', async (req, res, next) => {
     let gdd, meta = {}
 
     if (config.integration_type === 'n8n') {
-      try {
-        const data = await callN8n(config.webhook_url, { project_id, step_key: 'gdd', input_context: { prompt } })
-        gdd = data.gdd || data
-        meta = data.meta || {}
-        timer.lap('n8n webhook')
-      } catch (err) {
-        return res.status(502).json({ success: false, error: err.message, code: err.code || 'N8N_ERROR' })
-      }
+      // Fire-and-forget: n8n tarda >2 min, responde via /api/webhooks/n8n cuando termina
+      fireN8n(config.webhook_url, { project_id, chatInput: prompt })
+      return res.status(202).json({ success: true, async: true, project_id, message: 'GDD generation started — result will be saved automatically.' })
     } else {
       let result
       try {

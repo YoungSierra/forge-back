@@ -23,6 +23,7 @@ const adminPromptsRoutes    = require('./routes/admin.prompts.routes')
 const imageReferenceRoutes  = require('./routes/image-reference.routes')
 const charaterRoutes        = require('./routes/charaters.routes')
 const pipelineConfigRoutes  = require('./routes/pipeline-config.routes')
+const webhooksRoutes        = require('./routes/webhooks.routes')
 const { requireAdmin }   = require('./middleware/requireAdmin')
 
 // Ensure base storage dirs exist on startup
@@ -65,6 +66,7 @@ app.use('/api/feedback', feedbackRoutes)
 app.use('/api/admin', requireAdmin, adminRoutes)
 app.use('/api/admin', requireAdmin, adminConfigsRoutes)
 app.use('/api/admin', requireAdmin, adminPromptsRoutes)
+app.use('/api/webhooks', webhooksRoutes)
 
 // Models config — reads step models from DB via configService
 app.get('/api/models', async (req, res, next) => {

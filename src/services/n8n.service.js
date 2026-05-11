@@ -24,4 +24,13 @@ async function callN8n(webhookUrl, payload, timeoutMs = 120_000) {
   return response.json()
 }
 
-module.exports = { callN8n }
+// Dispara n8n sin esperar respuesta (para workflows de larga duración)
+function fireN8n(webhookUrl, payload) {
+  fetch(webhookUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  }).catch(err => console.error('[n8n fire] error:', err.message))
+}
+
+module.exports = { callN8n, fireN8n }
