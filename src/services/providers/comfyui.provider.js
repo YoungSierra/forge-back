@@ -97,34 +97,75 @@ async function downloadOutput(promptId, storagePath) {
   if (!histRes.ok) throw new Error(`ComfyUI jobs fetch failed: ${histRes.status}`)
 
   const jobData = await histRes.json()
-
-  // Find the first output node that has images (node id varies by workflow)
   const outputs = jobData?.outputs ?? jobData?.[promptId]?.outputs
+
   let imageEntry = null
+  const glbEntries = []
+
   for (const node of Object.values(outputs || {})) {
-    const img = node?.images?.[0]
-    if (img?.filename) { imageEntry = img; break }
+    // Buscar imágenes PNG/JPEG (excluir GLB que a veces aparece en images[])
+    if (!imageEntry && Array.isArray(node?.images)) {
+      for (const f of node.images) {
+        const name = (f?.filename || '').toLowerCase()
+        if (f?.filename && !name.endsWith('.glb') && !name.endsWith('.gltf')) {
+          imageEntry = f
+          break
+        }
+      }
+    }
+
+    // Buscar archivos GLB/GLTF — SaveGLB puede usar '3d', 'gltf', 'mesh' o 'files'; deduplicar por filename
+    for (const key of ['3d', 'gltf', 'mesh', 'files', 'images']) {
+      if (!Array.isArray(node?.[key])) continue
+      for (const f of node[key]) {
+        const name = (f?.filename || '').toLowerCase()
+        if ((name.endsWith('.glb') || name.endsWith('.gltf')) && !glbEntries.some(e => e.filename === f.filename)) {
+          glbEntries.push(f)
+        }
+      }
+    }
   }
 
-  if (!imageEntry) {
+  const basePath = storagePath.replace(/\.[^.]+$/, '')
+  let primaryResult = null
+
+  // Descargar imagen de preview (si existe)
+  if (imageEntry) {
+    const { filename, subfolder = '', type = 'output' } = imageEntry
+    const viewUrl = `${BASE_URL()}/api/view?filename=${encodeURIComponent(filename)}&subfolder=${encodeURIComponent(subfolder)}&type=${type}`
+    const imgRes  = await fetch(viewUrl, { headers: headers(), redirect: 'follow' })
+    if (imgRes.ok) {
+      const buffer = Buffer.from(await imgRes.arrayBuffer())
+      if (buffer.length >= 1000) {
+        const mime = imgRes.headers.get('content-type') || 'image/png'
+        const url  = await uploadToStorage(buffer, storagePath, mime)
+        primaryResult = { url, size_bytes: buffer.length }
+        console.log(`[ComfyUI] Image → ${storagePath} (${Math.round(buffer.length / 1024)}kb) job:${promptId}`)
+      }
+    }
+  }
+
+  // Descargar archivos GLB
+  const glbUrls = []
+  for (let i = 0; i < glbEntries.length; i++) {
+    const { filename, subfolder = '', type = 'output' } = glbEntries[i]
+    const viewUrl = `${BASE_URL()}/api/view?filename=${encodeURIComponent(filename)}&subfolder=${encodeURIComponent(subfolder)}&type=${type}`
+    const glbRes  = await fetch(viewUrl, { headers: headers(), redirect: 'follow' })
+    if (!glbRes.ok) { console.warn(`[ComfyUI] GLB download failed: ${glbRes.status} ${filename}`); continue }
+    const buffer  = Buffer.from(await glbRes.arrayBuffer())
+    const glbPath = `${basePath}_${i}.glb`
+    const url     = await uploadToStorage(buffer, glbPath, 'model/gltf-binary')
+    glbUrls.push(url)
+    console.log(`[ComfyUI] GLB → ${glbPath} (${Math.round(buffer.length / 1024)}kb) job:${promptId}`)
+    if (!primaryResult) primaryResult = { url, size_bytes: buffer.length }
+  }
+
+  if (!primaryResult) {
     console.error(`[ComfyUI] downloadOutput: outputs dump for job ${promptId}:`, JSON.stringify(outputs))
-    throw new Error(`ComfyUI: could not find output image in history for job ${promptId}`)
+    throw new Error(`ComfyUI: no output found (image or GLB) for job ${promptId}`)
   }
 
-  const { filename, subfolder = '', type = 'output' } = imageEntry
-  const viewUrl = `${BASE_URL()}/api/view?filename=${encodeURIComponent(filename)}&subfolder=${encodeURIComponent(subfolder)}&type=${type}`
-
-  // /api/view returns 302 → signed URL; follow redirects
-  const imgRes = await fetch(viewUrl, { headers: headers(), redirect: 'follow' })
-  if (!imgRes.ok) throw new Error(`ComfyUI view fetch failed: ${imgRes.status}`)
-
-  const buffer = Buffer.from(await imgRes.arrayBuffer())
-  if (buffer.length < 1000) throw new Error('ComfyUI image response too small')
-
-  const mime = imgRes.headers.get('content-type') || 'image/png'
-  const publicUrl = await uploadToStorage(buffer, storagePath, mime)
-  console.log(`[ComfyUI] Generated ${storagePath} (${Math.round(buffer.length / 1024)}kb) job:${promptId}`)
-  return { url: publicUrl, size_bytes: buffer.length, source: 'comfyui' }
+  return { url: primaryResult.url, size_bytes: primaryResult.size_bytes, glb_urls: glbUrls, source: 'comfyui' }
 }
 
 async function uploadImageToComfyUI(imageUrl) {

@@ -1276,4 +1276,269 @@ router.delete('/:id/members/:memberId', async (req, res, next) => {
   } catch (err) { next(err) }
 })
 
+// ─── Repo / Export to Repository ──────────────────────────────────────────────
+const repoService = require('../services/repo.service')
+
+// GET /api/projects/:id/repo-config
+router.get('/:id/repo-config', async (req, res, next) => {
+  try {
+    const { id } = req.params
+    const { data: project, error } = await db()
+      .from('projects')
+      .select('repo_config, repo_token_encrypted')
+      .eq('id', id)
+      .single()
+
+    if (error || !project) return res.status(404).json({ success: false, error: 'Project not found' })
+
+    const hasToken = !!project.repo_token_encrypted
+    if (!project.repo_config && !hasToken) return res.json({ success: true, repo_config: null })
+
+    res.json({
+      success: true,
+      repo_config: project.repo_config
+        ? { ...project.repo_config, has_token: hasToken }
+        : null
+    })
+  } catch (err) { next(err) }
+})
+
+// PUT /api/projects/:id/repo-config — guarda URL y/o token (encriptado)
+router.put('/:id/repo-config', async (req, res, next) => {
+  try {
+    const { id } = req.params
+    const { repo_url, repo_token } = req.body
+
+    if (!repo_url && !repo_token) {
+      return res.status(400).json({ success: false, error: 'repo_url or repo_token is required' })
+    }
+
+    const { data: existing, error: pErr } = await db()
+      .from('projects')
+      .select('repo_config, repo_token_encrypted')
+      .eq('id', id)
+      .single()
+
+    if (pErr) return res.status(404).json({ success: false, error: 'Project not found' })
+
+    const updates = {}
+
+    if (repo_token) {
+      updates.repo_token_encrypted = repoService.encrypt(repo_token)
+    }
+
+    const hasToken = !!updates.repo_token_encrypted || !!existing.repo_token_encrypted
+
+    if (repo_url) {
+      const provider = repoService.detectProvider(repo_url)
+      updates.repo_config = {
+        ...(existing.repo_config || {}),
+        repo_url,
+        provider,
+        has_token: hasToken,
+        configured_at: new Date().toISOString(),
+      }
+    } else if (existing.repo_config) {
+      // solo actualizamos has_token en el config existente
+      updates.repo_config = { ...existing.repo_config, has_token: hasToken }
+    }
+
+    const { error } = await db().from('projects').update(updates).eq('id', id)
+    if (error) return res.status(500).json({ success: false, error: error.message })
+
+    const { data: updated } = await db()
+      .from('projects')
+      .select('repo_config, repo_token_encrypted')
+      .eq('id', id)
+      .single()
+
+    res.json({
+      success: true,
+      repo_config: updated?.repo_config
+        ? { ...updated.repo_config, has_token: !!updated.repo_token_encrypted }
+        : null
+    })
+  } catch (err) { next(err) }
+})
+
+// POST /api/projects/:id/repo/create — crea repo en GitLab y guarda la URL
+router.post('/:id/repo/create', async (req, res, next) => {
+  try {
+    const { id } = req.params
+
+    const { data: project, error: pErr } = await db()
+      .from('projects')
+      .select('name, repo_token_encrypted, repo_config')
+      .eq('id', id)
+      .single()
+
+    if (pErr || !project) return res.status(404).json({ success: false, error: 'Project not found' })
+    if (!project.repo_token_encrypted) {
+      return res.status(400).json({ success: false, error: 'No token configured. Save a token first.' })
+    }
+
+    const token = repoService.decrypt(project.repo_token_encrypted)
+    const repoUrl = await repoService.createGitlabRepo(token, project.name || `forge-project-${id}`)
+    const provider = repoService.detectProvider(repoUrl)
+    const now = new Date().toISOString()
+
+    const repoConfig = {
+      repo_url: repoUrl,
+      has_token: true,
+      provider,
+      configured_at: now,
+    }
+
+    await db().from('projects').update({ repo_config: repoConfig }).eq('id', id)
+
+    res.json({ success: true, repo_url: repoUrl, repo_config: repoConfig })
+  } catch (err) { next(err) }
+})
+
+// POST /api/projects/:id/repo/validate — verifica acceso de escritura al repo
+router.post('/:id/repo/validate', async (req, res, next) => {
+  try {
+    const { id } = req.params
+
+    const { data: project, error: pErr } = await db()
+      .from('projects')
+      .select('repo_config, repo_token_encrypted')
+      .eq('id', id)
+      .single()
+
+    if (pErr || !project) return res.status(404).json({ success: false, error: 'Project not found' })
+    if (!project.repo_config?.repo_url) {
+      return res.status(400).json({ success: false, error: 'No repository URL configured' })
+    }
+    if (!project.repo_token_encrypted) {
+      return res.status(400).json({ success: false, error: 'No token configured' })
+    }
+
+    const token = repoService.decrypt(project.repo_token_encrypted)
+    const result = await repoService.validateGitlabAccess(token, project.repo_config.repo_url)
+
+    res.json({ success: true, ...result })
+  } catch (err) { next(err) }
+})
+
+// POST /api/projects/:id/repo/export — sube assets aprobados al repo
+router.post('/:id/repo/export', async (req, res, next) => {
+  try {
+    const { id } = req.params
+    const { node_keys } = req.body
+
+    if (!Array.isArray(node_keys) || node_keys.length === 0) {
+      return res.status(400).json({ success: false, error: 'node_keys array is required' })
+    }
+
+    const { data: project, error: pErr } = await db()
+      .from('projects')
+      .select('name, concept, repo_config, repo_token_encrypted')
+      .eq('id', id)
+      .single()
+
+    if (pErr || !project) return res.status(404).json({ success: false, error: 'Project not found' })
+    if (!project.repo_config?.repo_url) return res.status(400).json({ success: false, error: 'No repository configured' })
+    if (!project.repo_token_encrypted) return res.status(400).json({ success: false, error: 'No token configured' })
+
+    const token = repoService.decrypt(project.repo_token_encrypted)
+    const repoUrl = project.repo_config.repo_url
+
+    const { data: assets } = await db()
+      .from('assets')
+      .select('*, asset_versions!asset_versions_asset_id_fkey(*)')
+      .eq('project_id', id)
+      .eq('review_status', 'approved')
+      .in('step_key', node_keys)
+
+    const pushed = []
+    const errors = []
+
+    // GDD como JSON
+    if (node_keys.includes('gdd') && project.concept?.pipeline?.gdd) {
+      try {
+        const gddContent = JSON.stringify(project.concept.pipeline.gdd, null, 2)
+        await repoService.pushFileToGitlab(token, repoUrl, 'forge/gdd.json', gddContent, 'forge: export GDD')
+        pushed.push('forge/gdd.json')
+      } catch (e) {
+        errors.push({ file: 'forge/gdd.json', error: e.message })
+      }
+    }
+
+    // Assets binarios — fetch desde storage_url y push a GitLab
+    for (const asset of (assets || [])) {
+      const version = (asset.asset_versions || []).find(v => v.is_current)
+      if (!version?.storage_url) continue
+
+      try {
+        const fetchRes = await fetch(version.storage_url)
+        if (!fetchRes.ok) {
+          errors.push({ file: asset.name, error: `HTTP ${fetchRes.status} al obtener el asset` })
+          continue
+        }
+        const buffer = Buffer.from(await fetchRes.arrayBuffer())
+        const urlPath = version.storage_url.split('?')[0]
+        const ext = urlPath.split('.').pop() || 'bin'
+        const filePath = `forge/${asset.step_key}/${asset.name}.${ext}`
+        await repoService.pushFileToGitlab(token, repoUrl, filePath, buffer, `forge: export ${asset.step_key}/${asset.name}`)
+        pushed.push(filePath)
+      } catch (e) {
+        errors.push({ file: asset.name, error: e.message })
+      }
+    }
+
+    res.json({ success: true, pushed, errors })
+  } catch (err) { next(err) }
+})
+
+// GET /api/projects/:id/idea-candidate — devuelve la idea seleccionada más reciente
+router.get('/:id/idea-candidate', async (req, res, next) => {
+  try {
+    const { id } = req.params
+    const { data, error } = await db()
+      .from('project_idea_candidates')
+      .select('id, title, idea_data, original_description, selected_at')
+      .eq('project_id', id)
+      .order('selected_at', { ascending: false })
+      .limit(1)
+      .maybeSingle()
+
+    if (error) return res.status(500).json({ success: false, error: error.message })
+    res.json({ success: true, candidate: data ?? null })
+  } catch (err) { next(err) }
+})
+
+// POST /api/projects/:id/idea-candidate — guarda la idea seleccionada con su descripción original
+router.post('/:id/idea-candidate', async (req, res, next) => {
+  try {
+    const { id } = req.params
+    const { title, idea_data, original_description } = req.body
+    if (!title || !idea_data) return res.status(400).json({ success: false, error: 'title and idea_data are required' })
+
+    const { error } = await db()
+      .from('project_idea_candidates')
+      .insert({ project_id: id, title, idea_data, original_description: original_description ?? null })
+
+    if (error) return res.status(500).json({ success: false, error: error.message })
+    res.json({ success: true })
+  } catch (err) { next(err) }
+})
+
+// PATCH /api/projects/:id/name — actualiza el nombre del proyecto
+router.patch('/:id/name', async (req, res, next) => {
+  try {
+    const { id } = req.params
+    const { name } = req.body
+    if (!name?.trim()) return res.status(400).json({ success: false, error: 'name is required' })
+
+    const { error } = await db()
+      .from('projects')
+      .update({ name: name.trim() })
+      .eq('id', id)
+
+    if (error) return res.status(500).json({ success: false, error: error.message })
+    res.json({ success: true })
+  } catch (err) { next(err) }
+})
+
 module.exports = router

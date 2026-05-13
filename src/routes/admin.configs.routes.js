@@ -236,12 +236,20 @@ router.patch('/comfyui-workflows/:id', async (req, res, next) => {
 router.post('/comfyui-workflows/:id/test', async (req, res, next) => {
   try {
     const { prompt, width, height, seed, extras = {} } = req.body
-    const entry = await getWorkflowById(req.params.id)
-    if (!entry) return res.status(404).json({ success: false, error: 'Workflow not found' })
+
+    // Consulta directa a DB — el test admin ignora is_active
+    const { data: entry, error: entryErr } = await db()
+      .from('comfyui_workflows')
+      .select('*')
+      .eq('id', req.params.id)
+      .single()
+
+    if (entryErr || !entry) return res.status(404).json({ success: false, error: 'Workflow not found' })
+    if (!entry.workflow_json) return res.status(400).json({ success: false, error: 'Workflow has no workflow_json saved' })
 
     const inject = entry.inject_config || {}
 
-    // Build a clone of the workflow and inject provided values
+    // Clonar el workflow y aplicar los valores inyectados
     const workflow = JSON.parse(JSON.stringify(entry.workflow_json))
 
     function injectPoint(point, value) {
@@ -251,7 +259,10 @@ router.post('/comfyui-workflows/:id/test', async (req, res, next) => {
       node.inputs[point.field] = value
     }
 
-    if (prompt  !== undefined) injectPoint(inject.prompt, prompt)
+    if (prompt !== undefined) {
+      console.log(`[ComfyUI test] prompt →\n${prompt}`)
+      injectPoint(inject.prompt, prompt)
+    }
     if (width   !== undefined) injectPoint(inject.width,  Number(width))
     if (height  !== undefined) injectPoint(inject.height, Number(height))
     if (seed !== undefined && seed !== null && seed !== '') injectPoint(inject.seed, Number(seed))
@@ -286,10 +297,10 @@ router.post('/comfyui-workflows/:id/test', async (req, res, next) => {
     if (!prompt_id) return res.status(502).json({ success: false, error: 'ComfyUI: no prompt_id' })
 
     console.log(`[ComfyUI test] job ${prompt_id} workflow:${entry.name}`)
-    await pollUntilDone(prompt_id)
-    const storagePath = `admin/workflow-tests/${req.params.id}/${Date.now()}.jpg`
+    await pollUntilDone(prompt_id, 600_000)   // 10 min — workflows 3D pueden tardar
+    const storagePath = `admin/workflow-tests/${req.params.id}/${Date.now()}.png`
     const result = await downloadOutput(prompt_id, storagePath)
-    res.json({ success: true, image_url: result.url, job_id: prompt_id, prepared_workflow: workflow })
+    res.json({ success: true, image_url: result.url, glb_urls: result.glb_urls ?? [], job_id: prompt_id, prepared_workflow: workflow })
   } catch (err) {
     console.error(`[ComfyUI test] error:`, err.message)
     res.status(500).json({ success: false, error: err.message })

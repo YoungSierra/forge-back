@@ -39,6 +39,7 @@ const FALLBACK_MAP = {
   cinematics:           () => require('../prompts/cinematics.prompt').CINEMATICS_SYSTEM_PROMPT,
   voice:                () => require('../prompts/voice.prompt').VOICE_SYSTEM_PROMPT,
   validation:           () => require('../prompts/validation.prompt').VALIDATION_SYSTEM_PROMPT,
+  gen_idea:             () => require('../prompts/gen_idea.prompt').GEN_IDEA_SYSTEM_PROMPT,
   playtesting:          () => null,
 }
 
