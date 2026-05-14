@@ -16,7 +16,11 @@ const PIPELINE_CATALOG = [
   { nodeId: 'charaters',            phase: 'characters',  label: 'Characters',           description: 'Character models & blend shapes' },
   // ── World ────────────────────────────────────────────────────────────
   { nodeId: 'backgrounds',          phase: 'world',       label: 'Backgrounds',          description: 'Parallax background layers' },
-  { nodeId: 'modeling',             phase: 'world',       label: 'Modeling',             description: '3D meshes, props & environment geo' },
+  { nodeId: 'environments',          phase: 'world',       label: 'Environments',         description: 'Environment art direction & concept for 3D scenes' },
+  { nodeId: 'props',                phase: 'world',       label: 'Props',                description: 'Props & objects art direction for 3D production' },
+  { nodeId: 'modeling_characters',  phase: 'world',       label: 'Modeling (Characters)',description: '3D character meshes from renders' },
+  { nodeId: 'modeling_environments',phase: 'world',       label: 'Modeling (Envs)',      description: '3D environment and scenario meshes' },
+  { nodeId: 'modeling_props',       phase: 'world',       label: 'Modeling (Props)',     description: '3D prop and object meshes' },
   { nodeId: 'texturing',            phase: 'world',       label: 'Texturing',            description: 'PBR materials, UV unwrapping & baking' },
   { nodeId: 'rigging',              phase: 'world',       label: 'Rigging',              description: 'Skeleton setup & weight painting' },
   { nodeId: 'lighting',             phase: 'world',       label: 'Lighting',             description: 'Scene lighting, GI & lightmap baking' },

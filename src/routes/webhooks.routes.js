@@ -180,16 +180,28 @@ function buildGddJson(rawMarkdown) {
       // eliminar apodo entre comillas (rectas o curvas)
       const charName = namePart.replace(/\s*[“”"'][^“”"']*[“”"']/g, '').trim()
       if (!charName) continue
+      const appearance    = getField('appearance')
+      const gameplayRole  = getField('gameplay abilities') || getField('gameplay role')
+      const personality   = getField('personality')
+      const role          = getField('role')
+
+      // Construir sprite_prompt desde los campos del formato n8n
+      const spriteParts = [appearance, personality, gameplayRole].filter(Boolean)
+      const sprite_prompt = spriteParts.length
+        ? `${charName}, ${role || 'character'} — ${spriteParts.join(', ')}`
+        : ''
+
       characters.push({
         name:          charName,
-        role:          getField('role'),
+        role,
         age:           getField('age'),
-        appearance:    getField('appearance'),
-        personality:   getField('personality'),
+        appearance,
+        personality,
         backstory:     getField('backstory'),
         motivation:    getField('motivation'),
         arc:           getField('character arc'),
-        gameplay_role: getField('gameplay abilities') || getField('gameplay role'),
+        gameplay_role: gameplayRole,
+        sprite_prompt,
       })
     }
   }

@@ -5,7 +5,7 @@ const { callLLM } = require('../services/llm.service')
 const { buildCodePrompt } = require('../prompts/code.prompt')
 const { getPrompt } = require('../services/prompt.service')
 const { db } = require('../services/supabase.service')
-const { ensureProjectDir, getAssetUrl, slugify, clearNodeStorage, STORAGE_BASE } = require('../services/storage.service')
+const { ensureProjectDir, getAssetUrl, slugify, clearNodeStorage, STORAGE_BASE, uploadToStorage, getFromStorage } = require('../services/storage.service')
 const { generateImagesSequential, generateImageForNode } = require('../services/image.service')
 const { validateStepConfig, getWorkflowById } = require('../services/config.service')
 const { generateImageComfyUI } = require('../services/providers/comfyui.provider')
@@ -37,9 +37,9 @@ const gddOf = (concept) => concept?.pipeline?.gdd || {}
 
 // Builds a style prefix from GDD art direction + ADI to keep all generated images visually coherent
 function styleContext(gdd, adi) {
-  const style   = adi?.visual_style?.style_name   || gdd?.art_direction?.style   || ''
-  const palette = adi?.visual_style?.color_palette || gdd?.art_direction?.palette || ''
-  const mood    = adi?.visual_style?.mood          || gdd?.art_direction?.mood    || ''
+  const style   = (adi?.visual_keywords?.style || []).slice(0, 3).join(', ') || gdd?.art_direction?.style   || ''
+  const palette = adi?.ui_visual_direction?.palette_notes                     || gdd?.art_direction?.palette || ''
+  const mood    = adi?.world_summary?.mood                                    || gdd?.art_direction?.mood    || ''
   return [style, palette, mood].filter(Boolean).join(', ')
 }
 
@@ -222,7 +222,7 @@ router.post('/levels', async (req, res, next) => {
       return res.status(400).json({ success: false, error: 'Project has no levels in concept', code: 'VALIDATION_ERROR' })
     }
 
-    const adiContext = adi ? `\nArt direction: style=${adi.visual_style?.style_name || ''}, palette=${adi.visual_style?.color_palette || ''}, mood=${adi.visual_style?.mood || ''}, lighting=${adi.environment_art?.lighting_style || ''}` : ''
+    const adiContext = adi ? `\nArt direction: style=${(adi.visual_keywords?.style || []).slice(0, 3).join(', ')}, palette=${adi.ui_visual_direction?.palette_notes || ''}, mood=${adi.world_summary?.mood || ''}` : ''
 
     let result
     try {
@@ -455,8 +455,8 @@ router.post('/visual-guide', async (req, res, next) => {
 Title: ${projInfo.name || project.name}
 Genre: ${projInfo.genre || project.genre}
 Tone: ${projInfo.tone || 'neutral'}
-Art style: ${artDir.style || adi?.visual_style?.style_name || 'unspecified'}
-Palette: ${artDir.palette || adi?.visual_style?.color_palette || 'unspecified'}
+Art style: ${artDir.style || (adi?.visual_keywords?.style || []).slice(0, 3).join(', ') || 'unspecified'}
+Palette: ${artDir.palette || adi?.ui_visual_direction?.palette_notes || 'unspecified'}
 Lighting: ${artDir.lighting_style || 'unspecified'}
 References: ${(artDir.references || []).join(', ') || 'none'}
 Description: ${projInfo.elevator_pitch || ''}${adi ? `\nArt direction pillars: ${(adi.art_direction_pillars || []).map(p => p.name).join(', ')}` : ''}`
@@ -474,6 +474,93 @@ Description: ${projInfo.elevator_pitch || ''}${adi ? `\nArt direction pillars: $
     next(err)
   }
 })
+
+function adiToMarkdown(adi, projectName) {
+  const lines = []
+  lines.push(`# ${projectName} — Art Direction Intake\n`)
+  if (adi.description) lines.push(`${adi.description}\n`)
+
+  const ws = adi.world_summary || {}
+  lines.push(`## World Summary`)
+  if (ws.mood)         lines.push(`**Mood:** ${ws.mood}`)
+  if (ws.core_fantasy) lines.push(`**Core Fantasy:** ${ws.core_fantasy}`)
+  if (ws.tone?.length) lines.push(`**Tone:** ${ws.tone.join(', ')}`)
+  if (ws.themes?.length) lines.push(`**Themes:** ${ws.themes.join(', ')}`)
+  if (ws.contradictions?.length) lines.push(`**Contradictions:** ${ws.contradictions.join(' · ')}`)
+  lines.push('')
+
+  if ((adi.art_direction_pillars || []).length) {
+    lines.push(`## Art Direction Pillars`)
+    for (const p of adi.art_direction_pillars) lines.push(`- **${p.name}:** ${p.description}`)
+    lines.push('')
+  }
+
+  const vk = adi.visual_keywords || {}
+  if (Object.keys(vk).length) {
+    lines.push(`## Visual Keywords`)
+    for (const [cat, words] of Object.entries(vk)) {
+      if (Array.isArray(words) && words.length) lines.push(`- **${cat}:** ${words.join(', ')}`)
+    }
+    lines.push('')
+  }
+
+  const ke = adi.key_elements || {}
+  if (ke.characters?.length) {
+    lines.push(`## Characters`)
+    for (const c of ke.characters) {
+      lines.push(`### ${c.name} (${c.role})`)
+      if (c.visual_identity)       lines.push(`*Visual:* ${c.visual_identity}`)
+      if (c.behavior)              lines.push(`*Behavior:* ${c.behavior}`)
+      if (c.gameplay_implications) lines.push(`*Gameplay:* ${c.gameplay_implications}`)
+    }
+    lines.push('')
+  }
+
+  if (ke.environments?.length) {
+    lines.push(`## Environments`)
+    for (const e of ke.environments) {
+      lines.push(`### ${e.name}`)
+      if (e.visual_language)  lines.push(`*Visual:* ${e.visual_language}`)
+      if (e.emotional_impact) lines.push(`*Emotion:* ${e.emotional_impact}`)
+    }
+    lines.push('')
+  }
+
+  const ui = adi.ui_visual_direction || {}
+  if (Object.keys(ui).length) {
+    lines.push(`## UI Visual Direction`)
+    if (ui.style)               lines.push(`**Style:** ${ui.style}`)
+    if (ui.palette_notes)       lines.push(`**Palette:** ${ui.palette_notes}`)
+    if (ui.hud_philosophy)      lines.push(`**HUD:** ${ui.hud_philosophy}`)
+    if (ui.iconography_style)   lines.push(`**Icons:** ${ui.iconography_style}`)
+    if (ui.typography_direction) lines.push(`**Typography:** ${ui.typography_direction}`)
+    lines.push('')
+  }
+
+  const sm = adi.splash_and_marketing || {}
+  if (Object.keys(sm).length) {
+    lines.push(`## Splash & Marketing`)
+    if (sm.key_art_direction)     lines.push(`**Key Art:** ${sm.key_art_direction}`)
+    if (sm.composition_notes)     lines.push(`**Composition:** ${sm.composition_notes}`)
+    if (sm.brand_identity)        lines.push(`**Brand:** ${sm.brand_identity}`)
+    if (sm.social_format_guidance) lines.push(`**Social:** ${sm.social_format_guidance}`)
+    lines.push('')
+  }
+
+  if ((adi.open_questions || []).length) {
+    lines.push(`## Open Questions`)
+    for (const q of adi.open_questions) lines.push(`- [${q.type}] **${q.gap}** — ${q.impact}`)
+    lines.push('')
+  }
+
+  if ((adi.risks || []).length) {
+    lines.push(`## Risks`)
+    for (const r of adi.risks) lines.push(`- [${r.type}] ${r.risk}`)
+    lines.push('')
+  }
+
+  return lines.join('\n')
+}
 
 // POST /api/generate/art-direction-intake
 router.post('/art-direction-intake', async (req, res, next) => {
@@ -494,13 +581,24 @@ router.post('/art-direction-intake', async (req, res, next) => {
     const gdd = input_context?.gdd ?? gddOf(project.concept)
     const userPrompt = `Analyze this Game Design Document and generate the Art Direction Intake Document:\n\n${JSON.stringify(gdd, null, 2)}`
 
+    console.log(`[art-direction-intake] project=${project_id} gdd_keys=${Object.keys(gdd || {}).join(',')} prompt_chars=${userPrompt.length}`)
+
     let result
     try {
       result = await callLLM(await getPrompt('art_direction_intake'), userPrompt, { step: 'art_direction_intake', maxOutputTokens: 6144 })
+      console.log(`[art-direction-intake] OK tokens_used=${result.meta?.usage?.total_tokens ?? '?'}`)
     } catch (err) {
+      console.error(`[art-direction-intake] LLM error: ${err.message}`, { status: err.status, code: err.code })
       const { status, ...body } = llmErr(err)
       return res.status(status).json({ success: false, ...body })
     }
+
+    // Guardar markdown en R2 para visor
+    const md = adiToMarkdown(result.data, project.name)
+    const r2Path = `projects/${project_id}/art_direction_intake/raw.md`
+    uploadToStorage(Buffer.from(md, 'utf-8'), r2Path, 'text/plain').catch(e =>
+      console.warn(`[art-direction-intake] Failed to save raw.md: ${e.message}`)
+    )
 
     res.status(200).json({ success: true, art_direction_intake: result.data, meta: result.meta })
   } catch (err) {
@@ -530,7 +628,7 @@ router.post('/concept-art', async (req, res, next) => {
     const vg  = input_context?.visual_guide ?? project.concept?.pipeline?.visual_guide
     const userPrompt = `Game: ${project.name}
 Genre: ${gdd.project?.genre || project.genre}
-Art style: ${gdd.art_direction?.style || adi?.visual_style?.style_name || 'unspecified'}
+Art style: ${gdd.art_direction?.style || (adi?.visual_keywords?.style || []).slice(0, 3).join(', ') || 'unspecified'}
 ${vg ? `Visual style guide: ${JSON.stringify({ style_summary: vg.style_summary, sprite_rules: vg.sprite_rules?.slice(0, 3) })}` : ''}
 ${adi ? `Art direction pillars: ${(adi.art_direction_pillars || []).map(p => `${p.name}: ${p.description}`).join(' | ')}` : ''}
 Characters: ${JSON.stringify((gdd.characters || []).map(c => ({ name: c.name, role: c.role, description: c.description })))}
@@ -710,7 +808,7 @@ router.post('/uiux', async (req, res, next) => {
     const vg  = input_context?.visual_guide ?? project.concept?.pipeline?.visual_guide
     const userPrompt = `Game: ${project.name}, Genre: ${gdd.project?.genre || project.genre}
 Mechanics: ${(gdd.mechanics || []).map(m => m.name).join(', ')}
-Art style: ${gdd.art_direction?.style || adi?.visual_style?.style_name || 'unspecified'}
+Art style: ${gdd.art_direction?.style || (adi?.visual_keywords?.style || []).slice(0, 3).join(', ') || 'unspecified'}
 UI style: ${gdd.art_direction?.ui_style || adi?.ui_visual_direction?.style || 'unspecified'}
 ${adi?.ui_visual_direction ? `UI direction: palette_notes=${adi.ui_visual_direction.palette_notes}, hud_philosophy=${adi.ui_visual_direction.hud_philosophy}` : ''}
 ${vg ? `Visual style: ${vg.style_summary?.slice(0, 200) || ''}` : ''}
@@ -757,7 +855,7 @@ router.post('/icons', async (req, res, next) => {
     const userPrompt = `Game: ${project.name}, Genre: ${gdd.project?.genre || project.genre}
 Mechanics: ${JSON.stringify((gdd.mechanics || []).map(m => ({ name: m.name, type: m.type })))}
 Characters: ${(gdd.characters || []).map(c => c.name).join(', ')}
-Art style: ${gdd.art_direction?.style || adi?.visual_style?.style_name || 'unspecified'}
+Art style: ${gdd.art_direction?.style || (adi?.visual_keywords?.style || []).slice(0, 3).join(', ') || 'unspecified'}
 ${uiux ? `Icon style from UI/UX: ${uiux.design_system?.icon_style || 'unspecified'}` : ''}
 ${adi?.ui_visual_direction?.iconography_style ? `Iconography style: ${adi.ui_visual_direction.iconography_style}` : ''}`
 
@@ -807,7 +905,7 @@ router.post('/hud', async (req, res, next) => {
 Mechanics: ${JSON.stringify((gdd.mechanics || []).map(m => ({ name: m.name, description: m.description })))}
 Core loop: ${gdd.project?.core_loop || ''}
 Platform: ${gdd.project?.target_platform || 'PC'}
-Art style: ${gdd.art_direction?.style || adi?.visual_style?.style_name || 'unspecified'}
+Art style: ${gdd.art_direction?.style || (adi?.visual_keywords?.style || []).slice(0, 3).join(', ') || 'unspecified'}
 ${uiux ? `HUD elements from UI/UX: ${(uiux.hud_elements || []).join(', ')}` : ''}
 ${adi?.ui_visual_direction?.hud_philosophy ? `HUD philosophy: ${adi.ui_visual_direction.hud_philosophy}` : ''}`
 
@@ -849,8 +947,8 @@ router.post('/splash-art', async (req, res, next) => {
     const userPrompt = `Game: ${project.name}
 Genre: ${gdd.project?.genre || project.genre}
 Tone: ${gdd.project?.tone || ''}
-Art style: ${gdd.art_direction?.style || adi?.visual_style?.style_name || 'unspecified'}
-Color palette: ${gdd.art_direction?.color_palette || adi?.visual_style?.color_palette || ''}
+Art style: ${gdd.art_direction?.style || (adi?.visual_keywords?.style || []).slice(0, 3).join(', ') || 'unspecified'}
+Color palette: ${gdd.art_direction?.color_palette || adi?.ui_visual_direction?.palette_notes || ''}
 Main characters: ${chars || 'not specified'}
 Key settings: ${levels || 'not specified'}
 Key art direction: ${sm.key_art_direction || ''}
@@ -895,8 +993,8 @@ router.post('/marketing', async (req, res, next) => {
 Genre: ${gdd.project?.genre || project.genre}
 Tone: ${gdd.project?.tone || ''}
 Target platform: ${gdd.project?.target_platform || 'PC'}
-Art style: ${gdd.art_direction?.style || adi?.visual_style?.style_name || 'unspecified'}
-Color palette: ${gdd.art_direction?.color_palette || adi?.visual_style?.color_palette || ''}
+Art style: ${gdd.art_direction?.style || (adi?.visual_keywords?.style || []).slice(0, 3).join(', ') || 'unspecified'}
+Color palette: ${gdd.art_direction?.color_palette || adi?.ui_visual_direction?.palette_notes || ''}
 Brand identity: ${sm.brand_identity || ''}
 Social format guidance: ${sm.social_format_guidance || ''}
 ${splashArt?.image_prompt ? `Splash art reference prompt: ${splashArt.image_prompt}` : ''}`
@@ -977,9 +1075,34 @@ const baseCtx = (project, gdd) => {
   return `Game: ${project.name}, Genre: ${gdd.project?.genre || project.genre}, Engine: ${gdd.development?.suggested_engine || project.target_engine}`
 }
 
-makeDocRoute('modeling', 'modeling', (p, ctx) => {
+makeDocRoute('modeling_characters', 'modeling_characters', (p, ctx) => {
   const gdd = ctx?.gdd ?? gddOf(p.concept)
-  return `${baseCtx(p, gdd)}\nCharacters: ${JSON.stringify((gdd.characters || []).map(c => ({ name: c.name, role: c.role })))}\nLevels: ${(gdd.levels || []).map(l => l.environment).join(', ')}`
+  const adi = ctx?.art_direction_intake
+  return `${baseCtx(p, gdd)}\nCharacters: ${JSON.stringify((gdd.characters || []).map(c => ({ name: c.name, role: c.role, appearance: c.appearance })))}\nStyle: ${styleContext(gdd, adi)}`
+})
+
+makeDocRoute('environments', 'environments', (p, ctx) => {
+  const gdd = ctx?.gdd ?? gddOf(p.concept)
+  const adi = ctx?.art_direction_intake
+  return `${baseCtx(p, gdd)}\nLevels: ${JSON.stringify((gdd.levels || []).map(l => ({ name: l.name, environment: l.environment, mood: l.mood })))}\nStyle: ${styleContext(gdd, adi)}`
+})
+
+makeDocRoute('props', 'props', (p, ctx) => {
+  const gdd = ctx?.gdd ?? gddOf(p.concept)
+  const adi = ctx?.art_direction_intake
+  return `${baseCtx(p, gdd)}\nMechanics: ${JSON.stringify((gdd.mechanics || []).map(m => ({ name: m.name, description: m.description })))}\nLevels: ${(gdd.levels || []).map(l => l.name).join(', ')}\nStyle: ${styleContext(gdd, adi)}`
+})
+
+makeDocRoute('modeling_environments', 'modeling_environments', (p, ctx) => {
+  const gdd = ctx?.gdd ?? gddOf(p.concept)
+  const envData = ctx?.environments
+  return `${baseCtx(p, gdd)}\nEnvironments concept: ${JSON.stringify(envData || (gdd.levels || []).map(l => ({ name: l.name, environment: l.environment })))}`
+})
+
+makeDocRoute('modeling_props', 'modeling_props', (p, ctx) => {
+  const gdd = ctx?.gdd ?? gddOf(p.concept)
+  const propsData = ctx?.props
+  return `${baseCtx(p, gdd)}\nProps concept: ${JSON.stringify(propsData || (gdd.mechanics || []).map(m => ({ name: m.name })))}`
 })
 
 // ── charaters — custom route with per-character ComfyUI image generation ──────

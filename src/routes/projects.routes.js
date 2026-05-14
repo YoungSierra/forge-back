@@ -4,7 +4,7 @@ const fs = require('fs')
 const archiver = require('archiver')
 const router = express.Router()
 const { db, TEST_MEMBER_ID, calculateCost } = require('../services/supabase.service')
-const { ensureProjectDir, getAssetUrl, slugify, STORAGE_BASE } = require('../services/storage.service')
+const { ensureProjectDir, getAssetUrl, slugify, STORAGE_BASE, getFromStorage } = require('../services/storage.service')
 
 const STEP_ORDER = ['step_1_concept', 'sprites', 'levels', 'code', 'audio', 'step_6_export']
 
@@ -38,7 +38,7 @@ router.get('/', async (req, res, next) => {
 
     let query = db()
       .from('projects')
-      .select('*, assets(id, review_status), generation_jobs(id, current_step, status)')
+      .select('*, assets(id, review_status), generation_jobs(id, current_step, status), updated_at')
       .order('created_at', { ascending: false })
 
     if (memberProjectIds.length > 0) {
@@ -1539,6 +1539,37 @@ router.patch('/:id/name', async (req, res, next) => {
     if (error) return res.status(500).json({ success: false, error: error.message })
     res.json({ success: true })
   } catch (err) { next(err) }
+})
+
+// GET /api/projects/:id/art-direction-intake/raw
+router.get('/:id/art-direction-intake/raw', async (req, res, next) => {
+  try {
+    const { id } = req.params
+    const content = await getFromStorage(`projects/${id}/art_direction_intake/raw.md`)
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8')
+    res.send(content)
+  } catch (err) {
+    if (err.name === 'NoSuchKey' || err.$metadata?.httpStatusCode === 404) {
+      return res.status(404).json({ success: false, error: 'Art Direction Intake raw file not found' })
+    }
+    next(err)
+  }
+})
+
+// GET /api/projects/:id/gdd/raw — devuelve el markdown crudo del GDD
+router.get('/:id/gdd/raw', async (req, res, next) => {
+  try {
+    const { id } = req.params
+    const storagePath = `projects/${id}/gdd/raw.md`
+    const content = await getFromStorage(storagePath)
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8')
+    res.send(content)
+  } catch (err) {
+    if (err.name === 'NoSuchKey' || err.$metadata?.httpStatusCode === 404) {
+      return res.status(404).json({ success: false, error: 'GDD raw file not found' })
+    }
+    next(err)
+  }
 })
 
 module.exports = router

@@ -1,7 +1,7 @@
 const fs = require('fs')
 const path = require('path')
 const { PNG } = require('pngjs')
-const { S3Client, PutObjectCommand, ListObjectsV2Command, DeleteObjectsCommand } = require('@aws-sdk/client-s3')
+const { S3Client, PutObjectCommand, GetObjectCommand, ListObjectsV2Command, DeleteObjectsCommand } = require('@aws-sdk/client-s3')
 
 const STORAGE_BASE = process.env.STORAGE_PATH || './storage/forge-assets'
 
@@ -102,6 +102,15 @@ async function uploadToStorage(buffer, storagePath, mimeType = 'image/jpeg', buc
   return publicUrl
 }
 
+async function getFromStorage(storagePath, bucketKey = DEFAULT_BUCKET) {
+  const cfg = BUCKET_CONFIG[bucketKey] || BUCKET_CONFIG[DEFAULT_BUCKET]
+  const client = getR2Client()
+  const res = await client.send(new GetObjectCommand({ Bucket: cfg.name, Key: storagePath }))
+  const chunks = []
+  for await (const chunk of res.Body) chunks.push(chunk)
+  return Buffer.concat(chunks).toString('utf-8')
+}
+
 function slugify(text) {
   return text.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
 }
@@ -166,6 +175,7 @@ module.exports = {
   getAssetUrl,
   generatePlaceholderPNG,
   uploadToStorage,
+  getFromStorage,
   deleteStorageKeys,
   clearNodeStorage,
   clearItemStorage,

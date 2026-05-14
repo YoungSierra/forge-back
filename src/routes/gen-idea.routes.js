@@ -13,7 +13,7 @@ async function generateIdeaImage(prompt, index) {
 // POST /api/gen-idea
 router.post('/', async (req, res, next) => {
   try {
-    const { prompt = '', genre = '', tone = '', scope = '', engine = '', count = 7, exclude = [] } = req.body
+    const { prompt = '', genre = '', tone = '', scope = '', engine = '', count = 3, exclude = [] } = req.body
 
     if (!prompt.trim()) {
       return res.status(400).json({ success: false, error: 'prompt is required' })

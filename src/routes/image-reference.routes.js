@@ -99,6 +99,23 @@ router.post('/:id/image-reference/approve', async (req, res, next) => {
     }
 
     const selected = await approveSelection(req.params.id, selected_ids)
+
+    // Escribir en concept.pipeline.image_reference para que getNodeExecutionContext
+    // lo incluya como input de nodos downstream (charaters, etc.)
+    const { data: project } = await db().from('projects').select('id, concept').eq('id', req.params.id).single()
+    if (project) {
+      const pipeline = project.concept?.pipeline || {}
+      await db().from('projects').update({
+        concept: {
+          ...project.concept,
+          pipeline: {
+            ...pipeline,
+            image_reference: { approved: true, approved_at: new Date().toISOString(), selected_count: selected.length },
+          },
+        },
+      }).eq('id', req.params.id)
+    }
+
     res.json({ success: true, selected })
   } catch (err) { next(err) }
 })
