@@ -90,6 +90,47 @@ router.post('/:id/image-reference/generate', async (req, res, next) => {
   } catch (err) { next(err) }
 })
 
+// POST /api/projects/:id/image-reference/save-refined
+router.post('/:id/image-reference/save-refined', async (req, res, next) => {
+  try {
+    const { image_url, refined_from_id } = req.body
+    if (!image_url) return res.status(400).json({ success: false, error: 'image_url required' })
+
+    const { data: lastRound } = await db()
+      .from('character_image_refs')
+      .select('round')
+      .eq('project_id', req.params.id)
+      .eq('character_key', 'global')
+      .order('round', { ascending: false })
+      .limit(1)
+    const nextRound = (lastRound?.[0]?.round || 0) + 1
+
+    // Insertar imagen refinada como seleccionada
+    const { data: newImg, error: insertErr } = await db()
+      .from('character_image_refs')
+      .insert({
+        project_id:      req.params.id,
+        character_key:   'global',
+        image_url,
+        storage_path:    '',
+        round:           nextRound,
+        selected:        true,
+        refined_from_id: refined_from_id || null,
+      })
+      .select()
+      .single()
+
+    if (insertErr) return res.status(500).json({ success: false, error: insertErr.message })
+
+    // Deseleccionar la imagen original si se proveyó
+    if (refined_from_id) {
+      await db().from('character_image_refs').update({ selected: false }).eq('id', refined_from_id)
+    }
+
+    res.json({ success: true, image: newImg })
+  } catch (err) { next(err) }
+})
+
 // POST /api/projects/:id/image-reference/approve — approve exactly 2 images globally
 router.post('/:id/image-reference/approve', async (req, res, next) => {
   try {

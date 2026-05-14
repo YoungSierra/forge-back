@@ -3,6 +3,7 @@ const { callGroq }      = require('./providers/groq.provider')
 const { callTogether }  = require('./providers/together.provider')
 const { callOpenRouter } = require('./providers/openrouter.provider')
 const { callOpenAI }    = require('./providers/openai.provider')
+const { callMinimax }   = require('./providers/minimax.provider')
 const { resolveStepModel, parseModelString } = require('./config.service')
 
 async function callLLM(systemPrompt, userMessage, options = {}) {
@@ -26,6 +27,7 @@ async function callLLM(systemPrompt, userMessage, options = {}) {
     case 'together':   return callTogether(systemPrompt, userMessage, callOptions)
     case 'openrouter': return callOpenRouter(systemPrompt, userMessage, callOptions)
     case 'openai':     return callOpenAI(systemPrompt, userMessage, callOptions)
+    case 'minimax':    return callMinimax(systemPrompt, userMessage, callOptions)
     case 'gemini':
     default:           return callGemini(systemPrompt, userMessage, callOptions)
   }

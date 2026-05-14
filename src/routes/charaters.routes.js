@@ -50,6 +50,7 @@ router.get('/:id/charaters/status', async (req, res, next) => {
       const allVersions    = asset?.asset_versions?.length ?? 0
       const sprite_prompt  = buildSpritePrompt(c)
       if (sprite_prompt !== c.sprite_prompt) needsBackfill = true
+      const sortedVersions = [...(asset?.asset_versions ?? [])].sort((a, b) => b.version_number - a.version_number)
       return {
         character_key:   key,
         character_name:  c.name,
@@ -60,6 +61,7 @@ router.get('/:id/charaters/status', async (req, res, next) => {
         review_status:   asset?.review_status ?? null,
         current_version: currentVersion,
         total_versions:  allVersions,
+        all_versions:    sortedVersions,
       }
     })
 
@@ -257,6 +259,37 @@ router.post('/:id/charaters/:char_key/approve', async (req, res, next) => {
       .eq('id', asset.id)
 
     res.json({ success: true })
+  } catch (err) { next(err) }
+})
+
+// POST /api/projects/:id/charaters/:char_key/restore-version/:version_id
+router.post('/:id/charaters/:char_key/restore-version/:version_id', async (req, res, next) => {
+  try {
+    const { id: project_id, char_key, version_id } = req.params
+
+    const { data: asset } = await db()
+      .from('assets')
+      .select('id')
+      .eq('project_id', project_id)
+      .eq('step_key', 'charaters')
+      .eq('name', char_key)
+      .single()
+
+    if (!asset) return res.status(404).json({ success: false, error: 'No render found for this character' })
+
+    const { data: version } = await db()
+      .from('asset_versions')
+      .select('*')
+      .eq('id', version_id)
+      .eq('asset_id', asset.id)
+      .single()
+
+    if (!version) return res.status(404).json({ success: false, error: 'Version not found' })
+
+    await db().from('asset_versions').update({ is_current: false }).eq('asset_id', asset.id)
+    await db().from('asset_versions').update({ is_current: true }).eq('id', version_id)
+
+    res.json({ success: true, version })
   } catch (err) { next(err) }
 })
 

@@ -235,7 +235,7 @@ router.patch('/comfyui-workflows/:id', async (req, res, next) => {
 // POST /api/admin/comfyui-workflows/:id/test
 router.post('/comfyui-workflows/:id/test', async (req, res, next) => {
   try {
-    const { prompt, width, height, seed, extras = {} } = req.body
+    const { prompt, width, height, seed, extras = {}, storage_path } = req.body
 
     // Consulta directa a DB — el test admin ignora is_active
     const { data: entry, error: entryErr } = await db()
@@ -298,7 +298,7 @@ router.post('/comfyui-workflows/:id/test', async (req, res, next) => {
 
     console.log(`[ComfyUI test] job ${prompt_id} workflow:${entry.name}`)
     await pollUntilDone(prompt_id, 600_000)   // 10 min — workflows 3D pueden tardar
-    const storagePath = `admin/workflow-tests/${req.params.id}/${Date.now()}.png`
+    const storagePath = storage_path || `admin/workflow-tests/${req.params.id}/${Date.now()}.png`
     const result = await downloadOutput(prompt_id, storagePath)
     res.json({ success: true, image_url: result.url, glb_urls: result.glb_urls ?? [], job_id: prompt_id, prepared_workflow: workflow })
   } catch (err) {

@@ -57,8 +57,8 @@ router.post('/gdd', async (req, res, next) => {
     if (!prompt || typeof prompt !== 'string') {
       return res.status(400).json({ success: false, error: 'prompt is required', code: 'VALIDATION_ERROR' })
     }
-    if (prompt.length < 10 || prompt.length > 1000) {
-      return res.status(400).json({ success: false, error: 'prompt must be 10–1000 characters', code: 'VALIDATION_ERROR' })
+    if (prompt.length < 10 || prompt.length > 2000) {
+      return res.status(400).json({ success: false, error: 'prompt must be 10–2000 characters', code: 'VALIDATION_ERROR' })
     }
 
     const timer = makeTimer('GDD')
@@ -583,9 +583,45 @@ router.post('/art-direction-intake', async (req, res, next) => {
 
     console.log(`[art-direction-intake] project=${project_id} gdd_keys=${Object.keys(gdd || {}).join(',')} prompt_chars=${userPrompt.length}`)
 
+    // Schema JSON obligatorio — se appenda siempre al prompt (R2 o local) para que el modelo
+    // sepa exactamente qué keys producir, independientemente del template de contenido.
+    const ADI_JSON_SCHEMA = `
+
+---
+MANDATORY JSON OUTPUT SCHEMA — YOUR RESPONSE MUST BE THIS EXACT JSON STRUCTURE:
+
+{
+  "description": "string",
+  "world_summary": {
+    "tone": ["string"],
+    "mood": "string",
+    "themes": ["string"],
+    "core_fantasy": "string",
+    "contradictions": ["string"]
+  },
+  "key_elements": {
+    "characters": [{ "name": "string", "role": "string", "behavior": "string", "visual_identity": "string", "gameplay_implications": "string" }],
+    "environments": [{ "name": "string", "gameplay_function": "string", "visual_language": "string", "emotional_impact": "string" }],
+    "technology": { "advancement_level": "string", "visual_logic": "string", "material_identity": "string", "world_interaction": "string" },
+    "narrative_elements": { "core_conflict": "string", "visual_storytelling": ["string"], "symbolism": ["string"] }
+  },
+  "visual_keywords": { "style": ["string"], "world": ["string"], "character": ["string"], "material": ["string"], "fx": ["string"], "mood": ["string"] },
+  "visual_references": { "titles": ["string"], "direction": "2D | 3D | hybrid", "rationale": "string" },
+  "art_direction_pillars": [{ "name": "string", "description": "string" }],
+  "ui_visual_direction": { "style": "string", "palette_notes": "string", "typography_direction": "string", "iconography_style": "string", "hud_philosophy": "string", "menu_feel": "string" },
+  "splash_and_marketing": { "key_art_direction": "string", "composition_notes": "string", "brand_identity": "string", "social_format_guidance": "string" },
+  "open_questions": [{ "gap": "string", "type": "visual | design | production", "impact": "string" }],
+  "risks": [{ "risk": "string", "type": "pipeline | readability | tone | technical" }],
+  "acceptance_criteria": { "clear_visual_direction": true, "production_ready": true, "concept_art_executable": true, "cross_team_understandable": true, "notes": "string" }
+}
+
+Use the content guidelines above to fill each field. Output ONLY the JSON object — no markdown, no headers, no explanation.`
+
+    const basePrompt = await getPrompt('art_direction_intake')
+
     let result
     try {
-      result = await callLLM(await getPrompt('art_direction_intake'), userPrompt, { step: 'art_direction_intake', maxOutputTokens: 6144 })
+      result = await callLLM(basePrompt + ADI_JSON_SCHEMA, userPrompt, { step: 'art_direction_intake', maxOutputTokens: 6144 })
       console.log(`[art-direction-intake] OK tokens_used=${result.meta?.usage?.total_tokens ?? '?'}`)
     } catch (err) {
       console.error(`[art-direction-intake] LLM error: ${err.message}`, { status: err.status, code: err.code })

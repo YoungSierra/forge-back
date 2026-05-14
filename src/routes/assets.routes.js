@@ -27,41 +27,58 @@ router.get('/', async (req, res, next) => {
       assets = data || []
     }
 
-    // Image reference assets (selected character refs)
+    // Image reference assets — incluye cadena de refinamientos via refined_from_id
     let refAssets = []
     if (includeRefs) {
+      // Traer todos los refs del proyecto para poder construir cadenas
       let refQuery = db()
         .from('character_image_refs')
         .select('*')
-        .eq('selected', true)
         .order('created_at', { ascending: false })
-        .limit(200)
+        .limit(500)
 
       if (project_id) refQuery = refQuery.eq('project_id', project_id)
 
-      const { data: refs } = await refQuery
-      refAssets = (refs || []).map(r => ({
-        id:             `ref_${r.id}`,
-        project_id:     r.project_id,
-        step_key:       'image_reference',
-        name:           r.character_key.replace(/_/g, ' '),
-        type:           'image',
-        discipline:     'reference',
-        review_status:  'approved',
-        created_at:     r.created_at,
-        job_id:         null,
-        projects:       null,
-        asset_versions: [{
-          id:             `ref_v_${r.id}`,
+      const { data: allRefs } = await refQuery
+      const refsById = Object.fromEntries((allRefs || []).map(r => [r.id, r]))
+
+      // Solo los seleccionados son el "asset principal"
+      const selectedRefs = (allRefs || []).filter(r => r.selected)
+
+      refAssets = selectedRefs.map(r => {
+        // Construir cadena de ancestros: actual → padre → abuelo → ...
+        const chain = []
+        let cur = r
+        while (cur) {
+          chain.push(cur)
+          cur = cur.refined_from_id ? refsById[cur.refined_from_id] : null
+        }
+
+        const versions = chain.map((ref, i) => ({
+          id:             `ref_v_${ref.id}`,
           asset_id:       `ref_${r.id}`,
-          version_number: 1,
+          version_number: chain.length - i,
           source:         'image_reference',
-          storage_url:    r.image_url,
-          is_current:     true,
+          storage_url:    ref.image_url,
+          is_current:     i === 0,
+          created_at:     ref.created_at,
+          metadata:       { character_key: ref.character_key, round: ref.round, refined_from_id: ref.refined_from_id },
+        }))
+
+        return {
+          id:             `ref_${r.id}`,
+          project_id:     r.project_id,
+          step_key:       'image_reference',
+          name:           `Global ref · round ${r.round}`,
+          type:           'image',
+          discipline:     'reference',
+          review_status:  'approved',
           created_at:     r.created_at,
-          metadata:       { character_key: r.character_key, round: r.round },
-        }],
-      }))
+          job_id:         null,
+          projects:       null,
+          asset_versions: versions,
+        }
+      })
     }
 
     res.json({ success: true, assets: [...assets, ...refAssets] })
