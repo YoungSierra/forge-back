@@ -21,8 +21,9 @@ const adminRoutes        = require('./routes/admin.routes')
 const adminConfigsRoutes = require('./routes/admin.configs.routes')
 const adminPromptsRoutes    = require('./routes/admin.prompts.routes')
 const imageReferenceRoutes  = require('./routes/image-reference.routes')
-const charaterRoutes        = require('./routes/charaters.routes')
-const pipelineConfigRoutes  = require('./routes/pipeline-config.routes')
+const charaterRoutes              = require('./routes/charaters.routes')
+const modelingCharactersRoutes    = require('./routes/modeling-characters.routes')
+const pipelineConfigRoutes        = require('./routes/pipeline-config.routes')
 const webhooksRoutes        = require('./routes/webhooks.routes')
 const genIdeaRoutes         = require('./routes/gen-idea.routes')
 const { requireAdmin }   = require('./middleware/requireAdmin')
@@ -59,6 +60,7 @@ app.use('/api/generate', gddRoutes)
 app.use('/api/projects', projectsRoutes)
 app.use('/api/projects', imageReferenceRoutes)
 app.use('/api/projects', charaterRoutes)
+app.use('/api/projects', modelingCharactersRoutes)
 app.use('/api/projects', pipelineConfigRoutes)
 app.use('/api/assets', assetsRoutes)
 app.use('/api/validate', validationRoutes)
@@ -117,19 +119,43 @@ app.use((err, req, res, next) => {
   })
 })
 
+async function runMigrations() {
+  const { db } = require('./services/supabase.service')
+
+  // Renombrar step_key 'modeling' → 'modeling_characters' en step_configs
+  const { data: old } = await db().from('step_configs').select('id').eq('step_key', 'modeling').limit(1).single()
+  if (old) {
+    await db().from('step_configs').update({ step_key: 'modeling_characters' }).eq('step_key', 'modeling')
+    console.log('[migration] step_configs: modeling → modeling_characters')
+  }
+
+  // Insertar step_configs vacíos para nodos nuevos si no existen
+  const NEW_STEPS = ['environments', 'props', 'modeling_environments', 'modeling_props']
+  for (const step_key of NEW_STEPS) {
+    const { data: exists } = await db().from('step_configs').select('id').eq('step_key', step_key).limit(1).single()
+    if (!exists) {
+      await db().from('step_configs').insert({ step_key, integration_type: 'llm' })
+      console.log(`[migration] step_configs: inserted "${step_key}"`)
+    }
+  }
+}
+
 let supabaseReady = false
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`[FORGE] Server running on http://localhost:${PORT}`)
+  // Timeout largo para workflows 3D que pueden tardar varios minutos
+  server.timeout = 660_000 // 11 minutos (1 min más que el poll de ComfyUI)
   console.log(`[FORGE] Storage path: ${path.resolve(STORAGE_PATH)}`)
   console.log(`[FORGE] Frontend origin: ${FRONTEND_URL}`)
 
   // Warm up Supabase connection pool in the background so the first real
   // request doesn't pay the cold-start penalty (~60s on free tier).
   testConnection()
-    .then(() => {
+    .then(async () => {
       supabaseReady = true
       console.log('[FORGE] Supabase connection ready')
+      await runMigrations()
     })
     .catch(err => {
       console.warn('[FORGE] Supabase warm-up failed:', err.message)

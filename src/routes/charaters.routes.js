@@ -12,6 +12,19 @@ function gddOf(project) {
   return project?.concept?.pipeline?.gdd || {}
 }
 
+function buildSpritePrompt(c) {
+  const header = [c.name, c.role, c.age ? `age ${c.age}` : null].filter(Boolean).join(', ')
+  const parts = [
+    c.appearance,
+    c.personality,
+    c.motivation,
+    c.backstory,
+    c.arc,
+    c.gameplay_role,
+  ].filter(Boolean)
+  return parts.length ? `${header} — ${parts.join('. ')}` : header
+}
+
 // GET /api/projects/:id/charaters/status
 router.get('/:id/charaters/status', async (req, res, next) => {
   try {
@@ -29,16 +42,19 @@ router.get('/:id/charaters/status', async (req, res, next) => {
 
     const assetByKey = Object.fromEntries((assets || []).map(a => [a.name, a]))
 
+    let needsBackfill = false
     const status = characters.map((c, i) => {
       const key   = charKey(c)
       const asset = assetByKey[key]
       const currentVersion = asset?.asset_versions?.find(v => v.is_current) ?? null
       const allVersions    = asset?.asset_versions?.length ?? 0
+      const sprite_prompt  = buildSpritePrompt(c)
+      if (sprite_prompt !== c.sprite_prompt) needsBackfill = true
       return {
         character_key:   key,
         character_name:  c.name,
         character_index: i,
-        sprite_prompt:   c.sprite_prompt || '',
+        sprite_prompt,
         status:          !asset ? 'empty' : asset.review_status === 'approved' ? 'approved' : 'generated',
         asset_id:        asset?.id ?? null,
         review_status:   asset?.review_status ?? null,
@@ -46,6 +62,26 @@ router.get('/:id/charaters/status', async (req, res, next) => {
         total_versions:  allVersions,
       }
     })
+
+    // Backfill sprite_prompt en BD si algún personaje no lo tenía
+    if (needsBackfill) {
+      const updatedCharacters = characters.map(c => ({
+        ...c,
+        sprite_prompt: buildSpritePrompt(c),
+      }))
+      const gdd     = gddOf(project)
+      const pipeline = project.concept?.pipeline || {}
+      db().from('projects').update({
+        concept: {
+          ...project.concept,
+          pipeline: { ...pipeline, gdd: { ...gdd, characters: updatedCharacters } },
+        },
+      }).eq('id', req.params.id).then(() => {
+        console.log(`[charaters] sprite_prompt backfilled for project ${req.params.id}`)
+      }).catch(err => {
+        console.error('[charaters] backfill sprite_prompt error:', err)
+      })
+    }
 
     res.json({ success: true, characters: status })
   } catch (err) { next(err) }
@@ -95,7 +131,7 @@ router.post('/:id/charaters/:char_key/generate', async (req, res, next) => {
 
     const target = characters[charIndex]
     const namesStr   = target.name
-    const promptsStr = target.sprite_prompt || target.name
+    const promptsStr = buildSpritePrompt(target)
 
     const storagePath = `projects/${project_id}/charaters/${char_key}_${Date.now()}.png`
     const result = await generateImageComfyUI(workflow.name, '', 1024, 1024, storagePath, {
@@ -158,6 +194,48 @@ router.post('/:id/charaters/:char_key/generate', async (req, res, next) => {
     console.log(`[charaters] Generated render for "${char_key}" → ${result.url}`)
     // Always return image_url directly so the frontend can render regardless of DB insert result
     res.json({ success: true, asset_id: assetId, version, image_url: result.url })
+  } catch (err) { next(err) }
+})
+
+// POST /api/projects/:id/charaters/:char_key/save-refined
+router.post('/:id/charaters/:char_key/save-refined', async (req, res, next) => {
+  try {
+    const { id: project_id, char_key } = req.params
+    const { storage_url } = req.body
+    if (!storage_url) return res.status(400).json({ success: false, error: 'storage_url required' })
+
+    const { data: asset } = await db()
+      .from('assets')
+      .select('id')
+      .eq('project_id', project_id)
+      .eq('step_key', 'charaters')
+      .eq('name', char_key)
+      .single()
+
+    if (!asset) return res.status(404).json({ success: false, error: 'No render asset found for this character' })
+
+    // Vuelve a pending para que el personaje necesite re-aprobación
+    await db().from('assets').update({ review_status: 'pending' }).eq('id', asset.id)
+
+    // Marcar versiones previas como no-current
+    await db().from('asset_versions').update({ is_current: false }).eq('asset_id', asset.id)
+
+    const { count } = await db()
+      .from('asset_versions').select('*', { count: 'exact', head: true }).eq('asset_id', asset.id)
+
+    const { data: version, error: versionErr } = await db().from('asset_versions').insert({
+      asset_id:       asset.id,
+      version_number: (count || 0) + 1,
+      source:         'refined',
+      storage_url,
+      storage_bucket: 'r2',
+      is_current:     true,
+      metadata:       { character_key: char_key, refined_at: new Date().toISOString() },
+    }).select().single()
+
+    if (versionErr) console.error('[charaters] save-refined version error:', versionErr)
+
+    res.json({ success: true, version, image_url: storage_url })
   } catch (err) { next(err) }
 })
 

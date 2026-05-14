@@ -197,11 +197,11 @@ async function uploadImageToComfyUI(imageUrl) {
   return uploadedName
 }
 
-async function generateImageComfyUI(workflowName, prompt, width, height, storagePath, extras = {}) {
+async function generateImageComfyUI(workflowName, prompt, width, height, storagePath, extras = {}, timeoutMs = 120_000) {
   const startTime = Date.now()
   const promptId = await submitWorkflow(workflowName, prompt, width, height, extras)
-  console.log(`[ComfyUI] Submitted job ${promptId} workflow:${workflowName}`)
-  await pollUntilDone(promptId)
+  console.log(`[ComfyUI] Submitted job ${promptId} workflow:${workflowName} timeout:${timeoutMs / 1000}s`)
+  await pollUntilDone(promptId, timeoutMs)
   const result = await downloadOutput(promptId, storagePath)
   console.log(`[ComfyUI] Done in ${Date.now() - startTime}ms`)
   return result
