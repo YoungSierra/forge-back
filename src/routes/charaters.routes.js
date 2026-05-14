@@ -228,14 +228,17 @@ router.post('/:id/charaters/:char_key/save-refined', async (req, res, next) => {
     const { data: version, error: versionErr } = await db().from('asset_versions').insert({
       asset_id:       asset.id,
       version_number: (count || 0) + 1,
-      source:         'refined',
+      source:         'human_refined',
       storage_url,
       storage_bucket: 'r2',
       is_current:     true,
       metadata:       { character_key: char_key, refined_at: new Date().toISOString() },
     }).select().single()
 
-    if (versionErr) console.error('[charaters] save-refined version error:', versionErr)
+    if (versionErr) {
+      console.error('[charaters] save-refined version error:', versionErr)
+      return res.status(500).json({ success: false, error: `Failed to save version: ${versionErr.message}` })
+    }
 
     res.json({ success: true, version, image_url: storage_url })
   } catch (err) { next(err) }
