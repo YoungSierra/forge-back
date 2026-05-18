@@ -23,7 +23,7 @@ async function callOpenAI(systemPrompt, userMessage, options = {}) {
       { role: 'system', content: systemPrompt },
       { role: 'user',   content: userMessage },
     ],
-    response_format: { type: 'json_object' },
+    ...(options.rawText ? {} : { response_format: { type: 'json_object' } }),
     [tokenKey]: options.maxOutputTokens || 8192,
   }
 
@@ -40,6 +40,14 @@ async function callOpenAI(systemPrompt, userMessage, options = {}) {
     const err = new Error(`Response truncated: max_tokens too low (model: ${model})`)
     err.code = 'MAX_TOKENS'
     throw err
+  }
+
+  if (options.rawText) {
+    const usage = completion.usage || {}
+    return {
+      data: raw.trim(),
+      meta: { provider: 'openai', model, tokens_used: { input: usage.prompt_tokens || 0, output: usage.completion_tokens || 0, cached: usage.prompt_tokens_details?.cached_tokens || 0 }, duration_ms: Date.now() - startTime }
+    }
   }
 
   let parsed

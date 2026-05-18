@@ -6,6 +6,12 @@ const { callOpenAI }    = require('./providers/openai.provider')
 const { callMinimax }   = require('./providers/minimax.provider')
 const { resolveStepModel, parseModelString } = require('./config.service')
 
+// Limpia bloques <think>...</think> que algunos modelos con razonamiento extendido incluyen
+// (Gemini 2.5 Flash thinking, DeepSeek R1, Qwen, etc.) — aplica independiente del provider
+function stripThinkBlocks(text) {
+  return typeof text === 'string' ? text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim() : text
+}
+
 async function callLLM(systemPrompt, userMessage, options = {}) {
   const step = options.step || null
 
@@ -22,15 +28,19 @@ async function callLLM(systemPrompt, userMessage, options = {}) {
 
   console.log(`[LLM] Step: ${step || 'default'} | Provider: ${provider} | Model: ${model}`)
 
+  let result
   switch (provider) {
-    case 'groq':       return callGroq(systemPrompt, userMessage, callOptions)
-    case 'together':   return callTogether(systemPrompt, userMessage, callOptions)
-    case 'openrouter': return callOpenRouter(systemPrompt, userMessage, callOptions)
-    case 'openai':     return callOpenAI(systemPrompt, userMessage, callOptions)
-    case 'minimax':    return callMinimax(systemPrompt, userMessage, callOptions)
+    case 'groq':       result = await callGroq(systemPrompt, userMessage, callOptions); break
+    case 'together':   result = await callTogether(systemPrompt, userMessage, callOptions); break
+    case 'openrouter': result = await callOpenRouter(systemPrompt, userMessage, callOptions); break
+    case 'openai':     result = await callOpenAI(systemPrompt, userMessage, callOptions); break
+    case 'minimax':    result = await callMinimax(systemPrompt, userMessage, callOptions); break
     case 'gemini':
-    default:           return callGemini(systemPrompt, userMessage, callOptions)
+    default:           result = await callGemini(systemPrompt, userMessage, callOptions); break
   }
+
+  if (result?.data) result.data = stripThinkBlocks(result.data)
+  return result
 }
 
 module.exports = { callLLM, parseModelString }

@@ -19,7 +19,7 @@ async function callOpenRouter(systemPrompt, userMessage, options = {}) {
       model,
       temperature: options.temperature !== undefined ? options.temperature : 0.8,
       max_tokens: options.maxOutputTokens || 8192,
-      response_format: { type: 'json_object' },
+      ...(options.rawText ? {} : { response_format: { type: 'json_object' } }),
       messages: [
         { role: 'system', content: systemPrompt },
         { role: 'user', content: userMessage }
@@ -51,6 +51,14 @@ async function callOpenRouter(systemPrompt, userMessage, options = {}) {
   }
 
   const text = response.choices[0].message.content
+
+  if (options.rawText) {
+    return {
+      data: text.trim(),
+      meta: { provider: 'openrouter', model, tokens_used: { input: response.usage?.prompt_tokens || 0, output: response.usage?.completion_tokens || 0, cached: 0 }, duration_ms: Date.now() - startTime }
+    }
+  }
+
   const cleaned = text
     .replace(/^```json\s*/i, '')
     .replace(/^```\s*/i, '')

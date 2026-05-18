@@ -127,11 +127,11 @@ async function callMinimax(systemPrompt, userMessage, options = {}) {
   const JSON_OVERRIDE_PREFIX = 'CRITICAL OVERRIDE: Your ENTIRE response must be a single valid JSON object. Do NOT write markdown, headers, bullet points, tables, or any text outside the JSON. Start immediately with { and end with }. No code fences. No explanation.\n\n'
   const JSON_OVERRIDE_SUFFIX = '\n\n---\nFINAL REMINDER — THIS OVERRIDES ALL PREVIOUS FORMAT INSTRUCTIONS: Output ONLY a valid JSON object. Start with { and end with }. No markdown. No headers. No title line. No document structure. Pure JSON only.'
 
-  const effectiveSystem = isReasoning
+  const effectiveSystem = (!options.rawText && isReasoning)
     ? `${JSON_OVERRIDE_PREFIX}${systemPrompt}${JSON_OVERRIDE_SUFFIX}`
     : systemPrompt
 
-  const effectiveUser = isReasoning
+  const effectiveUser = (!options.rawText && isReasoning)
     ? `${userMessage}\n\n---\nOUTPUT REQUIREMENT: Respond with ONLY a valid JSON object. Start with { and end with }. No markdown. No headers. No text before or after the JSON.`
     : userMessage
 
@@ -144,9 +144,11 @@ async function callMinimax(systemPrompt, userMessage, options = {}) {
     ],
   }
 
-  if (!isReasoning) {
+  if (!isReasoning && !options.rawText) {
     params.temperature      = options.temperature !== undefined ? options.temperature : 0.8
     params.response_format  = { type: 'json_object' }
+  } else if (!isReasoning && options.rawText) {
+    params.temperature = options.temperature !== undefined ? options.temperature : 0.8
   }
 
   let response
@@ -177,7 +179,15 @@ async function callMinimax(systemPrompt, userMessage, options = {}) {
     throw err
   }
 
-  const raw    = response.choices[0]?.message?.content || ''
+  const raw = response.choices[0]?.message?.content || ''
+
+  if (options.rawText) {
+    return {
+      data: raw.trim(),
+      meta: { provider: 'minimax', model, tokens_used: { input: response.usage?.prompt_tokens || 0, output: response.usage?.completion_tokens || 0, cached: 0 }, duration_ms: Date.now() - startTime }
+    }
+  }
+
   const parsed = extractJson(raw)
 
   if (!parsed) {

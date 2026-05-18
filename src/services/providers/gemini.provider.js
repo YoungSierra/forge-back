@@ -10,7 +10,7 @@ async function callGemini(systemPrompt, userMessage, options = {}) {
     model,
     systemInstruction: systemPrompt,
     generationConfig: {
-      responseMimeType: 'application/json',
+      responseMimeType: options.rawText ? 'text/plain' : 'application/json',
       temperature: options.temperature !== undefined ? options.temperature : 0.8,
       maxOutputTokens: options.maxOutputTokens || 8192
     }
@@ -43,6 +43,14 @@ async function callGemini(systemPrompt, userMessage, options = {}) {
   }
 
   const text = response.text()
+  const usage = response.usageMetadata || {}
+
+  if (options.rawText) {
+    return {
+      data: text.trim(),
+      meta: { provider: 'gemini', model, tokens_used: { input: usage.promptTokenCount || 0, output: usage.candidatesTokenCount || 0, cached: usage.cachedContentTokenCount || 0 }, duration_ms: Date.now() - startTime }
+    }
+  }
 
   const cleaned = text
     .replace(/^```json\s*/i, '')
@@ -59,7 +67,6 @@ async function callGemini(systemPrompt, userMessage, options = {}) {
     err.raw = text.slice(0, 500)
     throw err
   }
-  const usage = response.usageMetadata || {}
 
   return {
     data: parsed,

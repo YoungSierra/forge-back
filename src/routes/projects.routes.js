@@ -991,11 +991,11 @@ router.post('/:id/approve-node', async (req, res, next) => {
       return res.status(500).json({ success: false, error: 'Failed to update project', code: 'SUPABASE_ERROR', details: uErr.message })
     }
 
-    // Upsert generation_job for this step
+    // Upsert generation_job — un solo registro por (project_id, step_key), se actualiza siempre
     const { data: existingJob } = await db()
       .from('generation_jobs').select('id')
-      .eq('project_id', id).eq('current_step', stepKey).eq('status', 'review')
-      .order('created_at', { ascending: false }).limit(1).single()
+      .eq('project_id', id).eq('current_step', stepKey)
+      .order('created_at', { ascending: false }).limit(1).maybeSingle()
 
     let jobId = existingJob?.id || null
     if (existingJob) {
@@ -1005,7 +1005,7 @@ router.post('/:id/approve-node', async (req, res, next) => {
         project_id: id, triggered_by: actorId, status: 'approved', progress: 100,
         current_step: stepKey, input_prompt: `Pipeline node approved: ${stepKey}`,
         started_at: now, completed_at: now,
-      }).select('id').single()
+      }).select('id').maybeSingle()
       if (newJob) jobId = newJob.id
     }
 

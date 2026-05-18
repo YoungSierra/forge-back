@@ -12,7 +12,7 @@ let _workflowsAt      = 0
 async function loadStepConfigs() {
   const { data, error } = await db()
     .from('step_configs')
-    .select('step_key, integration_type, model_name, comfyui_workflow_id, webhook_url, extra_params, is_active, image_enabled, image_integration_type, image_model, image_workflow_id, image_webhook_url')
+    .select('step_key, step_type, parent_key, order_index, label, integration_type, model_name, comfyui_workflow_id, webhook_url, extra_params, is_active, image_enabled, image_integration_type, image_model, image_workflow_id, image_webhook_url')
 
   if (error) throw new Error(`[configService] Failed to load step_configs: ${error.message}`)
 

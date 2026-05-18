@@ -44,11 +44,16 @@ const FALLBACK_MAP = {
   voice:                () => require('../prompts/voice.prompt').VOICE_SYSTEM_PROMPT,
   validation:           () => require('../prompts/validation.prompt').VALIDATION_SYSTEM_PROMPT,
   gen_idea:             () => require('../prompts/gen_idea.prompt').GEN_IDEA_SYSTEM_PROMPT,
+  rules:                () => null,
+  '00a_idea_expansion': () => null,
+  '00b_direction_lock': () => null,
   playtesting:          () => null,
 }
 
+// Cache por clave: { [step_key]: string }
+// Las claves en curso de carga usan una Promise para evitar fetches dobles simultáneos
 let _cache = {}
-let _loadPromise = null
+let _inflight = {}
 
 async function fetchFromR2(r2Path) {
   const bucket = process.env.CF_R2_PROMPTS_BUCKET
@@ -58,39 +63,57 @@ async function fetchFromR2(r2Path) {
   return res.Body.transformToString('utf-8')
 }
 
-async function _loadAllPrompts() {
+async function _loadOne(key) {
   const { db } = require('./supabase.service')
   const { data, error } = await db()
-    .from('prompt_configs')
-    .select('key, r2_path')
+    .from('step_configs')
+    .select('prompt_r2_path')
+    .eq('step_key', key)
+    .maybeSingle()
 
   if (error) {
-    console.warn('[promptService] Failed to load prompt_configs:', error.message)
-    return
+    console.warn(`[promptService] DB error for "${key}":`, error.message)
+    return null
   }
 
-  for (const row of data || []) {
-    if (!row.r2_path) continue
-    try {
-      _cache[row.key] = await fetchFromR2(row.r2_path)
-      console.log(`[promptService] Loaded "${row.key}" from R2: ${row.r2_path}`)
-    } catch (err) {
-      console.warn(`[promptService] Failed to load "${row.key}" from R2 (${row.r2_path}): ${err.message}`)
-    }
-  }
-}
+  const r2Path = data?.prompt_r2_path
+  if (!r2Path) return null
 
-function ensureLoaded() {
-  if (!_loadPromise) _loadPromise = _loadAllPrompts()
-  return _loadPromise
+  try {
+    const text = await fetchFromR2(r2Path)
+    console.log(`[promptService] Loaded "${key}" from R2: ${r2Path}`)
+    return text
+  } catch (err) {
+    console.warn(`[promptService] Failed to load "${key}" from R2 (${r2Path}): ${err.message}`)
+    return null
+  }
 }
 
 async function getPrompt(key) {
-  await ensureLoaded()
-  if (_cache[key]) {
-    console.log(`[promptService] getPrompt("${key}") → R2 (${_cache[key].length} chars)`)
-    return _cache[key]
+  // Cache hit
+  if (_cache[key] !== undefined) {
+    console.log(`[promptService] getPrompt("${key}") → cache (${_cache[key]?.length ?? 0} chars)`)
+    return _cache[key] || ''
   }
+
+  // Evitar fetches dobles simultáneos para la misma clave
+  if (!_inflight[key]) {
+    _inflight[key] = _loadOne(key).then(text => {
+      // Guardar null como cadena vacía para no re-intentar en la misma sesión
+      _cache[key] = text ?? ''
+      delete _inflight[key]
+      return _cache[key]
+    })
+  }
+
+  const r2Text = await _inflight[key]
+
+  if (r2Text) {
+    console.log(`[promptService] getPrompt("${key}") → R2 (${r2Text.length} chars)`)
+    return r2Text
+  }
+
+  // Fallback local
   const fallback = FALLBACK_MAP[key]?.()
   if (!fallback) console.warn(`[promptService] No prompt found for key "${key}"`)
   else console.log(`[promptService] getPrompt("${key}") → fallback local`)
@@ -99,7 +122,7 @@ async function getPrompt(key) {
 
 function invalidatePrompts() {
   _cache = {}
-  _loadPromise = null
+  _inflight = {}
 }
 
 module.exports = { getPrompt, invalidatePrompts }
