@@ -94,12 +94,13 @@ router.patch('/step-configs/:step_key', async (req, res, next) => {
     const {
       integration_type, model_name, comfyui_workflow_id, webhook_url, extra_params, is_active,
       image_enabled, image_integration_type, image_model, image_workflow_id, image_webhook_url,
-      label, order_index, parent_key, step_type,
+      label, order_index, parent_key, step_type, description,
     } = req.body
 
     const updates = { updated_by: req.adminMemberId, updated_at: new Date().toISOString() }
     if (step_type   !== undefined) updates.step_type   = step_type
     if (label       !== undefined) updates.label       = label || null
+    if (description !== undefined) updates.description = description || null
     if (order_index !== undefined) updates.order_index = Number(order_index)
     if (parent_key  !== undefined) updates.parent_key  = parent_key || null
     if (integration_type    !== undefined) updates.integration_type    = integration_type

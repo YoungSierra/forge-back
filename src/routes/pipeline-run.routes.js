@@ -308,10 +308,11 @@ router.post('/save-draft', async (req, res, next) => {
     const now      = new Date().toISOString()
     const pipeline = project.concept?.pipeline || {}
 
-    // Guardar draft: pending_review=true, approved=false
+    // Preservar campos existentes del entry (ej: chat_history) al actualizar draft
     const updatedPipeline = {
       ...pipeline,
       [step_key]: {
+        ...(pipeline[step_key] || {}),
         output: output ?? '',
         ...(Array.isArray(items) && items.length > 0 ? { items } : {}),
         ...(image_url ? { image_url } : {}),
@@ -362,6 +363,34 @@ router.post('/save-draft', async (req, res, next) => {
   } catch (err) {
     next(err)
   }
+})
+
+// POST /api/pipeline/save-chat-history
+// Guarda el historial de chat de un step en concept.pipeline[step_key].chat_history
+// Body: { project_id, step_key, chat_history }
+router.post('/save-chat-history', async (req, res, next) => {
+  try {
+    const { project_id, step_key, chat_history } = req.body
+    if (!project_id || !step_key || !Array.isArray(chat_history))
+      return res.status(400).json({ success: false, error: 'project_id, step_key, and chat_history are required' })
+
+    const { data: project, error: pErr } = await db()
+      .from('projects').select('id, concept').eq('id', project_id).single()
+    if (pErr || !project)
+      return res.status(404).json({ success: false, error: 'Project not found' })
+
+    const pipeline    = project.concept?.pipeline || {}
+    const existing    = pipeline[step_key] || {}
+    const updatedPipeline = { ...pipeline, [step_key]: { ...existing, chat_history } }
+
+    const { error: uErr } = await db()
+      .from('projects')
+      .update({ concept: { ...project.concept, pipeline: updatedPipeline } })
+      .eq('id', project_id)
+
+    if (uErr) return res.status(500).json({ success: false, error: 'Failed to save chat history' })
+    res.json({ success: true })
+  } catch (err) { next(err) }
 })
 
 // POST /api/pipeline/save-image-version

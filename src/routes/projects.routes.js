@@ -72,6 +72,15 @@ router.get('/', async (req, res, next) => {
         j.status === 'approved' && stepOrder.includes(j.current_step)
       ).length
 
+      // Conteo real de todos los jobs del nuevo pipeline (sin filtrar por STEP_ORDER)
+      const approved_job_count = jobs.filter(j => j.status === 'approved').length
+      const total_job_count    = jobs.filter(j => j.status !== 'invalidated').length
+
+      // Status derivado: si hay trabajo aprobado y el proyecto era draft, pasa a active
+      const computedStatus = p.status === 'draft' && approved_job_count > 0
+        ? 'active'
+        : p.status
+
       let node_approved_count = null
       let node_total_count = null
       const layout = p.canvas_layout
@@ -86,8 +95,11 @@ router.get('/', async (req, res, next) => {
         canvas_layout: undefined,
         assets: undefined,
         generation_jobs: undefined,
+        status: computedStatus,
         current_wizard_step,
         approved_wizard_count,
+        approved_job_count,
+        total_job_count,
         node_approved_count,
         node_total_count,
         approved_asset_count: assets.filter(a => a.review_status === 'approved').length,
@@ -965,7 +977,8 @@ router.post('/:id/approve-node', async (req, res, next) => {
 
     let updatedPipeline = {
       ...pipeline,
-      [stepKey]: { ...(nodeData || {}), approved: true, approved_at: now }
+      // Preservar datos existentes (items, output, etc.) al aprobar — no sobrescribir
+      [stepKey]: { ...(pipeline[stepKey] || {}), ...(nodeData || {}), approved: true, approved_at: now }
     }
 
     // levels: also promote expanded levels back into gdd.levels so other nodes can read them

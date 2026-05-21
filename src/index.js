@@ -26,10 +26,12 @@ const modelingCharactersRoutes    = require('./routes/modeling-characters.routes
 const pipelineConfigRoutes        = require('./routes/pipeline-config.routes')
 const webhooksRoutes        = require('./routes/webhooks.routes')
 const genIdeaRoutes         = require('./routes/gen-idea.routes')
+const ideationRoutes        = require('./routes/ideation.routes')
 const stage0Routes          = require('./routes/stage0.routes')
 const gddSectionsRoutes     = require('./routes/gdd-sections.routes')
 const pipelineRoutes        = require('./routes/pipeline.routes')
 const pipelineRunRoutes     = require('./routes/pipeline-run.routes')
+const chatRoutes            = require('./routes/chat.routes')
 const { requireAdmin }   = require('./middleware/requireAdmin')
 
 // Ensure base storage dirs exist on startup
@@ -75,10 +77,12 @@ app.use('/api/admin', requireAdmin, adminConfigsRoutes)
 app.use('/api/admin', requireAdmin, adminPromptsRoutes)
 app.use('/api/webhooks', webhooksRoutes)
 app.use('/api/gen-idea', genIdeaRoutes)
+app.use('/api/ideation', ideationRoutes)
 app.use('/api/generate', stage0Routes)
 app.use('/api/generate', gddSectionsRoutes)
 app.use('/api/pipeline', pipelineRoutes)
 app.use('/api/pipeline', pipelineRunRoutes)
+app.use('/api/chat',     chatRoutes)
 
 // Models config — reads step models from DB via configService
 app.get('/api/models', async (req, res, next) => {
