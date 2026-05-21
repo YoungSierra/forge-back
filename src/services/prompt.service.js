@@ -102,25 +102,27 @@ async function getPrompt(key) {
   // Evitar fetches dobles simultáneos para la misma clave
   if (!_inflight[key]) {
     _inflight[key] = _loadOne(key).then(text => {
-      // Guardar null como cadena vacía para no re-intentar en la misma sesión
-      _cache[key] = text ?? ''
       delete _inflight[key]
-      return _cache[key]
+      return text
     })
   }
 
   const r2Text = await _inflight[key]
 
+  let finalText = r2Text
   if (r2Text) {
     console.log(`[promptService] getPrompt("${key}") → R2 (${r2Text.length} chars)`)
-    return r2Text
+  } else {
+    // Fallback local
+    const fallback = FALLBACK_MAP[key]?.()
+    if (!fallback) console.warn(`[promptService] No prompt found for key "${key}"`)
+    else console.log(`[promptService] getPrompt("${key}") → fallback local`)
+    finalText = fallback || ''
   }
 
-  // Fallback local
-  const fallback = FALLBACK_MAP[key]?.()
-  if (!fallback) console.warn(`[promptService] No prompt found for key "${key}"`)
-  else console.log(`[promptService] getPrompt("${key}") → fallback local`)
-  return fallback || ''
+  // Cachear el resultado final (R2 o fallback) para que el segundo llamado también funcione
+  _cache[key] = finalText
+  return finalText
 }
 
 function invalidatePrompts() {
