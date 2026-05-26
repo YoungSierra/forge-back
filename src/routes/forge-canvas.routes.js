@@ -113,10 +113,18 @@ router.get('/', async (req, res, next) => {
       }
     } catch (e) { console.error('[forge-canvas] GET edges unexpected error:', e.message) }
 
+    // Canvas layout guardado (posiciones de nodos)
+    const { data: projectRow } = await db()
+      .from('forge_projects')
+      .select('canvas_layout')
+      .eq('id', project_id)
+      .single()
+
     res.json({
       success: true,
       nodes,
       edges,
+      canvas_layout: projectRow?.canvas_layout ?? null,
       active_blueprint: activeBlueprint
         ? { ...activeBlueprint.forge_blueprints, gate_decision: activeBlueprint.gate_decision ?? null }
         : null,
