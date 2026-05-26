@@ -223,6 +223,44 @@ router.post('/', async (req, res, next) => {
 
     ensureProjectDir(project.id)
 
+    // Auto-cargar blueprint de ideación por defecto
+    try {
+      const { data: bp } = await db()
+        .from('forge_blueprints')
+        .select('id, node_sequence, name')
+        .eq('phase', 'ideation')
+        .eq('is_default', true)
+        .single()
+
+      if (bp) {
+        const sequence = bp.node_sequence || []
+
+        if (sequence.length > 0) {
+          await db().from('forge_project_nodes').insert(
+            sequence.map((s, i) => ({
+              project_id:  project.id,
+              node_id:     s.node_id,
+              blueprint_id: bp.id,
+              order_index: i,
+            }))
+          )
+        }
+
+        await db().from('forge_project_blueprints').insert({
+          project_id:   project.id,
+          blueprint_id: bp.id,
+          trigger:      'project_creation',
+        })
+
+        console.log(`[create-project] blueprint "${bp.name}" cargado para proyecto ${project.id}`)
+      } else {
+        console.warn('[create-project] no hay blueprint ideation is_default=true — canvas vacío')
+      }
+    } catch (bpErr) {
+      // No bloquear la creación del proyecto si el blueprint falla
+      console.warn('[create-project] error cargando blueprint por defecto:', bpErr.message)
+    }
+
     res.status(201).json({ success: true, project_id: project.id, project })
   } catch (err) {
     next(err)

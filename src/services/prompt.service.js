@@ -47,6 +47,9 @@ const FALLBACK_MAP = {
   idtn_generate_concepts:   () => require('../prompts/idtn_generate_concepts.prompt').IDTN_GENERATE_CONCEPTS_SYSTEM_PROMPT,
   idtn_score_rank:          () => require('../prompts/idtn_score_rank.prompt').IDTN_SCORE_RANK_SYSTEM_PROMPT,
   idtn_surface_candidates:  () => require('../prompts/idtn_surface_candidates.prompt').IDTN_SURFACE_CANDIDATES_SYSTEM_PROMPT,
+  idtn_research_comparable: () => require('../prompts/idtn_research_comparable.prompt').IDTN_RESEARCH_COMPARABLE_SYSTEM_PROMPT,
+  idtn_analyze_gaps:        () => require('../prompts/idtn_analyze_gaps.prompt').IDTN_ANALYZE_GAPS_SYSTEM_PROMPT,
+  idtn_size_audience:       () => require('../prompts/idtn_size_audience.prompt').IDTN_SIZE_AUDIENCE_SYSTEM_PROMPT,
   rules:                () => null,
   '00a_idea_expansion': () => null,
   '00b_direction_lock': () => null,
@@ -125,9 +128,48 @@ async function getPrompt(key) {
   return finalText
 }
 
-function invalidatePrompts() {
-  _cache = {}
-  _inflight = {}
+// ── Skills — tabla forge_skill_configs ───────────────────────────────────────
+let _skillCache    = {}
+let _skillInflight = {}
+
+async function _loadSkill(key) {
+  const { db } = require('./supabase.service')
+  const { data, error } = await db()
+    .from('forge_skill_configs')
+    .select('r2_path')
+    .eq('key', key)
+    .maybeSingle()
+
+  if (error || !data?.r2_path) {
+    console.warn(`[promptService] skill "${key}" not configured in forge_skill_configs`)
+    return null
+  }
+
+  try {
+    const text = await fetchFromR2(data.r2_path)
+    console.log(`[promptService] skill "${key}" → R2 ${data.r2_path} (${text.length} chars)`)
+    return text
+  } catch (err) {
+    console.warn(`[promptService] skill "${key}" R2 fetch failed: ${err.message}`)
+    return null
+  }
 }
 
-module.exports = { getPrompt, invalidatePrompts }
+async function getSkill(key) {
+  if (_skillCache[key] !== undefined) return _skillCache[key] || null
+  if (!_skillInflight[key]) {
+    _skillInflight[key] = _loadSkill(key).then(t => { delete _skillInflight[key]; return t })
+  }
+  const text = await _skillInflight[key]
+  _skillCache[key] = text
+  return text
+}
+
+function invalidatePrompts() {
+  _cache         = {}
+  _inflight      = {}
+  _skillCache    = {}
+  _skillInflight = {}
+}
+
+module.exports = { getPrompt, getSkill, invalidatePrompts }

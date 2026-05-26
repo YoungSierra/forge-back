@@ -63,6 +63,7 @@ router.get('/prompt-configs', async (req, res, next) => {
       .sort((a, b) => a.order_index - b.order_index)
     sorted.push(...services)
 
+
     const prompt_configs = sorted.map(row => ({
       key:         row.step_key,
       r2_path:     row.prompt_r2_path || null,
