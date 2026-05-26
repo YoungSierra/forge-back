@@ -113,9 +113,9 @@ router.get('/', async (req, res, next) => {
       }
     } catch (e) { console.error('[forge-canvas] GET edges unexpected error:', e.message) }
 
-    // Canvas layout guardado (posiciones de nodos)
+    // Canvas layout guardado (posiciones de nodos) — se escribe en tabla 'projects'
     const { data: projectRow } = await db()
-      .from('forge_projects')
+      .from('projects')
       .select('canvas_layout')
       .eq('id', project_id)
       .single()
@@ -412,7 +412,7 @@ router.post('/nodes/:node_id/generate-pdf', async (req, res, next) => {
 
     // Post-procesar placeholders igual que en el chat
     const { data: project } = await db()
-      .from('forge_projects')
+      .from('projects')
       .select('name, studio_name')
       .eq('id', project_id)
       .single()
