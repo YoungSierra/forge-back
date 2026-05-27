@@ -101,6 +101,16 @@ router.get('/', async (req, res, next) => {
       .limit(1)
       .single()
 
+    // Conteo de nodos definidos en el blueprint — para evitar gate falso al eliminar un nodo
+    let blueprintTotalNodes = 0
+    if (activeBlueprint?.blueprint_id) {
+      const { count } = await db()
+        .from('forge_blueprint_nodes')
+        .select('id', { count: 'exact', head: true })
+        .eq('blueprint_id', activeBlueprint.blueprint_id)
+      blueprintTotalNodes = count ?? 0
+    }
+
     // Edges persistidos en DB (tabla puede no existir si la migración aún no se corrió)
     let edges = []
     try {
@@ -134,7 +144,7 @@ router.get('/', async (req, res, next) => {
       edges,
       canvas_layout: projectRow?.canvas_layout ?? null,
       active_blueprint: activeBlueprint
-        ? { ...activeBlueprint.forge_blueprints, gate_decision: activeBlueprint.gate_decision ?? null }
+        ? { ...activeBlueprint.forge_blueprints, gate_decision: activeBlueprint.gate_decision ?? null, total_nodes: blueprintTotalNodes }
         : null,
     })
   } catch (err) { next(err) }
