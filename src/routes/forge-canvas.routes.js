@@ -101,16 +101,6 @@ router.get('/', async (req, res, next) => {
       .limit(1)
       .single()
 
-    // Conteo de nodos definidos en el blueprint — para evitar gate falso al eliminar un nodo
-    let blueprintTotalNodes = 0
-    if (activeBlueprint?.blueprint_id) {
-      const { count } = await db()
-        .from('forge_blueprint_nodes')
-        .select('id', { count: 'exact', head: true })
-        .eq('blueprint_id', activeBlueprint.blueprint_id)
-      blueprintTotalNodes = count ?? 0
-    }
-
     // Edges persistidos en DB (tabla puede no existir si la migración aún no se corrió)
     let edges = []
     try {
@@ -144,7 +134,7 @@ router.get('/', async (req, res, next) => {
       edges,
       canvas_layout: projectRow?.canvas_layout ?? null,
       active_blueprint: activeBlueprint
-        ? { ...activeBlueprint.forge_blueprints, gate_decision: activeBlueprint.gate_decision ?? null, total_nodes: blueprintTotalNodes }
+        ? { ...activeBlueprint.forge_blueprints, gate_decision: activeBlueprint.gate_decision ?? null }
         : null,
     })
   } catch (err) { next(err) }
@@ -327,20 +317,20 @@ router.post('/load-blueprint', async (req, res, next) => {
 })
 
 // ─── DELETE /api/projects/:id/canvas/nodes/:project_node_id ──
-// Quita un nodo del canvas (soft remove)
+// Elimina un nodo del canvas (hard delete)
 router.delete('/nodes/:project_node_id', async (req, res, next) => {
   try {
     const { id: project_id, project_node_id } = req.params
 
+    // Limpiar edges primero, luego eliminar el nodo
+    try { await cleanupAndRewire(project_id, project_node_id, db) } catch (e) { console.error('[remove-node] auto-wire failed:', e.message) }
+
     const { error } = await db()
       .from('forge_project_nodes')
-      .update({ removed: true, removed_at: new Date().toISOString() })
+      .delete()
       .eq('id', project_node_id)
 
     if (error) throw error
-
-    // Limpiar edges del nodo removido y re-wiring para recuperar conexiones downstream
-    try { await cleanupAndRewire(project_id, project_node_id, db) } catch (e) { console.error('[remove-node] auto-wire failed:', e.message) }
 
     res.json({ success: true })
   } catch (err) { next(err) }
@@ -1219,33 +1209,39 @@ router.post('/add-node', async (req, res, next) => {
       return res.status(400).json({ success: false, error: 'node_id es requerido' })
     }
 
-    // Buscar cualquier registro existente (activo o removido)
+    // Si hay un blueprint activo, verificar si este nodo pertenece a él
+    let activeBlueprintId = null
+    const { data: activeBp } = await db()
+      .from('forge_project_blueprints')
+      .select('blueprint_id')
+      .eq('project_id', project_id)
+      .order('loaded_at', { ascending: false })
+      .limit(1)
+      .maybeSingle()
+
+    if (activeBp?.blueprint_id) {
+      const { data: bpNode } = await db()
+        .from('forge_blueprint_nodes')
+        .select('id')
+        .eq('blueprint_id', activeBp.blueprint_id)
+        .eq('node_id', node_id)
+        .maybeSingle()
+      if (bpNode) activeBlueprintId = activeBp.blueprint_id
+    }
+
+    // Verificar que no esté ya en canvas
     const { data: existing } = await db()
       .from('forge_project_nodes')
-      .select('id, removed')
+      .select('id')
       .eq('project_id', project_id)
       .eq('node_id', node_id)
       .maybeSingle()
 
     if (existing) {
-      if (!existing.removed) {
-        return res.status(409).json({ success: false, error: 'Node already in canvas' })
-      }
-
-      // Restaurar el registro en lugar de crear uno nuevo
-      const { data, error } = await db()
-        .from('forge_project_nodes')
-        .update({ removed: false, removed_at: null })
-        .eq('id', existing.id)
-        .select()
-        .single()
-
-      if (error) throw error
-      try { await autoWire(project_id, db) } catch (e) { console.error('[add-node] auto-wire failed:', e.message) }
-      return res.json({ success: true, project_node: data })
+      return res.status(409).json({ success: false, error: 'Node already in canvas' })
     }
 
-    // Registro nuevo — calcular el próximo order_index
+    // Calcular el próximo order_index
     const { data: maxOrder } = await db()
       .from('forge_project_nodes')
       .select('order_index')
@@ -1258,7 +1254,7 @@ router.post('/add-node', async (req, res, next) => {
 
     const { data, error } = await db()
       .from('forge_project_nodes')
-      .insert({ project_id, node_id, order_index })
+      .insert({ project_id, node_id, order_index, blueprint_id: activeBlueprintId })
       .select()
       .single()
 
