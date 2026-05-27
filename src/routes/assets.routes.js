@@ -129,4 +129,119 @@ router.patch('/:id/review', async (req, res, next) => {
   }
 })
 
+// ─── GET /api/assets/project-assets?project_id=xxx ───────────────────────────
+// Lista unificada: forge_assets (nuevo) + assets legacy, normalizados.
+// project_id es opcional — sin él trae todos los proyectos.
+router.get('/project-assets', async (req, res, next) => {
+  try {
+    const { project_id } = req.query
+
+    // ── forge_assets ──────────────────────────────────────────────────────────
+    let forgeQuery = db()
+      .from('forge_assets')
+      .select(`
+        id, name, format, status, storage_url, content, approved_at, created_at,
+        node_id, project_id,
+        forge_nodes ( node_key, title, phase )
+      `)
+      .order('approved_at', { ascending: false, nullsFirst: false })
+
+    if (project_id) forgeQuery = forgeQuery.eq('project_id', project_id)
+
+    const { data: forgeAssets } = await forgeQuery
+
+    // Versiones de forge_assets
+    const forgeAssetIds = (forgeAssets || []).map(a => a.id)
+    let forgeVersionsMap = {}
+    if (forgeAssetIds.length > 0) {
+      const { data: fv } = await db()
+        .from('forge_asset_versions')
+        .select('id, asset_id, storage_url, version_number, is_current, metadata, created_at')
+        .in('asset_id', forgeAssetIds)
+        .order('version_number', { ascending: false })
+      for (const v of (fv || [])) {
+        if (!forgeVersionsMap[v.asset_id]) forgeVersionsMap[v.asset_id] = []
+        forgeVersionsMap[v.asset_id].push(v)
+      }
+    }
+
+    const forgeNormalized = (forgeAssets || []).map(a => ({
+      id:          a.id,
+      source:      'forge',
+      name:        a.name,
+      node_key:    a.forge_nodes?.node_key ?? null,
+      node_title:  a.forge_nodes?.title    ?? null,
+      phase:       a.forge_nodes?.phase    ?? null,
+      format:      a.format,
+      status:      a.status,
+      storage_url: a.storage_url ?? null,
+      content:     a.content     ?? null,
+      created_at:  a.approved_at ?? a.created_at,
+      versions:    (forgeVersionsMap[a.id] || []).map(v => ({
+        id:             v.id,
+        storage_url:    v.storage_url,
+        version_number: v.version_number,
+        is_current:     v.is_current,
+        model_used:     v.metadata?.model_used ?? null,
+        created_at:     v.created_at,
+      })),
+    }))
+
+    // ── assets legacy ─────────────────────────────────────────────────────────
+    let legacyQuery = db()
+      .from('assets')
+      .select(`
+        id, name, step_key, review_status, created_at,
+        asset_versions ( id, storage_url, version_number, is_current, model_used, created_at )
+      `)
+      .order('created_at', { ascending: false })
+
+    if (project_id) legacyQuery = legacyQuery.eq('project_id', project_id)
+
+    const { data: legacyAssets } = await legacyQuery
+
+    const imageSteps = new Set(['sprites','characters','charaters','concept_art','backgrounds','icons','hud','splash_art','marketing','image_reference','visual_guide'])
+    const audioSteps = new Set(['audio','sfx','voice'])
+    const codeSteps  = new Set(['code'])
+    const modelSteps = new Set(['modeling_characters','modeling_environments','modeling_props','modeling'])
+
+    function legacyFormat(step_key) {
+      if (imageSteps.has(step_key)) return 'image'
+      if (audioSteps.has(step_key)) return 'audio'
+      if (codeSteps.has(step_key))  return 'code'
+      if (modelSteps.has(step_key)) return 'model_3d'
+      return 'document'
+    }
+
+    const legacyNormalized = (legacyAssets || []).map(a => ({
+      id:          a.id,
+      source:      'legacy',
+      name:        a.name,
+      node_key:    a.step_key,
+      node_title:  a.step_key,
+      phase:       null,
+      format:      legacyFormat(a.step_key),
+      status:      a.review_status,
+      storage_url: (a.asset_versions?.find(v => v.is_current) ?? a.asset_versions?.[0])?.storage_url ?? null,
+      content:     null,
+      created_at:  a.created_at,
+      versions:    (a.asset_versions || [])
+        .sort((x, y) => y.version_number - x.version_number)
+        .map(v => ({
+          id:             v.id,
+          storage_url:    v.storage_url,
+          version_number: v.version_number,
+          is_current:     v.is_current,
+          model_used:     v.model_used ?? null,
+          created_at:     v.created_at,
+        })),
+    }))
+
+    const unified = [...forgeNormalized, ...legacyNormalized]
+      .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
+
+    res.json({ success: true, assets: unified })
+  } catch (err) { next(err) }
+})
+
 module.exports = router

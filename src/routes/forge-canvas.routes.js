@@ -1,6 +1,7 @@
 const express = require('express')
 const router  = express.Router({ mergeParams: true })
 const { db }  = require('../services/supabase.service')
+const { autoWire, cleanupAndRewire } = require('../services/auto-wire.service')
 
 // ─── GET /api/projects/:id/canvas ────────────────────────────
 // Devuelve los nodos del proyecto con su DNA + última sesión
@@ -219,6 +220,9 @@ router.post('/gate', async (req, res, next) => {
       .from('forge_project_blueprints')
       .insert({ project_id, blueprint_id: nextBp.id, trigger: 'gate_accept', loaded_by: member_id || null })
 
+    // Auto-wiring para los nodos del nuevo blueprint
+    try { await autoWire(project_id, db) } catch (e) { console.error('[gate] auto-wire failed:', e.message) }
+
     res.json({ success: true, decision, next_blueprint: { id: nextBp.id, name: nextBp.name, phase: nextPhase } })
   } catch (err) { next(err) }
 })
@@ -291,11 +295,16 @@ router.post('/load-blueprint', async (req, res, next) => {
       .from('forge_project_blueprints')
       .insert({ project_id, blueprint_id, trigger, loaded_by: loaded_by || null })
 
+    // Auto-wiring: conectar inputs a outputs upstream automáticamente
+    let wiredCount = 0
+    try { wiredCount = await autoWire(project_id, db) } catch (e) { console.error('[load-blueprint] auto-wire failed:', e.message) }
+
     res.json({
       success:         true,
       blueprint_name:  blueprint.name,
       nodes_added:     toInsert.length,
       nodes_skipped:   sequence.length - toInsert.length,
+      edges_wired:     wiredCount,
     })
   } catch (err) { next(err) }
 })
@@ -304,12 +313,18 @@ router.post('/load-blueprint', async (req, res, next) => {
 // Quita un nodo del canvas (soft remove)
 router.delete('/nodes/:project_node_id', async (req, res, next) => {
   try {
+    const { id: project_id, project_node_id } = req.params
+
     const { error } = await db()
       .from('forge_project_nodes')
       .update({ removed: true, removed_at: new Date().toISOString() })
-      .eq('id', req.params.project_node_id)
+      .eq('id', project_node_id)
 
     if (error) throw error
+
+    // Limpiar edges del nodo removido y re-wiring para recuperar conexiones downstream
+    try { await cleanupAndRewire(project_id, project_node_id, db) } catch (e) { console.error('[remove-node] auto-wire failed:', e.message) }
+
     res.json({ success: true })
   } catch (err) { next(err) }
 })
@@ -774,8 +789,10 @@ router.post('/nodes/:node_id/chat', async (req, res, next) => {
             // Si el edge apunta a un output slot específico, extraer solo esa sección
             const srcHandle = edge.source_handle
             if (srcHandle?.startsWith('out-')) {
-              const idx       = parseInt(srcHandle.replace('out-', ''), 10)
-              const outputDef = outputs[idx]
+              const handleVal = srcHandle.slice(4) // "out-concept_brief" → "concept_brief"
+              // Buscar por nombre (nuevo formato) o por índice (legacy)
+              const outputDef = outputs.find(o => o.name === handleVal)
+                ?? outputs[parseInt(handleVal, 10)]
               if (outputDef?.name) {
                 const extracted = extractSection(content, outputDef.name)
                 if (extracted) {
@@ -1080,6 +1097,7 @@ router.post('/add-node', async (req, res, next) => {
         .single()
 
       if (error) throw error
+      try { await autoWire(project_id, db) } catch (e) { console.error('[add-node] auto-wire failed:', e.message) }
       return res.json({ success: true, project_node: data })
     }
 
@@ -1101,6 +1119,7 @@ router.post('/add-node', async (req, res, next) => {
       .single()
 
     if (error) throw error
+    try { await autoWire(project_id, db) } catch (e) { console.error('[add-node] auto-wire failed:', e.message) }
     res.json({ success: true, project_node: data })
   } catch (err) { next(err) }
 })
@@ -1148,6 +1167,7 @@ router.post('/add-asset-node', async (req, res, next) => {
         .select()
         .single()
       if (error) throw error
+      try { await autoWire(project_id, db) } catch (e) { console.error('[add-asset-node] auto-wire failed:', e.message) }
       return res.json({ success: true, project_node: data })
     }
 
@@ -1158,6 +1178,7 @@ router.post('/add-asset-node', async (req, res, next) => {
       .single()
 
     if (error) throw error
+    try { await autoWire(project_id, db) } catch (e) { console.error('[add-asset-node] auto-wire failed:', e.message) }
     res.json({ success: true, project_node: data })
   } catch (err) { next(err) }
 })
