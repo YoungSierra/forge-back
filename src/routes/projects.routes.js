@@ -38,7 +38,7 @@ router.get('/', async (req, res, next) => {
 
     let query = db()
       .from('projects')
-      .select('*, assets(id, review_status), generation_jobs(id, current_step, status), updated_at')
+      .select('*, assets(id, review_status), generation_jobs(id, current_step, status), forge_sessions(id, status, node_id), forge_project_nodes(id, removed, node_type), updated_at')
       .order('created_at', { ascending: false })
 
     if (memberProjectIds.length > 0) {
@@ -76,19 +76,20 @@ router.get('/', async (req, res, next) => {
       const approved_job_count = jobs.filter(j => j.status === 'approved').length
       const total_job_count    = jobs.filter(j => j.status !== 'invalidated').length
 
+      // Conteo desde NodeDNA: forge_project_nodes + forge_sessions
+      const forgeNodes    = p.forge_project_nodes || []
+      const forgeSessions = p.forge_sessions      || []
+
+      const activeForgeNodes  = forgeNodes.filter(n => !n.removed && (n.node_type === 'forge_node' || !n.node_type))
+      const approvedNodeIds   = new Set(forgeSessions.filter(s => s.status === 'approved').map(s => s.node_id))
+
+      const node_total_count    = activeForgeNodes.length > 0 ? activeForgeNodes.length : null
+      const node_approved_count = approvedNodeIds.size
+
       // Status derivado: si hay trabajo aprobado y el proyecto era draft, pasa a active
-      const computedStatus = p.status === 'draft' && approved_job_count > 0
+      const computedStatus = p.status === 'draft' && (approved_job_count > 0 || approvedNodeIds.size > 0)
         ? 'active'
         : p.status
-
-      let node_approved_count = null
-      let node_total_count = null
-      const layout = p.canvas_layout
-      if (layout?.nodes?.length) {
-        const approvable = layout.nodes.filter(n => n.type !== 'forgeGroup' && !n.data?.comingSoon)
-        node_total_count    = approvable.length
-        node_approved_count = approvable.filter(n => n.data?.approved).length
-      }
 
       return {
         ...p,
