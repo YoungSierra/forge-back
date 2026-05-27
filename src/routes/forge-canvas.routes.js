@@ -1,7 +1,14 @@
-const express = require('express')
-const router  = express.Router({ mergeParams: true })
-const { db }  = require('../services/supabase.service')
+const express    = require('express')
+const router     = express.Router({ mergeParams: true })
+const multer     = require('multer')
+const { db }     = require('../services/supabase.service')
 const { autoWire, cleanupAndRewire } = require('../services/auto-wire.service')
+
+// Multer para attachments de chat — límite 50 MB por archivo
+const chatUpload = multer({
+  storage: multer.memoryStorage(),
+  limits:  { fileSize: 50 * 1024 * 1024 },
+})
 
 // ─── GET /api/projects/:id/canvas ────────────────────────────
 // Devuelve los nodos del proyecto con su DNA + última sesión
@@ -483,14 +490,32 @@ router.get('/nodes/:node_id/session', async (req, res, next) => {
 
     const { data: msgs } = await db()
       .from('forge_messages')
-      .select('role, content, order_index')
+      .select('id, role, content, order_index')
       .eq('session_id', session.id)
       .order('order_index')
 
+    // Cargar attachments de la sesión agrupados por message_id
+    const { data: attachments } = await db()
+      .from('forge_attachments')
+      .select('message_id, file_name, mime_type, file_size_bytes, storage_url')
+      .eq('session_id', session.id)
+
+    const attachmentsByMsg = {}
+    for (const att of (attachments || [])) {
+      if (!attachmentsByMsg[att.message_id]) attachmentsByMsg[att.message_id] = []
+      attachmentsByMsg[att.message_id].push({
+        file_name:       att.file_name,
+        mime_type:       att.mime_type,
+        file_size_bytes: att.file_size_bytes,
+        storage_url:     att.storage_url,
+      })
+    }
+
     // Mapear roles: human→user, agent→assistant
     const messages = (msgs || []).map(m => ({
-      role:    m.role === 'human' ? 'user' : 'assistant',
-      content: m.content,
+      role:        m.role === 'human' ? 'user' : 'assistant',
+      content:     m.content,
+      attachments: attachmentsByMsg[m.id] || [],
     }))
 
     // Incluir asset aprobado si la sesión está aprobada
@@ -521,10 +546,10 @@ function extractSection(content, sectionName) {
 
 // ─── POST /api/projects/:id/canvas/nodes/:node_id/chat ────────
 // Conversación multi-turno con un nodo usando forge_sessions/forge_messages
-router.post('/nodes/:node_id/chat', async (req, res, next) => {
+router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req, res, next) => {
   try {
     const { id: project_id, node_id } = req.params
-    const { user_message, session_id, member_id } = req.body
+    const { user_message, session_id, member_id, attachment_url } = req.body
 
     if (!user_message?.trim()) {
       return res.status(400).json({ success: false, error: 'user_message es requerido' })
@@ -581,6 +606,53 @@ router.post('/nodes/:node_id/chat', async (req, res, next) => {
         .single()
       if (createErr) throw createErr
       session = created
+    }
+
+    // ── Procesar adjunto (Reference Injection 5.2) ───────────────
+    let pendingAttachment = null
+
+    if (req.file || attachment_url) {
+      const { extractText: extractAttachText } = require('../services/extraction.service')
+      const { uploadToStorage: uploadAttachment } = require('../services/storage.service')
+
+      if (req.file) {
+        // Verificar límite acumulado de sesión (200 MB)
+        const { data: sizeRows } = await db()
+          .from('forge_attachments')
+          .select('file_size_bytes')
+          .eq('session_id', session.id)
+        const sessionBytes = (sizeRows || []).reduce((s, r) => s + (r.file_size_bytes || 0), 0)
+        if (sessionBytes + req.file.size > 200 * 1024 * 1024) {
+          return res.status(400).json({ success: false, error: 'Session attachment limit exceeded (200 MB)' })
+        }
+
+        const dotIdx      = req.file.originalname.lastIndexOf('.')
+        const ext         = dotIdx >= 0 ? req.file.originalname.slice(dotIdx + 1) : 'bin'
+        const storagePath = `projects/${project_id}/chat-attachments/${session.id}-${Date.now()}.${ext}`
+        const storageUrl  = await uploadAttachment(req.file.buffer, storagePath, req.file.mimetype, 'forge-assets')
+        const extracted   = await extractAttachText(req.file.buffer, req.file.mimetype)
+
+        pendingAttachment = {
+          file_name:       req.file.originalname,
+          mime_type:       req.file.mimetype,
+          file_size_bytes: req.file.size,
+          storage_url:     storageUrl,
+          extracted_text:  extracted || null,
+        }
+      } else if (attachment_url) {
+        try {
+          const urlObj = new URL(attachment_url)
+          pendingAttachment = {
+            file_name:       urlObj.hostname + (urlObj.pathname !== '/' ? urlObj.pathname : ''),
+            mime_type:       'text/uri-list',
+            file_size_bytes: null,
+            storage_url:     attachment_url,
+            extracted_text:  null,
+          }
+        } catch {
+          return res.status(400).json({ success: false, error: 'Invalid URL provided' })
+        }
+      }
     }
 
     // Cargar historial persistido para construir contexto
@@ -846,6 +918,30 @@ router.post('/nodes/:node_id/chat', async (req, res, next) => {
 
     const systemPrompt = [layer1, ...layer2Parts, toolsBlock].filter(Boolean).join('\n\n')
 
+    // ── Layer 3: session attachments (Reference Injection) ────────
+    const { data: sessionAttachments } = await db()
+      .from('forge_attachments')
+      .select('file_name, mime_type, storage_url, extracted_text')
+      .eq('session_id', session.id)
+      .order('created_at')
+
+    const attachmentParts = [
+      ...(sessionAttachments || []).map(att =>
+        att.extracted_text
+          ? `### ${att.file_name}\n${att.extracted_text.slice(0, 3000)}${att.extracted_text.length > 3000 ? '\n[truncated]' : ''}`
+          : `### ${att.file_name}\nURL: ${att.storage_url}`
+      ),
+      ...(pendingAttachment ? [
+        pendingAttachment.extracted_text
+          ? `### ${pendingAttachment.file_name}\n${pendingAttachment.extracted_text.slice(0, 3000)}${pendingAttachment.extracted_text.length > 3000 ? '\n[truncated]' : ''}`
+          : `### ${pendingAttachment.file_name}\nURL: ${pendingAttachment.storage_url}`
+      ] : []),
+    ]
+
+    const finalSystemPrompt = attachmentParts.length
+      ? systemPrompt + '\n\n## Attached references\n' + attachmentParts.join('\n\n')
+      : systemPrompt
+
     // Historial como texto plano para el LLM
     const historyText = (historyMsgs || [])
       .map(m => `${m.role === 'human' ? 'Human' : 'Agent'}: ${m.content}`)
@@ -872,7 +968,8 @@ router.post('/nodes/:node_id/chat', async (req, res, next) => {
     console.log(`  tools:        ${toolsList ?? '(none)'}`)
     console.log(`  skills:       ${skillsList ?? '(none)'}`)
     console.log(`  inputs:       ${resolvedInputs.length} referencia(s) — ${resolvedInputs.length ? resolvedInputs.map(d => d.split('\n')[0].replace('### ', '')).join(', ') : '(none)'}`)
-    console.log(`  system prompt (${systemPrompt.length} chars):\n${systemPrompt}`)
+    console.log(`  attachments:  ${attachmentParts.length} adjunto(s) en sesión`)
+    console.log(`  system prompt (${finalSystemPrompt.length} chars):\n${finalSystemPrompt}`)
 
     console.log(`  history msgs: ${historyMsgs?.length ?? 0}`)
     console.log(`  user message: ${user_message.trim().slice(0, 120)}${user_message.length > 120 ? '…' : ''}`)
@@ -886,7 +983,7 @@ router.post('/nodes/:node_id/chat', async (req, res, next) => {
     let   meta            = null
 
     for (let iter = 0; iter < MAX_TOOL_ITERS; iter++) {
-      const result = await callLLM(systemPrompt, currentUserMsg, {
+      const result = await callLLM(finalSystemPrompt, currentUserMsg, {
         model:           executorStr,
         rawText:         true,
         temperature:     0.7,
@@ -1019,7 +1116,7 @@ router.post('/nodes/:node_id/chat', async (req, res, next) => {
       }
     }
 
-    // Persistir par de mensajes — tool_calls en el mensaje del agente si los hubo
+    // Persistir mensajes — humano primero para obtener su ID (requerido por forge_attachments)
     const agentRecord = {
       session_id:  session.id,
       role:        'agent',
@@ -1028,14 +1125,39 @@ router.post('/nodes/:node_id/chat', async (req, res, next) => {
       tool_calls:  allToolCalls.length ? allToolCalls : [],
     }
 
-    const { error: insertErr } = await db().from('forge_messages').insert([
-      { session_id: session.id, role: 'human', content: user_message.trim(), order_index: nextIndex, tool_calls: [] },
-      agentRecord,
-    ])
+    const { data: humanMsg, error: humanInsertErr } = await db()
+      .from('forge_messages')
+      .insert({ session_id: session.id, role: 'human', content: user_message.trim(), order_index: nextIndex, tool_calls: [] })
+      .select('id')
+      .single()
 
-    if (insertErr) {
-      console.error('[forge-chat] forge_messages insert error:', insertErr)
-      throw new Error(`Failed to save messages: ${insertErr.message}`)
+    if (humanInsertErr) {
+      console.error('[forge-chat] forge_messages insert error:', humanInsertErr)
+      throw new Error(`Failed to save messages: ${humanInsertErr.message}`)
+    }
+
+    if (pendingAttachment && humanMsg) {
+      const { error: attErr } = await db()
+        .from('forge_attachments')
+        .insert({
+          message_id:      humanMsg.id,
+          session_id:      session.id,
+          file_name:       pendingAttachment.file_name,
+          mime_type:       pendingAttachment.mime_type,
+          file_size_bytes: pendingAttachment.file_size_bytes,
+          storage_url:     pendingAttachment.storage_url,
+          extracted_text:  pendingAttachment.extracted_text,
+        })
+      if (attErr) console.error('[forge-chat] forge_attachments insert error:', attErr)
+    }
+
+    const { error: agentInsertErr } = await db()
+      .from('forge_messages')
+      .insert(agentRecord)
+
+    if (agentInsertErr) {
+      console.error('[forge-chat] forge_messages agent insert error:', agentInsertErr)
+      throw new Error(`Failed to save agent message: ${agentInsertErr.message}`)
     }
 
     // Incrementar contador de iteraciones
@@ -1044,7 +1166,19 @@ router.post('/nodes/:node_id/chat', async (req, res, next) => {
       .update({ iteration_count: session.iteration_count + 1 })
       .eq('id', session.id)
 
-    res.json({ success: true, reply: replyText, session_id: session.id, meta, doc_url: docUrl ?? undefined })
+    res.json({
+      success:    true,
+      reply:      replyText,
+      session_id: session.id,
+      meta,
+      doc_url:    docUrl ?? undefined,
+      attachment: pendingAttachment ? {
+        file_name:       pendingAttachment.file_name,
+        mime_type:       pendingAttachment.mime_type,
+        file_size_bytes: pendingAttachment.file_size_bytes,
+        storage_url:     pendingAttachment.storage_url,
+      } : undefined,
+    })
   } catch (err) { next(err) }
 })
 
