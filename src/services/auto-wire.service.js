@@ -40,9 +40,28 @@ async function autoWire(project_id, db) {
     .select('target_node_id, target_handle')
     .eq('project_id', project_id)
 
-  const connectedSlots = new Set(
-    (existingEdges || []).map(e => `${e.target_node_id}:${e.target_handle}`)
-  )
+  // Mapa id → inputs array para normalizar handles posicionales (in-0 → in-key)
+  const inputsByNodeId = {}
+  for (const pn of (projectNodes || [])) {
+    if (Array.isArray(pn.forge_nodes?.inputs)) {
+      inputsByNodeId[pn.id] = pn.forge_nodes.inputs
+    }
+  }
+
+  const connectedSlots = new Set()
+  for (const e of (existingEdges || [])) {
+    let handle = e.target_handle
+    // Normalizar handle posicional (in-0, in-1…) al nombre del input correspondiente
+    if (handle?.startsWith('in-')) {
+      const after = handle.slice(3)
+      const idx   = parseInt(after, 10)
+      if (!isNaN(idx) && String(idx) === after) {
+        const inputs = inputsByNodeId[e.target_node_id]
+        if (inputs?.[idx]?.key) handle = `in-${inputs[idx].key}`
+      }
+    }
+    connectedSlots.add(`${e.target_node_id}:${handle}`)
+  }
 
   // Solo forge_nodes tienen DNA inputs/outputs — primitivos y assets son fuentes manuales
   const forgeNodes = (projectNodes || []).filter(
