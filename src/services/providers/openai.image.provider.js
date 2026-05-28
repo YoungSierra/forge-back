@@ -45,7 +45,6 @@ async function generateImageOpenAI(modelId, prompt, width, height, storagePath) 
       n: 1,
       size,
       quality: 'standard',
-      response_format: 'url',
     })
     const imageUrl = response.data?.[0]?.url
     if (!imageUrl) throw new Error('OpenAI images.generate: no URL in response')

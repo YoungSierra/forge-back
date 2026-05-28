@@ -337,7 +337,7 @@ router.delete('/nodes/:project_node_id', async (req, res, next) => {
 })
 
 // ─── POST /api/projects/:id/canvas/nodes/:node_id/accept ─────
-// Aprueba el output del nodo: crea forge_asset y cierra la sesión
+// Aprueba el output del nodo: crea forge_asset(s) y cierra la sesión
 router.post('/nodes/:node_id/accept', async (req, res, next) => {
   try {
     const { id: project_id, node_id } = req.params
@@ -347,10 +347,10 @@ router.post('/nodes/:node_id/accept', async (req, res, next) => {
       return res.status(400).json({ success: false, error: 'session_id y content son requeridos' })
     }
 
-    // Obtener nombre del nodo para el asset
+    // Obtener nombre, key y outputs del nodo
     const { data: node, error: nodeErr } = await db()
       .from('forge_nodes')
-      .select('id, title, node_key')
+      .select('id, title, node_key, outputs')
       .eq('id', node_id)
       .single()
 
@@ -358,7 +358,7 @@ router.post('/nodes/:node_id/accept', async (req, res, next) => {
       return res.status(404).json({ success: false, error: 'Node not found' })
     }
 
-    // Crear el forge_asset con el contenido aceptado
+    // Crear el forge_asset con el contenido de texto aceptado
     const { data: asset, error: assetErr } = await db()
       .from('forge_assets')
       .insert({
@@ -366,7 +366,7 @@ router.post('/nodes/:node_id/accept', async (req, res, next) => {
         project_id,
         session_id,
         name:           `${node.title} — Output`,
-        format:         doc_url ? 'document' : 'markdown',
+        format:         doc_url ? 'docx' : 'markdown',
         status:         'approved',
         content:        content.trim(),
         storage_url:    doc_url || null,
@@ -390,7 +390,40 @@ router.post('/nodes/:node_id/accept', async (req, res, next) => {
 
     if (sessErr) throw sessErr
 
-    res.json({ success: true, asset_id: asset.id })
+    // Persistir imágenes PNG generadas en forge_assets
+    const { data: sessionData } = await db()
+      .from('forge_sessions')
+      .select('output_images')
+      .eq('id', session_id)
+      .single()
+
+    const outputImages = sessionData?.output_images || {}
+    const pngOutputDefs = (node.outputs || []).filter(o =>
+      (o.format === 'png' || o.format === 'image') && o.image_gen
+    )
+
+    const imageAssets = pngOutputDefs.flatMap(outDef => {
+      const items = (outputImages[outDef.name] || []).filter(i => i.image_url)
+      return items.map(item => ({
+        node_id,
+        project_id,
+        session_id,
+        name:        `${node.title} — ${outDef.name}`,
+        format:      'png',
+        status:      'approved',
+        content:     null,
+        storage_url: item.image_url,
+        approved_by: member_id || null,
+        approved_at: new Date().toISOString(),
+      }))
+    })
+
+    if (imageAssets.length > 0) {
+      const { error: imgErr } = await db().from('forge_assets').insert(imageAssets)
+      if (imgErr) console.error('[accept] Error guardando image assets:', imgErr.message)
+    }
+
+    res.json({ success: true, asset_id: asset.id, image_assets_saved: imageAssets.length })
   } catch (err) { next(err) }
 })
 
@@ -443,6 +476,9 @@ router.post('/nodes/:node_id/sessions/:session_id/generate-item-image', async (r
     } else if (provider === 'openai') {
       const { generateImageOpenAI } = require('../services/providers/openai.image.provider')
       result = await generateImageOpenAI(modelOrWf, item_text.trim(), 1024, 1024, storagePath)
+    } else if (provider === 'fal') {
+      const { generateImageFal } = require('../services/providers/fal.image.provider')
+      result = await generateImageFal(modelOrWf, item_text.trim(), 1024, 1024, storagePath)
     } else {
       return res.status(400).json({ success: false, error: `Provider de imagen no soportado: "${provider}"` })
     }
@@ -605,6 +641,7 @@ router.get('/nodes/:node_id/session', async (req, res, next) => {
 
     // Incluir asset aprobado si la sesión está aprobada
     let asset = null
+    let imageAssets = []
     if (session.status === 'approved' && session.output_asset_id) {
       const { data: assetData } = await db()
         .from('forge_assets')
@@ -612,9 +649,18 @@ router.get('/nodes/:node_id/session', async (req, res, next) => {
         .eq('id', session.output_asset_id)
         .maybeSingle()
       asset = assetData
+
+      // Cargar image assets PNG aprobados de esta sesión
+      const { data: imgData } = await db()
+        .from('forge_assets')
+        .select('id, name, storage_url')
+        .eq('session_id', session.id)
+        .eq('format', 'png')
+        .not('storage_url', 'is', null)
+      imageAssets = imgData || []
     }
 
-    res.json({ success: true, session, messages, asset })
+    res.json({ success: true, session, messages, asset, image_assets: imageAssets })
   } catch (err) { next(err) }
 })
 
