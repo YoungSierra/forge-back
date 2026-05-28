@@ -5,6 +5,7 @@ const archiver = require('archiver')
 const router = express.Router()
 const { db, TEST_MEMBER_ID, calculateCost } = require('../services/supabase.service')
 const { ensureProjectDir, getAssetUrl, slugify, STORAGE_BASE, getFromStorage } = require('../services/storage.service')
+const { autoWire } = require('../services/auto-wire.service')
 
 const STEP_ORDER = ['step_1_concept', 'sprites', 'levels', 'code', 'audio', 'step_6_export']
 
@@ -252,6 +253,9 @@ router.post('/', async (req, res, next) => {
           blueprint_id: bp.id,
           trigger:      'project_creation',
         })
+
+        // Conectar nodos del blueprint automáticamente
+        try { await autoWire(project.id, db) } catch (e) { console.error('[create-project] auto-wire failed:', e.message) }
 
         console.log(`[create-project] blueprint "${bp.name}" cargado para proyecto ${project.id}`)
       } else {

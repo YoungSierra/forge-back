@@ -4,6 +4,7 @@ const { callTogether }  = require('./providers/together.provider')
 const { callOpenRouter } = require('./providers/openrouter.provider')
 const { callOpenAI }    = require('./providers/openai.provider')
 const { callMinimax }   = require('./providers/minimax.provider')
+const { callMimo }      = require('./providers/mimo.provider')
 const { resolveStepModel, parseModelString } = require('./config.service')
 
 // Limpia bloques <think>...</think> que algunos modelos con razonamiento extendido incluyen
@@ -35,6 +36,7 @@ async function callLLM(systemPrompt, userMessage, options = {}) {
     case 'openrouter': result = await callOpenRouter(systemPrompt, userMessage, callOptions); break
     case 'openai':     result = await callOpenAI(systemPrompt, userMessage, callOptions); break
     case 'minimax':    result = await callMinimax(systemPrompt, userMessage, callOptions); break
+    case 'mimo':       result = await callMimo(systemPrompt, userMessage, callOptions); break
     case 'gemini':
     default:           result = await callGemini(systemPrompt, userMessage, callOptions); break
   }

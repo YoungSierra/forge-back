@@ -46,7 +46,7 @@ router.get('/', async (req, res, next) => {
     if (nodeIds.length > 0) {
       const { data: sessions, error: sessionsError } = await db()
         .from('forge_sessions')
-        .select('id, node_id, status, iteration_count, started_at, completed_at, output_asset_id')
+        .select('id, node_id, status, iteration_count, started_at, completed_at, output_asset_id, output_images')
         .eq('project_id', project_id)
         .in('node_id', nodeIds)
         .order('created_at', { ascending: false })
@@ -394,6 +394,91 @@ router.post('/nodes/:node_id/accept', async (req, res, next) => {
   } catch (err) { next(err) }
 })
 
+// ─── POST /api/projects/:id/canvas/nodes/:node_id/sessions/:session_id/generate-item-image ─
+// Genera imagen on-demand para un item de un output con image_gen:true
+router.post('/nodes/:node_id/sessions/:session_id/generate-item-image', async (req, res, next) => {
+  try {
+    const { id: project_id, node_id, session_id } = req.params
+    const { output_key, item_index, item_text } = req.body
+
+    if (!output_key || item_index == null || !item_text?.trim()) {
+      return res.status(400).json({ success: false, error: 'output_key, item_index y item_text son requeridos' })
+    }
+
+    // Leer DNA del nodo para obtener el workflow configurado en el output
+    const { data: node, error: nodeErr } = await db()
+      .from('forge_nodes')
+      .select('node_key, outputs')
+      .eq('id', node_id)
+      .single()
+
+    if (nodeErr || !node) {
+      return res.status(404).json({ success: false, error: 'Node not found' })
+    }
+
+    const outputDef = (node.outputs || []).find(o => o.name === output_key)
+    if (!outputDef?.image_gen) {
+      return res.status(400).json({ success: false, error: `Output "${output_key}" no tiene image_gen habilitado` })
+    }
+
+    const imageGenModel = outputDef.image_gen_model
+    if (!imageGenModel) {
+      return res.status(400).json({ success: false, error: `Output "${output_key}" no tiene image_gen_model definido` })
+    }
+
+    // Parsear "provider:model_o_workflow"
+    const colonIdx = imageGenModel.indexOf(':')
+    if (colonIdx < 0) {
+      return res.status(400).json({ success: false, error: `image_gen_model debe tener formato "provider:model" — recibido: "${imageGenModel}"` })
+    }
+    const provider   = imageGenModel.slice(0, colonIdx)
+    const modelOrWf  = imageGenModel.slice(colonIdx + 1)
+
+    const storagePath = `projects/${project_id}/item-images/${node.node_key}/${output_key}-${session_id}-${item_index}-${Date.now()}.png`
+
+    let result
+    if (provider === 'comfyui') {
+      const { generateImageComfyUI } = require('../services/providers/comfyui.provider')
+      result = await generateImageComfyUI(modelOrWf, item_text.trim(), 1024, 1024, storagePath)
+    } else if (provider === 'openai') {
+      const { generateImageOpenAI } = require('../services/providers/openai.image.provider')
+      result = await generateImageOpenAI(modelOrWf, item_text.trim(), 1024, 1024, storagePath)
+    } else {
+      return res.status(400).json({ success: false, error: `Provider de imagen no soportado: "${provider}"` })
+    }
+
+    // Leer output_images actual y hacer merge
+    const { data: sessionRow } = await db()
+      .from('forge_sessions')
+      .select('output_images')
+      .eq('id', session_id)
+      .single()
+
+    const currentImages = sessionRow?.output_images || {}
+    const outputItems   = Array.isArray(currentImages[output_key]) ? [...currentImages[output_key]] : []
+
+    // Upsert por index
+    const existing = outputItems.find(e => e.index === item_index)
+    if (existing) {
+      existing.image_url = result.url
+    } else {
+      outputItems.push({ index: item_index, text: item_text.trim(), image_url: result.url })
+    }
+    outputItems.sort((a, b) => a.index - b.index)
+
+    const updatedImages = { ...currentImages, [output_key]: outputItems }
+
+    const { error: updateErr } = await db()
+      .from('forge_sessions')
+      .update({ output_images: updatedImages })
+      .eq('id', session_id)
+
+    if (updateErr) throw updateErr
+
+    res.json({ success: true, image_url: result.url, output_images: updatedImages })
+  } catch (err) { next(err) }
+})
+
 // ─── POST /api/projects/:id/canvas/nodes/:node_id/generate-pdf ─
 // Genera (o devuelve cached) el PDF del output aprobado del nodo
 router.post('/nodes/:node_id/generate-pdf', async (req, res, next) => {
@@ -478,7 +563,7 @@ router.get('/nodes/:node_id/session', async (req, res, next) => {
 
     const { data: session, error: sessErr } = await db()
       .from('forge_sessions')
-      .select('id, status, iteration_count, started_at, completed_at, output_asset_id')
+      .select('id, status, iteration_count, started_at, completed_at, output_asset_id, output_images')
       .eq('project_id', project_id)
       .eq('node_id', node_id)
       .order('created_at', { ascending: false })
