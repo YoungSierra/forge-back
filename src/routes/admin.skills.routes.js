@@ -26,50 +26,17 @@ async function r2PathExists(r2Path) {
 }
 
 // GET /api/admin/skill-configs
-// Devuelve todos los skills únicos usados en forge_nodes, combinados con su config en DB
+// Devuelve todos los skills registrados en forge_skill_configs (fuente de verdad)
 router.get('/skill-configs', async (req, res, next) => {
   try {
-    // Extraer skills únicos de forge_nodes usando unnest en Postgres
-    const { data: nodeRows, error: nodeErr } = await db()
-      .rpc('get_unique_skills')
-
-    // Fallback si no existe la función RPC: query manual
-    let skillKeys = []
-    if (nodeErr || !nodeRows) {
-      const { data: nodes } = await db()
-        .from('forge_nodes')
-        .select('skills')
-        .not('skills', 'is', null)
-      const seen = new Set()
-      for (const n of nodes || []) {
-        for (const s of (n.skills || [])) {
-          if (s && !seen.has(s)) { seen.add(s); skillKeys.push(s) }
-        }
-      }
-    } else {
-      skillKeys = nodeRows.map(r => r.skill_key)
-    }
-
-    skillKeys.sort()
-
-    // Traer configs guardadas
-    const { data: configs } = await db()
+    const { data: configs, error } = await db()
       .from('forge_skill_configs')
       .select('key, r2_path, description, updated_at')
+      .order('key')
 
-    const configMap = Object.fromEntries((configs || []).map(c => [c.key, c]))
+    if (error) return res.status(500).json({ success: false, error: error.message })
 
-    const skill_configs = skillKeys.map(key => {
-      const cfg = configMap[key] || {}
-      return {
-        key,
-        r2_path:     cfg.r2_path     || null,
-        description: cfg.description || null,
-        updated_at:  cfg.updated_at  || null,
-      }
-    })
-
-    res.json({ success: true, skill_configs })
+    res.json({ success: true, skill_configs: configs || [] })
   } catch (err) { next(err) }
 })
 
