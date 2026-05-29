@@ -10,6 +10,101 @@ const chatUpload = multer({
   limits:  { fileSize: 50 * 1024 * 1024 },
 })
 
+// ─── Migración de output_images: formato viejo → nuevo con variations[] ──────
+// Viejo: [{ index, image_url, text }]
+// Nuevo: [{ index, variations: [{ url, condition }] }]
+function migrateOutputImages(raw) {
+  if (!raw || typeof raw !== 'object') return {}
+  const result = {}
+  for (const [key, items] of Object.entries(raw)) {
+    if (!Array.isArray(items)) { result[key] = items; continue }
+    result[key] = items.map(item => {
+      if (Array.isArray(item.variations)) return item  // ya en nuevo formato
+      return {
+        index:      item.index,
+        variations: item.image_url ? [{ url: item.image_url, condition: null }] : [],
+      }
+    })
+  }
+  return result
+}
+
+// ─── Normalización post-generación de secciones estructuradas ────────────────
+
+// Normaliza listas estructuradas a bullets "- item" para renderizado consistente
+// El LLM debe incluir el label "Variation N:" en el texto — esta función solo
+// garantiza que cada ítem tenga el prefijo bullet correcto
+function normalizeStructuredSection(body) {
+  const lines  = body.split('\n')
+  const result = []
+
+  for (const line of lines) {
+    const t = line.trim()
+    if (!t)                  { result.push('');  continue }
+    if (/^#{1,4}\s/.test(t)) { result.push(t);   continue }  // subheadings — conservar
+    if (/^---+$/.test(t))    { continue }                     // HR — saltar
+    if (/^[-*•]\s/.test(t))  { result.push(t);   continue }  // ya es bullet — conservar
+
+    const numbered = t.match(/^\d+[.)]\s+(.+)/)
+    if (numbered)            { result.push('- ' + numbered[1]); continue }
+    if (t.length > 2)        { result.push('- ' + t) }
+  }
+  return result.join('\n')
+}
+
+// Asegura que las filas con | tengan formato de tabla markdown con separador
+function normalizeTableSection(body) {
+  const lines  = body.split('\n')
+  const rows   = lines.filter(l => l.trim().includes('|'))
+  const rest   = lines.filter(l => !l.trim().includes('|'))
+  if (!rows.length) return body
+
+  const normalized = rows.map(r => {
+    let t = r.trim()
+    if (!t.startsWith('|')) t = '| ' + t
+    if (!t.endsWith('|'))   t = t + ' |'
+    return t
+  })
+
+  // Agregar separador --- después de la primera fila si no existe
+  const hasSep = normalized.some(r => /^\|[\s\-:]+(\|[\s\-:]+)*\|$/.test(r))
+  if (!hasSep && normalized.length >= 1) {
+    const colCount = (normalized[0].match(/\|/g) || []).length - 1
+    normalized.splice(1, 0, '|' + ' --- |'.repeat(colCount))
+  }
+
+  return (rest.filter(Boolean).length ? rest.join('\n') + '\n' : '') + normalized.join('\n') + '\n'
+}
+
+// Aplica normalización a las secciones del replyText según el format declarado en cada output
+function normalizeOutputSections(text, outputDefs) {
+  if (!outputDefs || !outputDefs.length) return text
+  const structuredNames = new Set(outputDefs.filter(o => typeof o === 'object' && o.format === 'structured').map(o => o.name).filter(Boolean))
+  const tableNames      = new Set(outputDefs.filter(o => typeof o === 'object' && o.format === 'markdown_table').map(o => o.name).filter(Boolean))
+  if (!structuredNames.size && !tableNames.size) return text
+
+  // Partir por \n## — más fiable que split con regex multiline+^  en Node.js
+  const SEP   = '\n## '
+  const parts = ('\n' + text).split(SEP)
+  // parts[0] = '\n' + texto previo al primer ## (o vacío si empieza con ##)
+  const result = [parts[0].slice(1)]  // quitar el \n que agregamos para hacer el split uniforme
+
+  for (let i = 1; i < parts.length; i++) {
+    const newlineIdx = parts[i].indexOf('\n')
+    if (newlineIdx < 0) { result.push('## ' + parts[i]); continue }
+
+    const name = parts[i].slice(0, newlineIdx).trim()
+    const body = parts[i].slice(newlineIdx)
+
+    let normalizedBody = body
+    if (structuredNames.has(name))  normalizedBody = normalizeStructuredSection(body)
+    else if (tableNames.has(name))  normalizedBody = normalizeTableSection(body)
+
+    result.push('## ' + name + normalizedBody)
+  }
+  return result.join('\n')
+}
+
 // ─── GET /api/projects/:id/canvas ────────────────────────────
 // Devuelve los nodos del proyecto con su DNA + última sesión
 router.get('/', async (req, res, next) => {
@@ -53,9 +148,12 @@ router.get('/', async (req, res, next) => {
 
       if (sessionsError) throw sessionsError
 
-      // Quedarse solo con la última sesión por nodo
+      // Quedarse solo con la última sesión por nodo — migrar output_images al leer
       for (const s of (sessions || [])) {
-        if (!sessionsByNodeId[s.node_id]) sessionsByNodeId[s.node_id] = s
+        if (!sessionsByNodeId[s.node_id]) {
+          if (s.output_images) s.output_images = migrateOutputImages(s.output_images)
+          sessionsByNodeId[s.node_id] = s
+        }
       }
     }
 
@@ -432,7 +530,7 @@ router.post('/nodes/:node_id/accept', async (req, res, next) => {
 router.post('/nodes/:node_id/sessions/:session_id/generate-item-image', async (req, res, next) => {
   try {
     const { id: project_id, node_id, session_id } = req.params
-    const { output_key, item_index, item_text } = req.body
+    const { output_key, item_index, item_text, condition } = req.body
 
     if (!output_key || item_index == null || !item_text?.trim()) {
       return res.status(400).json({ success: false, error: 'output_key, item_index y item_text son requeridos' })
@@ -469,36 +567,49 @@ router.post('/nodes/:node_id/sessions/:session_id/generate-item-image', async (r
 
     const storagePath = `projects/${project_id}/item-images/${node.node_key}/${output_key}-${session_id}-${item_index}-${Date.now()}.png`
 
+    // Limpiar markdown del texto del ítem y construir prompt final con la condición de variación
+    const cleanText = item_text.trim()
+      .replace(/\*{1,2}([^*]+)\*{1,2}/g, '$1')  // quitar negrita/cursiva
+      .replace(/^[-*]\s+/, '')                    // quitar bullet inicial
+      .replace(/^(Variation\s+\d+:\s*)/i, '')     // quitar prefijo "Variation N:"
+    const imagePrompt = condition?.trim()
+      ? `${cleanText}\n\nAdditional visual requirement: ${condition.trim()}`
+      : cleanText
+
     let result
     if (provider === 'comfyui') {
       const { generateImageComfyUI } = require('../services/providers/comfyui.provider')
-      result = await generateImageComfyUI(modelOrWf, item_text.trim(), 1024, 1024, storagePath)
+      result = await generateImageComfyUI(modelOrWf, imagePrompt, 1024, 1024, storagePath)
     } else if (provider === 'openai') {
       const { generateImageOpenAI } = require('../services/providers/openai.image.provider')
-      result = await generateImageOpenAI(modelOrWf, item_text.trim(), 1024, 1024, storagePath)
+      result = await generateImageOpenAI(modelOrWf, imagePrompt, 1024, 1024, storagePath)
     } else if (provider === 'fal') {
       const { generateImageFal } = require('../services/providers/fal.image.provider')
-      result = await generateImageFal(modelOrWf, item_text.trim(), 1024, 1024, storagePath)
+      result = await generateImageFal(modelOrWf, imagePrompt, 1024, 1024, storagePath)
     } else {
       return res.status(400).json({ success: false, error: `Provider de imagen no soportado: "${provider}"` })
     }
 
-    // Leer output_images actual y hacer merge
+    // Leer output_images actual, migrar si viene en formato viejo y hacer append
     const { data: sessionRow } = await db()
       .from('forge_sessions')
       .select('output_images')
       .eq('id', session_id)
       .single()
 
-    const currentImages = sessionRow?.output_images || {}
+    const currentImages = migrateOutputImages(sessionRow?.output_images || {})
     const outputItems   = Array.isArray(currentImages[output_key]) ? [...currentImages[output_key]] : []
 
-    // Upsert por index
-    const existing = outputItems.find(e => e.index === item_index)
-    if (existing) {
-      existing.image_url = result.url
+    // Append variación al ítem existente o crear nuevo
+    const newVariation = { url: result.url, condition: condition?.trim() || null }
+    const existingIdx  = outputItems.findIndex(e => e.index === item_index)
+    if (existingIdx >= 0) {
+      outputItems[existingIdx] = {
+        ...outputItems[existingIdx],
+        variations: [...(outputItems[existingIdx].variations || []), newVariation],
+      }
     } else {
-      outputItems.push({ index: item_index, text: item_text.trim(), image_url: result.url })
+      outputItems.push({ index: item_index, variations: [newVariation] })
     }
     outputItems.sort((a, b) => a.index - b.index)
 
@@ -658,6 +769,11 @@ router.get('/nodes/:node_id/session', async (req, res, next) => {
         .eq('format', 'png')
         .not('storage_url', 'is', null)
       imageAssets = imgData || []
+    }
+
+    // Migrar output_images al nuevo formato con variations[] antes de devolver
+    if (session.output_images) {
+      session.output_images = migrateOutputImages(session.output_images)
     }
 
     res.json({ success: true, session, messages, asset, image_assets: imageAssets })
@@ -893,8 +1009,19 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
     // Incluir purpose + constraints + skills siempre (aunque haya default_prompt)
     const outputDefs    = Array.isArray(node.outputs) ? node.outputs : []
     const outputNames   = outputDefs.map(o => typeof o === 'object' ? o.name : o).filter(Boolean)
+
+    // Instrucciones de formato por output según su campo "format"
+    const FORMAT_HINTS = {
+      structured:      'Output a FLAT numbered list ONLY — no subheadings, no category labels, no prose introduction. Each item MUST follow this exact format: `- Variation N: Name: brief description`\n  Example:\n  - Variation 1: The Archivist: An immersive sim set in a post-collapse archive city\n  - Variation 2: Backrooms Builder: Procedural architecture exploration game',
+      markdown_table:  'MUST be a markdown table with header row and `|---|` separator row.\n  Example:\n  | Name | Score | Notes |\n  |------|-------|-------|\n  | Item A | 9/10 | reason |',
+      single_sentence: 'Single sentence only — no markdown, no line breaks, no bullets.',
+    }
+    const outputFormatLines = outputDefs
+      .filter(o => typeof o === 'object' && o.name && FORMAT_HINTS[o.format])
+      .map(o => `- **${o.name}**: ${FORMAT_HINTS[o.format]}`)
+
     const formatInstr   = outputNames.length
-      ? `\n## Output format\nStructure your response in markdown. Each output must be its own section with the exact level-2 heading "## <output_name>". Required sections: ${outputNames.map(n => `"## ${n}"`).join(', ')}.`
+      ? `\n## Output format\nStructure your response in markdown. Each output must be its own section with the exact level-2 heading "## <output_name>". Required sections: ${outputNames.map(n => `"## ${n}"`).join(', ')}.${outputFormatLines.length ? '\n\nPer-section format requirements:\n' + outputFormatLines.join('\n') : ''}`
       : ''
 
     const layer1Extras = [
@@ -1138,7 +1265,7 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
         model:           executorStr,
         rawText:         true,
         temperature:     0.7,
-        maxOutputTokens: 2048,
+        maxOutputTokens: 8192,
       })
 
       meta      = result.meta
@@ -1170,6 +1297,23 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
       currentUserMsg = currentUserMsg
         + `\n\nAgent: ${replyText}\n\n${toolResultParts.join('\n\n')}\n\nContinue your response using the tool results above.`
     }
+
+    // Eliminar párrafo de disclaimer cuando un tool falla y el LLM lo anuncia
+    // (ej: "Web search is unavailable — I'll work from my training knowledge...")
+    // Estrategia: si el primer párrafo (hasta \n\n o primer heading) contiene las keywords, eliminarlo
+    {
+      const DISCLAIMER_RE = /web search is (?:unavailable|not (?:available|configured))|training knowledge|not have (?:access to|real-?time)|cannot (?:access|perform) (?:web|internet) search/i
+      const firstBreak = replyText.search(/\n\n|\n(?=#)/)
+      if (firstBreak > 0) {
+        const firstPara = replyText.slice(0, firstBreak)
+        if (DISCLAIMER_RE.test(firstPara)) {
+          replyText = replyText.slice(firstBreak).trimStart()
+        }
+      }
+    }
+
+    // Normalizar secciones estructuradas — independiente de cómo las formateó el LLM
+    replyText = normalizeOutputSections(replyText, outputDefs)
 
     // Si el nodo tiene doc_gen_docx y el LLM no la llamó por su cuenta, generar automáticamente
     let docUrl    = null
