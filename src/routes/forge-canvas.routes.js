@@ -576,6 +576,10 @@ router.post('/nodes/:node_id/sessions/:session_id/generate-item-image', async (r
       ? `${cleanText}\n\nAdditional visual requirement: ${condition.trim()}`
       : cleanText
 
+    const { logExecution: logExec } = require('../services/execution-log.service')
+    const memberId = req.headers['x-member-id'] || null
+    const imgStart = Date.now()
+
     let result
     if (provider === 'comfyui') {
       const { generateImageComfyUI } = require('../services/providers/comfyui.provider')
@@ -589,6 +593,23 @@ router.post('/nodes/:node_id/sessions/:session_id/generate-item-image', async (r
     } else {
       return res.status(400).json({ success: false, error: `Provider de imagen no soportado: "${provider}"` })
     }
+
+    // Registrar costo estimado de generación de imagen (no bloqueante)
+    logExec({
+      project_id:   project_id,
+      node_id:      node_id,
+      session_id:   session_id,
+      triggered_by: memberId,
+      trigger_type: 'image_gen',
+      executor_type: provider === 'openai' ? 'openai_image' : provider,
+      provider,
+      model:        modelOrWf,
+      is_estimated: true,
+      duration_ms:  Date.now() - imgStart,
+      started_at:   new Date(imgStart).toISOString(),
+      status:       'success',
+      metadata:     { output_key, item_index, width: 1024, height: 1024, node_key: node.node_key },
+    })
 
     // Leer output_images actual, migrar si viene en formato viejo y hacer append
     const { data: sessionRow } = await db()
@@ -913,6 +934,7 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
 
     const { getPrompt, getSkill } = require('../services/prompt.service')
     const { callLLM }   = require('../services/llm.service')
+    const { logExecution } = require('../services/execution-log.service')
 
     // ── Obtener metadata del proyecto (Layer 2) ───────────────────
     const { data: project } = await db()
@@ -1297,6 +1319,23 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
       currentUserMsg = currentUserMsg
         + `\n\nAgent: ${replyText}\n\n${toolResultParts.join('\n\n')}\n\nContinue your response using the tool results above.`
     }
+
+    // Registrar costo y performance del llamado LLM (no bloqueante)
+    logExecution({
+      project_id:   project_id,
+      node_id:      node_id,
+      session_id:   session.id,
+      triggered_by: memberId || null,
+      trigger_type: 'chat',
+      executor_type:'llm',
+      provider:     meta?.provider   || null,
+      model:        meta?.model      || null,
+      tokens:       meta?.tokens_used || null,
+      duration_ms:  meta?.duration_ms || null,
+      started_at:   new Date(Date.now() - (meta?.duration_ms || 0)).toISOString(),
+      status:       'success',
+      metadata:     { node_key: node.node_key, iter_count: allToolCalls.length > 0 ? undefined : 1 },
+    })
 
     // Eliminar párrafo de disclaimer cuando un tool falla y el LLM lo anuncia
     // (ej: "Web search is unavailable — I'll work from my training knowledge...")
