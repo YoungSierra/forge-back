@@ -12,13 +12,18 @@ async function callAnthropic(systemPrompt, userMessage, options = {}) {
 
   let response
   try {
-    response = await getClient().messages.create({
+    // claude-opus-4-x no acepta temperature (usa extended thinking internamente)
+    const supportsTemperature = !model.startsWith('claude-opus-4')
+    const createParams = {
       model,
-      max_tokens:  options.maxOutputTokens || 8192,
-      temperature: options.temperature !== undefined ? options.temperature : 0.8,
-      system:      systemPrompt,
-      messages:    [{ role: 'user', content: userMessage }],
-    })
+      max_tokens: options.maxOutputTokens || 8192,
+      system:     systemPrompt,
+      messages:   [{ role: 'user', content: userMessage }],
+    }
+    if (supportsTemperature) {
+      createParams.temperature = options.temperature !== undefined ? options.temperature : 0.8
+    }
+    response = await getClient().messages.create(createParams)
   } catch (err) {
     const status = err.status || err.statusCode
     if (status === 429) {

@@ -341,7 +341,7 @@ router.delete('/nodes/:project_node_id', async (req, res, next) => {
 router.post('/nodes/:node_id/accept', async (req, res, next) => {
   try {
     const { id: project_id, node_id } = req.params
-    const { session_id, content, member_id, doc_url } = req.body
+    const { session_id, content, member_id, doc_url, doc_format } = req.body
 
     if (!session_id || !content?.trim()) {
       return res.status(400).json({ success: false, error: 'session_id y content son requeridos' })
@@ -366,7 +366,7 @@ router.post('/nodes/:node_id/accept', async (req, res, next) => {
         project_id,
         session_id,
         name:           `${node.title} — Output`,
-        format:         doc_url ? 'docx' : 'markdown',
+        format:         doc_url ? (doc_format || 'docx') : 'markdown',
         status:         'approved',
         content:        content.trim(),
         storage_url:    doc_url || null,
@@ -929,6 +929,7 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
       .maybeSingle()
 
     let resolvedInputs = []
+    const injectedPngUrls = new Set() // evitar duplicados cuando hay múltiples edges del mismo nodo
 
     if (currentPNode) {
       // 1. Outputs de nodos conectados por edge
@@ -972,13 +973,14 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
           const content = (sourcePNode.text_content || '').trim()
           if (content) resolvedInputs.push(`### ${label}\n${content}`)
         } else {
-          // Forge-node: buscar output aprobado
+          // Forge-node: buscar output de texto aprobado (excluir PNG para no confundir con imágenes)
           const { data: asset } = await db()
             .from('forge_assets')
             .select('content, storage_url')
             .eq('project_id', project_id)
             .eq('node_id', sourcePNode.node_id)
             .eq('status', 'approved')
+            .neq('format', 'png')
             .order('created_at', { ascending: false })
             .limit(1)
             .maybeSingle()
@@ -1007,6 +1009,23 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
 
             const snippet = content.slice(0, 3000) + (content.length > 3000 ? '\n[truncated]' : '')
             resolvedInputs.push(`### ${slotLabel}\n${snippet}`)
+          }
+
+          // Inyectar imágenes PNG aprobadas del nodo upstream como referencias de URL
+          const { data: pngAssets } = await db()
+            .from('forge_assets')
+            .select('name, storage_url')
+            .eq('project_id', project_id)
+            .eq('node_id', sourcePNode.node_id)
+            .eq('status', 'approved')
+            .eq('format', 'png')
+            .not('storage_url', 'is', null)
+
+          for (const png of (pngAssets || [])) {
+            if (png.storage_url && !injectedPngUrls.has(png.storage_url)) {
+              injectedPngUrls.add(png.storage_url)
+              resolvedInputs.push(`### ${png.name} (generated image)\nURL: ${png.storage_url}`)
+            }
           }
         }
       }
@@ -1043,7 +1062,8 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
     const { getToolsBlock, parseToolCalls, executeTool } = require('../services/tools.service')
 
     const activeTools = Array.isArray(node.tools) && node.tools.length ? node.tools : []
-    // doc_gen_docx se ejecuta automáticamente al final — no exponerla al LLM para evitar alucinaciones
+    // doc_gen_docx se ejecuta automáticamente — no exponerla al LLM para evitar alucinaciones
+    // doc_gen_pptx sí se expone: el modelo es responsable de llamarla con contenido + imágenes
     const llmVisibleTools = activeTools.filter(t => t !== 'doc_gen_docx')
     const toolsBlock      = getToolsBlock(llmVisibleTools)
 
@@ -1135,10 +1155,12 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
         const toolResult = await executeTool(tc.tool, tc.args, { project_id, node_id })
         allToolCalls.push({ ...tc, result: toolResult })
 
-        // Para doc_gen_docx con URL exitosa, pedir al LLM que presente el link en markdown
+        // Capturar URL de documentos generados para devolverla al frontend
         let resultText = JSON.stringify(toolResult, null, 2)
-        if (tc.tool === 'doc_gen_docx' && toolResult.success && toolResult.url) {
-          resultText = `Document generated successfully.\nFilename: ${toolResult.filename}\nDownload URL: ${toolResult.url}\n\nPresent this to the user as a markdown link: [${toolResult.filename}](${toolResult.url}) — make sure to include the full URL so they can open it.`
+        if ((tc.tool === 'doc_gen_docx' || tc.tool === 'doc_gen_pptx') && toolResult.success && toolResult.url) {
+          docUrl     = toolResult.url
+          docFormat  = toolResult.format || (tc.tool === 'doc_gen_pptx' ? 'pptx' : 'pdf')
+          resultText = `File generated successfully.\nFilename: ${toolResult.filename}\nDownload URL: ${toolResult.url}\n\nTell the user the file is ready. Do NOT reproduce the slide content again.`
         }
 
         toolResultParts.push(`<tool_result tool="${tc.tool}">\n${resultText}\n</tool_result>`)
@@ -1150,7 +1172,8 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
     }
 
     // Si el nodo tiene doc_gen_docx y el LLM no la llamó por su cuenta, generar automáticamente
-    let docUrl = null
+    let docUrl    = null
+    let docFormat = null
     const hasDocTool   = activeTools.includes('doc_gen_docx')
     const alreadyCalled = allToolCalls.some(tc => tc.tool === 'doc_gen_docx')
 
@@ -1238,12 +1261,42 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
         }, { project_id, node_id })
 
         if (docResult.success && docResult.url) {
-          docUrl = docResult.url
+          docUrl    = docResult.url
+          docFormat = 'pdf'
           allToolCalls.push({ tool: 'doc_gen_docx', args: { auto: true }, result: docResult })
           // No embebemos el link en replyText — el frontend lo maneja via doc_url
         }
       } catch (docErr) {
         console.error('[forge-chat] auto doc_gen_docx failed:', docErr.message)
+      }
+    }
+
+    // Auto-generar PPTX si el nodo tiene doc_gen_pptx y el LLM produjo contenido
+    const hasPptxTool     = activeTools.includes('doc_gen_pptx')
+    const pptxAlreadyCalled = allToolCalls.some(tc => tc.tool === 'doc_gen_pptx')
+
+    if (hasPptxTool && !pptxAlreadyCalled && replyText.trim().length > 200) {
+      try {
+        // Extraer URLs de imágenes PNG inyectadas desde nodos upstream
+        const pngImageUrls = resolvedInputs
+          .filter(s => s.includes('(generated image)'))
+          .map(s => { const m = s.match(/URL:\s*(https?:\/\/\S+)/); return m ? m[1] : null })
+          .filter(Boolean)
+
+        const pptxResult = await executeTool('doc_gen_pptx', {
+          title:   `${node.title} — ${project?.name ?? 'Presentation'}`,
+          content: replyText,
+          images:  pngImageUrls,
+        }, { project_id, node_id })
+
+        if (pptxResult.success && pptxResult.url) {
+          docUrl    = pptxResult.url
+          docFormat = 'pptx'
+          allToolCalls.push({ tool: 'doc_gen_pptx', args: { auto: true }, result: pptxResult })
+          console.log(`[forge-chat] auto doc_gen_pptx — ${pngImageUrls.length} images, url: ${pptxResult.url}`)
+        }
+      } catch (pptxErr) {
+        console.error('[forge-chat] auto doc_gen_pptx failed:', pptxErr.message)
       }
     }
 
@@ -1302,7 +1355,8 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
       reply:      replyText,
       session_id: session.id,
       meta,
-      doc_url:    docUrl ?? undefined,
+      doc_url:    docUrl    ?? undefined,
+      doc_format: docFormat ?? undefined,
       attachment: pendingAttachment ? {
         file_name:       pendingAttachment.file_name,
         mime_type:       pendingAttachment.mime_type,

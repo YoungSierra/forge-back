@@ -31,6 +31,14 @@ const TOOL_SCHEMAS = {
       content: 'string — full document content in Markdown format (use # for title, ## for sections)',
     },
   },
+  doc_gen_pptx: {
+    description: 'Generate and export a PowerPoint presentation deck following the V57 cinematic template structure. Returns a download URL. IMPORTANT: Use the labeled field format from the skill template — each ## slide section must use the exact field labels (Eyebrow:, Title:, Tagline:, GENRE:, PLATFORM:, etc.) so the renderer can apply the correct layout per slide. Do NOT flatten the template fields into plain prose.',
+    args: {
+      title:   'string — presentation title (format: "Document Type — Project Name")',
+      content: 'string — slide content following the v57_cinematic_deck_template field structure: ## Slide N — Name, then labeled fields as bullets (- Eyebrow: ..., - Title: ..., - Tagline: ..., - GENRE: ..., etc.)',
+      images:  'array (optional) — image URLs to embed in slides, referenced by index position',
+    },
+  },
   kb_read: {
     description: 'Read an entry from the project knowledge base.',
     args: { key: 'string — the knowledge base entry key' },
@@ -499,6 +507,359 @@ async function docGenDocx(title, content, projectId, nodeId) {
   return { success: true, url, filename: `${title || 'document'}.pdf`, format: 'pdf' }
 }
 
+// ─── PPTX: parser inteligente de template fields V57 ─────────────────────────
+
+// Campos de metadata que se omiten del output visual
+const PPTX_SKIP_LABELS = new Set([
+  'Studio', 'File reference', 'Sign-off', 'Footer', 'Image',
+  'Badge', 'Section', 'Kicker', 'Slide', 'Credit',
+])
+
+// Conjunto completo de labels conocidos (para evitar falsos positivos)
+const PPTX_KNOWN_LABELS = new Set([
+  ...PPTX_SKIP_LABELS,
+  'Eyebrow', 'Title', 'Tagline', 'Line', 'Support line', 'The real claim', 'Kicker line',
+  'Subtitle', 'Intro', 'Setup',
+])
+
+// Extrae label y valor de "Label: value" (con o sin bullet prefix, con o sin **bold**)
+function pptxExtractField(rawLine) {
+  const line = rawLine.replace(/^[-*•]\s+/, '').replace(/\*\*/g, '').trim()
+  const m = line.match(/^([A-Za-z][A-Za-z\s/&-]{0,28}):\s*(.+)/)
+  if (!m) return null
+  const label = m[1].trim()
+  const isAllCaps = label.length > 1 && label === label.toUpperCase() && /^[A-Z]/.test(label)
+  if (!isAllCaps && !PPTX_KNOWN_LABELS.has(label)) return null
+  return { label, value: m[2].trim(), isAllCaps }
+}
+
+// Analiza el cuerpo de una slide y categoriza cada elemento
+function pptxParseSlideBody(lines) {
+  const out = { eyebrow: null, title: null, taglines: [], factSheet: [], bullets: [], paragraphs: [] }
+  for (const raw of lines) {
+    const line = raw.trim()
+    if (!line || /^#{1,4}\s/.test(line) || /^---+$/.test(line)) continue
+
+    const field = pptxExtractField(line)
+    if (field) {
+      const { label, value, isAllCaps } = field
+      if (PPTX_SKIP_LABELS.has(label))  { continue }
+      if (isAllCaps)                     { out.factSheet.push({ label, value }); continue }
+      if (label === 'Eyebrow')           { out.eyebrow = value; continue }
+      if (label === 'Title')             { out.title   = value; continue }
+      if (['Tagline', 'Line', 'Support line', 'The real claim', 'Kicker line', 'Subtitle'].includes(label)) {
+        out.taglines.push(value); continue
+      }
+      continue
+    }
+
+    if (/^[-*•]\s+/.test(raw)) {
+      const t = raw.replace(/^[-*•]\s+/, '').trim()
+      if (t) out.bullets.push(t)
+    } else {
+      out.paragraphs.push(line)
+    }
+  }
+  return out
+}
+
+// ── Layout hero: eyebrow + título grande + tagline (fondo imagen full-bleed) ──
+function renderHeroSlide(slide, sectionTitle, body, img, C) {
+  const cl = s => (s || '').replace(/\*\*/g, '').replace(/\*/g, '').trim()
+  const W  = img ? 6.8 : 12.3
+
+  if (img) {
+    slide.addImage({ data: img, x: 0, y: 0, w: 13.33, h: 7.5 })
+    slide.addShape('rect', { x: 0,   y: 0, w: 13.33, h: 7.5, fill: { color: '000000', transparency: 30 } })
+    slide.addShape('rect', { x: 0,   y: 0, w: 7.8,   h: 7.5, fill: { color: C.BG_DARK, transparency: 40 } })
+  }
+
+  const eyebrow   = body.eyebrow   || sectionTitle
+  const heroTitle = body.title     || sectionTitle
+  const tagline   = body.taglines[0] || ''
+
+  slide.addText(cl(eyebrow).toUpperCase(), {
+    x: 0.6, y: 0.88, w: W, h: 0.28,
+    fontSize: 8, color: C.AMBER, bold: true, charSpacing: 3.5,
+  })
+  slide.addShape('rect', { x: 0.6, y: 1.26, w: 0.65, h: 0.035, fill: { color: C.AMBER } })
+  slide.addText(cl(heroTitle), {
+    x: 0.55, y: 1.38, w: W, h: 3.1,
+    fontSize: 38, color: C.WHITE, bold: true, breakLine: true, valign: 'top', fontFace: 'Calibri',
+  })
+  if (tagline) {
+    slide.addText(`"${cl(tagline)}"`, {
+      x: 0.6, y: 4.7, w: W, h: 0.55, fontSize: 14, color: C.GRAY, italic: true, breakLine: true,
+    })
+  }
+  let bY = tagline ? 5.38 : 4.75
+  for (const b of body.bullets.slice(0, 3)) {
+    if (bY > 6.8) break
+    slide.addText([
+      { text: '▪  ', options: { color: C.AMBER, bold: true } },
+      { text: cl(b), options: { color: C.LIGHT } },
+    ], { x: 0.7, y: bY, w: W, h: 0.36, fontSize: 10, breakLine: true })
+    bY += 0.38
+  }
+}
+
+// ── Layout fact sheet: grid 2-col de pares clave/valor en MAYÚSCULAS ──────────
+function renderFactSheetSlide(slide, sectionTitle, body, img, C) {
+  const cl  = s => (s || '').replace(/\*\*/g, '').replace(/\*/g, '').trim()
+  const TWX = img ? 8.1 : 12.7
+  const TX  = 0.5
+
+  if (img) {
+    slide.addImage({ data: img, x: 8.7, y: 0.65, w: 4.35, h: 5.1 })
+    slide.addShape('rect', { x: 8.7, y: 0.65, w: 4.35, h: 5.1, fill: { color: '000000', transparency: 55 } })
+  }
+
+  if (body.eyebrow) {
+    slide.addText(cl(body.eyebrow).toUpperCase(), {
+      x: TX, y: 0.18, w: TWX, h: 0.25, fontSize: 8, color: C.AMBER, bold: true, charSpacing: 3,
+    })
+  }
+  const headY = body.eyebrow ? 0.5 : 0.22
+  slide.addText(cl(sectionTitle).replace(/_/g, ' '), {
+    x: TX, y: headY, w: TWX, h: 0.55, fontSize: 22, color: C.WHITE, bold: true,
+  })
+  slide.addShape('rect', { x: TX, y: headY + 0.6, w: TWX, h: 0.03, fill: { color: C.AMBER } })
+
+  const colW  = (TWX - 0.2) / 2
+  const ROW_H = 0.72
+  let fy = headY + 0.72
+
+  for (let i = 0; i < body.factSheet.length; i += 2) {
+    const a = body.factSheet[i]
+    const b = body.factSheet[i + 1]
+    if (fy + ROW_H > 7.0) break
+
+    slide.addShape('rect', {
+      x: TX, y: fy, w: TWX, h: ROW_H,
+      fill: { color: i % 4 === 0 ? C.BG_CARD : C.BG_SLIDE },
+    })
+
+    slide.addText(a.label, {
+      x: TX + 0.14, y: fy + 0.07, w: colW - 0.2, h: 0.22,
+      fontSize: 7.5, color: C.AMBER, bold: true, charSpacing: 1.5,
+    })
+    slide.addText(cl(a.value), {
+      x: TX + 0.14, y: fy + 0.3, w: colW - 0.2, h: 0.34,
+      fontSize: 13, color: C.WHITE, bold: true, breakLine: true,
+    })
+
+    if (b) {
+      slide.addText(b.label, {
+        x: TX + colW + 0.2, y: fy + 0.07, w: colW - 0.2, h: 0.22,
+        fontSize: 7.5, color: C.AMBER, bold: true, charSpacing: 1.5,
+      })
+      slide.addText(cl(b.value), {
+        x: TX + colW + 0.2, y: fy + 0.3, w: colW - 0.2, h: 0.34,
+        fontSize: 13, color: C.WHITE, bold: true, breakLine: true,
+      })
+    }
+
+    slide.addShape('rect', { x: TX, y: fy + ROW_H, w: TWX, h: 0.012, fill: { color: C.DIVIDER } })
+    fy += ROW_H
+  }
+
+  if (body.bullets.length > 0 && fy < 6.8) {
+    fy += 0.18
+    for (const b of body.bullets.slice(0, 3)) {
+      if (fy > 6.9) break
+      slide.addText([
+        { text: '▪  ', options: { color: C.AMBER, bold: true } },
+        { text: cl(b), options: { color: C.LIGHT } },
+      ], { x: TX + 0.1, y: fy, w: TWX - 0.1, h: 0.36, fontSize: 10, breakLine: true })
+      fy += 0.38
+    }
+  }
+}
+
+// ── Layout contenido: título + bullets + párrafos ─────────────────────────────
+function renderContentSlide(slide, sectionTitle, body, img, C) {
+  const cl  = s => (s || '').replace(/\*\*/g, '').replace(/\*/g, '').trim()
+  const TWX = img ? 8.0 : 12.6
+  const TX  = 0.5
+
+  if (img) {
+    slide.addImage({ data: img, x: 8.8, y: 0.7, w: 4.25, h: 5.1 })
+    slide.addShape('rect', { x: 8.8, y: 0.7, w: 4.25, h: 5.1, fill: { color: '000000', transparency: 60 } })
+  }
+
+  let headY = 0.18
+  if (body.eyebrow) {
+    slide.addText(cl(body.eyebrow).toUpperCase(), {
+      x: TX, y: headY, w: TWX, h: 0.25, fontSize: 8, color: C.AMBER, bold: true, charSpacing: 3,
+    })
+    headY += 0.3
+  }
+  slide.addText(cl(sectionTitle).replace(/_/g, ' '), {
+    x: TX, y: headY, w: TWX, h: 0.55, fontSize: 22, color: C.WHITE, bold: true, breakLine: true,
+  })
+  const divY = headY + 0.6
+  slide.addShape('rect', { x: TX, y: divY, w: TWX, h: 0.025, fill: { color: C.AMBER } })
+
+  let cy = divY + 0.22
+  const items = [
+    ...body.taglines.map(t  => ({ kind: 'tagline', text: t })),
+    ...body.bullets.map(b   => ({ kind: 'bullet',  text: b })),
+    ...body.paragraphs.map(p => ({ kind: 'para',    text: p })),
+  ]
+
+  for (const item of items) {
+    if (cy > 6.8) break
+    if (item.kind === 'tagline') {
+      slide.addText(cl(item.text), {
+        x: TX, y: cy, w: TWX, h: 0.44, fontSize: 14, color: C.LIGHT, italic: true, breakLine: true,
+      })
+      cy += 0.48
+    } else if (item.kind === 'bullet') {
+      slide.addText([
+        { text: '▪  ', options: { color: C.AMBER, bold: true } },
+        { text: cl(item.text), options: { color: C.LIGHT } },
+      ], { x: TX + 0.15, y: cy, w: TWX - 0.2, h: 0.38, fontSize: 10.5, breakLine: true })
+      cy += 0.41
+    } else {
+      slide.addText(cl(item.text), {
+        x: TX, y: cy, w: TWX, h: 0.38, fontSize: 10.5, color: C.GRAY, breakLine: true,
+      })
+      cy += 0.42
+    }
+  }
+}
+
+// ─── PPTX generator ──────────────────────────────────────────────────────────
+
+async function docGenPptx(title, content, images, projectId, nodeId) {
+  const PptxGenJS = require('pptxgenjs')
+  const pptx = new PptxGenJS()
+  pptx.layout = 'LAYOUT_WIDE' // 13.33" × 7.5"
+
+  // Paleta V57 cinematic
+  const C = {
+    BG_DARK:  '0d0f14',
+    BG_SLIDE: '111318',
+    BG_CARD:  '1a1e27',
+    AMBER:    'F59E0B',
+    WHITE:    'FFFFFF',
+    LIGHT:    'E5E7EB',
+    GRAY:     '9CA3AF',
+    GRAY_DIM: '4B5563',
+    DIVIDER:  '2D3748',
+  }
+
+  // Descargar imágenes como base64 para embeber en la presentación
+  const imgData = []
+  for (const url of (images || [])) {
+    try {
+      const res  = await fetch(url, { signal: AbortSignal.timeout(12000) })
+      const buf  = await res.arrayBuffer()
+      const b64  = Buffer.from(buf).toString('base64')
+      const mime = res.headers.get('content-type') || 'image/png'
+      imgData.push(`data:${mime};base64,${b64}`)
+    } catch { imgData.push(null) }
+  }
+  const validImgs = imgData.filter(Boolean)
+
+  // Secciones de output-format wrapper que no son slides (investor_deck, output, etc.)
+  const OUTPUT_WRAPPER = /^(investor_deck|output|result|response|deck)$/i
+  const sections      = parseMarkdownSections(content)
+  const contentSlides = sections.filter(s => s.level >= 2 && !OUTPUT_WRAPPER.test(s.title.trim()))
+
+  const dashIdx  = title.indexOf(' — ')
+  const gameTitle = dashIdx !== -1 ? title.slice(dashIdx + 3) : title
+  const docType   = dashIdx !== -1 ? title.slice(0, dashIdx)  : 'INVESTOR DECK'
+
+  // Detectar slide de portada (primera sección si su título contiene "cover" o "slide 01")
+  const isCoverTitle = t => /cover|portada|slide\s*0*1\b/i.test(t)
+  const coverSec     = contentSlides[0] && isCoverTitle(contentSlides[0].title) ? contentSlides[0] : null
+  const coverBody    = coverSec ? pptxParseSlideBody(coverSec.lines) : { eyebrow: null, title: null, taglines: [], factSheet: [], bullets: [], paragraphs: [] }
+
+  const coverTitle   = coverBody.title       || gameTitle
+  const coverTagline = coverBody.taglines[0] || ''
+  const coverEyebrow = coverBody.eyebrow     || docType.toUpperCase()
+
+  function amberStripe(slide, y) {
+    slide.addShape('rect', { x: 0, y, w: 13.33, h: 0.055, fill: { color: C.AMBER } })
+  }
+
+  // ── Slide 1: Cover ─────────────────────────────────────────────────────────
+  const cover = pptx.addSlide()
+  cover.background = { color: C.BG_DARK }
+
+  if (validImgs[0]) {
+    cover.addImage({ data: validImgs[0], x: 7.1, y: 0.06, w: 6.23, h: 7.38 })
+    cover.addShape('rect', { x: 7.1, y: 0.06, w: 6.23, h: 7.38, fill: { color: '000000', transparency: 30 } })
+    cover.addShape('rect', { x: 5.5, y: 0,    w: 2.1,  h: 7.5,  fill: { color: C.BG_DARK, transparency: 40 } })
+  }
+
+  cover.addText(coverEyebrow.replace(/\*\*/g, '').toUpperCase(), {
+    x: 0.55, y: 1.1, w: 6.3, h: 0.28, fontSize: 8, color: C.AMBER, bold: true, charSpacing: 3.5,
+  })
+  cover.addShape('rect', { x: 0.55, y: 1.5, w: 0.8, h: 0.04, fill: { color: C.AMBER } })
+  cover.addText(coverTitle.replace(/\*\*/g, ''), {
+    x: 0.5, y: 1.65, w: 6.3, h: 3.2,
+    fontSize: 52, color: C.WHITE, bold: true, breakLine: true, valign: 'top', fontFace: 'Calibri',
+  })
+  if (coverTagline) {
+    cover.addText(`"${coverTagline.replace(/\*\*/g, '')}"`, {
+      x: 0.55, y: 5.05, w: 6.3, h: 0.7, fontSize: 14, color: C.GRAY, italic: true, breakLine: true,
+    })
+  }
+  cover.addText('V57 STUDIO', {
+    x: 0.55, y: 6.86, w: 3, h: 0.25, fontSize: 8, color: C.AMBER, bold: true, charSpacing: 2,
+  })
+  cover.addText('CONFIDENTIAL  ·  INTERNAL USE ONLY', {
+    x: 0.55, y: 7.13, w: 7, h: 0.22, fontSize: 7, color: C.GRAY_DIM,
+  })
+  amberStripe(cover, 0)
+  amberStripe(cover, 7.44)
+
+  // ── Content slides ─────────────────────────────────────────────────────────
+  const loopStart = coverSec ? 1 : 0
+  let imgCursor   = validImgs.length > 1 ? 1 : 0
+
+  for (let si = loopStart; si < contentSlides.length; si++) {
+    const sec  = contentSlides[si]
+    const body = pptxParseSlideBody(sec.lines)
+
+    const hasHero = body.title !== null || body.taglines.length > 0
+    const hasFact = body.factSheet.length >= 2
+    const slideImg = validImgs.length > 0 ? validImgs[imgCursor % validImgs.length] : null
+    imgCursor++
+
+    const slide = pptx.addSlide()
+    slide.background = { color: C.BG_SLIDE }
+
+    if (hasHero) {
+      renderHeroSlide(slide, sec.title, body, slideImg, C)
+    } else if (hasFact) {
+      renderFactSheetSlide(slide, sec.title, body, slideImg, C)
+    } else {
+      renderContentSlide(slide, sec.title, body, slideImg, C)
+    }
+
+    // Barras amber encima de todo el contenido
+    amberStripe(slide, 0)
+    amberStripe(slide, 7.44)
+
+    slide.addText(`${si - loopStart + 2}`, {
+      x: 12.88, y: 7.1, w: 0.38, h: 0.25, fontSize: 8, color: C.GRAY_DIM, align: 'right',
+    })
+  }
+
+  const buffer      = await pptx.write({ outputType: 'nodebuffer' })
+  const slug        = Date.now()
+  const storagePath = `projects/${projectId}/tools/deck_${slug}.pptx`
+  const url         = await uploadToStorage(
+    buffer, storagePath,
+    'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  )
+
+  return { success: true, url, filename: `${title || 'deck'}.pptx`, format: 'pptx' }
+}
+
 // ─── Dispatcher ───────────────────────────────────────────────────────────────
 
 async function executeTool(name, args, context = {}) {
@@ -515,6 +876,10 @@ async function executeTool(name, args, context = {}) {
     case 'doc_gen_docx':
       if (!args.content) return { success: false, error: 'content is required' }
       return docGenDocx(args.title || 'Document', args.content, context.project_id, context.node_id)
+
+    case 'doc_gen_pptx':
+      if (!args.content) return { success: false, error: 'content is required' }
+      return docGenPptx(args.title || 'Presentation', args.content, args.images || [], context.project_id, context.node_id)
 
     case 'kb_read':
       return { success: false, error: 'Knowledge base not implemented yet. This tool is reserved for future use.' }
