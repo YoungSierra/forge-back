@@ -117,7 +117,7 @@ router.get('/', async (req, res, next) => {
       .select(`
         id, order_index, added_at,
         node_type, node_id, source_asset_id,
-        text_label, text_content,
+        text_label, text_content, is_stale,
         blueprint_id,
         forge_nodes (
           id, node_key, title, phase, purpose,
@@ -137,6 +137,7 @@ router.get('/', async (req, res, next) => {
     // Última sesión por nodo
     const nodeIds = (projectNodes || []).filter(pn => pn.node_id).map(pn => pn.node_id)
     let sessionsByNodeId = {}
+    let sessionsWithAgentMsg = new Set()
 
     if (nodeIds.length > 0) {
       const { data: sessions, error: sessionsError } = await db()
@@ -157,9 +158,23 @@ router.get('/', async (req, res, next) => {
       }
     }
 
-    // Cargar output assets de sesiones aprobadas (batch — evita N+1)
+    // Detectar sesiones active sin asset pero con mensajes de agente (crash en run previo)
+    const activeSessIds = Object.values(sessionsByNodeId)
+      .filter(s => s.status === 'active' && !s.output_asset_id)
+      .map(s => s.id)
+    if (activeSessIds.length > 0) {
+      const { data: agentMsgs } = await db()
+        .from('forge_messages')
+        .select('session_id')
+        .in('session_id', activeSessIds)
+        .eq('role', 'agent')
+        .limit(activeSessIds.length)
+      for (const m of (agentMsgs || [])) sessionsWithAgentMsg.add(m.session_id)
+    }
+
+    // Cargar output assets de sesiones aprobadas o auto_approved (batch — evita N+1)
     const outputAssetIds = Object.values(sessionsByNodeId)
-      .filter(s => s.status === 'approved' && s.output_asset_id)
+      .filter(s => (s.status === 'approved' || s.status === 'auto_approved') && s.output_asset_id)
       .map(s => s.output_asset_id)
 
     let outputAssetsMap = {}
@@ -177,6 +192,7 @@ router.get('/', async (req, res, next) => {
       const nodeType     = pn.node_type || 'forge_node'
       const session      = nodeType === 'forge_node' ? (sessionsByNodeId[pn.node_id] || null) : null
       const output_asset = session?.output_asset_id ? (outputAssetsMap[session.output_asset_id] ?? null) : null
+      const has_content  = !!(output_asset || (session && sessionsWithAgentMsg.has(session.id)))
       return {
         project_node_id: pn.id,
         order_index:     pn.order_index,
@@ -186,7 +202,8 @@ router.get('/', async (req, res, next) => {
         asset:           pn.forge_project_library_assets || null,
         text_label:      pn.text_label  ?? null,
         text_content:    pn.text_content ?? null,
-        session:         session ? { ...session, output_asset } : null,
+        is_stale:        pn.is_stale ?? false,
+        session:         session ? { ...session, output_asset, has_content } : null,
       }
     })
 
@@ -258,6 +275,26 @@ router.post('/gate', async (req, res, next) => {
 
     if (decision !== 'ACCEPT') {
       return res.json({ success: true, decision, next_blueprint: null })
+    }
+
+    // ACCEPT → sellar todos los nodos auto_approved del blueprint aceptado
+    // Obtener los node_ids del blueprint
+    const { data: bpNodes } = await db()
+      .from('forge_project_nodes')
+      .select('node_id')
+      .eq('project_id', project_id)
+      .eq('blueprint_id', blueprint_id)
+      .eq('removed', false)
+
+    const bpNodeIds = (bpNodes || []).map(n => n.node_id)
+
+    if (bpNodeIds.length > 0) {
+      await db()
+        .from('forge_sessions')
+        .update({ status: 'approved', completed_at: new Date().toISOString() })
+        .eq('project_id', project_id)
+        .eq('status', 'auto_approved')
+        .in('node_id', bpNodeIds)
     }
 
     // ACCEPT → buscar y cargar el siguiente blueprint por fase
@@ -464,7 +501,7 @@ router.post('/nodes/:node_id/accept', async (req, res, next) => {
         project_id,
         session_id,
         name:           `${node.title} — Output`,
-        format:         doc_url ? (doc_format || 'docx') : 'markdown',
+        format:         doc_url ? (doc_format === 'pptx' ? 'pptx' : 'docx') : 'markdown',
         status:         'approved',
         content:        content.trim(),
         storage_url:    doc_url || null,
@@ -594,22 +631,26 @@ router.post('/nodes/:node_id/sessions/:session_id/generate-item-image', async (r
       return res.status(400).json({ success: false, error: `Provider de imagen no soportado: "${provider}"` })
     }
 
-    // Registrar costo estimado de generación de imagen (no bloqueante)
-    logExec({
-      project_id:   project_id,
-      node_id:      node_id,
-      session_id:   session_id,
-      triggered_by: memberId,
-      trigger_type: 'image_gen',
-      executor_type: provider === 'openai' ? 'openai_image' : provider,
-      provider,
-      model:        modelOrWf,
-      is_estimated: true,
-      duration_ms:  Date.now() - imgStart,
-      started_at:   new Date(imgStart).toISOString(),
-      status:       'success',
-      metadata:     { output_key, item_index, width: 1024, height: 1024, node_key: node.node_key },
-    })
+    // Registrar costo estimado de generación de imagen (no bloqueante, nunca rompe el flujo)
+    try {
+      logExec({
+        project_id:   project_id,
+        node_id:      node_id,
+        session_id:   session_id,
+        triggered_by: memberId,
+        trigger_type: 'image_gen',
+        executor_type: provider === 'openai' ? 'openai_image' : provider,
+        provider,
+        model:        modelOrWf,
+        is_estimated: true,
+        duration_ms:  Date.now() - imgStart,
+        started_at:   new Date(imgStart).toISOString(),
+        status:       'success',
+        metadata:     { output_key, item_index, width: 1024, height: 1024, node_key: node.node_key },
+      })
+    } catch (logErr) {
+      console.error('[generate-item-image] logExec failed (non-fatal):', logErr.message)
+    }
 
     // Leer output_images actual, migrar si viene en formato viejo y hacer append
     const { data: sessionRow } = await db()
@@ -659,7 +700,7 @@ router.post('/nodes/:node_id/generate-pdf', async (req, res, next) => {
       .select('id, output_asset_id, status')
       .eq('project_id', project_id)
       .eq('node_id', node_id)
-      .eq('status', 'approved')
+      .in('status', ['approved', 'auto_approved'])
       .order('completed_at', { ascending: false })
       .limit(1)
       .maybeSingle()
@@ -743,7 +784,7 @@ router.get('/nodes/:node_id/session', async (req, res, next) => {
 
     const { data: msgs } = await db()
       .from('forge_messages')
-      .select('id, role, content, order_index')
+      .select('id, role, content, order_index, tool_calls')
       .eq('session_id', session.id)
       .order('order_index')
 
@@ -769,12 +810,13 @@ router.get('/nodes/:node_id/session', async (req, res, next) => {
       role:        m.role === 'human' ? 'user' : 'assistant',
       content:     m.content,
       attachments: attachmentsByMsg[m.id] || [],
+      tool_calls:  m.tool_calls?.length ? m.tool_calls : undefined,
     }))
 
-    // Incluir asset aprobado si la sesión está aprobada
+    // Cargar asset si existe
     let asset = null
     let imageAssets = []
-    if (session.status === 'approved' && session.output_asset_id) {
+    if (session.output_asset_id) {
       const { data: assetData } = await db()
         .from('forge_assets')
         .select('id, name, format, content, storage_url')
@@ -782,7 +824,6 @@ router.get('/nodes/:node_id/session', async (req, res, next) => {
         .maybeSingle()
       asset = assetData
 
-      // Cargar image assets PNG aprobados de esta sesión
       const { data: imgData } = await db()
         .from('forge_assets')
         .select('id, name, storage_url')
@@ -790,6 +831,28 @@ router.get('/nodes/:node_id/session', async (req, res, next) => {
         .eq('format', 'png')
         .not('storage_url', 'is', null)
       imageAssets = imgData || []
+    }
+
+    // Fallback: si no hay asset, usar el último mensaje del agente (sesiones con bug de constraint)
+    if (!asset) {
+      const { data: lastAgentMsg } = await db()
+        .from('forge_messages')
+        .select('content')
+        .eq('session_id', session.id)
+        .eq('role', 'agent')
+        .order('order_index', { ascending: false })
+        .limit(1)
+        .maybeSingle()
+
+      if (lastAgentMsg?.content) {
+        asset = {
+          id:          null,
+          name:        'Output',
+          format:      'markdown',
+          content:     lastAgentMsg.content,
+          storage_url: null,
+        }
+      }
     }
 
     // Migrar output_images al nuevo formato con variations[] antes de devolver
@@ -1122,13 +1185,13 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
           const content = (sourcePNode.text_content || '').trim()
           if (content) resolvedInputs.push(`### ${label}\n${content}`)
         } else {
-          // Forge-node: buscar output de texto aprobado (excluir PNG para no confundir con imágenes)
+          // Forge-node: buscar output de texto aprobado o auto_approved (excluir PNG)
           const { data: asset } = await db()
             .from('forge_assets')
             .select('content, storage_url')
             .eq('project_id', project_id)
             .eq('node_id', sourcePNode.node_id)
-            .eq('status', 'approved')
+            .in('status', ['approved', 'auto_approved'])
             .neq('format', 'png')
             .order('created_at', { ascending: false })
             .limit(1)
@@ -1160,13 +1223,13 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
             resolvedInputs.push(`### ${slotLabel}\n${snippet}`)
           }
 
-          // Inyectar imágenes PNG aprobadas del nodo upstream como referencias de URL
+          // Inyectar imágenes PNG aprobadas o auto_approved del nodo upstream
           const { data: pngAssets } = await db()
             .from('forge_assets')
             .select('name, storage_url')
             .eq('project_id', project_id)
             .eq('node_id', sourcePNode.node_id)
-            .eq('status', 'approved')
+            .in('status', ['approved', 'auto_approved'])
             .eq('format', 'png')
             .not('storage_url', 'is', null)
 
@@ -1320,22 +1383,26 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
         + `\n\nAgent: ${replyText}\n\n${toolResultParts.join('\n\n')}\n\nContinue your response using the tool results above.`
     }
 
-    // Registrar costo y performance del llamado LLM (no bloqueante)
-    logExecution({
-      project_id:   project_id,
-      node_id:      node_id,
-      session_id:   session.id,
-      triggered_by: memberId || null,
-      trigger_type: 'chat',
-      executor_type:'llm',
-      provider:     meta?.provider   || null,
-      model:        meta?.model      || null,
-      tokens:       meta?.tokens_used || null,
-      duration_ms:  meta?.duration_ms || null,
-      started_at:   new Date(Date.now() - (meta?.duration_ms || 0)).toISOString(),
-      status:       'success',
-      metadata:     { node_key: node.node_key, iter_count: allToolCalls.length > 0 ? undefined : 1 },
-    })
+    // Registrar costo y performance del llamado LLM (no bloqueante, nunca rompe el flujo)
+    try {
+      logExecution({
+        project_id:   project_id,
+        node_id:      node_id,
+        session_id:   session.id,
+        triggered_by: member_id || null,
+        trigger_type: 'chat',
+        executor_type:'llm',
+        provider:     meta?.provider    || null,
+        model:        meta?.model       || null,
+        tokens:       meta?.tokens_used || null,
+        duration_ms:  meta?.duration_ms || null,
+        started_at:   new Date(Date.now() - (meta?.duration_ms || 0)).toISOString(),
+        status:       'success',
+        metadata:     { node_key: node.node_key, iter_count: allToolCalls.length > 0 ? undefined : 1 },
+      })
+    } catch (logErr) {
+      console.error('[forge-chat] logExecution failed (non-fatal):', logErr.message)
+    }
 
     // Eliminar párrafo de disclaimer cuando un tool falla y el LLM lo anuncia
     // (ej: "Web search is unavailable — I'll work from my training knowledge...")
@@ -1993,6 +2060,263 @@ router.patch('/nodes/:project_node_id/text', async (req, res, next) => {
 
     if (error) throw error
     res.json({ success: true })
+  } catch (err) { next(err) }
+})
+
+// ─── POST /api/projects/:id/canvas/run-validate ─────────────────
+// Valida que todos los inputs required de los forge_nodes del canvas tienen fuente válida
+router.post('/run-validate', async (req, res, next) => {
+  try {
+    const { id: project_id } = req.params
+
+    // Cargar todos los nodos del canvas
+    const { data: pNodes } = await db()
+      .from('forge_project_nodes')
+      .select('id, node_id, node_type, text_content, text_label, source_asset_id')
+      .eq('project_id', project_id)
+      .eq('removed', false)
+
+    const forgeNodes = (pNodes || []).filter(n => n.node_type === 'forge_node')
+
+    // Cargar definiciones de nodos (inputs required)
+    const nodeIds = forgeNodes.map(n => n.node_id)
+    const { data: nodeDefs } = await db()
+      .from('forge_nodes')
+      .select('id, node_key, title, inputs')
+      .in('id', nodeIds)
+
+    const defById = Object.fromEntries((nodeDefs || []).map(n => [n.id, n]))
+
+    // Cargar sesiones activas con mensajes de agente (intervención manual pendiente)
+    const { data: activeSessions } = await db()
+      .from('forge_sessions')
+      .select('node_id, id')
+      .eq('project_id', project_id)
+      .eq('status', 'active')
+
+    // Para cada sesión activa, verificar si tiene mensajes del agente
+    const unreviewedNodeIds = new Set()
+    for (const sess of (activeSessions || [])) {
+      const { count } = await db()
+        .from('forge_messages')
+        .select('id', { count: 'exact', head: true })
+        .eq('session_id', sess.id)
+        .eq('role', 'agent')
+      if (count > 0) unreviewedNodeIds.add(sess.node_id)
+    }
+
+    // Cargar todos los edges del proyecto
+    const { data: edges } = await db()
+      .from('forge_project_edges')
+      .select('source_node_id, target_node_id')
+      .eq('project_id', project_id)
+
+    const edgesByTarget = {}
+    for (const e of (edges || [])) {
+      if (!edgesByTarget[e.target_node_id]) edgesByTarget[e.target_node_id] = []
+      edgesByTarget[e.target_node_id].push(e.source_node_id)
+    }
+
+    const pNodeById = Object.fromEntries((pNodes || []).map(n => [n.id, n]))
+
+    const errors = []
+
+    for (const pn of forgeNodes) {
+      const def = defById[pn.node_id]
+      if (!def) continue
+
+      // Prioridad 1: sesión activa con respuesta del agente no aceptada → el usuario debe resolver
+      if (unreviewedNodeIds.has(pn.node_id)) {
+        errors.push({
+          type:          'unreviewed_session',
+          projectNodeId: pn.id,
+          nodeId:        pn.node_id,
+          nodeKey:       def.node_key,
+          nodeTitle:     def.title,
+          reason:        `Has an unreviewed response — Accept or discard it before running`,
+        })
+        continue
+      }
+
+      const inputs   = def.inputs
+      const required = Array.isArray(inputs)
+        ? inputs.filter(i => i.required).map(i => i.key ?? i)
+        : Array.isArray(inputs?.required) ? inputs.required : []
+
+      const incomingSources = edgesByTarget[pn.id] || []
+
+      // Prioridad 2: inputs required sin ninguna fuente conectada
+      if (required.length > 0 && incomingSources.length === 0) {
+        errors.push({
+          type:          'missing_input',
+          projectNodeId: pn.id,
+          nodeId:        pn.node_id,
+          nodeKey:       def.node_key,
+          nodeTitle:     def.title,
+          reason:        `Requires "${required[0]}" — connect a Text Input node with your idea first`,
+        })
+        continue
+      }
+
+      // Prioridad 3: fuentes conectadas vacías
+      for (const sourceId of incomingSources) {
+        const src = pNodeById[sourceId]
+        if (!src) continue
+        if (src.node_type === 'forge_node') continue  // se ejecutará antes en el run — OK
+
+        if (src.node_type === 'text_input' && !src.text_content?.trim()) {
+          errors.push({
+            type:          'empty_source',
+            projectNodeId: pn.id,
+            nodeId:        pn.node_id,
+            nodeKey:       def.node_key,
+            nodeTitle:     def.title,
+            reason:        `"${src.text_label || 'Text Input'}" is connected but has no text`,
+          })
+        } else if (src.node_type === 'library_asset') {
+          const { data: asset } = await db()
+            .from('forge_project_library_assets')
+            .select('extracted_text, storage_url')
+            .eq('id', src.source_asset_id)
+            .maybeSingle()
+          if (!asset?.extracted_text && !asset?.storage_url) {
+            errors.push({
+              type:          'empty_source',
+              projectNodeId: pn.id,
+              nodeId:        pn.node_id,
+              nodeKey:       def.node_key,
+              nodeTitle:     def.title,
+              reason:        `Asset connected to "${def.title}" has no content`,
+            })
+          }
+        }
+      }
+    }
+
+    res.json({ success: true, valid: errors.length === 0, errors })
+  } catch (err) { next(err) }
+})
+
+// ─── POST /api/projects/:id/canvas/nodes/:project_node_id/auto-run ──
+// Ejecuta un nodo en modo autopilot y lo auto-aprueba como auto_approved
+router.post('/nodes/:project_node_id/auto-run', async (req, res, next) => {
+  try {
+    const { id: project_id, project_node_id } = req.params
+    const { member_id } = req.body
+
+    const { buildSystemPrompt, runReActLoop, propagateStale } = require('../services/canvas-chat.service')
+    const { logExecution } = require('../services/execution-log.service')
+    const normalizeOutputSections = (text, defs) => text  // sin normalización en auto-run
+
+    // Obtener el forge_node_id desde el project_node_id
+    const { data: pNode } = await db()
+      .from('forge_project_nodes')
+      .select('node_id, node_type')
+      .eq('id', project_node_id)
+      .eq('removed', false)
+      .maybeSingle()
+
+    if (!pNode || pNode.node_type !== 'forge_node') {
+      return res.status(404).json({ success: false, error: 'Project node not found or not a forge_node' })
+    }
+
+    const node_id = pNode.node_id
+
+    // Crear nueva sesión activa
+    const { data: session, error: sessErr } = await db()
+      .from('forge_sessions')
+      .insert({
+        project_id,
+        node_id,
+        status:          'active',
+        iteration_count: 0,
+        started_at:      new Date().toISOString(),
+        triggered_by:    member_id || null,
+      })
+      .select('id, iteration_count')
+      .single()
+
+    if (sessErr) throw sessErr
+
+    const userMessage = 'Generate the output for this step'
+
+    // Componer system prompt
+    const { finalSystemPrompt, baseUserMsg, executorStr, activeTools, outputDefs, resolvedInputs, node } =
+      await buildSystemPrompt(db, { projectId: project_id, nodeId: node_id, sessionId: session.id, userMessage })
+
+    // Ejecutar ReAct loop
+    const { replyText, allToolCalls, docUrl, docFormat, meta } = await runReActLoop({
+      finalSystemPrompt, baseUserMsg, executorStr, activeTools, resolvedInputs,
+      projectId: project_id, nodeId: node_id, nodeName: node.title,
+    })
+
+    // Registrar costo (nunca rompe el flujo)
+    try { logExecution({
+      project_id,
+      node_id,
+      session_id:   session.id,
+      triggered_by: member_id || null,
+      trigger_type: 'auto_run',
+      executor_type:'llm',
+      provider:     meta?.provider   || null,
+      model:        meta?.model      || null,
+      tokens:       meta?.tokens_used || null,
+      duration_ms:  meta?.duration_ms || null,
+      started_at:   new Date(Date.now() - (meta?.duration_ms || 0)).toISOString(),
+      status:       'success',
+      metadata:     { node_key: node.node_key },
+    }) } catch (logErr) { console.error('[auto-run] logExecution failed (non-fatal):', logErr.message) }
+
+    // Persistir mensajes
+    await db()
+      .from('forge_messages')
+      .insert({ session_id: session.id, role: 'human', content: userMessage, order_index: 0, tool_calls: [] })
+
+    await db()
+      .from('forge_messages')
+      .insert({ session_id: session.id, role: 'agent', content: replyText, order_index: 1, tool_calls: allToolCalls.length ? allToolCalls : [] })
+
+    // Crear asset auto_approved
+    const { data: asset, error: assetErr } = await db()
+      .from('forge_assets')
+      .insert({
+        node_id,
+        project_id,
+        session_id:   session.id,
+        name:         `${node.title} — Output`,
+        format:       docUrl ? (docFormat === 'pptx' ? 'pptx' : 'docx') : 'markdown',
+        status:       'approved',
+        content:      replyText,
+        storage_url:  docUrl || null,
+        approved_by:  member_id || null,
+        approved_at:  new Date().toISOString(),
+      })
+      .select('id')
+      .single()
+
+    if (assetErr) throw assetErr
+
+    // Cerrar sesión como auto_approved
+    await db()
+      .from('forge_sessions')
+      .update({ status: 'auto_approved', output_asset_id: asset.id, completed_at: new Date().toISOString(), iteration_count: 1 })
+      .eq('id', session.id)
+
+    // Limpiar is_stale del nodo actual y propagar stale a descendientes
+    await db()
+      .from('forge_project_nodes')
+      .update({ is_stale: false })
+      .eq('id', project_node_id)
+
+    await propagateStale(db, project_id, project_node_id)
+
+    res.json({
+      success:    true,
+      session_id: session.id,
+      reply:      replyText,
+      doc_url:    docUrl   || undefined,
+      doc_format: docFormat || undefined,
+    })
   } catch (err) { next(err) }
 })
 

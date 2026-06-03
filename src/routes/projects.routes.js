@@ -1333,7 +1333,8 @@ router.delete('/:id/members/:memberId', async (req, res, next) => {
 })
 
 // ─── Repo / Export to Repository ──────────────────────────────────────────────
-const repoService = require('../services/repo.service')
+const repoService    = require('../services/repo.service')
+const scaffoldService = require('../services/scaffold.service')
 
 // GET /api/projects/:id/repo-config
 router.get('/:id/repo-config', async (req, res, next) => {
@@ -1477,19 +1478,15 @@ router.post('/:id/repo/validate', async (req, res, next) => {
   } catch (err) { next(err) }
 })
 
-// POST /api/projects/:id/repo/export — sube assets aprobados al repo
+// POST /api/projects/:id/repo/export — inicializa scaffold + sube todos los assets aprobados
 router.post('/:id/repo/export', async (req, res, next) => {
   try {
     const { id } = req.params
-    const { node_keys } = req.body
-
-    if (!Array.isArray(node_keys) || node_keys.length === 0) {
-      return res.status(400).json({ success: false, error: 'node_keys array is required' })
-    }
+    const { target_engine } = req.body
 
     const { data: project, error: pErr } = await db()
       .from('projects')
-      .select('name, concept, repo_config, repo_token_encrypted')
+      .select('name, concept, repo_config, repo_token_encrypted, target_engine')
       .eq('id', id)
       .single()
 
@@ -1497,53 +1494,165 @@ router.post('/:id/repo/export', async (req, res, next) => {
     if (!project.repo_config?.repo_url) return res.status(400).json({ success: false, error: 'No repository configured' })
     if (!project.repo_token_encrypted) return res.status(400).json({ success: false, error: 'No token configured' })
 
-    const token = repoService.decrypt(project.repo_token_encrypted)
+    const engine  = target_engine || project.target_engine || 'unity'
+    const token   = repoService.decrypt(project.repo_token_encrypted)
     const repoUrl = project.repo_config.repo_url
 
-    const { data: assets } = await db()
-      .from('assets')
-      .select('*, asset_versions!asset_versions_asset_id_fkey(*)')
+    // Traer todos los forge_assets aprobados
+    const { data: assets, error: assetsErr } = await db()
+      .from('forge_assets')
+      .select('id, name, format, content, storage_url, node_id')
       .eq('project_id', id)
-      .eq('review_status', 'approved')
-      .in('step_key', node_keys)
+      .eq('status', 'approved')
+
+    console.log('[repo/export] assets found:', assets?.length ?? 0, assetsErr?.message ?? '')
+
+    // Traer node_keys en una segunda query para evitar problemas de join
+    const nodeIds = [...new Set((assets || []).map(a => a.node_id).filter(Boolean))]
+    const nodeKeyMap = {}
+    if (nodeIds.length > 0) {
+      const { data: nodes } = await db()
+        .from('forge_nodes')
+        .select('id, node_key')
+        .in('id', nodeIds)
+      for (const n of (nodes || [])) nodeKeyMap[n.id] = n.node_key
+    }
 
     const pushed = []
     const errors = []
 
-    // GDD como JSON
-    if (node_keys.includes('gdd') && project.concept?.pipeline?.gdd) {
+    // ── 1. Scaffold de carpetas vacías (.gitkeep) ──────────────────────────────
+    const folders = scaffoldService.FOLDERS[engine] || scaffoldService.FOLDERS.unity
+    for (const folder of folders) {
+      const path = `${folder}/.gitkeep`
       try {
-        const gddContent = JSON.stringify(project.concept.pipeline.gdd, null, 2)
-        await repoService.pushFileToGitlab(token, repoUrl, 'forge/gdd.json', gddContent, 'forge: export GDD')
-        pushed.push('forge/gdd.json')
+        await repoService.pushFileToGitlab(token, repoUrl, path, '', 'forge: initialize project scaffold')
+        pushed.push(path)
       } catch (e) {
-        errors.push({ file: 'forge/gdd.json', error: e.message })
+        errors.push({ file: path, error: e.message })
       }
     }
 
-    // Assets binarios — fetch desde storage_url y push a GitLab
+    // ── 2. Assets aprobados ────────────────────────────────────────────────────
     for (const asset of (assets || [])) {
-      const version = (asset.asset_versions || []).find(v => v.is_current)
-      if (!version?.storage_url) continue
+      const nodeKey  = nodeKeyMap[asset.node_id] || 'misc'
+      const destPath = scaffoldService.assetDestPath(engine, nodeKey, asset.name, asset.format)
 
       try {
-        const fetchRes = await fetch(version.storage_url)
-        if (!fetchRes.ok) {
-          errors.push({ file: asset.name, error: `HTTP ${fetchRes.status} al obtener el asset` })
+        if (asset.content) {
+          // Si hay content (markdown), siempre preferir el md sobre el binario
+          const mdPath = scaffoldService.assetDestPath(engine, nodeKey, asset.name, 'markdown')
+          await repoService.pushFileToGitlab(token, repoUrl, mdPath, asset.content, `forge: add ${nodeKey}/${asset.name}`)
+          pushed.push(mdPath)
+        } else if (asset.storage_url) {
+          // Sin content — subir el binario (png, pptx sin texto, etc.)
+          const fetchRes = await fetch(asset.storage_url)
+          if (!fetchRes.ok) {
+            errors.push({ file: destPath, error: `HTTP ${fetchRes.status}` })
+            continue
+          }
+          const buffer = Buffer.from(await fetchRes.arrayBuffer())
+          await repoService.pushFileToGitlab(token, repoUrl, destPath, buffer, `forge: add ${nodeKey}/${asset.name}`)
+          pushed.push(destPath)
+        } else {
           continue
         }
-        const buffer = Buffer.from(await fetchRes.arrayBuffer())
-        const urlPath = version.storage_url.split('?')[0]
-        const ext = urlPath.split('.').pop() || 'bin'
-        const filePath = `forge/${asset.step_key}/${asset.name}.${ext}`
-        await repoService.pushFileToGitlab(token, repoUrl, filePath, buffer, `forge: export ${asset.step_key}/${asset.name}`)
-        pushed.push(filePath)
       } catch (e) {
-        errors.push({ file: asset.name, error: e.message })
+        errors.push({ file: destPath, error: e.message })
       }
     }
 
-    res.json({ success: true, pushed, errors })
+    // ── 3. Imágenes generadas on-demand de sesiones aprobadas ─────────────────
+    const approvedPngUrls = new Set(
+      (assets || []).filter(a => a.format === 'png' && a.storage_url).map(a => a.storage_url)
+    )
+
+    const { data: approvedSessions } = await db()
+      .from('forge_sessions')
+      .select('id, node_id, output_images, forge_nodes(node_key)')
+      .eq('project_id', id)
+      .eq('status', 'approved')
+      .not('output_images', 'is', null)
+
+    for (const session of (approvedSessions || [])) {
+      const raw     = session.output_images
+      const nodeKey = session.forge_nodes?.node_key || 'misc'
+      if (!raw || typeof raw !== 'object') continue
+
+      const refFolder = engine === 'unreal' ? 'Content/Art/References'
+                      : engine === 'godot'  ? 'assets/art/references'
+                      :                       'Assets/Art/References'
+
+      for (const [outputKey, items] of Object.entries(raw)) {
+        if (!Array.isArray(items)) continue
+
+        for (const item of items) {
+          const variations = Array.isArray(item.variations)
+            ? item.variations
+            : item.image_url ? [{ url: item.image_url, condition: null }] : []
+
+          for (let varIdx = 0; varIdx < variations.length; varIdx++) {
+            const v = variations[varIdx]
+            if (!v.url || approvedPngUrls.has(v.url)) continue
+
+            const condPart = v.condition ? `_${v.condition.replace(/[^a-z0-9]/gi, '_').toLowerCase()}` : ''
+            const destPath = `${refFolder}/${nodeKey}/${outputKey}_${(item.index ?? 0) + 1}${varIdx > 0 ? `_v${varIdx + 1}` : ''}${condPart}.png`
+
+            try {
+              const fetchRes = await fetch(v.url)
+              if (!fetchRes.ok) {
+                errors.push({ file: destPath, error: `HTTP ${fetchRes.status}` })
+                continue
+              }
+              const buffer = Buffer.from(await fetchRes.arrayBuffer())
+              await repoService.pushFileToGitlab(token, repoUrl, destPath, buffer, `forge: add generated image ${nodeKey}/${outputKey}`)
+              pushed.push(destPath)
+            } catch (e) {
+              errors.push({ file: destPath, error: e.message })
+            }
+          }
+        }
+      }
+    }
+
+    // ── 5. Root files ──────────────────────────────────────────────────────────
+    const rootFiles = [
+      { path: '.gitignore',    content: scaffoldService.getGitignore(engine) },
+      { path: '.gitattributes', content: scaffoldService.getGitattributes(engine) },
+      { path: '.editorconfig', content: scaffoldService.getEditorconfig() },
+    ]
+
+    for (const rf of rootFiles) {
+      try {
+        await repoService.pushFileToGitlab(token, repoUrl, rf.path, rf.content, `forge: add ${rf.path}`)
+        pushed.push(rf.path)
+      } catch (e) {
+        errors.push({ file: rf.path, error: e.message })
+      }
+    }
+
+    // ── 6. README.md con estructura real exportada ─────────────────────────────
+    const assetPaths   = pushed.filter(p => !p.endsWith('.gitkeep'))
+    const conceptBrief = project.concept?.pipeline?.gdd?.concept?.one_liner
+      || project.concept?.pipeline?.concept_brief
+      || project.concept?.one_liner
+      || ''
+
+    const readme = scaffoldService.generateReadme({
+      projectName:  project.name || 'My Game',
+      engine,
+      conceptBrief,
+      pushedAssets: assetPaths,
+    })
+
+    try {
+      await repoService.pushFileToGitlab(token, repoUrl, 'README.md', readme, 'forge: initialize README')
+      pushed.push('README.md')
+    } catch (e) {
+      errors.push({ file: 'README.md', error: e.message })
+    }
+
+    res.json({ success: true, pushed, errors, engine })
   } catch (err) { next(err) }
 })
 

@@ -169,6 +169,7 @@ router.get('/project-assets', async (req, res, next) => {
       id:          a.id,
       source:      'forge',
       name:        a.name,
+      project_id:  a.project_id ?? null,
       node_key:    a.forge_nodes?.node_key ?? null,
       node_title:  a.forge_nodes?.title    ?? null,
       phase:       a.forge_nodes?.phase    ?? null,
@@ -191,7 +192,7 @@ router.get('/project-assets', async (req, res, next) => {
     let legacyQuery = db()
       .from('assets')
       .select(`
-        id, name, step_key, review_status, created_at,
+        id, name, step_key, review_status, created_at, project_id,
         asset_versions ( id, storage_url, version_number, is_current, model_used, created_at )
       `)
       .order('created_at', { ascending: false })
@@ -217,6 +218,7 @@ router.get('/project-assets', async (req, res, next) => {
       id:          a.id,
       source:      'legacy',
       name:        a.name,
+      project_id:  a.project_id ?? null,
       node_key:    a.step_key,
       node_title:  a.step_key,
       phase:       null,
@@ -237,7 +239,65 @@ router.get('/project-assets', async (req, res, next) => {
         })),
     }))
 
-    const unified = [...forgeNormalized, ...legacyNormalized]
+    // ── imágenes generadas on-demand (forge_sessions.output_images) ─────────────
+    // Se excluyen URLs que ya están en forge_assets (PNGs aprobados) para evitar duplicados
+    const approvedPngUrls = new Set(
+      (forgeAssets || []).filter(a => a.format === 'png' && a.storage_url).map(a => a.storage_url)
+    )
+
+    let sessionsQuery = db()
+      .from('forge_sessions')
+      .select('id, project_id, node_id, status, created_at, output_images, forge_nodes(node_key, title, phase)')
+      .not('output_images', 'is', null)
+
+    if (project_id) sessionsQuery = sessionsQuery.eq('project_id', project_id)
+
+    const { data: sessions } = await sessionsQuery
+
+    const generatedNormalized = []
+
+    for (const session of (sessions || [])) {
+      const raw = session.output_images
+      if (!raw || typeof raw !== 'object') continue
+
+      const nodeKey   = session.forge_nodes?.node_key ?? null
+      const nodeTitle = session.forge_nodes?.title    ?? null
+      const nodePhase = session.forge_nodes?.phase    ?? null
+
+      for (const [outputKey, items] of Object.entries(raw)) {
+        if (!Array.isArray(items)) continue
+
+        for (const item of items) {
+          // Soporta formato viejo { image_url } y nuevo { variations[] }
+          const variations = Array.isArray(item.variations)
+            ? item.variations
+            : item.image_url ? [{ url: item.image_url, condition: null }] : []
+
+          variations.forEach((v, varIdx) => {
+            if (!v.url || approvedPngUrls.has(v.url)) return
+
+            const label = v.condition ? ` (${v.condition})` : ''
+            generatedNormalized.push({
+              id:          `${session.id}_${outputKey}_${item.index}_${varIdx}`,
+              source:      'generated',
+              name:        `${nodeTitle ?? nodeKey ?? 'Node'} — ${outputKey} #${(item.index ?? 0) + 1}${label}`,
+              project_id:  session.project_id ?? null,
+              node_key:    nodeKey,
+              node_title:  nodeTitle,
+              phase:       nodePhase,
+              format:      'image',
+              status:      'generated',
+              storage_url: v.url,
+              content:     null,
+              created_at:  session.created_at,
+              versions:    [],
+            })
+          })
+        }
+      }
+    }
+
+    const unified = [...forgeNormalized, ...legacyNormalized, ...generatedNormalized]
       .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
 
     res.json({ success: true, assets: unified })
