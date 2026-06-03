@@ -512,17 +512,16 @@ async function docGenDocx(title, content, projectId, nodeId) {
 // Campos de metadata que se omiten del output visual
 const PPTX_SKIP_LABELS = new Set([
   'Studio', 'File reference', 'Sign-off', 'Footer', 'Image',
-  'Badge', 'Section', 'Kicker', 'Slide', 'Credit',
+  'Badge', 'Section', 'Kicker', 'Slide', 'Credit', 'Footnote',
+  'Footer notes', 'Optional document ID', 'Optional badge',
 ])
 
-// Conjunto completo de labels conocidos (para evitar falsos positivos)
 const PPTX_KNOWN_LABELS = new Set([
   ...PPTX_SKIP_LABELS,
   'Eyebrow', 'Title', 'Tagline', 'Line', 'Support line', 'The real claim', 'Kicker line',
-  'Subtitle', 'Intro', 'Setup',
+  'Subtitle', 'Intro', 'Setup', 'Thesis', 'Closing note',
 ])
 
-// Extrae label y valor de "Label: value" (con o sin bullet prefix, con o sin **bold**)
 function pptxExtractField(rawLine) {
   const line = rawLine.replace(/^[-*•]\s+/, '').replace(/\*\*/g, '').trim()
   const m = line.match(/^([A-Za-z][A-Za-z\s/&-]{0,28}):\s*(.+)/)
@@ -535,27 +534,67 @@ function pptxExtractField(rawLine) {
 
 // Analiza el cuerpo de una slide y categoriza cada elemento
 function pptxParseSlideBody(lines) {
-  const out = { eyebrow: null, title: null, taglines: [], factSheet: [], bullets: [], paragraphs: [] }
+  const out = {
+    eyebrow: null, title: null, taglines: [], factSheet: [], dirItems: [],
+    bullets: [], paragraphs: [], strikethrough: null, imageHint: null, compItems: [],
+  }
   for (const raw of lines) {
     const line = raw.trim()
     if (!line || /^#{1,4}\s/.test(line) || /^---+$/.test(line)) continue
 
+    const stripped = line.replace(/^[-*•]\s+/, '').replace(/\*\*/g, '').trim()
+
+    // Image: image_wide/interior/object — capturar hint
+    const imgMatch = stripped.match(/^Image\s*:\s*(image_\w+)/i)
+    if (imgMatch) { out.imageHint = imgMatch[1].toLowerCase(); continue }
+
+    // Paragraph N: — extraer solo el valor
+    const paraMatch = stripped.match(/^Paragraph\s+\d+\s*:\s*(.+)/i)
+    if (paraMatch) { out.paragraphs.push(paraMatch[1].trim()); continue }
+
+    // Line N: — tagline sin prefijo numérico
+    const lineNMatch = stripped.match(/^Line\s+\d+\s*:\s*(.+)/i)
+    if (lineNMatch) { out.taglines.push(lineNMatch[1].trim()); continue }
+
+    // What it is NOT: — tachado
+    const strikeMatch = stripped.match(/^What(?:\s+it\s+is|\s+the\s+game\s+is)\s+NOT[^:]*:\s*(.+)/i)
+    if (strikeMatch) {
+      out.strikethrough = strikeMatch[1].replace(/~~(.+?)~~/g, '$1').trim()
+      continue
+    }
+
+    // VISUAL — style: value / AUDIO — style: value → direction items (full-width, no stats bar)
+    const dirMatch = stripped.match(/^(VISUAL|AUDIO)\s*[—–-]+\s*([^:]{1,50}):\s*(.+)/i)
+    if (dirMatch) {
+      out.dirItems.push({ label: dirMatch[1].toUpperCase() + ' — ' + dirMatch[2].trim(), value: dirMatch[3].trim() })
+      continue
+    }
+
     const field = pptxExtractField(line)
     if (field) {
       const { label, value, isAllCaps } = field
-      if (PPTX_SKIP_LABELS.has(label))  { continue }
-      if (isAllCaps)                     { out.factSheet.push({ label, value }); continue }
-      if (label === 'Eyebrow')           { out.eyebrow = value; continue }
-      if (label === 'Title')             { out.title   = value; continue }
-      if (['Tagline', 'Line', 'Support line', 'The real claim', 'Kicker line', 'Subtitle'].includes(label)) {
+      if (PPTX_SKIP_LABELS.has(label)) { continue }
+      // Items de comparación: all-caps label CON → en el valor → comparison table, no stats bar
+      if (isAllCaps && value.includes('→')) { out.compItems.push(value); continue }
+      if (isAllCaps)                    { out.factSheet.push({ label, value }); continue }
+      if (label === 'Eyebrow')          { out.eyebrow = value; continue }
+      if (label === 'Title')            { out.title   = value; continue }
+      // Subtitle → párrafo (sin comillas — distinto de Line/Tagline)
+      if (label === 'Subtitle')         { out.paragraphs.push(value); continue }
+      if (['Tagline', 'Line', 'Support line', 'The real claim', 'Kicker line'].includes(label)) {
         out.taglines.push(value); continue
+      }
+      if (label === 'Thesis' || label === 'Closing note') {
+        out.paragraphs.push(value); continue
       }
       continue
     }
 
     if (/^[-*•]\s+/.test(raw)) {
       const t = raw.replace(/^[-*•]\s+/, '').trim()
-      if (t) out.bullets.push(t)
+      // Bullet con → es item de tabla de comparación
+      if (t && t.includes('→')) out.compItems.push(t)
+      else if (t)                out.bullets.push(t)
     } else {
       out.paragraphs.push(line)
     }
@@ -563,43 +602,118 @@ function pptxParseSlideBody(lines) {
   return out
 }
 
-// ── Layout hero: eyebrow + título grande + tagline (fondo imagen full-bleed) ──
+// ── Layout hero ──────────────────────────────────────────────────────────────
 function renderHeroSlide(slide, sectionTitle, body, img, C) {
   const cl = s => (s || '').replace(/\*\*/g, '').replace(/\*/g, '').trim()
   const W  = img ? 6.8 : 12.3
 
   if (img) {
     slide.addImage({ data: img, x: 0, y: 0, w: 13.33, h: 7.5 })
-    slide.addShape('rect', { x: 0,   y: 0, w: 13.33, h: 7.5, fill: { color: '000000', transparency: 30 } })
-    slide.addShape('rect', { x: 0,   y: 0, w: 7.8,   h: 7.5, fill: { color: C.BG_DARK, transparency: 40 } })
+    slide.addShape('rect', { x: 0, y: 0, w: 13.33, h: 7.5, fill: { color: '000000', transparency: 30 } })
+    slide.addShape('rect', { x: 0, y: 0, w: 7.8,   h: 7.5, fill: { color: C.BG_DARK, transparency: 40 } })
   }
 
-  const eyebrow   = body.eyebrow   || sectionTitle
-  const heroTitle = body.title     || sectionTitle
-  const tagline   = body.taglines[0] || ''
+  const eyebrow = body.eyebrow || null
 
-  slide.addText(cl(eyebrow).toUpperCase(), {
-    x: 0.6, y: 0.88, w: W, h: 0.28,
-    fontSize: 8, color: C.AMBER, bold: true, charSpacing: 3.5,
-  })
-  slide.addShape('rect', { x: 0.6, y: 1.26, w: 0.65, h: 0.035, fill: { color: C.AMBER } })
-  slide.addText(cl(heroTitle), {
-    x: 0.55, y: 1.38, w: W, h: 3.1,
-    fontSize: 38, color: C.WHITE, bold: true, breakLine: true, valign: 'top', fontFace: 'Calibri',
-  })
-  if (tagline) {
-    slide.addText(`"${cl(tagline)}"`, {
-      x: 0.6, y: 4.7, w: W, h: 0.55, fontSize: 14, color: C.GRAY, italic: true, breakLine: true,
+  // Si no hay Title: explícito, usar el primer tagline como claim principal (slides tipo statement/twist)
+  const hasExplicitTitle = body.title !== null
+  const heroTitle        = body.title || (body.taglines.length > 0 ? body.taglines[0] : null)
+  const subTaglines      = hasExplicitTitle ? body.taglines : body.taglines.slice(1)
+
+  const hasStats   = body.factSheet.length >= 2 && body.factSheet.length <= 6
+  const hasDirItems = body.dirItems.length > 0
+  const hasContent = body.bullets.length + body.paragraphs.length > 0 || body.strikethrough || hasDirItems
+
+  // Font del título según densidad de contenido
+  const titleFontSize = hasContent ? (heroTitle && heroTitle.length > 60 ? 26 : 30) : 38
+  const titleH        = hasContent ? 2.2 : 3.1
+
+  if (eyebrow) {
+    slide.addText(cl(eyebrow).toUpperCase(), {
+      x: 0.6, y: 0.88, w: W, h: 0.28, fontSize: 8, color: C.AMBER, bold: true, charSpacing: 3.5,
+    })
+    slide.addShape('rect', { x: 0.6, y: 1.26, w: 0.65, h: 0.035, fill: { color: C.AMBER } })
+  }
+
+  if (heroTitle) {
+    slide.addText(cl(heroTitle), {
+      x: 0.55, y: 1.38, w: W, h: titleH,
+      fontSize: titleFontSize, color: C.WHITE, bold: true, breakLine: true, valign: 'top', fontFace: 'Calibri',
     })
   }
-  let bY = tagline ? 5.38 : 4.75
-  for (const b of body.bullets.slice(0, 3)) {
-    if (bY > 6.8) break
-    slide.addText([
-      { text: '▪  ', options: { color: C.AMBER, bold: true } },
-      { text: cl(b), options: { color: C.LIGHT } },
-    ], { x: 0.7, y: bY, w: W, h: 0.36, fontSize: 10, breakLine: true })
-    bY += 0.38
+
+  let cy = 1.38 + titleH + 0.08
+
+  // Sub-taglines con comillas — máx 2
+  for (const tl of subTaglines.slice(0, 2)) {
+    if (cy > 5.8) break
+    slide.addText(`"${cl(tl)}"`, {
+      x: 0.6, y: cy, w: W, h: 0.5, fontSize: 12, color: C.GRAY, italic: true, breakLine: true,
+    })
+    cy += 0.54
+  }
+
+  // Línea tachada (What it is NOT)
+  if (body.strikethrough && cy <= 6.0) {
+    slide.addText(cl(body.strikethrough), {
+      x: 0.6, y: cy, w: W, h: 0.34,
+      fontSize: 11, color: C.GRAY_DIM, italic: true, strike: true, breakLine: true,
+    })
+    cy += 0.38
+  }
+
+  // Direction items (VISUAL/AUDIO) — full-width, label en amber + valor en LIGHT
+  for (const di of body.dirItems.slice(0, 2)) {
+    if (cy > 6.4) break
+    slide.addShape('rect', { x: 0.55, y: cy - 0.02, w: W, h: 0.76, fill: { color: C.BG_CARD } })
+    slide.addShape('rect', { x: 0.55, y: cy - 0.02, w: 0.03, h: 0.76, fill: { color: C.AMBER } })
+    slide.addText(cl(di.label), {
+      x: 0.7, y: cy, w: W - 0.2, h: 0.2, fontSize: 8, color: C.AMBER, bold: true, charSpacing: 1.5,
+    })
+    slide.addText(cl(di.value), {
+      x: 0.7, y: cy + 0.22, w: W - 0.2, h: 0.5, fontSize: 9.5, color: C.LIGHT, breakLine: true,
+    })
+    cy += 0.8
+  }
+
+  // Bullets y párrafos
+  const bodyItems = [
+    ...body.bullets.map(b   => ({ kind: 'bullet', text: b })),
+    ...body.paragraphs.map(p => ({ kind: 'para',   text: p })),
+  ]
+  for (const item of bodyItems.slice(0, 4)) {
+    if (cy > 6.2) break
+    if (item.kind === 'bullet') {
+      slide.addText([
+        { text: '▪  ', options: { color: C.AMBER, bold: true } },
+        { text: cl(item.text), options: { color: C.LIGHT } },
+      ], { x: 0.6, y: cy, w: W, h: 0.38, fontSize: 10, breakLine: true })
+    } else {
+      slide.addText(cl(item.text), {
+        x: 0.6, y: cy, w: W, h: 0.38, fontSize: 10, color: C.GRAY, breakLine: true,
+      })
+    }
+    cy += 0.41
+  }
+
+  // Stats bar — solo para facts cortos (SCOPE/TEAM/PLATFORM/WINDOW), no para direction
+  if (hasStats && !hasDirItems) {
+    const stats = body.factSheet.slice(0, 4)
+    const statW = W / stats.length
+    const statY = 6.28
+    stats.forEach((f, i) => {
+      const sx = 0.55 + i * statW
+      slide.addShape('rect', { x: sx, y: statY - 0.08, w: statW - 0.12, h: 0.95, fill: { color: C.BG_CARD } })
+      slide.addShape('rect', { x: sx, y: statY - 0.08, w: 0.03, h: 0.95, fill: { color: C.AMBER } })
+      slide.addText(cl(f.label), {
+        x: sx + 0.1, y: statY, w: statW - 0.22, h: 0.2,
+        fontSize: 7, color: C.AMBER, bold: true, charSpacing: 1.5,
+      })
+      slide.addText(cl(f.value), {
+        x: sx + 0.1, y: statY + 0.22, w: statW - 0.22, h: 0.56,
+        fontSize: 10, color: C.WHITE, bold: true, breakLine: true,
+      })
+    })
   }
 }
 
@@ -619,8 +733,9 @@ function renderFactSheetSlide(slide, sectionTitle, body, img, C) {
       x: TX, y: 0.18, w: TWX, h: 0.25, fontSize: 8, color: C.AMBER, bold: true, charSpacing: 3,
     })
   }
-  const headY = body.eyebrow ? 0.5 : 0.22
-  slide.addText(cl(sectionTitle).replace(/_/g, ' '), {
+  const headY    = body.eyebrow ? 0.5 : 0.22
+  const headText = body.title ? cl(body.title) : cl(sectionTitle).replace(/_/g, ' ')
+  slide.addText(headText, {
     x: TX, y: headY, w: TWX, h: 0.55, fontSize: 22, color: C.WHITE, bold: true,
   })
   slide.addShape('rect', { x: TX, y: headY + 0.6, w: TWX, h: 0.03, fill: { color: C.AMBER } })
@@ -673,6 +788,75 @@ function renderFactSheetSlide(slide, sectionTitle, body, img, C) {
       ], { x: TX + 0.1, y: fy, w: TWX - 0.1, h: 0.36, fontSize: 10, breakLine: true })
       fy += 0.38
     }
+  }
+}
+
+// ── Layout comparison table: izquierda tachada / derecha numerada ─────────────
+function renderComparisonSlide(slide, sectionTitle, body, img, C) {
+  const cl  = s => (s || '').replace(/\*\*/g, '').replace(/\*/g, '').replace(/~~(.+?)~~/g, '$1').trim()
+  const TWX = img ? 8.2 : 12.8
+  const TX  = 0.5
+
+  if (img) {
+    slide.addImage({ data: img, x: 9.0, y: 0.6, w: 4.1, h: 5.2 })
+    slide.addShape('rect', { x: 9.0, y: 0.6, w: 4.1, h: 5.2, fill: { color: '000000', transparency: 60 } })
+  }
+
+  // Eyebrow + título
+  let headY = 0.18
+  if (body.eyebrow) {
+    slide.addText(body.eyebrow.toUpperCase(), {
+      x: TX, y: headY, w: TWX, h: 0.25, fontSize: 8, color: C.AMBER, bold: true, charSpacing: 3,
+    })
+    headY += 0.3
+  }
+  const headText = body.title ? cl(body.title) : cl(sectionTitle)
+  slide.addText(headText, {
+    x: TX, y: headY, w: TWX, h: 0.5, fontSize: 20, color: C.WHITE, bold: true, breakLine: true,
+  })
+  slide.addShape('rect', { x: TX, y: headY + 0.55, w: TWX, h: 0.025, fill: { color: C.AMBER } })
+
+  // Cabeceras de columna
+  const colY  = headY + 0.65
+  const LW    = TWX * 0.48
+  const RW    = TWX * 0.48
+  const RX    = TX + TWX * 0.52
+  slide.addText('THE CATEGORY TODAY', {
+    x: TX, y: colY, w: LW, h: 0.22, fontSize: 7.5, color: C.GRAY_DIM, bold: true, charSpacing: 1.5,
+  })
+  slide.addText('THIS PROJECT', {
+    x: RX, y: colY, w: RW, h: 0.22, fontSize: 7.5, color: C.AMBER, bold: true, charSpacing: 1.5,
+  })
+  slide.addShape('rect', { x: TX, y: colY + 0.25, w: TWX, h: 0.012, fill: { color: C.DIVIDER } })
+
+  // Filas de comparación
+  const ROW_H = 0.72
+  let ry = colY + 0.28
+  for (const item of body.compItems.slice(0, 5)) {
+    if (ry + ROW_H > 7.1) break
+
+    // Separar "old part → 01 new part"
+    const arrowIdx = item.indexOf('→')
+    const leftRaw  = arrowIdx >= 0 ? item.slice(0, arrowIdx).trim() : item
+    const rightRaw = arrowIdx >= 0 ? item.slice(arrowIdx + 1).trim() : ''
+
+    // Limpiar strikethrough markdown del lado izquierdo
+    const leftText  = leftRaw.replace(/~~(.+?)~~/g, '$1').replace(/\*\*/g,'').replace(/\*/g,'').trim()
+    const rightText = rightRaw.replace(/\*\*/g,'').replace(/\*/g,'').trim()
+
+    slide.addShape('rect', { x: TX, y: ry, w: TWX, h: ROW_H, fill: { color: C.BG_CARD } })
+    slide.addShape('rect', { x: TX + LW + 0.04, y: ry, w: 0.012, h: ROW_H, fill: { color: C.DIVIDER } })
+
+    slide.addText(leftText, {
+      x: TX + 0.1, y: ry + 0.1, w: LW - 0.2, h: ROW_H - 0.2,
+      fontSize: 9.5, color: C.GRAY_DIM, italic: true, strike: true, breakLine: true, valign: 'top',
+    })
+    slide.addText(rightText, {
+      x: RX + 0.1, y: ry + 0.1, w: RW - 0.2, h: ROW_H - 0.2,
+      fontSize: 10, color: C.LIGHT, bold: false, breakLine: true, valign: 'top',
+    })
+    slide.addShape('rect', { x: TX, y: ry + ROW_H, w: TWX, h: 0.01, fill: { color: C.DIVIDER } })
+    ry += ROW_H
   }
 }
 
@@ -762,6 +946,11 @@ async function docGenPptx(title, content, images, projectId, nodeId) {
   }
   const validImgs = imgData.filter(Boolean)
 
+  // Mapa de nombre canónico → base64 (image_wide = [0], image_interior = [1], image_object = [2])
+  const IMG_NAMES = ['image_wide', 'image_interior', 'image_object']
+  const imgByName = {}
+  IMG_NAMES.forEach((name, i) => { if (imgData[i]) imgByName[name] = imgData[i] })
+
   // Secciones de output-format wrapper que no son slides (investor_deck, output, etc.)
   const OUTPUT_WRAPPER = /^(investor_deck|output|result|response|deck)$/i
   const sections      = parseMarkdownSections(content)
@@ -785,11 +974,13 @@ async function docGenPptx(title, content, images, projectId, nodeId) {
   }
 
   // ── Slide 1: Cover ─────────────────────────────────────────────────────────
-  const cover = pptx.addSlide()
+  const cover     = pptx.addSlide()
   cover.background = { color: C.BG_DARK }
 
-  if (validImgs[0]) {
-    cover.addImage({ data: validImgs[0], x: 7.1, y: 0.06, w: 6.23, h: 7.38 })
+  // Cover siempre usa image_wide si está disponible
+  const coverImg = imgByName['image_wide'] || validImgs[0] || null
+  if (coverImg) {
+    cover.addImage({ data: coverImg, x: 7.1, y: 0.06, w: 6.23, h: 7.38 })
     cover.addShape('rect', { x: 7.1, y: 0.06, w: 6.23, h: 7.38, fill: { color: '000000', transparency: 30 } })
     cover.addShape('rect', { x: 5.5, y: 0,    w: 2.1,  h: 7.5,  fill: { color: C.BG_DARK, transparency: 40 } })
   }
@@ -824,20 +1015,32 @@ async function docGenPptx(title, content, images, projectId, nodeId) {
     const sec  = contentSlides[si]
     const body = pptxParseSlideBody(sec.lines)
 
-    const hasHero = body.title !== null || body.taglines.length > 0
-    const hasFact = body.factSheet.length >= 2
-    const slideImg = validImgs.length > 0 ? validImgs[imgCursor % validImgs.length] : null
-    imgCursor++
+    // Limpiar prefijo "Slide N — " para evitar que aparezca en el título visible
+    const cleanTitle = sec.title.replace(/^Slide\s+\d+\s*[—\-–]\s*/i, '').trim()
+
+    const hasComp   = body.compItems.length > 0
+    const hasHero   = body.title !== null || body.taglines.length > 0 || body.strikethrough || body.dirItems.length > 0
+    const hasFact   = body.factSheet.length >= 2
+    const isPureFact = hasFact && body.factSheet.length >= 5 && body.dirItems.length === 0 && !hasComp
+
+    // Imagen: preferir el hint del LLM (image_wide/interior/object) sobre el índice cíclico
+    const hintImg  = body.imageHint ? (imgByName[body.imageHint] ?? null) : null
+    const slideImg = hintImg || (validImgs.length > 0 ? validImgs[imgCursor % validImgs.length] : null)
+    if (!hintImg) imgCursor++
 
     const slide = pptx.addSlide()
     slide.background = { color: C.BG_SLIDE }
 
-    if (hasHero) {
-      renderHeroSlide(slide, sec.title, body, slideImg, C)
+    if (hasComp) {
+      renderComparisonSlide(slide, cleanTitle, body, slideImg, C)
+    } else if (isPureFact) {
+      renderFactSheetSlide(slide, cleanTitle, body, slideImg, C)
+    } else if (hasHero) {
+      renderHeroSlide(slide, cleanTitle, body, slideImg, C)
     } else if (hasFact) {
-      renderFactSheetSlide(slide, sec.title, body, slideImg, C)
+      renderFactSheetSlide(slide, cleanTitle, body, slideImg, C)
     } else {
-      renderContentSlide(slide, sec.title, body, slideImg, C)
+      renderContentSlide(slide, cleanTitle, body, slideImg, C)
     }
 
     // Barras amber encima de todo el contenido

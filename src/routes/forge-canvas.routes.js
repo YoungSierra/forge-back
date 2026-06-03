@@ -538,19 +538,42 @@ router.post('/nodes/:node_id/accept', async (req, res, next) => {
     )
 
     const imageAssets = pngOutputDefs.flatMap(outDef => {
-      const items = (outputImages[outDef.name] || []).filter(i => i.image_url)
-      return items.map(item => ({
-        node_id,
-        project_id,
-        session_id,
-        name:        `${node.title} — ${outDef.name}`,
-        format:      'png',
-        status:      'approved',
-        content:     null,
-        storage_url: item.image_url,
-        approved_by: member_id || null,
-        approved_at: new Date().toISOString(),
-      }))
+      const items = (outputImages[outDef.name] || [])
+      return items.flatMap(item => {
+        // Formato nuevo: variations[]
+        if (Array.isArray(item.variations)) {
+          return item.variations
+            .filter(v => v.url)
+            .map(v => ({
+              node_id,
+              project_id,
+              session_id,
+              name:        `${node.title} — ${outDef.name}`,
+              format:      'png',
+              status:      'approved',
+              content:     null,
+              storage_url: v.url,
+              approved_by: member_id || null,
+              approved_at: new Date().toISOString(),
+            }))
+        }
+        // Formato viejo: image_url
+        if (item.image_url) {
+          return [{
+            node_id,
+            project_id,
+            session_id,
+            name:        `${node.title} — ${outDef.name}`,
+            format:      'png',
+            status:      'approved',
+            content:     null,
+            storage_url: item.image_url,
+            approved_by: member_id || null,
+            approved_at: new Date().toISOString(),
+          }]
+        }
+        return []
+      })
     })
 
     if (imageAssets.length > 0) {
@@ -1239,6 +1262,42 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
               resolvedInputs.push(`### ${png.name} (generated image)\nURL: ${png.storage_url}`)
             }
           }
+
+          // Fallback: si no hay PNGs en forge_assets, leer output_images de la sesión aprobada
+          // (cubre casos donde el accept fue anterior al fix del formato variations[])
+          if ((pngAssets || []).length === 0) {
+            const { data: approvedSession } = await db()
+              .from('forge_sessions')
+              .select('output_images, forge_nodes(title, outputs)')
+              .eq('project_id', project_id)
+              .eq('node_id', sourcePNode.node_id)
+              .eq('status', 'approved')
+              .order('created_at', { ascending: false })
+              .limit(1)
+              .maybeSingle()
+
+            if (approvedSession?.output_images) {
+              const nodeTitle2  = approvedSession.forge_nodes?.title ?? nodeTitle ?? 'Node'
+              const pngOutputs  = (approvedSession.forge_nodes?.outputs || [])
+                .filter(o => (o.format === 'png' || o.format === 'image') && o.image_gen)
+              const raw = approvedSession.output_images
+
+              for (const outDef of pngOutputs) {
+                const items = Array.isArray(raw[outDef.name]) ? raw[outDef.name] : []
+                for (const item of items) {
+                  const urls = Array.isArray(item.variations)
+                    ? item.variations.map(v => v.url).filter(Boolean)
+                    : item.image_url ? [item.image_url] : []
+                  for (const url of urls) {
+                    if (!injectedPngUrls.has(url)) {
+                      injectedPngUrls.add(url)
+                      resolvedInputs.push(`### ${nodeTitle2} — ${outDef.name} (generated image)\nURL: ${url}`)
+                    }
+                  }
+                }
+              }
+            }
+          }
         }
       }
 
@@ -1344,6 +1403,8 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
     let   replyText       = ''
     let   allToolCalls    = []    // historial de calls para persistir
     let   meta            = null
+    let   docUrl          = null
+    let   docFormat       = null
 
     for (let iter = 0; iter < MAX_TOOL_ITERS; iter++) {
       const result = await callLLM(finalSystemPrompt, currentUserMsg, {
@@ -1361,9 +1422,21 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
 
       console.log(`[forge-chat] tool calls iter=${iter + 1}:`, calls.map(c => c.tool))
 
+      // Extraer URLs reales de imágenes del contexto (para resolver nombres en doc_gen_pptx)
+      const contextPngUrls = resolvedInputs
+        .filter(s => s.includes('(generated image)'))
+        .map(s => { const m = s.match(/URL:\s*(https?:\/\/\S+)/); return m ? m[1] : null })
+        .filter(Boolean)
+
       // Ejecutar cada tool y acumular resultados
       const toolResultParts = []
       for (const tc of calls) {
+        // Reemplazar nombres de imagen con URLs reales cuando el LLM pasa keys en vez de URLs
+        if (tc.tool === 'doc_gen_pptx' && Array.isArray(tc.args?.images) && contextPngUrls.length > 0) {
+          const hasNonUrls = tc.args.images.some(img => !img.startsWith('http'))
+          if (hasNonUrls) tc.args.images = contextPngUrls
+        }
+
         const toolResult = await executeTool(tc.tool, tc.args, { project_id, node_id })
         allToolCalls.push({ ...tc, result: toolResult })
 
@@ -1422,8 +1495,6 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
     replyText = normalizeOutputSections(replyText, outputDefs)
 
     // Si el nodo tiene doc_gen_docx y el LLM no la llamó por su cuenta, generar automáticamente
-    let docUrl    = null
-    let docFormat = null
     const hasDocTool   = activeTools.includes('doc_gen_docx')
     const alreadyCalled = allToolCalls.some(tc => tc.tool === 'doc_gen_docx')
 
