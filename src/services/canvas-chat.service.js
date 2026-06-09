@@ -100,7 +100,9 @@ async function buildSystemPrompt(db, { projectId, nodeId, sessionId, userMessage
     })
     .filter(Boolean).join('\n')
 
-  const outputNames = outputDefs.map(o => typeof o === 'object' ? o.name : o).filter(Boolean)
+  const outputNames  = outputDefs.map(o => typeof o === 'object' ? o.name : o).filter(Boolean)
+  // Si el nodo tiene tools, el output lo produce la tool call — no inyectar instrucción de formato markdown
+  const nodeHasTools = Array.isArray(node.tools) && node.tools.length > 0
 
   const FORMAT_HINTS = {
     structured:      'Output a FLAT numbered list ONLY — no subheadings, no category labels, no prose introduction. Each item MUST follow this exact format: `- Variation N: Name: brief description`',
@@ -111,7 +113,7 @@ async function buildSystemPrompt(db, { projectId, nodeId, sessionId, userMessage
     .filter(o => typeof o === 'object' && o.name && FORMAT_HINTS[o.format])
     .map(o => `- **${o.name}**: ${FORMAT_HINTS[o.format]}`)
 
-  const formatInstr = outputNames.length
+  const formatInstr = outputNames.length && !nodeHasTools
     ? `\n## Output format\nStructure your response in markdown. Each output must be its own section with the exact level-2 heading "## <output_name>". Required sections: ${outputNames.map(n => `"## ${n}"`).join(', ')}.${outputFormatLines.length ? '\n\nPer-section format requirements:\n' + outputFormatLines.join('\n') : ''}`
     : ''
 

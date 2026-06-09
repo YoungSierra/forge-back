@@ -198,7 +198,7 @@ router.get('/:id', async (req, res, next) => {
 router.post('/', async (req, res, next) => {
   try {
     const { name, member_id } = req.body
-    const actorId = member_id || TEST_MEMBER_ID
+    const actorId = member_id || req.headers['x-member-id'] || TEST_MEMBER_ID
 
     if (!name?.trim()) {
       return res.status(400).json({ success: false, error: 'name is required', code: 'VALIDATION_ERROR' })

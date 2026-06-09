@@ -1117,6 +1117,8 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
     // Incluir purpose + constraints + skills siempre (aunque haya default_prompt)
     const outputDefs    = Array.isArray(node.outputs) ? node.outputs : []
     const outputNames   = outputDefs.map(o => typeof o === 'object' ? o.name : o).filter(Boolean)
+    // Si el nodo tiene tools, el output lo produce la tool call — no inyectar instrucción de formato markdown
+    const nodeHasTools  = Array.isArray(node.tools) && node.tools.length > 0
 
     // Instrucciones de formato por output según su campo "format"
     const FORMAT_HINTS = {
@@ -1128,7 +1130,7 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
       .filter(o => typeof o === 'object' && o.name && FORMAT_HINTS[o.format])
       .map(o => `- **${o.name}**: ${FORMAT_HINTS[o.format]}`)
 
-    const formatInstr   = outputNames.length
+    const formatInstr   = outputNames.length && !nodeHasTools
       ? `\n## Output format\nStructure your response in markdown. Each output must be its own section with the exact level-2 heading "## <output_name>". Required sections: ${outputNames.map(n => `"## ${n}"`).join(', ')}.${outputFormatLines.length ? '\n\nPer-section format requirements:\n' + outputFormatLines.join('\n') : ''}`
       : ''
 

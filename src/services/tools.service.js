@@ -32,11 +32,11 @@ const TOOL_SCHEMAS = {
     },
   },
   doc_gen_pptx: {
-    description: 'Generate and export a PowerPoint presentation deck following the V57 cinematic template structure. Returns a download URL. IMPORTANT: Use the labeled field format from the skill template — each ## slide section must use the exact field labels (Eyebrow:, Title:, Tagline:, GENRE:, PLATFORM:, etc.) so the renderer can apply the correct layout per slide. Do NOT flatten the template fields into plain prose.',
+    description: 'Generate and export a PowerPoint presentation deck from a JSON deck object following the v57_cinematic_deck_template schema. Returns a download URL. The renderer applies layout automatically based on each slide\'s "type" field.',
     args: {
-      title:   'string — presentation title (format: "Document Type — Project Name")',
-      content: 'string — slide content following the v57_cinematic_deck_template field structure: ## Slide N — Name, then labeled fields as bullets (- Eyebrow: ..., - Title: ..., - Tagline: ..., - GENRE: ..., etc.)',
-      images:  'array (optional) — image URLs to embed in slides, referenced by index position',
+      title:   'string — the game title (used as filename)',
+      content: 'object — the complete deck as a JSON object (NOT a string). Must have "meta" and "slides" keys following v57_cinematic_deck_template schema. Pass the object directly, do not serialize it to a string.',
+      images:  'array — image URLs from Art Direction node in exact order: [image_wide_url, image_interior_url, image_object_url]. Extract these from the ## Input references section.',
     },
   },
   kb_read: {
@@ -77,17 +77,21 @@ function getToolsBlock(tools) {
 // Busca todos los <tool_call>JSON</tool_call> en la respuesta del LLM
 function parseToolCalls(text) {
   if (!text || typeof text !== 'string') return []
+  const { jsonrepair } = require('jsonrepair')
   const results = []
   const regex = /<tool_call>([\s\S]*?)<\/tool_call>/g
   let match
   while ((match = regex.exec(text)) !== null) {
+    const src = match[1].trim()
+    let parsed = null
     try {
-      const parsed = JSON.parse(match[1].trim())
-      if (parsed.tool && typeof parsed.tool === 'string') {
-        results.push({ tool: parsed.tool, args: parsed.args || {} })
-      }
+      parsed = JSON.parse(src)
     } catch {
-      // Ignorar tool calls malformados
+      // JSON malformado — intentar reparar antes de descartar
+      try { parsed = JSON.parse(jsonrepair(src)) } catch {}
+    }
+    if (parsed?.tool && typeof parsed.tool === 'string') {
+      results.push({ tool: parsed.tool, args: parsed.args || {} })
     }
   }
   return results
@@ -913,9 +917,494 @@ function renderContentSlide(slide, sectionTitle, body, img, C) {
   }
 }
 
+// ─── PPTX Cinematic Renderer (JSON schema v2) ────────────────────────────────
+
+async function docGenPptxCinematic(deck, imageUrls, projectId) {
+  const PptxGenJS = require('pptxgenjs')
+  const https     = require('https')
+  const http      = require('http')
+  const fs        = require('fs')
+  const pathMod   = require('path')
+  const os        = require('os')
+
+  const P = deck.meta?.palette || {}
+  const C = {
+    BG:      (P.bg      || '0A0D0A').replace('#', ''),
+    SURFACE: (P.surface || '141814').replace('#', ''),
+    CARD:    (P.card    || '1E241E').replace('#', ''),
+    ACCENT:  (P.accent  || 'F5A623').replace('#', ''),
+    WHITE:   'FFFFFF',
+    LIGHT:   'D1D5DB',
+    MUTED:   '6B7280',
+    DIM:     '2D3530',
+  }
+
+  const W = 13.33, H = 7.5, M = 0.65
+  const TITLE = 'Arial', MONO = 'Consolas', BODY = 'Calibri'
+  const gameTitle = (deck.meta?.game_title || 'UNTITLED').toUpperCase()
+
+  // Descarga una URL a un archivo temporal, siguiendo redirects hasta 5 saltos
+  function downloadToFile(srcUrl, destPath, hops) {
+    if (hops > 5) return Promise.reject(new Error('too many redirects'))
+    return new Promise((resolve, reject) => {
+      const lib = srcUrl.startsWith('https') ? https : http
+      const req = lib.get(srcUrl, { headers: { 'User-Agent': 'Mozilla/5.0' } }, res => {
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+          res.resume()
+          return resolve(downloadToFile(res.headers.location, destPath, hops + 1))
+        }
+        if (res.statusCode !== 200) {
+          res.resume()
+          return reject(new Error(`HTTP ${res.statusCode}`))
+        }
+        const file = fs.createWriteStream(destPath)
+        res.pipe(file)
+        file.on('error', err => { fs.unlink(destPath, () => {}); reject(err) })
+        file.on('close', resolve)
+      })
+      req.on('error', e => { fs.unlink(destPath, () => {}); reject(e) })
+    })
+  }
+
+  // Descargar imágenes a archivos temporales
+  const images = {}
+  const imgKeys = ['image_wide', 'image_interior', 'image_object']
+  for (let i = 0; i < imgKeys.length; i++) {
+    const url = (imageUrls || [])[i]
+    if (!url) continue
+    const key = imgKeys[i]
+    const tmpPath = pathMod.join(os.tmpdir(), `forge_deck_${Date.now()}_${key}.png`)
+    try {
+      await downloadToFile(url, tmpPath, 0)
+      images[key] = tmpPath
+    } catch (e) {
+      console.warn(`[deck] ${key} no descargada:`, e.message)
+    }
+  }
+
+  // ── Helpers ──────────────────────────────────────────────────────────────────
+
+  function txt(sl, text, x, y, w, h, opts = {}) {
+    const { size = 18, color = C.LIGHT, bold = false, italic = false,
+            align = 'left', font = BODY } = opts
+    const lines = String(text).split('\n')
+    const arr   = lines.map((line, i) => ({
+      text:    line,
+      options: i < lines.length - 1 ? { breakLine: true } : {},
+    }))
+    sl.addText(arr, { x, y, w, h, fontSize: size, color, bold, italic,
+                      fontFace: font, align, valign: 'top', wrap: true, isTextBox: true })
+  }
+
+  function rct(sl, prs, x, y, w, h, opts = {}) {
+    const { fill, line, lineW = 0.5, alpha } = opts
+    const o = { x, y, w, h }
+    o.fill = fill
+      ? (alpha !== undefined
+          ? { type: 'solid', color: fill, transparency: 100 - alpha }
+          : { type: 'solid', color: fill })
+      : { type: 'none' }
+    o.line = line ? { color: line, width: lineW } : { type: 'none' }
+    sl.addShape(prs.ShapeType.rect, o)
+  }
+
+  function imgEl(sl, localPath, x, y, w, h) {
+    sl.addImage({ path: localPath, x, y, w, h })
+  }
+
+  function overlay(sl, prs, x, y, w, h, alpha = 55) {
+    rct(sl, prs, x, y, w, h, { fill: C.BG, alpha })
+  }
+
+  function brackets(sl, prs) {
+    const s = 0.28, t = 0.022, p = 0.20
+    ;[
+      [[p, p, s, t], [p, p, t, s]],
+      [[W-p-s, p, s, t], [W-p-t, p, t, s]],
+      [[p, H-p-t, s, t], [p, H-p-s, t, s]],
+      [[W-p-s, H-p-t, s, t], [W-p-t, H-p-s, t, s]],
+    ].forEach(c => c.forEach(([x, y, w, h]) => rct(sl, prs, x, y, w, h, { fill: C.ACCENT })))
+  }
+
+  function chrome(sl, prs, section, page) {
+    txt(sl, `${gameTitle}  //  ${section}`, M, 0.12, 10, 0.28,  { size: 9, color: C.MUTED, font: MONO })
+    // right edge en 12.65 para no solaparse con el bracket vertical (x=13.11)
+    txt(sl, `${String(page).padStart(2, '0')} / 12`, 11.5, 0.12, 1.15, 0.28, { size: 9, color: C.MUTED, font: MONO, align: 'right' })
+    txt(sl, `${deck.meta?.studio || ''}  ·  CONFIDENTIAL`, M, H-0.38, 7, 0.26, { size: 8, color: C.MUTED, font: MONO })
+    txt(sl, gameTitle, 10.3, H-0.38, 2.35, 0.26, { size: 8, color: C.MUTED, font: MONO, align: 'right' })
+  }
+
+  function eb(sl, text, x, y, w = 11) {
+    txt(sl, `// ${text}`, x, y, w, 0.35, { size: 11, color: C.ACCENT, font: MONO })
+  }
+
+  function rule(sl, prs, x, y, w) {
+    rct(sl, prs, x, y, w, 0.012, { fill: C.DIM })
+  }
+
+  // ── Slide renderers ───────────────────────────────────────────────────────────
+
+  function renderCover(prs, sl, s) {
+    sl.background = { color: C.BG }
+    if (images.image_wide) imgEl(sl, images.image_wide, 0, 0, W, H)
+    overlay(sl, prs, 0, 0, W, H, 55)
+    brackets(sl, prs)
+
+    eb(sl, s.eyebrow || 'PITCH OVERVIEW', M, 0.18)
+    txt(sl, s.title || gameTitle, M, 0.62, W-2*M, 1.55,
+        { size: 76, color: C.WHITE, bold: true, font: TITLE })
+    if (s.tagline) {
+      txt(sl, s.tagline, M, 2.28, W-2*M, 0.88, { size: 20, color: C.LIGHT, font: BODY })
+    }
+    if (s.tags?.length) {
+      txt(sl, s.tags.join('  ◆  '), M, 3.28, W-2*M, 0.35, { size: 10, color: C.ACCENT, font: MONO })
+    }
+    if (s.footer) {
+      txt(sl, s.footer, M, H-0.62, W-2*M, 0.28, { size: 9, color: C.MUTED, font: MONO })
+    }
+    txt(sl, '01 / 12', 11.5, H-0.38, 1.15, 0.28, { size: 9, color: C.MUTED, font: MONO, align: 'right' })
+  }
+
+  function renderOneLiner(prs, sl, s, page) {
+    sl.background = { color: C.BG }
+    brackets(sl, prs)
+    chrome(sl, prs, s.section || 'THE CONCEPT', page)
+    eb(sl, s.eyebrow || 'ONE-LINER', M, 0.95)
+    txt(sl, `"${s.quote}"`, M, 1.52, W-2*M, 3.45,
+        { size: 44, color: C.WHITE, bold: true, font: TITLE })
+    if (s.subtitle) {
+      txt(sl, s.subtitle, M, 5.15, W-2*M, 0.82, { size: 18, color: C.MUTED, font: BODY })
+    }
+  }
+
+  function renderFactSheet(prs, sl, s, page) {
+    sl.background = { color: C.BG }
+    brackets(sl, prs)
+    chrome(sl, prs, s.section || 'FACT SHEET', page)
+    eb(sl, s.eyebrow || 'FACT SHEET', M, 0.95)
+    txt(sl, s.title || 'Fact Sheet.', M, 1.32, W-2*M, 0.6,
+        { size: 26, color: C.WHITE, bold: true, font: TITLE })
+    rule(sl, prs, M, 2.0, W-2*M)
+
+    const rowH = 0.52
+    const lw   = 3.2
+    const rw   = W - 2*M - lw - 0.3
+    ;(s.rows || []).forEach((row, i) => {
+      const y = 2.1 + i * rowH
+      rct(sl, prs, M, y, W-2*M, rowH, { fill: i % 2 === 0 ? C.SURFACE : C.BG })
+      txt(sl, row.label, M+0.14, y+0.1, lw, 0.3,
+          { size: 9, color: C.ACCENT, font: MONO, bold: true })
+      txt(sl, row.value, M+lw+0.3, y+0.1, rw, 0.3,
+          { size: 13, color: C.LIGHT, font: BODY })
+      rct(sl, prs, M, y+rowH, W-2*M, 0.01, { fill: C.DIM })
+    })
+  }
+
+  function renderSetting(prs, sl, s, page) {
+    sl.background = { color: C.BG }
+    brackets(sl, prs)
+    chrome(sl, prs, s.section || 'SETTING', page)
+    eb(sl, s.eyebrow || 'SETTING', M, 0.95)
+    txt(sl, s.title || '', M, 1.35, W-2*M, 0.85,
+        { size: 32, color: C.WHITE, bold: true, font: TITLE })
+    rule(sl, prs, M, 2.28, W-2*M)
+
+    let y = 2.42
+    ;(s.paragraphs || []).forEach(para => {
+      txt(sl, para, M, y, W-2*M, 1.1, { size: 15, color: C.LIGHT, font: BODY })
+      y += 1.05
+    })
+    if (s.kicker) {
+      txt(sl, s.kicker, M, H-0.72, W-2*M, 0.32, { size: 10, color: C.ACCENT, font: MONO, bold: true })
+    }
+  }
+
+  function renderStatement(prs, sl, s, page) {
+    sl.background = { color: C.BG }
+    brackets(sl, prs)
+    chrome(sl, prs, s.section || 'CORE FANTASY', page)
+    eb(sl, s.eyebrow || 'CORE FANTASY', M, 0.95)
+    if (s.not_this) {
+      txt(sl, s.not_this, M, 1.55, W-2*M, 0.72,
+          { size: 24, color: C.MUTED, font: TITLE, bold: true })
+    }
+    rule(sl, prs, M, 2.45, W-2*M)
+    txt(sl, s.claim || '', M, 2.6, W-2*M, 2.0,
+        { size: 40, color: C.WHITE, bold: true, font: TITLE })
+    if (s.support) {
+      txt(sl, s.support, M, 4.75, W-2*M, 0.65, { size: 18, color: C.MUTED, font: BODY })
+    }
+  }
+
+  function renderLoop(prs, sl, s, page) {
+    sl.background = { color: C.BG }
+    brackets(sl, prs)
+    chrome(sl, prs, s.section || 'CORE LOOP', page)
+    eb(sl, s.eyebrow || 'CORE LOOP', M, 0.95)
+    txt(sl, s.title || '', M, 1.35, W-2*M, 0.82,
+        { size: 28, color: C.WHITE, bold: true, font: TITLE })
+
+    const beats  = s.beats || []
+    const n      = beats.length
+    const arrW   = 0.18
+    const cw     = (W - 2*M - (n-1)*arrW) / n
+    const ch     = 3.05, cy = 2.52
+
+    beats.forEach((beat, i) => {
+      const x    = M + i*(cw + arrW)
+      const bNum = beat.num ?? String(i+1).padStart(2, '0')
+      rct(sl, prs, x, cy, cw, ch, { fill: C.CARD, line: C.DIM })
+      txt(sl, `${bNum} · ${beat.label}`, x+0.14, cy+0.14, cw-0.28, 0.32,
+          { size: 9, color: C.ACCENT, font: MONO, bold: true })
+      rule(sl, prs, x+0.14, cy+0.54, cw-0.28)
+      txt(sl, beat.title, x+0.14, cy+0.62, cw-0.28, 0.6,
+          { size: 13, color: C.WHITE, bold: true, font: BODY })
+      txt(sl, beat.body,  x+0.14, cy+1.32, cw-0.28, 1.55,
+          { size: 12, color: C.LIGHT, font: BODY })
+      if (i < n-1) {
+        txt(sl, '→', x+cw+0.02, cy+1.2, arrW, 0.45, { size: 12, color: C.ACCENT, align: 'center' })
+      }
+    })
+    if (s.closing) {
+      txt(sl, s.closing, M, H-0.55, W-2*M, 0.28, { size: 8, color: C.MUTED, font: MONO })
+    }
+  }
+
+  function renderPillars(prs, sl, s, page) {
+    sl.background = { color: C.BG }
+    brackets(sl, prs)
+    chrome(sl, prs, s.section || 'DESIGN PILLARS', page)
+    eb(sl, s.eyebrow || 'THREE SIGNATURE MECHANICS', M, 0.95)
+    txt(sl, s.title || '', M, 1.35, W-2*M, 0.82,
+        { size: 28, color: C.WHITE, bold: true, font: TITLE })
+
+    const pillars = s.pillars || []
+    const colW    = (W - 2*M) / 3 - 0.06
+    const ch      = 3.65, cy = 2.5
+    pillars.forEach((p, i) => {
+      const x    = M + i * ((W - 2*M) / 3)
+      const pNum = p.num ?? String(i+1).padStart(2, '0')
+      rct(sl, prs, x, cy, colW, ch, { fill: C.CARD, line: C.DIM })
+      txt(sl, pNum, x+0.22, cy+0.22, 0.45, 0.4,
+          { size: 13, color: C.ACCENT, font: MONO, bold: true })
+      txt(sl, p.name, x+0.22, cy+0.7,  colW-0.44, 0.95,
+          { size: 18, color: C.WHITE, bold: true, font: BODY })
+      txt(sl, p.body, x+0.22, cy+1.75, colW-0.44, 1.9,
+          { size: 13, color: C.LIGHT, font: BODY })
+    })
+  }
+
+  function renderCatalog(prs, sl, s, page) {
+    sl.background = { color: C.BG }
+    brackets(sl, prs)
+    chrome(sl, prs, s.section || 'CONTENT CATALOG', page)
+    eb(sl, s.eyebrow || 'CONTENT', M, 0.95)
+    txt(sl, s.title || '', M, 1.35, W-2*M, 0.90,
+        { size: 26, color: C.WHITE, bold: true, font: TITLE })
+    if (s.subtitle) {
+      txt(sl, s.subtitle, M, 2.38, W-2*M, 0.36, { size: 13, color: C.MUTED, font: BODY })
+    }
+
+    const items = s.items || []
+    const cols  = 3
+    const colW  = (W - 2*M) / cols - 0.06
+    const rowH  = items.length > 3 ? 1.82 : 3.2
+    const startY = 2.82
+
+    items.forEach((item, i) => {
+      const row = Math.floor(i / cols)
+      const col = i % cols
+      const x   = M + col * ((W - 2*M) / cols)
+      const y   = startY + row * (rowH + 0.12)
+      rct(sl, prs, x, y, colW, rowH, { fill: C.CARD, line: C.DIM })
+      txt(sl, item.tag,  x+0.16, y+0.14, colW-0.32, 0.28,
+          { size: 9, color: C.ACCENT, font: MONO, bold: true })
+      txt(sl, item.name, x+0.16, y+0.46, colW-0.32, 0.5,
+          { size: 15, color: C.WHITE, bold: true, font: BODY })
+      txt(sl, item.sub,  x+0.16, y+1.02, colW-0.32, rowH-1.15,
+          { size: 12, color: C.LIGHT, font: BODY })
+    })
+    if (s.footnote) {
+      txt(sl, s.footnote, M, H-0.55, W-2*M, 0.28, { size: 8, color: C.MUTED, font: MONO })
+    }
+  }
+
+  function renderDirection(prs, sl, s, page) {
+    sl.background = { color: C.BG }
+    if (images.image_interior) {
+      imgEl(sl, images.image_interior, 0, 0.52, 6.2, H-0.52)
+    } else {
+      rct(sl, prs, 0, 0.52, 6.2, H-0.52, { fill: C.SURFACE, line: C.DIM })
+    }
+    brackets(sl, prs)
+    chrome(sl, prs, s.section || 'DIRECTION', page)
+
+    const rx = 6.55, rw = W - rx - M
+    eb(sl, s.eyebrow || 'ART & AUDIO DIRECTION', rx, 0.95)
+
+    txt(sl, '// VISUAL', rx, 1.55, rw, 0.28, { size: 9, color: C.ACCENT, font: MONO, bold: true })
+    txt(sl, s.visual?.headline || '', rx, 1.85, rw, 0.48,
+        { size: 16, color: C.WHITE, bold: true, font: BODY })
+    txt(sl, s.visual?.body || '', rx, 2.38, rw, 1.08, { size: 13, color: C.LIGHT, font: BODY })
+    rule(sl, prs, rx, 3.52, rw)
+
+    txt(sl, '// AUDIO', rx, 3.65, rw, 0.28, { size: 9, color: C.ACCENT, font: MONO, bold: true })
+    txt(sl, s.audio?.headline || '', rx, 3.95, rw, 0.48,
+        { size: 16, color: C.WHITE, bold: true, font: BODY })
+    txt(sl, s.audio?.body || '', rx, 4.48, rw, 1.5, { size: 13, color: C.LIGHT, font: BODY })
+  }
+
+  function renderWowMoment(prs, sl, s, page) {
+    sl.background = { color: C.BG }
+    brackets(sl, prs)
+    chrome(sl, prs, s.section || 'NARRATIVE HOOK', page)
+    eb(sl, s.eyebrow || 'THE WOW MOMENT', M, 0.95)
+
+    const lineColors   = [C.MUTED, C.LIGHT, C.WHITE]
+    const lineSizes    = [24, 30, 38]
+    const lineHeights  = [0.82, 1.08, 1.40]
+    const lineAdvances = [0.92, 1.20, 1.55]
+    let y = 1.72
+    ;(s.lines || []).forEach((line, i) => {
+      const sz = lineSizes[i] || 24
+      txt(sl, line, M, y, W-2*M, lineHeights[i] ?? 0.82,
+          { size: sz, color: lineColors[i] || C.WHITE, bold: i === 2, font: TITLE })
+      y += lineAdvances[i] ?? 0.92
+    })
+    if (s.support) {
+      txt(sl, s.support, M, y + 0.35, W-2*M, 0.55, { size: 16, color: C.MUTED, font: BODY })
+    }
+  }
+
+  function renderComparison(prs, sl, s, page) {
+    sl.background = { color: C.BG }
+    brackets(sl, prs)
+    chrome(sl, prs, s.section || 'DIFFERENTIATORS', page)
+    eb(sl, s.eyebrow || 'WHY THIS, WHY NOW', M, 0.95)
+    txt(sl, s.title || '', M, 1.35, W-2*M, 0.65,
+        { size: 26, color: C.WHITE, bold: true, font: TITLE })
+
+    const lw = 5.9, rw = 5.9, rx = 7.1
+    txt(sl, 'THE CATEGORY TODAY', M,  3.2, lw, 0.3, { size: 10, color: C.MUTED, font: MONO })
+    txt(sl, gameTitle,             rx, 3.2, rw, 0.3, { size: 10, color: C.ACCENT, font: MONO, bold: true })
+    rule(sl, prs, M, 3.52, W-2*M)
+
+    const rowH = 0.72
+    ;(s.rows || []).forEach((row, i) => {
+      const y   = 3.6 + i * rowH
+      const bgL = i % 2 === 0 ? C.SURFACE : C.BG
+      const bgR = i % 2 === 0 ? C.CARD    : C.SURFACE
+      rct(sl, prs, M,  y, lw, rowH-0.02, { fill: bgL, line: C.DIM })
+      rct(sl, prs, rx, y, rw, rowH-0.02, { fill: bgR, line: C.DIM })
+      txt(sl, row.left,                        M+0.14, y+0.1, lw-0.28, rowH-0.2, { size: 13, color: C.MUTED, font: BODY })
+      txt(sl, row.right, rx+0.14, y+0.1, rw-0.28, rowH-0.2, { size: 13, color: C.WHITE, font: BODY })
+    })
+  }
+
+  function renderClosing(prs, sl, s, page) {
+    sl.background = { color: C.BG }
+    if (images.image_wide) imgEl(sl, images.image_wide, 0, 0, W, H)
+    overlay(sl, prs, 0, 0, W, H, 60)
+    brackets(sl, prs)
+    chrome(sl, prs, s.section || 'THE OPPORTUNITY', page)
+    eb(sl, s.eyebrow || 'THE OPPORTUNITY', M, 0.95)
+
+    txt(sl, s.title || '', M, 1.48, W-2*M, 1.8, { size: 52, color: C.WHITE, bold: true, font: TITLE })
+    if (s.thesis) {
+      txt(sl, s.thesis, M, 3.42, W-2*M, 0.9, { size: 15, color: C.LIGHT, font: BODY })
+    }
+    rule(sl, prs, M, 4.42, W-2*M)
+
+    const stats = s.stats || []
+    const sw    = (W - 2*M) / (stats.length || 4)
+    stats.forEach((stat, i) => {
+      const sx = M + i * sw
+      txt(sl, stat.value, sx, 4.58, sw, 0.65, { size: 22, color: C.ACCENT, bold: true, font: TITLE, align: 'center' })
+      txt(sl, stat.label, sx, 5.28, sw, 0.3,  { size: 9,  color: C.MUTED,  font: MONO,  align: 'center' })
+    })
+    rule(sl, prs, M, 5.68, W-2*M)
+
+    const bw = 5.6, bh = 0.62, by = 5.82
+    rct(sl, prs, M,   by, bw, bh, { line: C.ACCENT, lineW: 1.2 })
+    if (s.next_step) {
+      txt(sl, `NEXT STEP  —  ${s.next_step.toUpperCase()}`, M+0.22, by+0.14, bw-0.44, 0.38,
+          { size: 12, color: C.ACCENT, font: MONO, bold: true })
+    }
+    rct(sl, prs, 7.4, by, bw, bh, { line: C.MUTED, lineW: 1.2 })
+    if (s.contact) {
+      txt(sl, `CONTACT  —  ${s.contact}`, 7.62, by+0.14, bw-0.44, 0.38,
+          { size: 12, color: C.MUTED, font: MONO })
+    }
+    txt(sl, 'THANK YOU  ◆  QUESTIONS WELCOME', M, H-0.42, W-2*M, 0.28,
+        { size: 9, color: C.MUTED, font: MONO, align: 'center' })
+  }
+
+  // ── Dispatch y render ─────────────────────────────────────────────────────────
+
+  const renderers = {
+    cover:      (prs, sl, s)     => renderCover(prs, sl, s),
+    one_liner:  (prs, sl, s, pg) => renderOneLiner(prs, sl, s, pg),
+    fact_sheet: (prs, sl, s, pg) => renderFactSheet(prs, sl, s, pg),
+    setting:    (prs, sl, s, pg) => renderSetting(prs, sl, s, pg),
+    statement:  (prs, sl, s, pg) => renderStatement(prs, sl, s, pg),
+    loop:       (prs, sl, s, pg) => renderLoop(prs, sl, s, pg),
+    pillars:    (prs, sl, s, pg) => renderPillars(prs, sl, s, pg),
+    catalog:    (prs, sl, s, pg) => renderCatalog(prs, sl, s, pg),
+    direction:  (prs, sl, s, pg) => renderDirection(prs, sl, s, pg),
+    wow_moment: (prs, sl, s, pg) => renderWowMoment(prs, sl, s, pg),
+    comparison: (prs, sl, s, pg) => renderComparison(prs, sl, s, pg),
+    closing:    (prs, sl, s, pg) => renderClosing(prs, sl, s, pg),
+  }
+
+  const prs = new PptxGenJS()
+  prs.layout = 'LAYOUT_WIDE'
+
+  ;(deck.slides || []).forEach((s, i) => {
+    const fn = renderers[s.type]
+    if (!fn) return
+    fn(prs, prs.addSlide(), s, i + 1)
+  })
+
+  const buffer      = await prs.write({ outputType: 'nodebuffer' })
+
+  for (const p of Object.values(images)) {
+    try { fs.unlinkSync(p) } catch {}
+  }
+  const slug        = Date.now()
+  const storagePath = `projects/${projectId}/tools/deck_${slug}.pptx`
+  const url         = await uploadToStorage(
+    buffer, storagePath,
+    'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  )
+  return { success: true, url, filename: `${deck.meta?.game_title || 'deck'}.pptx`, format: 'pptx' }
+}
+
 // ─── PPTX generator ──────────────────────────────────────────────────────────
 
 async function docGenPptx(title, content, images, projectId, nodeId) {
+  // Detectar JSON cinematic v2 — también maneja el caso en que el auto-trigger
+  // pasa replyText completo con <tool_call> adentro (parseToolCalls falló)
+  try {
+    const { jsonrepair } = require('jsonrepair')
+    let src  = typeof content === 'string' ? content : JSON.stringify(content)
+    let imgs = images || []
+
+    // Si el contenido es la respuesta cruda del LLM, extraer args del tool_call
+    const tcMatch = src.match(/<tool_call>([\s\S]*?)<\/tool_call>/)
+    if (tcMatch) {
+      try {
+        const tc = JSON.parse(jsonrepair(tcMatch[1].trim()))
+        if (tc?.args?.content) src = tc.args.content
+        if (!imgs.length && Array.isArray(tc?.args?.images)) imgs = tc.args.images
+      } catch {}
+    }
+
+    const deck = JSON.parse(src)
+    if (deck?.slides && Array.isArray(deck.slides) && deck.slides.length > 0) {
+      return docGenPptxCinematic(deck, imgs, projectId)
+    }
+  } catch {}
+
   const PptxGenJS = require('pptxgenjs')
   const pptx = new PptxGenJS()
   pptx.layout = 'LAYOUT_WIDE' // 13.33" × 7.5"
