@@ -1297,10 +1297,10 @@ router.get('/:id/members', async (req, res, next) => {
 router.post('/:id/members', async (req, res, next) => {
   try {
     const { id } = req.params
-    const { member_id, project_role = 'reviewer', discipline } = req.body
+    const { member_id, project_role = 'reviewer', discipline = 'design' } = req.body
 
-    if (!member_id || !discipline) {
-      return res.status(400).json({ success: false, error: 'member_id and discipline are required' })
+    if (!member_id) {
+      return res.status(400).json({ success: false, error: 'member_id is required' })
     }
 
     const { data, error } = await db()
