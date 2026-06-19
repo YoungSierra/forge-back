@@ -38,6 +38,7 @@ router.post('/', async (req, res, next) => {
     const {
       node_key, title, phase,
       purpose, inputs, outputs, constraints, tools, skills, default_prompt,
+      standalone_prompt, role,
     } = req.body
 
     if (!node_key || !title || !phase) {
@@ -48,13 +49,15 @@ router.post('/', async (req, res, next) => {
       .from('forge_nodes')
       .insert({
         node_key, title, phase,
-        purpose:        purpose        || '',
-        inputs:         inputs         || { required: [], optional: [], description: '' },
-        outputs:        outputs        || [],
-        constraints:    constraints    || '',
-        tools:          tools          || [],
-        skills:         skills         || [],
-        default_prompt: default_prompt || '',
+        purpose:           purpose           || '',
+        inputs:            inputs            || { wired: [], direct_context: '' },
+        outputs:           outputs           || [],
+        constraints:       constraints       || '',
+        tools:             tools             || [],
+        skills:            skills            || [],
+        default_prompt:    default_prompt    || '',
+        standalone_prompt: standalone_prompt || '',
+        role:              role              || 'standard',
         status: 'active',
       })
       .select()
@@ -69,9 +72,9 @@ router.post('/', async (req, res, next) => {
 router.patch('/:id', async (req, res, next) => {
   try {
     const allowed = [
-      'node_key', 'title', 'phase', 'status',
+      'node_key', 'title', 'phase', 'status', 'role',
       'purpose', 'inputs', 'outputs', 'constraints',
-      'tools', 'skills', 'default_prompt', 'executor',
+      'tools', 'skills', 'default_prompt', 'standalone_prompt', 'executor',
     ]
     const updates = {}
     for (const key of allowed) {

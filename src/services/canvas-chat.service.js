@@ -22,16 +22,29 @@ function injectSkillVars(template, vars) {
  * Construye el system prompt completo para un nodo dado.
  * Devuelve { finalSystemPrompt, baseUserMsg, executorStr, activeTools, outputDefs, resolvedInputs }
  */
-async function buildSystemPrompt(db, { projectId, nodeId, sessionId, userMessage, historyMsgs = [], attachmentParts = [] }) {
+async function buildSystemPrompt(db, { projectId, nodeId, sessionId, userMessage, historyMsgs = [], attachmentParts = [], targetOutputKey = null }) {
   const { getPrompt, getSkill } = require('./prompt.service')
 
   const { data: node } = await db()
     .from('forge_nodes')
-    .select('id, node_key, title, phase, purpose, inputs, outputs, constraints, tools, skills, default_prompt, executor')
+    .select('id, node_key, title, phase, purpose, inputs, outputs, constraints, tools, skills, default_prompt, standalone_prompt, role, executor')
     .eq('id', nodeId)
     .single()
 
   if (!node) throw new Error(`Node not found: ${nodeId}`)
+
+  // Normaliza outputs — soporta formato nuevo {key} y legado {name}
+  const normalizeOutput = o => ({ ...o, key: o.key || o.name, label: o.label || o.name || o.key })
+  const outputDefs = (Array.isArray(node.outputs) ? node.outputs : []).map(normalizeOutput)
+
+  // Output específico siendo trabajado (modo output enfocado)
+  const targetOutput = targetOutputKey
+    ? outputDefs.find(o => o.key === targetOutputKey) ?? null
+    : null
+
+  // Detecta si hay inputs wired disponibles para este nodo
+  const wiredInputDefs = Array.isArray(node.inputs?.wired) ? node.inputs.wired : []
+  const directContext  = node.inputs?.direct_context || ''
 
   const { data: project } = await db()
     .from('projects')
@@ -62,20 +75,31 @@ async function buildSystemPrompt(db, { projectId, nodeId, sessionId, userMessage
 
   const r2Prompt = node.default_prompt ? null : await getPrompt(node.node_key)
 
-  let layer1 = node.default_prompt
-    ? injectVars(node.default_prompt, templateVars)
-    : r2Prompt
-      ? injectVars(r2Prompt, templateVars)
-      : null
+  // Prompt base: v1.4.0 — nodo default_prompt como base compartida + output prompt encima
+  let basePrompt = null
+  if (targetOutput) {
+    const nodePart = node.default_prompt ? injectVars(node.default_prompt, templateVars) : null
+    const outPart  = targetOutput.prompt  ? injectVars(targetOutput.prompt,  templateVars) : null
+    basePrompt = [nodePart, outPart].filter(Boolean).join('\n\n')
+  } else if (node.default_prompt) {
+    basePrompt = injectVars(node.default_prompt, templateVars)
+  } else if (r2Prompt) {
+    basePrompt = injectVars(r2Prompt, templateVars)
+  }
 
-  const outputDefs = Array.isArray(node.outputs) ? node.outputs : []
+  // Qué outputs mostrar en el system prompt
+  const activeOutputDefs = targetOutput ? [targetOutput] : outputDefs
 
-  if (!layer1) {
-    const outputsBlock = outputDefs.length
-      ? outputDefs.map(o => {
-          const name   = typeof o === 'object' ? o.name   : o
-          const format = typeof o === 'object' ? o.format : null
-          const desc   = typeof o === 'object' ? o.description : null
+  let layer1 = null
+
+  if (basePrompt) {
+    layer1 = basePrompt
+  } else {
+    const outputsBlock = activeOutputDefs.length
+      ? activeOutputDefs.map(o => {
+          const name   = o.key || o.name || ''
+          const format = o.format || null
+          const desc   = o.description || null
           return `- **${name}**${format ? ` (${format})` : ''}${desc ? ` — ${desc}` : ''}`
         }).join('\n')
       : ''
@@ -90,6 +114,19 @@ async function buildSystemPrompt(db, { projectId, nodeId, sessionId, userMessage
     ].filter(Boolean).join('\n')
   }
 
+  // Modo standalone: no hay inputs wired definidos o el nodo lo requiere explícitamente
+  if (node.standalone_prompt) {
+    layer1 += `\n\n## Standalone mode\n${node.standalone_prompt}`
+    if (directContext) {
+      layer1 += `\n\nIf the user hasn't provided context yet, ask them: "${directContext}"`
+    }
+  }
+
+  // Modo output enfocado: indicar claramente qué output se está trabajando
+  if (targetOutput) {
+    layer1 += `\n\n## Current target output\nYou are working specifically on: **${targetOutput.label}** (${targetOutput.key}).\nFocus your response on producing this output. Other outputs of this node are available as context but are not the current target.`
+  }
+
   const skillDefs  = Array.isArray(node.skills) ? node.skills : []
   const skillTexts = await Promise.all(skillDefs.map(s => getSkill(s)))
   const skillsBlock = skillDefs
@@ -100,8 +137,7 @@ async function buildSystemPrompt(db, { projectId, nodeId, sessionId, userMessage
     })
     .filter(Boolean).join('\n')
 
-  const outputNames  = outputDefs.map(o => typeof o === 'object' ? o.name : o).filter(Boolean)
-  // Si el nodo tiene tools, el output lo produce la tool call — no inyectar instrucción de formato markdown
+  const outputNames  = activeOutputDefs.map(o => o.key || o.name).filter(Boolean)
   const nodeHasTools = Array.isArray(node.tools) && node.tools.length > 0
 
   const FORMAT_HINTS = {
@@ -109,9 +145,9 @@ async function buildSystemPrompt(db, { projectId, nodeId, sessionId, userMessage
     markdown_table:  'MUST be a markdown table with header row and `|---|` separator row.',
     single_sentence: 'Single sentence only — no markdown, no line breaks, no bullets.',
   }
-  const outputFormatLines = outputDefs
-    .filter(o => typeof o === 'object' && o.name && FORMAT_HINTS[o.format])
-    .map(o => `- **${o.name}**: ${FORMAT_HINTS[o.format]}`)
+  const outputFormatLines = activeOutputDefs
+    .filter(o => typeof o === 'object' && (o.key || o.name) && FORMAT_HINTS[o.format])
+    .map(o => `- **${o.key || o.name}**: ${FORMAT_HINTS[o.format]}`)
 
   const formatInstr = outputNames.length && !nodeHasTools
     ? `\n## Output format\nStructure your response in markdown. Each output must be its own section with the exact level-2 heading "## <output_name>". Required sections: ${outputNames.map(n => `"## ${n}"`).join(', ')}.${outputFormatLines.length ? '\n\nPer-section format requirements:\n' + outputFormatLines.join('\n') : ''}`
@@ -154,13 +190,27 @@ async function buildSystemPrompt(db, { projectId, nodeId, sessionId, userMessage
     try {
       const { data: edgeData } = await db()
         .from('forge_project_edges')
-        .select('source_node_id, source_handle')
+        .select('source_node_id, source_handle, target_handle')
         .eq('project_id', projectId)
         .eq('target_node_id', currentPNode.id)
       incomingEdges = edgeData || []
     } catch { /* tabla no migrada aún */ }
 
+    // v1.4.0: filtrar inputs por uses.inputs[] del output específico
+    const usesInputs = targetOutput?.uses?.inputs ?? null
+    if (usesInputs !== null) {
+      incomingEdges = incomingEdges.filter(edge => {
+        const inputKey = (edge.target_handle || '').replace(/^in-/, '')
+        return usesInputs.includes(inputKey)
+      })
+    }
+
+    const seenSourceNodeIds = new Set()
     for (const edge of incomingEdges) {
+      // Dedup: un solo entry por nodo upstream, sin importar cuántos edges vengan de él
+      if (seenSourceNodeIds.has(edge.source_node_id)) continue
+      seenSourceNodeIds.add(edge.source_node_id)
+
       const { data: sourcePNode } = await db()
         .from('forge_project_nodes')
         .select(`
@@ -262,9 +312,35 @@ async function buildSystemPrompt(db, { projectId, nodeId, sessionId, userMessage
   const llmVisibleTools  = activeTools.filter(t => t !== 'doc_gen_docx')
   const toolsBlock       = getToolsBlock(llmVisibleTools)
 
+  // Outputs existentes del mismo nodo como contexto (excluye el target actual)
+  const existingNodeOutputs = []
+  if (projectId && nodeId) {
+    const { data: nodeAssets } = await db()
+      .from('forge_assets')
+      .select('name, content, format')
+      .eq('project_id', projectId)
+      .eq('node_id', nodeId)
+      .in('status', ['approved', 'auto_approved'])
+      .neq('format', 'png')
+      .order('created_at', { ascending: false })
+
+    // v1.4.0: solo inyectar siblings declarados en uses.siblings_if_present[]
+    const siblingsAllowed = targetOutput?.uses?.siblings_if_present ?? null
+    for (const asset of (nodeAssets || [])) {
+      const assetKey = (asset.name || '').toLowerCase().replace(/\s+/g, '_')
+      if (targetOutputKey && assetKey === targetOutputKey) continue
+      if (siblingsAllowed !== null && !siblingsAllowed.includes(assetKey)) continue
+      if (asset.content) {
+        const snippet = asset.content.slice(0, 2000) + (asset.content.length > 2000 ? '\n[truncated]' : '')
+        existingNodeOutputs.push(`### ${asset.name} (this node — existing output)\n${snippet}`)
+      }
+    }
+  }
+
   const layer2Parts = [
-    projectMeta       ? `## Project context\n${projectMeta}`              : '',
-    resolvedInputs.length ? `## Input references\n${resolvedInputs.join('\n\n')}` : '',
+    projectMeta              ? `## Project context\n${projectMeta}`                                : '',
+    resolvedInputs.length    ? `## Input references\n${resolvedInputs.join('\n\n')}`               : '',
+    existingNodeOutputs.length ? `## Existing outputs from this node\n${existingNodeOutputs.join('\n\n')}` : '',
   ].filter(Boolean)
 
   const systemPrompt = [layer1, ...layer2Parts, toolsBlock].filter(Boolean).join('\n\n')
@@ -284,7 +360,7 @@ async function buildSystemPrompt(db, { projectId, nodeId, sessionId, userMessage
 
   const executorStr = node.executor?.model || process.env.DEFAULT_MODEL
 
-  return { finalSystemPrompt, baseUserMsg, executorStr, activeTools, outputDefs, resolvedInputs, node }
+  return { finalSystemPrompt, baseUserMsg, executorStr, activeTools, outputDefs, resolvedInputs, node, targetOutput }
 }
 
 /**

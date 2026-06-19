@@ -118,10 +118,11 @@ router.get('/', async (req, res, next) => {
         id, order_index, added_at,
         node_type, node_id, source_asset_id,
         text_label, text_content, is_stale,
-        blueprint_id,
+        blueprint_id, lane_id, bound_item_ref,
         forge_nodes (
           id, node_key, title, phase, purpose,
-          inputs, outputs, tools, skills, executor, status
+          inputs, outputs, tools, skills, executor, status, role,
+          default_prompt, standalone_prompt
         ),
         forge_project_library_assets (
           id, display_name, description, file_name, mime_type, file_size_bytes,
@@ -134,32 +135,61 @@ router.get('/', async (req, res, next) => {
 
     if (nodesError) throw nodesError
 
-    // Última sesión por nodo
+    // Sesiones por nodo: generales (output_key null) y por output específico
     const nodeIds = (projectNodes || []).filter(pn => pn.node_id).map(pn => pn.node_id)
-    let sessionsByNodeId = {}
+    let sessionsByNodeId = {}           // node_id → última sesión general
+    let outputSessionsByNodeId = {}     // node_id → { [output_key]: última sesión }
     let sessionsWithAgentMsg = new Set()
 
     if (nodeIds.length > 0) {
-      const { data: sessions, error: sessionsError } = await db()
-        .from('forge_sessions')
-        .select('id, node_id, status, iteration_count, started_at, completed_at, output_asset_id, output_images')
-        .eq('project_id', project_id)
-        .in('node_id', nodeIds)
-        .order('created_at', { ascending: false })
+      // Intenta con output_key; si falla (migración 027 pendiente) reintenta sin ella
+      let rawSessions = []
+      {
+        const { data, error } = await db()
+          .from('forge_sessions')
+          .select('id, node_id, output_key, status, iteration_count, started_at, completed_at, output_asset_id, output_images')
+          .eq('project_id', project_id)
+          .in('node_id', nodeIds)
+          .order('created_at', { ascending: false })
 
-      if (sessionsError) throw sessionsError
+        if (error) {
+          // Columna output_key no existe aún — fallback sin ella
+          const { data: data2, error: err2 } = await db()
+            .from('forge_sessions')
+            .select('id, node_id, status, iteration_count, started_at, completed_at, output_asset_id, output_images')
+            .eq('project_id', project_id)
+            .in('node_id', nodeIds)
+            .order('created_at', { ascending: false })
+          if (err2) throw err2
+          rawSessions = (data2 || []).map(s => ({ ...s, output_key: null }))
+        } else {
+          rawSessions = data || []
+        }
+      }
 
-      // Quedarse solo con la última sesión por nodo — migrar output_images al leer
-      for (const s of (sessions || [])) {
-        if (!sessionsByNodeId[s.node_id]) {
-          if (s.output_images) s.output_images = migrateOutputImages(s.output_images)
-          sessionsByNodeId[s.node_id] = s
+      for (const s of rawSessions) {
+        if (s.output_images) s.output_images = migrateOutputImages(s.output_images)
+        if (s.output_key) {
+          // Sesión específica de un output — una por output_key por nodo
+          if (!outputSessionsByNodeId[s.node_id]) outputSessionsByNodeId[s.node_id] = {}
+          if (!outputSessionsByNodeId[s.node_id][s.output_key]) {
+            outputSessionsByNodeId[s.node_id][s.output_key] = s
+          }
+        } else {
+          // Sesión general del nodo
+          if (!sessionsByNodeId[s.node_id]) sessionsByNodeId[s.node_id] = s
         }
       }
     }
 
+    // Todas las sesiones activas para detectar crash (sin asset, con mensajes de agente)
+    const allSessions = [
+      ...Object.values(sessionsByNodeId),
+      ...Object.values(outputSessionsByNodeId).flatMap(m => Object.values(m)),
+    ]
+
     // Detectar sesiones active sin asset pero con mensajes de agente (crash en run previo)
-    const activeSessIds = Object.values(sessionsByNodeId)
+    const activeSessIds = allSessions
       .filter(s => s.status === 'active' && !s.output_asset_id)
       .map(s => s.id)
     if (activeSessIds.length > 0) {
@@ -172,8 +202,8 @@ router.get('/', async (req, res, next) => {
       for (const m of (agentMsgs || [])) sessionsWithAgentMsg.add(m.session_id)
     }
 
-    // Cargar output assets de sesiones aprobadas o auto_approved (batch — evita N+1)
-    const outputAssetIds = Object.values(sessionsByNodeId)
+    // Cargar output assets de todas las sesiones aprobadas/auto_approved (batch — evita N+1)
+    const outputAssetIds = allSessions
       .filter(s => (s.status === 'approved' || s.status === 'auto_approved') && s.output_asset_id)
       .map(s => s.output_asset_id)
 
@@ -193,10 +223,21 @@ router.get('/', async (req, res, next) => {
       const session      = nodeType === 'forge_node' ? (sessionsByNodeId[pn.node_id] || null) : null
       const output_asset = session?.output_asset_id ? (outputAssetsMap[session.output_asset_id] ?? null) : null
       const has_content  = !!(output_asset || (session && sessionsWithAgentMsg.has(session.id)))
+
+      // Construir mapa de sesiones por output_key
+      const outputSessMap = nodeType === 'forge_node' ? (outputSessionsByNodeId[pn.node_id] ?? {}) : {}
+      const output_sessions = {}
+      for (const [ok, os] of Object.entries(outputSessMap)) {
+        const oa = os.output_asset_id ? (outputAssetsMap[os.output_asset_id] ?? null) : null
+        output_sessions[ok] = { ...os, output_asset: oa, has_content: !!(oa || sessionsWithAgentMsg.has(os.id)) }
+      }
+
       return {
         project_node_id: pn.id,
         order_index:     pn.order_index,
         blueprint_id:    pn.blueprint_id,
+        lane_id:         pn.lane_id         ?? null,
+        bound_item_ref:  pn.bound_item_ref  ?? null,
         node_type:       nodeType,
         node:            pn.forge_nodes || null,
         asset:           pn.forge_project_library_assets || null,
@@ -204,6 +245,7 @@ router.get('/', async (req, res, next) => {
         text_content:    pn.text_content ?? null,
         is_stale:        pn.is_stale ?? false,
         session:         session ? { ...session, output_asset, has_content } : null,
+        output_sessions,
       }
     })
 
@@ -243,10 +285,22 @@ router.get('/', async (req, res, next) => {
       .eq('id', project_id)
       .single()
 
+    // Lanes del proyecto (tabla puede no existir si la migración 029 no se corrió aún)
+    let lanes = []
+    try {
+      const { data: lanesData } = await db()
+        .from('forge_lanes')
+        .select('id, lane_key, label, color, bound_item_ref')
+        .eq('project_id', project_id)
+        .order('lane_key')
+      lanes = lanesData || []
+    } catch (e) { console.error('[forge-canvas] GET lanes failed (tabla puede no existir):', e.message) }
+
     res.json({
       success: true,
       nodes,
       edges,
+      lanes,
       canvas_layout: projectRow?.canvas_layout ?? null,
       active_blueprint: activeBlueprint
         ? { ...activeBlueprint.forge_blueprints, gate_decision: activeBlueprint.gate_decision ?? null }
@@ -324,7 +378,152 @@ router.post('/gate', async (req, res, next) => {
       return res.json({ success: true, decision, next_blueprint: null })
     }
 
-    // Nodos ya en el canvas para evitar duplicados
+    // ── Fan-out: detección type-driven (Instancing Brief v1.2) ──────────────────
+    // Busca Connection outputs tipo list<T> aprobados en el blueprint actual.
+    // Si el próximo blueprint tiene nodos con single<T> input → fan-out.
+    // Sin flags en blueprints ni nodos; todo se deriva de port cardinalities.
+    {
+      const { fanOut, classifySequenceNodes, parseItemsFromContent } = require('../services/fan-out.service')
+
+      const { data: bpNodes } = await db()
+        .from('forge_project_nodes')
+        .select('id, node_id')
+        .eq('project_id', project_id)
+        .eq('blueprint_id', blueprint_id)
+        .eq('removed', false)
+
+      const bpNodeIds = (bpNodes || []).map(n => n.node_id).filter(Boolean)
+
+      let fanOutItems       = null
+      let fanOutItemType    = null
+      let fanOutOutputKey   = null
+      let gateProjectNodeId = null
+
+      if (bpNodeIds.length > 0) {
+        // DNA de los nodos del blueprint actual — buscar Connection outputs list<T>
+        const { data: currentDna } = await db()
+          .from('forge_nodes')
+          .select('id, outputs')
+          .in('id', bpNodeIds)
+
+        const nextSeqNodeIds = (nextBp.node_sequence || []).map(s => s.node_id).filter(Boolean)
+
+        for (const node of (currentDna || [])) {
+          // Soporta formato v1.3.0 (array plano con type:'connection') y legacy (outputs.connections)
+          const rawOutputs = Array.isArray(node.outputs)
+            ? node.outputs
+            : Array.isArray(node.outputs?.connections) ? node.outputs.connections : []
+
+          const connOutputs = rawOutputs.filter(o =>
+            o.type === 'connection' || (typeof o.type === 'string' && o.type.startsWith('list<'))
+          )
+
+          for (const conn of connOutputs) {
+            // v1.3.0: T viene de format ("list<concept_seed>"); legacy: T venía de type
+            const T = conn.format?.match(/^list<(.+)>$/)?.[1]
+              ?? conn.type?.match(/^list<(.+)>$/)?.[1]
+            if (!T) continue
+
+            // v1.3.0 usa 'key'; legacy usaba 'name'
+            const connKey = conn.key ?? conn.name
+            if (!connKey) continue
+
+            // Verificar que el próximo blueprint tiene single<T> inputs
+            if (nextSeqNodeIds.length > 0) {
+              const { data: nextDna } = await db()
+                .from('forge_nodes')
+                .select('id, inputs')
+                .in('id', nextSeqNodeIds)
+
+              const hasSingleT = (nextDna || []).some(n => {
+                const ports = Array.isArray(n.inputs) ? n.inputs
+                  : Array.isArray(n.inputs?.wired) ? n.inputs.wired : []
+                return ports.some(p => p.cardinality === 'single' && p.type === T)
+              })
+              if (!hasSingleT) continue
+            }
+
+            // Buscar asset aprobado para este Connection output.
+            // Intento 1: sesión per-output (output_key = connKey)
+            // Intento 2: forge_asset por nombre — cubre sesiones generales
+            let outputAssetId = null
+
+            const { data: perOutputSess } = await db()
+              .from('forge_sessions')
+              .select('output_asset_id')
+              .eq('project_id', project_id)
+              .eq('node_id', node.id)
+              .eq('output_key', connKey)
+              .in('status', ['approved', 'auto_approved'])
+              .limit(1)
+              .maybeSingle()
+
+            if (perOutputSess?.output_asset_id) {
+              outputAssetId = perOutputSess.output_asset_id
+            } else {
+              // Intento 2: sesión general (output_key IS NULL) — contiene respuesta completa
+              // con la sección ## connKey embebida; extractSeedsFromAsset la extraerá
+              const { data: genSess } = await db()
+                .from('forge_sessions')
+                .select('output_asset_id')
+                .eq('project_id', project_id)
+                .eq('node_id', node.id)
+                .is('output_key', null)
+                .in('status', ['approved', 'auto_approved'])
+                .order('created_at', { ascending: false })
+                .limit(1)
+                .maybeSingle()
+              outputAssetId = genSess?.output_asset_id ?? null
+            }
+
+            if (!outputAssetId) continue
+
+            const { data: asset } = await db()
+              .from('forge_assets')
+              .select('content')
+              .eq('id', outputAssetId)
+              .single()
+
+            const items = parseItemsFromContent(asset?.content)
+            if (!items.length) continue
+
+            fanOutItems       = items
+            fanOutItemType    = T
+            fanOutOutputKey   = connKey
+            gateProjectNodeId = (bpNodes || []).find(n => n.node_id === node.id)?.id ?? null
+            break
+          }
+          if (fanOutItems) break
+        }
+      }
+
+      if (fanOutItems && gateProjectNodeId) {
+        const fanOutResult = await fanOut({
+          project_id,
+          gate_project_node_id: gateProjectNodeId,
+          gate_output_key:      fanOutOutputKey,
+          nextBlueprint:        nextBp,
+          items:                fanOutItems,
+          itemType:             fanOutItemType,
+          db,
+        })
+
+        await db()
+          .from('forge_project_blueprints')
+          .insert({ project_id, blueprint_id: nextBp.id, trigger: 'gate_fanout', loaded_by: member_id || null })
+
+        return res.json({
+          success:        true,
+          decision,
+          next_blueprint: { id: nextBp.id, name: nextBp.name, phase: nextPhase },
+          fan_out:        true,
+          lanes_created:  fanOutResult.lanes_created,
+        })
+      }
+      // Sin fan-out detectado — continuar con flujo normal
+    }
+
+    // ── Flujo normal (sin fan-out): cargar nodos del blueprint ────────────────
     const { data: existing } = await db()
       .from('forge_project_nodes')
       .select('node_id')
@@ -383,7 +582,7 @@ router.post('/load-blueprint', async (req, res, next) => {
     // Verificar que el blueprint existe
     const { data: blueprint, error: bpError } = await db()
       .from('forge_blueprints')
-      .select('id, node_sequence, name')
+      .select('id, node_sequence, edges, name')
       .eq('id', blueprint_id)
       .single()
 
@@ -437,16 +636,71 @@ router.post('/load-blueprint', async (req, res, next) => {
       .from('forge_project_blueprints')
       .insert({ project_id, blueprint_id, trigger, loaded_by: loaded_by || null })
 
-    // Auto-wiring: conectar inputs a outputs upstream automáticamente
+    // Crear edges desde blueprint.edges (from_node_id → to_node_id usando forge_node UUIDs)
+    // Traducir a source_node_id/target_node_id usando project_node UUIDs
+    let blueprintEdgesCreated = 0
+    const bpEdges = Array.isArray(blueprint.edges) ? blueprint.edges : []
+    if (bpEdges.length > 0) {
+      // Obtener todos los project_nodes actuales para construir el mapa node_id → project_node_id
+      const { data: allPNodes } = await db()
+        .from('forge_project_nodes')
+        .select('id, node_id')
+        .eq('project_id', project_id)
+        .eq('removed', false)
+
+      const nodeIdToProjectNodeId = {}
+      for (const pn of (allPNodes || [])) {
+        nodeIdToProjectNodeId[pn.node_id] = pn.id
+      }
+
+      // Edges ya existentes para evitar duplicados
+      const { data: existingEdges } = await db()
+        .from('forge_project_edges')
+        .select('source_node_id, target_node_id')
+        .eq('project_id', project_id)
+
+      const existingPairs = new Set(
+        (existingEdges || []).map(e => `${e.source_node_id}:${e.target_node_id}`)
+      )
+
+      const edgesToInsert = []
+      for (const edge of bpEdges) {
+        const srcPNodeId = nodeIdToProjectNodeId[edge.from_node_id]
+        const tgtPNodeId = nodeIdToProjectNodeId[edge.to_node_id]
+        if (!srcPNodeId || !tgtPNodeId) continue
+        const pair = `${srcPNodeId}:${tgtPNodeId}`
+        if (existingPairs.has(pair)) continue
+        edgesToInsert.push({
+          project_id,
+          source_node_id: srcPNodeId,
+          source_handle:  null,
+          target_node_id: tgtPNodeId,
+          target_handle:  null,
+          is_auto:        true,
+        })
+        existingPairs.add(pair)
+      }
+
+      if (edgesToInsert.length > 0) {
+        const { error: edgeErr } = await db()
+          .from('forge_project_edges')
+          .insert(edgesToInsert)
+        if (edgeErr) console.error('[load-blueprint] error creando blueprint edges:', edgeErr.message)
+        else blueprintEdgesCreated = edgesToInsert.length
+      }
+    }
+
+    // Auto-wiring adicional: conectar por tipo si hay wired ports compatibles
     let wiredCount = 0
     try { wiredCount = await autoWire(project_id, db) } catch (e) { console.error('[load-blueprint] auto-wire failed:', e.message) }
 
     res.json({
-      success:         true,
-      blueprint_name:  blueprint.name,
-      nodes_added:     toInsert.length,
-      nodes_skipped:   sequence.length - toInsert.length,
-      edges_wired:     wiredCount,
+      success:               true,
+      blueprint_name:        blueprint.name,
+      nodes_added:           toInsert.length,
+      nodes_skipped:         sequence.length - toInsert.length,
+      blueprint_edges_added: blueprintEdgesCreated,
+      edges_wired:           wiredCount,
     })
   } catch (err) { next(err) }
 })
@@ -493,6 +747,22 @@ router.post('/nodes/:node_id/accept', async (req, res, next) => {
       return res.status(404).json({ success: false, error: 'Node not found' })
     }
 
+    // Obtener output_key de la sesión para nombrar el asset correctamente
+    const { data: sessRow } = await db()
+      .from('forge_sessions')
+      .select('output_key')
+      .eq('id', session_id)
+      .maybeSingle()
+
+    // Si la sesión tiene output_key, usar el label del output DNA como nombre del asset
+    const outputKey = sessRow?.output_key ?? null
+    const outputDef = outputKey
+      ? (node.outputs || []).find(o => (o.key || o.name) === outputKey)
+      : null
+    const assetName = outputDef
+      ? `${node.title} — ${outputDef.label || outputDef.name || outputKey}`
+      : `${node.title} — Output`
+
     // Crear el forge_asset con el contenido de texto aceptado
     const { data: asset, error: assetErr } = await db()
       .from('forge_assets')
@@ -500,7 +770,7 @@ router.post('/nodes/:node_id/accept', async (req, res, next) => {
         node_id,
         project_id,
         session_id,
-        name:           `${node.title} — Output`,
+        name:           assetName,
         format:         doc_url ? (doc_format === 'pptx' ? 'pptx' : 'docx') : 'markdown',
         status:         'approved',
         content:        content.trim(),
@@ -607,7 +877,7 @@ router.post('/nodes/:node_id/sessions/:session_id/generate-item-image', async (r
       return res.status(404).json({ success: false, error: 'Node not found' })
     }
 
-    const outputDef = (node.outputs || []).find(o => o.name === output_key)
+    const outputDef = (node.outputs || []).find(o => (o.key || o.name) === output_key)
     if (!outputDef?.image_gen) {
       return res.status(400).json({ success: false, error: `Output "${output_key}" no tiene image_gen habilitado` })
     }
@@ -792,18 +1062,83 @@ router.post('/nodes/:node_id/generate-pdf', async (req, res, next) => {
 router.get('/nodes/:node_id/session', async (req, res, next) => {
   try {
     const { id: project_id, node_id } = req.params
+    const { output_key = null } = req.query
 
-    const { data: session, error: sessErr } = await db()
+    let baseQuery = db()
       .from('forge_sessions')
       .select('id, status, iteration_count, started_at, completed_at, output_asset_id, output_images')
       .eq('project_id', project_id)
       .eq('node_id', node_id)
       .order('created_at', { ascending: false })
       .limit(1)
-      .maybeSingle()
+
+    // Filtrar por output_key si la columna existe; si falla, cae al más reciente
+    let session = null
+    {
+      let q = baseQuery
+      if (output_key) q = q.eq('output_key', output_key)
+      else            q = q.is('output_key', null)
+      const { data, error: qErr } = await q.maybeSingle()
+      if (qErr) {
+        // Columna output_key no existe aún — buscar sin filtro
+        const { data: d2, error: sessErr } = await baseQuery.maybeSingle()
+        if (sessErr) throw sessErr
+        session = d2
+      } else {
+        session = data
+      }
+    }
+    const sessErr = null  // ya manejado arriba
 
     if (sessErr) throw sessErr
-    if (!session) return res.json({ success: true, session: null, messages: [] })
+
+    // Si no hay sesión general, buscar per-output sessions con imágenes o assets
+    if (!session) {
+      const { data: perOutSessions } = await db()
+        .from('forge_sessions')
+        .select('id, output_key, output_images, output_asset_id, status')
+        .eq('project_id', project_id)
+        .eq('node_id', node_id)
+        .not('output_key', 'is', null)
+        .order('created_at', { ascending: false })
+
+      if (!perOutSessions?.length) {
+        return res.json({ success: true, session: null, messages: [] })
+      }
+
+      // Merge de output_images de todas las per-output sessions
+      const allOutputImages = {}
+      for (const ps of perOutSessions) {
+        if (ps.output_images) {
+          Object.assign(allOutputImages, migrateOutputImages(ps.output_images))
+        }
+      }
+
+      // Cargar asset del primer output session aprobado que tenga uno
+      let perOutAsset = null
+      for (const ps of perOutSessions) {
+        if (ps.output_asset_id) {
+          const { data: aData } = await db()
+            .from('forge_assets')
+            .select('id, name, format, content, storage_url')
+            .eq('id', ps.output_asset_id)
+            .maybeSingle()
+          if (aData) { perOutAsset = aData; break }
+        }
+      }
+
+      const syntheticSession = Object.keys(allOutputImages).length
+        ? { output_images: allOutputImages }
+        : null
+
+      return res.json({
+        success:      true,
+        session:      syntheticSession,
+        messages:     [],
+        asset:        perOutAsset,
+        image_assets: [],
+      })
+    }
 
     const { data: msgs } = await db()
       .from('forge_messages')
@@ -856,8 +1191,9 @@ router.get('/nodes/:node_id/session', async (req, res, next) => {
       imageAssets = imgData || []
     }
 
-    // Fallback: si no hay asset, usar el último mensaje del agente (sesiones con bug de constraint)
-    if (!asset) {
+    // Fallback: si no hay asset pero la sesión estaba aprobada, reconstruir desde el último mensaje del agente
+    // Solo aplica a sesiones aprobadas — evita bloquear el botón Accept en sesiones activas
+    if (!asset && (session.status === 'approved' || session.status === 'auto_approved')) {
       const { data: lastAgentMsg } = await db()
         .from('forge_messages')
         .select('content')
@@ -883,6 +1219,22 @@ router.get('/nodes/:node_id/session', async (req, res, next) => {
       session.output_images = migrateOutputImages(session.output_images)
     }
 
+    // Merge de output_images de per-output sessions (si existen)
+    const { data: perOutForMerge } = await db()
+      .from('forge_sessions')
+      .select('output_images')
+      .eq('project_id', project_id)
+      .eq('node_id', node_id)
+      .not('output_key', 'is', null)
+
+    if (perOutForMerge?.length) {
+      const merged = { ...(session.output_images ?? {}) }
+      for (const ps of perOutForMerge) {
+        if (ps.output_images) Object.assign(merged, migrateOutputImages(ps.output_images))
+      }
+      session = { ...session, output_images: Object.keys(merged).length ? merged : session.output_images }
+    }
+
     res.json({ success: true, session, messages, asset, image_assets: imageAssets })
   } catch (err) { next(err) }
 })
@@ -903,7 +1255,7 @@ function extractSection(content, sectionName) {
 router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req, res, next) => {
   try {
     const { id: project_id, node_id } = req.params
-    const { user_message, session_id, member_id, attachment_url } = req.body
+    const { user_message, session_id, member_id, attachment_url, target_output_key = null, project_node_id: explicit_project_node_id = null } = req.body
 
     if (!user_message?.trim()) {
       return res.status(400).json({ success: false, error: 'user_message es requerido' })
@@ -912,13 +1264,19 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
     // Obtener definición del nodo para componer el prompt y resolver el modelo
     const { data: node, error: nodeErr } = await db()
       .from('forge_nodes')
-      .select('id, node_key, title, phase, purpose, inputs, outputs, constraints, tools, skills, default_prompt, executor')
+      .select('id, node_key, title, phase, purpose, inputs, outputs, constraints, tools, skills, default_prompt, standalone_prompt, role, executor')
       .eq('id', node_id)
       .single()
 
     if (nodeErr || !node) {
       return res.status(404).json({ success: false, error: 'Node not found' })
     }
+
+    // Normalizar outputs para soportar formato v1.3.0 (key/label) y legacy (name)
+    const normalizeOutput = o => ({ ...o, key: o.key || o.name, label: o.label || o.name || o.key })
+    const allOutputDefs = (Array.isArray(node.outputs) ? node.outputs : []).map(normalizeOutput)
+    const targetOutput  = target_output_key ? allOutputDefs.find(o => o.key === target_output_key) ?? null : null
+    const directContext = node.inputs?.direct_context || ''
 
     // Buscar o crear sesión activa
     let session = null
@@ -933,7 +1291,7 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
     }
 
     if (!session) {
-      const { data: existing } = await db()
+      let baseQ = db()
         .from('forge_sessions')
         .select('id, iteration_count')
         .eq('project_id', project_id)
@@ -941,24 +1299,56 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
         .eq('status', 'active')
         .order('created_at', { ascending: false })
         .limit(1)
-        .maybeSingle()
-      session = existing
+
+      // Si hay project_node_id explícito (instancia de lane), filtrar por él para
+      // diferenciar sesiones de 2.1-A vs 2.1-B (misma forge_node.id, distinto project_node)
+      if (explicit_project_node_id) {
+        baseQ = baseQ.eq('project_node_id', explicit_project_node_id)
+      }
+
+      // Sesión separada por output_key — null = sesión general del nodo
+      let lookupQ = baseQ
+      if (target_output_key) lookupQ = lookupQ.eq('output_key', target_output_key)
+      else                   lookupQ = lookupQ.is('output_key', null)
+
+      const { data: existing, error: lookupErr } = await lookupQ.maybeSingle()
+      if (lookupErr) {
+        // Columna output_key no existe aún — buscar sin filtro
+        const { data: d2 } = await baseQ.maybeSingle()
+        session = d2
+      } else {
+        session = existing
+      }
     }
 
     if (!session) {
-      const { data: created, error: createErr } = await db()
+      // Intentar insertar con output_key; si falla (columna no existe), insertar sin ella
+      const insertPayload = {
+        project_id,
+        node_id,
+        output_key:       target_output_key || null,
+        project_node_id:  explicit_project_node_id || null,
+        status:           'active',
+        iteration_count:  0,
+        started_at:       new Date().toISOString(),
+        triggered_by:     member_id || null,
+      }
+      let { data: created, error: createErr } = await db()
         .from('forge_sessions')
-        .insert({
-          project_id,
-          node_id,
-          status:          'active',
-          iteration_count: 0,
-          started_at:      new Date().toISOString(),
-          triggered_by:    member_id || null,
-        })
+        .insert(insertPayload)
         .select('id, iteration_count')
         .single()
-      if (createErr) throw createErr
+      if (createErr) {
+        // Columna output_key o project_node_id no existe — insertar sin ellas
+        const { output_key: _ok, project_node_id: _pnid, ...payloadWithoutKey } = insertPayload
+        const { data: c2, error: e2 } = await db()
+          .from('forge_sessions')
+          .insert(payloadWithoutKey)
+          .select('id, iteration_count')
+          .single()
+        if (e2) throw e2
+        created = c2
+      }
       session = created
     }
 
@@ -1072,24 +1462,25 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
       timeline:      project?.timeline         || null,
     }
 
-    // default_prompt del nodo primero; R2 solo como fallback si está vacío
-    const r2Prompt = node.default_prompt ? null : await getPrompt(node.node_key)
+    // Orden de preferencia: output.prompt > default_prompt > R2 fallback
+    const r2Prompt = (!node.default_prompt && !targetOutput?.prompt) ? await getPrompt(node.node_key) : null
 
-    let layer1 = node.default_prompt
-      ? injectVars(node.default_prompt, templateVars)
-      : r2Prompt
-        ? injectVars(r2Prompt, templateVars)
-        : null
+    let layer1 = targetOutput?.prompt
+      ? injectVars(targetOutput.prompt, templateVars)
+      : node.default_prompt
+        ? injectVars(node.default_prompt, templateVars)
+        : r2Prompt
+          ? injectVars(r2Prompt, templateVars)
+          : null
 
     if (!layer1) {
       // Componer desde DNA cuando no hay prompt explícito
-      const outputDefs = Array.isArray(node.outputs) ? node.outputs : []
-      const outputsBlock = outputDefs.length
-        ? outputDefs.map(o => {
-            const name   = typeof o === 'object' ? o.name   : o
-            const format = typeof o === 'object' ? o.format : null
-            const desc   = typeof o === 'object' ? o.description : null
-            return `- **${name}**${format ? ` (${format})` : ''}${desc ? ` — ${desc}` : ''}`
+      const outputsBlock = allOutputDefs.length
+        ? allOutputDefs.map(o => {
+            const label  = o.label || o.key
+            const format = o.format || null
+            const desc   = o.description || null
+            return `- **${label}**${format ? ` (${format})` : ''}${desc ? ` — ${desc}` : ''}`
           }).join('\n')
         : ''
 
@@ -1098,8 +1489,8 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
         `You are operating as the "${node.title}" node (phase: ${node.phase}).`,
         node.purpose     ? `\n## Purpose\n${node.purpose}`         : '',
         node.constraints ? `\n## Constraints\n${node.constraints}` : '',
-        outputsBlock     ? `\n## Outputs to produce\nProduce each output as a separate section using the exact heading "## <output_name>":\n${outputsBlock}` : '',
-        `\nFormat your response in markdown. Each output section must start with its exact name as a level-2 heading (## output_name).`,
+        outputsBlock     ? `\n## Outputs to produce\nProduce each output as a separate section using the exact heading "## <output_key>":\n${outputsBlock}` : '',
+        `\nFormat your response in markdown. Each output section must start with its exact key as a level-2 heading (## output_key).`,
       ].filter(Boolean).join('\n')
     }
 
@@ -1115,8 +1506,7 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
       .filter(Boolean).join('\n')
 
     // Incluir purpose + constraints + skills siempre (aunque haya default_prompt)
-    const outputDefs    = Array.isArray(node.outputs) ? node.outputs : []
-    const outputNames   = outputDefs.map(o => typeof o === 'object' ? o.name : o).filter(Boolean)
+    const outputNames   = allOutputDefs.map(o => o.key).filter(Boolean)
     // Si el nodo tiene tools, el output lo produce la tool call — no inyectar instrucción de formato markdown
     const nodeHasTools  = Array.isArray(node.tools) && node.tools.length > 0
 
@@ -1126,12 +1516,14 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
       markdown_table:  'MUST be a markdown table with header row and `|---|` separator row.\n  Example:\n  | Name | Score | Notes |\n  |------|-------|-------|\n  | Item A | 9/10 | reason |',
       single_sentence: 'Single sentence only — no markdown, no line breaks, no bullets.',
     }
-    const outputFormatLines = outputDefs
-      .filter(o => typeof o === 'object' && o.name && FORMAT_HINTS[o.format])
-      .map(o => `- **${o.name}**: ${FORMAT_HINTS[o.format]}`)
+    const outputFormatLines = allOutputDefs
+      .filter(o => o.key && FORMAT_HINTS[o.format])
+      .map(o => `- **${o.key}**: ${FORMAT_HINTS[o.format]}`)
 
-    const formatInstr   = outputNames.length && !nodeHasTools
-      ? `\n## Output format\nStructure your response in markdown. Each output must be its own section with the exact level-2 heading "## <output_name>". Required sections: ${outputNames.map(n => `"## ${n}"`).join(', ')}.${outputFormatLines.length ? '\n\nPer-section format requirements:\n' + outputFormatLines.join('\n') : ''}`
+    // En modo targetOutput solo pedir ese output específico
+    const visibleOutputNames = targetOutput ? [targetOutput.key] : outputNames
+    const formatInstr = visibleOutputNames.length && !nodeHasTools
+      ? `\n## Output format\nStructure your response in markdown. Each output must be its own section with the exact level-2 heading "## <output_key>". Required sections: ${visibleOutputNames.map(n => `"## ${n}"`).join(', ')}.${outputFormatLines.length && !targetOutput ? '\n\nPer-section format requirements:\n' + outputFormatLines.join('\n') : ''}`
       : ''
 
     const layer1Extras = [
@@ -1139,6 +1531,10 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
       node.constraints && !layer1.includes(node.constraints) ? `\n## Constraints\n${node.constraints}` : '',
       skillsBlock || '',
       formatInstr && !layer1.includes('## Output format')    ? formatInstr                              : '',
+      // Modo standalone: incluir prompt de contexto y pregunta directa si aplica
+      node.standalone_prompt ? `\n## Standalone mode\n${node.standalone_prompt}${directContext ? `\n\nIf the user hasn't provided context yet, ask them: "${directContext}"` : ''}` : '',
+      // Modo output-focused: restringir respuesta al output seleccionado
+      targetOutput ? `\n## Current target output\nYou are working specifically on: **${targetOutput.label}** (${targetOutput.key}).\nFocus your response on producing this output only — do not generate other outputs.` : '',
     ].filter(Boolean).join('\n')
 
     layer1 = layer1 + layer1Extras
@@ -1157,16 +1553,29 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
     ].filter(Boolean).join('\n')
 
     // Resolver inputs: edges (outputs de nodos upstream) + library assets asignados
-    const { data: currentPNode } = await db()
-      .from('forge_project_nodes')
-      .select('id')
-      .eq('project_id', project_id)
-      .eq('node_id', node_id)
-      .eq('removed', false)
-      .maybeSingle()
+    // Si se recibe explicit_project_node_id (instancia de lane), usar ese directamente
+    let currentPNode = null
+    if (explicit_project_node_id) {
+      const { data: pnDirect } = await db()
+        .from('forge_project_nodes')
+        .select('id, bound_item_ref')
+        .eq('id', explicit_project_node_id)
+        .maybeSingle()
+      currentPNode = pnDirect
+    } else {
+      const { data: pnByNode } = await db()
+        .from('forge_project_nodes')
+        .select('id, bound_item_ref')
+        .eq('project_id', project_id)
+        .eq('node_id', node_id)
+        .eq('removed', false)
+        .maybeSingle()
+      currentPNode = pnByNode
+    }
 
     let resolvedInputs = []
-    const injectedPngUrls = new Set() // evitar duplicados cuando hay múltiples edges del mismo nodo
+    const injectedPngUrls   = new Set() // evitar duplicados de PNG cuando hay múltiples edges del mismo nodo
+    const seenSourceNodeIds = new Set() // evitar inyectar el mismo nodo upstream dos veces (múltiples edges)
 
     if (currentPNode) {
       // 1. Outputs de nodos conectados por edge
@@ -1181,6 +1590,8 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
       } catch { /* tabla no migrada aún */ }
 
       for (const edge of incomingEdges) {
+        if (seenSourceNodeIds.has(edge.source_node_id)) continue
+        seenSourceNodeIds.add(edge.source_node_id)
         const { data: sourcePNode } = await db()
           .from('forge_project_nodes')
           .select(`
@@ -1326,9 +1737,42 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
       }
     }
 
+    // Inyectar bound_item_ref al inicio de inputs si el nodo es una instancia de lane
+    // bound_item_ref es JSONB — formatear a texto legible para el LLM
+    if (currentPNode?.bound_item_ref) {
+      const ref = currentPNode.bound_item_ref
+      const refText = (typeof ref === 'object' && ref !== null)
+        ? Object.entries(ref)
+            .filter(([, v]) => v !== null && v !== undefined && v !== '')
+            .map(([k, v]) => `**${k}:** ${v}`)
+            .join('\n')
+        : String(ref)
+      resolvedInputs.unshift(`### Bound item (this lane)\n${refText}`)
+    }
+
+    // Outputs existentes de este mismo nodo (para modo output-focused y standalone)
+    const existingNodeOutputs = []
+    if (allOutputDefs.length) {
+      const { data: siblingAssets } = await db()
+        .from('forge_assets')
+        .select('name, content')
+        .eq('project_id', project_id)
+        .eq('node_id', node_id)
+        .in('status', ['approved', 'auto_approved'])
+        .neq('format', 'png')
+        .order('created_at', { ascending: false })
+
+      for (const asset of (siblingAssets || [])) {
+        if (asset.name === target_output_key) continue  // excluir el output objetivo
+        const snippet = (asset.content || '').slice(0, 2000)
+        if (snippet) existingNodeOutputs.push(`### ${asset.name}\n${snippet}`)
+      }
+    }
+
     const layer2Parts = [
-      projectMeta      ? `## Project context\n${projectMeta}`              : '',
-      resolvedInputs.length ? `## Input references\n${resolvedInputs.join('\n\n')}` : '',
+      projectMeta             ? `## Project context\n${projectMeta}`                                    : '',
+      resolvedInputs.length   ? `## Input references\n${resolvedInputs.join('\n\n')}`                   : '',
+      existingNodeOutputs.length ? `## Existing outputs from this node\n${existingNodeOutputs.join('\n\n')}` : '',
     ].filter(Boolean)
 
     // ── Ensamblar system prompt ───────────────────────────────────
@@ -1387,7 +1831,7 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
     console.log('\n─── [forge-chat] LLM call ───────────────────────────')
     console.log(`  node:         ${node.node_key} — ${node.title}`)
     console.log(`  model:        ${executorStr}`)
-    console.log(`  prompt src:   ${node.default_prompt ? 'default_prompt' : r2Prompt ? 'R2' : 'DNA composed'}`)
+    console.log(`  prompt src:   ${targetOutput?.prompt ? `output:${targetOutput.key}` : node.default_prompt ? 'default_prompt' : r2Prompt ? 'R2' : 'DNA composed'}${targetOutput ? ` [target: ${targetOutput.key}]` : ''}`)
     console.log(`  project:      ${project?.name ?? '(sin nombre)'}`)
     console.log(`  tools:        ${toolsList ?? '(none)'}`)
     console.log(`  skills:       ${skillsList ?? '(none)'}`)
@@ -1494,7 +1938,7 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
     }
 
     // Normalizar secciones estructuradas — independiente de cómo las formateó el LLM
-    replyText = normalizeOutputSections(replyText, outputDefs)
+    replyText = normalizeOutputSections(replyText, allOutputDefs)
 
     // Si el nodo tiene doc_gen_docx y el LLM no la llamó por su cuenta, generar automáticamente
     const hasDocTool   = activeTools.includes('doc_gen_docx')
@@ -1505,14 +1949,14 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
         // Extraer solo la sección del output principal (format: document/pdf)
         // para no incluir outputs secundarios (light_pitches, etc.) en el PDF
         let docContent = replyText
-        const docOutputDef = outputDefs.find(o => {
+        const docOutputDef = allOutputDefs.find(o => {
           const fmt = typeof o === 'object' ? (o.format ?? '') : ''
           return ['document', 'pdf', 'doc'].includes(fmt.toLowerCase())
-        }) || outputDefs[0]
+        }) || allOutputDefs[0]
 
         if (docOutputDef) {
           const outName        = typeof docOutputDef === 'object' ? docOutputDef.name : docOutputDef
-          const secondaryDefs  = outputDefs.filter(o => o !== docOutputDef)
+          const secondaryDefs  = allOutputDefs.filter(o => o !== docOutputDef)
 
           // Estrategia: localizar dónde empieza la primera sección SECUNDARIA y cortar ahí.
           // Más robusto que extraer la primaria, porque el LLM suele renombrar su heading
@@ -1717,8 +2161,9 @@ router.post('/add-node', async (req, res, next) => {
       return res.status(400).json({ success: false, error: 'node_id es requerido' })
     }
 
-    // Si hay un blueprint activo, verificar si este nodo pertenece a él
+    // Buscar blueprint activo y su node_sequence — fuente de verdad para orden y membresía
     let activeBlueprintId = null
+    let blueprintSequence = []
     const { data: activeBp } = await db()
       .from('forge_project_blueprints')
       .select('blueprint_id')
@@ -1728,14 +2173,19 @@ router.post('/add-node', async (req, res, next) => {
       .maybeSingle()
 
     if (activeBp?.blueprint_id) {
-      const { data: bpNode } = await db()
-        .from('forge_blueprint_nodes')
-        .select('id')
-        .eq('blueprint_id', activeBp.blueprint_id)
-        .eq('node_id', node_id)
-        .maybeSingle()
-      if (bpNode) activeBlueprintId = activeBp.blueprint_id
+      const { data: bp } = await db()
+        .from('forge_blueprints')
+        .select('node_sequence')
+        .eq('id', activeBp.blueprint_id)
+        .single()
+      blueprintSequence = bp?.node_sequence || []
+      // El nodo pertenece al blueprint si está en node_sequence
+      if (blueprintSequence.some(s => s.node_id === node_id)) {
+        activeBlueprintId = activeBp.blueprint_id
+      }
     }
+
+    console.log('[add-node] node_id:', node_id, 'activeBlueprintId:', activeBlueprintId, 'seqLen:', blueprintSequence.length)
 
     // Verificar que no esté ya en canvas
     const { data: existing } = await db()
@@ -1767,7 +2217,41 @@ router.post('/add-node', async (req, res, next) => {
       .single()
 
     if (error) throw error
-    try { await autoWire(project_id, db) } catch (e) { console.error('[add-node] auto-wire failed:', e.message) }
+
+    // Re-numerar nodos del blueprint para que autoWire ubique correctamente el nodo re-agregado
+    if (activeBlueprintId && blueprintSequence.length > 0) {
+      const { data: bpProjectNodes } = await db()
+        .from('forge_project_nodes')
+        .select('id, node_id, order_index')
+        .eq('project_id', project_id)
+        .eq('blueprint_id', activeBlueprintId)
+        .or('removed.is.null,removed.eq.false')
+        .order('order_index', { ascending: true })
+
+      console.log('[add-node] bpProjectNodes:', JSON.stringify(bpProjectNodes?.map(n => ({ node_id: n.node_id, order_index: n.order_index }))))
+
+      if (bpProjectNodes && bpProjectNodes.length > 0) {
+        const baseIdx = bpProjectNodes[0].order_index
+        const seqMap = new Map(blueprintSequence.map((s, i) => [s.node_id, i]))
+        const sorted = [...bpProjectNodes].sort(
+          (a, b) => (seqMap.get(a.node_id) ?? 999) - (seqMap.get(b.node_id) ?? 999)
+        )
+        console.log('[add-node] re-indexing, sorted order:', sorted.map((n, i) => `${n.node_id}→${baseIdx + i}`))
+        for (let i = 0; i < sorted.length; i++) {
+          await db()
+            .from('forge_project_nodes')
+            .update({ order_index: baseIdx + i })
+            .eq('id', sorted[i].id)
+        }
+      }
+    }
+
+    // Limpiar edges auto-wired para recalcular óptimos con el nuevo nodo en el canvas
+    await db().from('forge_project_edges').delete().eq('project_id', project_id).eq('is_auto', true)
+    try {
+      const wired = await autoWire(project_id, db)
+      console.log('[add-node] autoWire created', wired, 'edges')
+    } catch (e) { console.error('[add-node] auto-wire failed:', e.message) }
     res.json({ success: true, project_node: data })
   } catch (err) { next(err) }
 })
@@ -1932,6 +2416,165 @@ router.get('/nodes/:project_node_id/inputs', async (req, res, next) => {
 
     if (error) throw error
     res.json({ success: true, inputs: data })
+  } catch (err) { next(err) }
+})
+
+// ─── GET /api/projects/:id/canvas/nodes/:project_node_id/context-inputs ──────
+// Devuelve los inputs resueltos de un nodo para el panel de contexto del chat.
+// Solo se llama para nodos gate — misma lógica de resolución que el chat, sin llamar al LLM.
+router.get('/nodes/:project_node_id/context-inputs', async (req, res, next) => {
+  try {
+    const { id: project_id, project_node_id } = req.params
+
+    const { data: pNode, error: pnErr } = await db()
+      .from('forge_project_nodes')
+      .select('id, bound_item_ref')
+      .eq('id', project_node_id)
+      .maybeSingle()
+    if (pnErr) throw pnErr
+    if (!pNode) return res.json({ success: true, inputs: [] })
+
+    const inputs = []
+    const injectedPngUrls = new Set()
+
+    // 1. Bound item del lane (va primero — es el contexto más específico)
+    if (pNode.bound_item_ref) {
+      const ref = pNode.bound_item_ref
+      const content = (typeof ref === 'object' && ref !== null)
+        ? Object.entries(ref)
+            .filter(([, v]) => v !== null && v !== undefined && v !== '')
+            .map(([k, v]) => `**${k}:** ${v}`)
+            .join('\n')
+        : String(ref)
+      const rawLabel = (typeof ref === 'object' && ref !== null)
+        ? (ref.title || ref.label || 'Lane item')
+        : String(ref).slice(0, 40)
+      inputs.push({ label: String(rawLabel), content, source: 'lane' })
+    }
+
+    // 2. Edges entrantes (outputs de nodos upstream conectados por edge)
+    let incomingEdges = []
+    try {
+      const { data: edgeData } = await db()
+        .from('forge_project_edges')
+        .select('source_node_id, source_handle')
+        .eq('project_id', project_id)
+        .eq('target_node_id', pNode.id)
+      incomingEdges = edgeData || []
+    } catch { /* tabla no migrada aún */ }
+
+    // Un entry por nodo fuente — si hay múltiples edges del mismo origen, solo el primero
+    const seenSourceNodes = new Set()
+
+    for (const edge of incomingEdges) {
+      if (seenSourceNodes.has(edge.source_node_id)) continue
+      seenSourceNodes.add(edge.source_node_id)
+      const { data: srcPN } = await db()
+        .from('forge_project_nodes')
+        .select(`
+          node_id, node_type, text_label, text_content,
+          forge_nodes(title, outputs),
+          forge_project_library_assets(display_name, extracted_text, storage_url, asset_type)
+        `)
+        .eq('id', edge.source_node_id)
+        .maybeSingle()
+      if (!srcPN) continue
+
+      if ((srcPN.node_type || 'forge_node') === 'library_asset') {
+        const lib = srcPN.forge_project_library_assets
+        if (!lib) continue
+        if (lib.extracted_text) {
+          inputs.push({ label: lib.display_name, content: lib.extracted_text, source: 'edge', source_project_node_id: edge.source_node_id, output_key: null })
+        } else if (lib.asset_type === 'image') {
+          inputs.push({ label: lib.display_name, content: `![${lib.display_name}](${lib.storage_url})`, source: 'edge', isImage: true, source_project_node_id: edge.source_node_id, output_key: null })
+        }
+      } else if (srcPN.node_type === 'text_input') {
+        const content = (srcPN.text_content || '').trim()
+        if (content) inputs.push({ label: srcPN.text_label || 'Text Input', content, source: 'edge', source_project_node_id: edge.source_node_id, output_key: null })
+      } else {
+        // Forge-node: buscar asset aprobado
+        const { data: asset } = await db()
+          .from('forge_assets')
+          .select('content')
+          .eq('project_id', project_id)
+          .eq('node_id', srcPN.node_id)
+          .in('status', ['approved', 'auto_approved'])
+          .neq('format', 'png')
+          .order('created_at', { ascending: false })
+          .limit(1)
+          .maybeSingle()
+
+        if (asset?.content) {
+          const nodeTitle = srcPN.forge_nodes?.title ?? 'Node'
+          const outputs   = srcPN.forge_nodes?.outputs ?? []
+          let content = asset.content
+          let label   = nodeTitle
+          let outputKey = null
+
+          const srcHandle = edge.source_handle
+          if (srcHandle?.startsWith('out-')) {
+            const handleVal = srcHandle.slice(4)
+            const outDef = outputs.find(o => o.key === handleVal || o.name === handleVal)
+              ?? outputs[parseInt(handleVal, 10)]
+            if (outDef) {
+              outputKey = outDef.key || outDef.name || null
+              const extracted = outputKey ? extractSection(content, outputKey) : null
+              if (extracted) {
+                content = extracted
+                label   = `${nodeTitle} — ${outDef.label || outputKey}`
+              }
+            }
+          }
+
+          inputs.push({
+            label, content, source: 'edge',
+            source_project_node_id: edge.source_node_id,
+            output_key: outputKey,
+          })
+        }
+
+        // PNGs aprobados del nodo upstream
+        const { data: pngAssets } = await db()
+          .from('forge_assets')
+          .select('name, storage_url')
+          .eq('project_id', project_id)
+          .eq('node_id', srcPN.node_id)
+          .in('status', ['approved', 'auto_approved'])
+          .eq('format', 'png')
+          .not('storage_url', 'is', null)
+
+        for (const png of (pngAssets || [])) {
+          if (png.storage_url && !injectedPngUrls.has(png.storage_url)) {
+            injectedPngUrls.add(png.storage_url)
+            // Formato markdown para que el frontend lo renderice como imagen inline
+            inputs.push({ label: png.name, content: `![${png.name}](${png.storage_url})`, source: 'edge', isImage: true, source_project_node_id: edge.source_node_id, output_key: null })
+          }
+        }
+      }
+    }
+
+    // 3. Library assets asignados explícitamente al nodo
+    const { data: libInputs } = await db()
+      .from('forge_project_node_inputs')
+      .select(`
+        input_label,
+        forge_project_library_assets(display_name, extracted_text, storage_url, asset_type)
+      `)
+      .eq('project_node_id', pNode.id)
+      .eq('source_type', 'library_asset')
+      .order('order_index')
+
+    for (const inp of (libInputs || [])) {
+      const lib = inp.forge_project_library_assets
+      if (!lib) continue
+      if (lib.extracted_text) {
+        inputs.push({ label: lib.display_name, content: lib.extracted_text, source: 'library' })
+      } else if (lib.asset_type === 'image') {
+        inputs.push({ label: lib.display_name, content: `![${lib.display_name}](${lib.storage_url})`, source: 'library', isImage: true })
+      }
+    }
+
+    res.json({ success: true, inputs })
   } catch (err) { next(err) }
 })
 
@@ -2315,7 +2958,7 @@ router.post('/nodes/:project_node_id/auto-run', async (req, res, next) => {
 
     // Componer system prompt
     const { finalSystemPrompt, baseUserMsg, executorStr, activeTools, outputDefs, resolvedInputs, node } =
-      await buildSystemPrompt(db, { projectId: project_id, nodeId: node_id, sessionId: session.id, userMessage })
+      await buildSystemPrompt(db, { projectId: project_id, nodeId: node_id, sessionId: session.id, userMessage, targetOutputKey: req.body.target_output_key || null })
 
     // Ejecutar ReAct loop
     const { replyText, allToolCalls, docUrl, docFormat, meta } = await runReActLoop({
@@ -2390,6 +3033,15 @@ router.post('/nodes/:project_node_id/auto-run', async (req, res, next) => {
       doc_url:    docUrl   || undefined,
       doc_format: docFormat || undefined,
     })
+  } catch (err) { next(err) }
+})
+
+// Re-corre auto-wire manualmente — útil después de reconstruir project_nodes vía SQL
+router.post('/rewire', async (req, res, next) => {
+  const project_id = req.params.id
+  try {
+    const created = await autoWire(project_id, db)
+    res.json({ ok: true, edges_created: created })
   } catch (err) { next(err) }
 })
 
