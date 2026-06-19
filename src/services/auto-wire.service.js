@@ -111,8 +111,25 @@ async function autoWire(project_id, db) {
         const tgtLane = target.lane_id   ?? null
         if (srcLane !== null && tgtLane !== null && srcLane !== tgtLane) continue
 
-        const outputs = upstream.forge_nodes.outputs
-        if (!Array.isArray(outputs)) continue
+        // Normalizar outputs: soporta array plano, objeto suelto, y { connections, assets } legacy
+        let outputs = upstream.forge_nodes.outputs
+        if (!Array.isArray(outputs)) {
+          if (outputs && typeof outputs === 'object') {
+            if (Array.isArray(outputs.connections) || Array.isArray(outputs.assets)) {
+              outputs = [
+                ...(Array.isArray(outputs.connections) ? outputs.connections : []),
+                ...(Array.isArray(outputs.assets)      ? outputs.assets      : []),
+              ]
+            } else if (outputs.key || outputs.name) {
+              // objeto suelto de un solo output (sin envolver en array)
+              outputs = [outputs]
+            } else {
+              continue
+            }
+          } else {
+            continue
+          }
+        }
 
         for (let outIdx = 0; outIdx < outputs.length; outIdx++) {
           const output    = outputs[outIdx]

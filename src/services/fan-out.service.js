@@ -188,8 +188,18 @@ async function fanOut({ project_id, gate_project_node_id, gate_output_key, nextB
     .single()
 
   const savedNodes = projectRow?.canvas_layout?.nodes ?? []
-  const gatePos    = savedNodes.find(n => n.id === gate_project_node_id)?.position
-    ?? { x: 760, y: 150 }
+
+  // Calcular Y base desde los nodos existentes para que los nuevos queden alineados
+  const existingYVals = savedNodes.map(n => n.position?.y).filter(y => typeof y === 'number')
+  const baseY = existingYVals.length > 0
+    ? Math.round(existingYVals.reduce((a, b) => a + b, 0) / existingYVals.length)
+    : 0
+
+  const existingXVals = savedNodes.map(n => n.position?.x).filter(x => typeof x === 'number')
+  const maxX = existingXVals.length > 0 ? Math.max(...existingXVals) : 760
+
+  const gatePos = savedNodes.find(n => n.id === gate_project_node_id)?.position
+    ?? { x: maxX, y: baseY }
 
   // 3. Próximo order_index disponible
   const { data: maxOrder } = await db()

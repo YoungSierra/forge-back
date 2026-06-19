@@ -1642,15 +1642,16 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
             // Si el edge apunta a un output slot específico, extraer solo esa sección
             const srcHandle = edge.source_handle
             if (srcHandle?.startsWith('out-')) {
-              const handleVal = srcHandle.slice(4) // "out-concept_brief" → "concept_brief"
-              // Buscar por nombre (nuevo formato) o por índice (legacy)
-              const outputDef = outputs.find(o => o.name === handleVal)
+              const handleVal = srcHandle.slice(4) // "out-concept_seeds" → "concept_seeds"
+              // Buscar por key (v1.3.0) o name (legacy) o por índice
+              const outputDef = outputs.find(o => (o.key || o.name) === handleVal)
                 ?? outputs[parseInt(handleVal, 10)]
-              if (outputDef?.name) {
-                const extracted = extractSection(content, outputDef.name)
+              if (outputDef) {
+                const sectionKey = outputDef.key || outputDef.name
+                const extracted  = sectionKey ? extractSection(content, sectionKey) : null
                 if (extracted) {
                   content   = extracted
-                  slotLabel = `${nodeTitle} → ${outputDef.name}`
+                  slotLabel = `${nodeTitle} → ${outputDef.label || sectionKey}`
                 }
               }
             }
