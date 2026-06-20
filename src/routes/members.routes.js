@@ -19,6 +19,26 @@ router.get('/search', async (req, res, next) => {
   }
 })
 
+// PATCH /api/members/profile — el propio usuario actualiza su display_name al aceptar invite
+router.patch('/profile', async (req, res, next) => {
+  try {
+    const { auth_user_id, display_name } = req.body
+    if (!auth_user_id || !display_name) {
+      return res.status(400).json({ success: false, error: 'auth_user_id and display_name are required' })
+    }
+
+    const { data, error } = await db()
+      .from('members')
+      .update({ display_name })
+      .eq('auth_user_id', auth_user_id)
+      .select('id, display_name, role')
+      .single()
+
+    if (error) return res.status(500).json({ success: false, error: error.message })
+    res.json({ success: true, member: data })
+  } catch (err) { next(err) }
+})
+
 // GET /api/members/by-auth/:auth_user_id — resolve member_id from auth user
 router.get('/by-auth/:auth_user_id', async (req, res, next) => {
   try {
