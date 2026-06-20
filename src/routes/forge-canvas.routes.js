@@ -3046,4 +3046,44 @@ router.post('/rewire', async (req, res, next) => {
   } catch (err) { next(err) }
 })
 
+// ─── DELETE /canvas/lanes/:lane_id ────────────────────────────────────────────
+// Elimina un lane y todos sus nodos miembro en cascade
+router.delete('/lanes/:lane_id', async (req, res, next) => {
+  try {
+    const { id: project_id, lane_id } = req.params
+
+    // Obtener todos los nodos del lane
+    const { data: memberNodes } = await db()
+      .from('forge_project_nodes')
+      .select('id')
+      .eq('project_id', project_id)
+      .eq('lane_id', lane_id)
+
+    // Limpiar edges y rewire por cada nodo miembro
+    for (const node of memberNodes ?? []) {
+      try { await cleanupAndRewire(project_id, node.id, db) } catch { /* noop */ }
+    }
+
+    // Eliminar nodos miembro
+    if (memberNodes?.length) {
+      await db()
+        .from('forge_project_nodes')
+        .delete()
+        .eq('project_id', project_id)
+        .eq('lane_id', lane_id)
+    }
+
+    // Eliminar el lane
+    const { error } = await db()
+      .from('forge_lanes')
+      .delete()
+      .eq('id', lane_id)
+      .eq('project_id', project_id)
+
+    if (error) throw error
+
+    res.json({ success: true })
+  } catch (err) { next(err) }
+})
+
 module.exports = router
