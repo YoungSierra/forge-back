@@ -2338,6 +2338,13 @@ router.put('/edges', async (req, res) => {
   const { edges } = req.body
 
   try {
+    // Solo edges reales nodo→nodo: descartar virtuales de lane ("lane-<uuid>") y
+    // cualquier id que no sea uuid válido. Evita borrar todo y fallar al insertar basura.
+    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+    const cleanEdges = (Array.isArray(edges) ? edges : []).filter(
+      e => UUID_RE.test(e?.source ?? '') && UUID_RE.test(e?.target ?? '')
+    )
+
     const { error: delError } = await db()
       .from('forge_project_edges')
       .delete()
@@ -2348,8 +2355,8 @@ router.put('/edges', async (req, res) => {
       return res.json({ success: true, pending_migration: true })
     }
 
-    if (Array.isArray(edges) && edges.length > 0) {
-      const rows = edges.map(e => ({
+    if (cleanEdges.length > 0) {
+      const rows = cleanEdges.map(e => ({
         project_id,
         source_node_id: e.source,
         target_node_id: e.target,
@@ -2360,7 +2367,7 @@ router.put('/edges', async (req, res) => {
       if (insError) {
         console.error('[forge-canvas] PUT /edges insert failed:', insError.message, '| rows:', JSON.stringify(rows))
         // Fallback: intentar sin handles (migración 013 puede no haberse corrido)
-        const rowsBasic = edges.map(e => ({ project_id, source_node_id: e.source, target_node_id: e.target }))
+        const rowsBasic = cleanEdges.map(e => ({ project_id, source_node_id: e.source, target_node_id: e.target }))
         const { error: insError2 } = await db().from('forge_project_edges').insert(rowsBasic)
         if (insError2) {
           console.error('[forge-canvas] PUT /edges fallback also failed:', insError2.message)
