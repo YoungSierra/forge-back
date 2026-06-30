@@ -4,6 +4,253 @@ const multer     = require('multer')
 const { db }     = require('../services/supabase.service')
 const { autoWire, cleanupAndRewire } = require('../services/auto-wire.service')
 
+// ─── ¿El blueprint está sellado? (gate ACCEPT) ───────────────────────────────
+// forge_project_blueprints acumula varias filas por blueprint (historial de loads).
+// Por eso NO se puede usar .maybeSingle() — con >1 fila devuelve error + data null y
+// el guard fallaría abierto. Se sella si CUALQUIER fila tiene gate_decision = 'ACCEPT'.
+async function isBlueprintSealed(project_id, blueprint_id) {
+  if (!blueprint_id) return false
+  const { data } = await db()
+    .from('forge_project_blueprints')
+    .select('gate_decision')
+    .eq('project_id', project_id)
+    .eq('blueprint_id', blueprint_id)
+  return (data || []).some(r => r.gate_decision === 'ACCEPT')
+}
+
+// ─── Outputs de texto/asset de un nodo (Decision 5: imágenes fuera de scope v1) ──
+// Los outputs de imagen (image_gen + format png/image) los maneja la tarea #8, no Run.
+function textOutputsOf(node) {
+  const outs = (Array.isArray(node?.outputs) ? node.outputs : []).map(o => ({ ...o, key: o.key || o.name }))
+  return outs.filter(o => o.key && !(o.image_gen === true && (o.format === 'png' || o.format === 'image')))
+}
+
+// ─── Outputs PENDIENTES de un nodo — qué debe correr Run (bug A, per-output-aware) ──
+// Reglas locked:
+//  · Decision 3A: si el nodo está stale → se re-corren TODOS sus outputs.
+//  · Decision 2A: una sesión general aprobada "tapa" el nodo completo (retro-compat blob).
+//  · un output con sesión per-output aprobada está satisfecho → no se vuelve a correr.
+async function pendingOutputsForNode(project_id, node_id, isStale, node) {
+  const textOuts = textOutputsOf(node)
+  if (!textOuts.length) return []
+  if (isStale) return textOuts.map(o => o.key)
+
+  // Sesión general aprobada → nodo satisfecho (no se toca)
+  const { data: gen } = await db()
+    .from('forge_sessions')
+    .select('id')
+    .eq('project_id', project_id)
+    .eq('node_id', node_id)
+    .is('output_key', null)
+    .in('status', ['approved', 'auto_approved'])
+    .limit(1)
+  if ((gen || []).length) return []
+
+  // Outputs con sesión per-output aprobada → satisfechos
+  const { data: outSess } = await db()
+    .from('forge_sessions')
+    .select('output_key')
+    .eq('project_id', project_id)
+    .eq('node_id', node_id)
+    .not('output_key', 'is', null)
+    .in('status', ['approved', 'auto_approved'])
+  const approved = new Set((outSess || []).map(s => s.output_key))
+
+  return textOuts.filter(o => !approved.has(o.key)).map(o => o.key)
+}
+
+// ─── Ejecuta UN output de un nodo como sesión per-output auto-aprobada ──────────
+// Núcleo reusable del auto-run. No toca otros outputs ya aprobados (bug A).
+async function executeOneOutput({ project_id, node_id, targetOutputKey, member_id }) {
+  const { buildSystemPrompt, runReActLoop } = require('../services/canvas-chat.service')
+  const { logExecution } = require('../services/execution-log.service')
+
+  // Sesión enfocada en este output (output_key = key)
+  const { data: session, error: sessErr } = await db()
+    .from('forge_sessions')
+    .insert({
+      project_id,
+      node_id,
+      output_key:      targetOutputKey,
+      status:          'active',
+      iteration_count: 0,
+      started_at:      new Date().toISOString(),
+      triggered_by:    member_id || null,
+    })
+    .select('id')
+    .single()
+  if (sessErr) throw sessErr
+
+  const userMessage = 'Generate the output for this step'
+
+  const { finalSystemPrompt, baseUserMsg, executorStr, activeTools, resolvedInputs, node } =
+    await buildSystemPrompt(db, { projectId: project_id, nodeId: node_id, sessionId: session.id, userMessage, targetOutputKey })
+
+  const { replyText, allToolCalls, docUrl, docFormat, meta } = await runReActLoop({
+    finalSystemPrompt, baseUserMsg, executorStr, activeTools, resolvedInputs,
+    projectId: project_id, nodeId: node_id, nodeName: node.title,
+  })
+
+  try { logExecution({
+    project_id, node_id, session_id: session.id, triggered_by: member_id || null,
+    trigger_type: 'auto_run', executor_type: 'llm',
+    provider: meta?.provider || null, model: meta?.model || null,
+    tokens: meta?.tokens_used || null, duration_ms: meta?.duration_ms || null,
+    started_at: new Date(Date.now() - (meta?.duration_ms || 0)).toISOString(),
+    status: 'success', metadata: { node_key: node.node_key, output_key: targetOutputKey },
+  }) } catch (logErr) { console.error('[auto-run] logExecution failed (non-fatal):', logErr.message) }
+
+  await db().from('forge_messages').insert({ session_id: session.id, role: 'human', content: userMessage, order_index: 0, tool_calls: [] })
+  await db().from('forge_messages').insert({ session_id: session.id, role: 'agent', content: replyText, order_index: 1, tool_calls: allToolCalls.length ? allToolCalls : [] })
+
+  // Nombre del asset: usa el label del output cuando aplica
+  const outDef = (Array.isArray(node.outputs) ? node.outputs : []).find(o => (o.key || o.name) === targetOutputKey)
+  const assetName = outDef
+    ? `${node.title} — ${outDef.label || outDef.name || targetOutputKey}`
+    : `${node.title} — Output`
+
+  const { data: asset, error: assetErr } = await db()
+    .from('forge_assets')
+    .insert({
+      node_id, project_id, session_id: session.id, name: assetName,
+      format:      docUrl ? (docFormat === 'pptx' ? 'pptx' : 'docx') : 'markdown',
+      status:      'approved', content: replyText, storage_url: docUrl || null,
+      approved_by: member_id || null, approved_at: new Date().toISOString(),
+    })
+    .select('id')
+    .single()
+  if (assetErr) throw assetErr
+
+  await db().from('forge_sessions')
+    .update({ status: 'auto_approved', output_asset_id: asset.id, completed_at: new Date().toISOString(), iteration_count: 1 })
+    .eq('id', session.id)
+
+  return { output_key: targetOutputKey, session_id: session.id, asset_id: asset.id, reply: replyText, doc_url: docUrl || undefined, doc_format: docFormat || undefined }
+}
+
+// ─── Outputs de IMAGEN pendientes de un nodo (auto-gen, #8) ────────────────────
+// Mismo criterio "satisfecho" que los de texto: sesión per-output aprobada = listo.
+// stale → se re-generan todos. Condición estricta: image_gen && format∈{png,image}.
+async function pendingImageOutputsForNode(project_id, node_id, isStale, node) {
+  const { imageOutputsOf } = require('../services/image-gen.service')
+  const imgOuts = imageOutputsOf(node)
+  if (!imgOuts.length) return []
+  if (isStale) return imgOuts.map(o => o.key)
+
+  // Sesión general aprobada → nodo satisfecho (retro-compat blob, decision 2A)
+  const { data: gen } = await db()
+    .from('forge_sessions')
+    .select('id')
+    .eq('project_id', project_id)
+    .eq('node_id', node_id)
+    .is('output_key', null)
+    .in('status', ['approved', 'auto_approved'])
+    .limit(1)
+  if ((gen || []).length) return []
+
+  // Outputs con sesión per-output aprobada → satisfechos
+  const { data: outSess } = await db()
+    .from('forge_sessions')
+    .select('output_key')
+    .eq('project_id', project_id)
+    .eq('node_id', node_id)
+    .not('output_key', 'is', null)
+    .in('status', ['approved', 'auto_approved'])
+  const approved = new Set((outSess || []).map(s => s.output_key))
+
+  return imgOuts.filter(o => !approved.has(o.key)).map(o => o.key)
+}
+
+// ─── Ejecuta UN output de imagen como sesión per-output auto-aprobada (#8) ──────
+// Corre el ReAct del output (produce los prompts según su ADN, con siblings ya
+// disponibles si se corrió después de los outputs de texto), parsea N ítems y
+// genera 1 imagen por ítem. Persiste en forge_sessions.output_images Y forge_assets.
+async function executeImageOutput({ project_id, node_id, targetOutputKey, member_id }) {
+  const { buildSystemPrompt, runReActLoop } = require('../services/canvas-chat.service')
+  const { logExecution } = require('../services/execution-log.service')
+  const { parseOutputItems, generateOneImage } = require('../services/image-gen.service')
+
+  // Sesión enfocada en este output de imagen
+  const { data: session, error: sessErr } = await db()
+    .from('forge_sessions')
+    .insert({
+      project_id, node_id, output_key: targetOutputKey, status: 'active',
+      iteration_count: 0, started_at: new Date().toISOString(), triggered_by: member_id || null,
+    })
+    .select('id')
+    .single()
+  if (sessErr) throw sessErr
+
+  const userMessage = 'Generate the output for this step'
+
+  const { finalSystemPrompt, baseUserMsg, executorStr, activeTools, resolvedInputs, node } =
+    await buildSystemPrompt(db, { projectId: project_id, nodeId: node_id, sessionId: session.id, userMessage, targetOutputKey })
+
+  const { replyText, allToolCalls, meta } = await runReActLoop({
+    finalSystemPrompt, baseUserMsg, executorStr, activeTools, resolvedInputs,
+    projectId: project_id, nodeId: node_id, nodeName: node.title,
+  })
+
+  // Log del run LLM (no bloqueante)
+  try { logExecution({
+    project_id, node_id, session_id: session.id, triggered_by: member_id || null,
+    trigger_type: 'auto_run', executor_type: 'llm',
+    provider: meta?.provider || null, model: meta?.model || null,
+    tokens: meta?.tokens_used || null, duration_ms: meta?.duration_ms || null,
+    started_at: new Date(Date.now() - (meta?.duration_ms || 0)).toISOString(),
+    status: 'success', metadata: { node_key: node.node_key, output_key: targetOutputKey },
+  }) } catch (logErr) { console.error('[auto-run img] logExecution failed (non-fatal):', logErr.message) }
+
+  await db().from('forge_messages').insert({ session_id: session.id, role: 'human', content: userMessage, order_index: 0, tool_calls: [] })
+  await db().from('forge_messages').insert({ session_id: session.id, role: 'agent', content: replyText, order_index: 1, tool_calls: allToolCalls.length ? allToolCalls : [] })
+
+  // DNA del output + parseo de ítems (el conteo lo dicta el contenido, no se hardcodea)
+  const outDef = (Array.isArray(node.outputs) ? node.outputs : []).find(o => (o.key || o.name) === targetOutputKey)
+  const items  = parseOutputItems(replyText || '', outDef?.format || 'png')
+
+  // Generar 1 imagen por ítem en paralelo (acota latencia en runs por tiers)
+  const results = await Promise.all(items.map((itemText, idx) =>
+    generateOneImage({
+      project_id, node_id, session_id: session.id, node_key: node.node_key,
+      output_key: targetOutputKey, image_gen_model: outDef?.image_gen_model,
+      item_index: idx, item_text: itemText, condition: null, member_id,
+    })
+      .then(r => ({ idx, url: r.url, itemText }))
+      .catch(err => { console.error(`[auto-run img] item ${idx} failed:`, err.message); return null })
+  ))
+
+  const ok = results.filter(Boolean)
+
+  // Persistir en forge_sessions.output_images (formato nuevo con variations[])
+  const outputItems = ok.map(r => ({ index: r.idx, variations: [{ url: r.url, condition: null }] }))
+  await db().from('forge_sessions')
+    .update({ output_images: { [targetOutputKey]: outputItems } })
+    .eq('id', session.id)
+
+  // Crear una fila forge_assets png por imagen → downstream las encuentra
+  const baseName = `${node.title} — ${outDef?.label || outDef?.name || targetOutputKey}`
+  let firstAssetId = null
+  for (const r of ok) {
+    const assetName = ok.length > 1 ? `${baseName} ${r.idx + 1}` : baseName
+    const { data: asset } = await db()
+      .from('forge_assets')
+      .insert({
+        node_id, project_id, session_id: session.id, name: assetName,
+        format: 'png', status: 'approved', content: r.itemText, storage_url: r.url,
+        approved_by: member_id || null, approved_at: new Date().toISOString(),
+      })
+      .select('id')
+      .single()
+    if (!firstAssetId) firstAssetId = asset?.id || null
+  }
+
+  await db().from('forge_sessions')
+    .update({ status: 'auto_approved', output_asset_id: firstAssetId, completed_at: new Date().toISOString(), iteration_count: 1 })
+    .eq('id', session.id)
+
+  return { output_key: targetOutputKey, session_id: session.id, asset_id: firstAssetId, images: ok.length }
+}
+
 // Multer para attachments de chat — límite 50 MB por archivo
 const chatUpload = multer({
   storage: multer.memoryStorage(),
@@ -135,6 +382,19 @@ router.get('/', async (req, res, next) => {
 
     if (nodesError) throw nodesError
 
+    // Blueprints sellados (gate ACCEPT) del proyecto — para marcar nodos no-runnable.
+    // Una fila ACCEPT en cualquiera de las (posibles varias) filas del blueprint lo sella.
+    const sealedBpIds = new Set()
+    {
+      const { data: allBpRows } = await db()
+        .from('forge_project_blueprints')
+        .select('blueprint_id, gate_decision')
+        .eq('project_id', project_id)
+      for (const r of (allBpRows || [])) {
+        if (r.gate_decision === 'ACCEPT') sealedBpIds.add(r.blueprint_id)
+      }
+    }
+
     // Sesiones por nodo: generales (output_key null) y por output específico
     const nodeIds = (projectNodes || []).filter(pn => pn.node_id).map(pn => pn.node_id)
     let sessionsByNodeId = {}           // node_id → última sesión general
@@ -236,6 +496,7 @@ router.get('/', async (req, res, next) => {
         project_node_id: pn.id,
         order_index:     pn.order_index,
         blueprint_id:    pn.blueprint_id,
+        sealed:          sealedBpIds.has(pn.blueprint_id),
         lane_id:         pn.lane_id         ?? null,
         bound_item_ref:  pn.bound_item_ref  ?? null,
         node_type:       nodeType,
@@ -249,14 +510,36 @@ router.get('/', async (req, res, next) => {
       }
     })
 
-    // Blueprint activo (el último cargado) con su gate_decision
-    const { data: activeBlueprint } = await db()
-      .from('forge_project_blueprints')
-      .select('blueprint_id, trigger, loaded_at, gate_decision, forge_blueprints(id, blueprint_key, name, phase, gate)')
-      .eq('project_id', project_id)
-      .order('loaded_at', { ascending: false })
-      .limit(1)
-      .single()
+    // Blueprint activo = la fase MÁS AVANZADA con nodos cargados en el canvas.
+    // No se deriva de forge_project_blueprints porque esa tabla puede no tener fila
+    // para fases cargadas vía fan-out, y acumula filas selladas de fases viejas
+    // (rompía la resolución: devolvía Ideation sellada en vez de Concept viva).
+    const PHASE_SEQUENCE = ['ideation', 'concept', 'preprod', 'production']
+    const loadedBpIds = [...new Set((projectNodes || []).map(n => n.blueprint_id).filter(Boolean))]
+    let activeBlueprint = null
+    if (loadedBpIds.length > 0) {
+      const { data: bpDefs } = await db()
+        .from('forge_blueprints')
+        .select('id, blueprint_key, name, phase, gate')
+        .in('id', loadedBpIds)
+      // La fase viva es la de mayor índice en la secuencia de fases
+      const live = (bpDefs || [])
+        .slice()
+        .sort((a, b) => PHASE_SEQUENCE.indexOf(a.phase) - PHASE_SEQUENCE.indexOf(b.phase))
+        .pop() || null
+      if (live) {
+        // gate_decision de esa fase: sellada si ALGUNA fila es ACCEPT (puede haber varias)
+        const { data: gdRows } = await db()
+          .from('forge_project_blueprints')
+          .select('gate_decision')
+          .eq('project_id', project_id)
+          .eq('blueprint_id', live.id)
+        const gateDecision = (gdRows || []).some(r => r.gate_decision === 'ACCEPT')
+          ? 'ACCEPT'
+          : ((gdRows || []).find(r => r.gate_decision)?.gate_decision ?? null)
+        activeBlueprint = { ...live, gate_decision: gateDecision }
+      }
+    }
 
     // Edges persistidos en DB (tabla puede no existir si la migración aún no se corrió)
     let edges = []
@@ -302,9 +585,7 @@ router.get('/', async (req, res, next) => {
       edges,
       lanes,
       canvas_layout: projectRow?.canvas_layout ?? null,
-      active_blueprint: activeBlueprint
-        ? { ...activeBlueprint.forge_blueprints, gate_decision: activeBlueprint.gate_decision ?? null }
-        : null,
+      active_blueprint: activeBlueprint,
     })
   } catch (err) { next(err) }
 })
@@ -376,6 +657,21 @@ router.post('/gate', async (req, res, next) => {
 
     if (!nextBp) {
       return res.json({ success: true, decision, next_blueprint: null })
+    }
+
+    // Idempotencia (#5): si el siguiente blueprint YA tiene nodos cargados, no recrear
+    // nada (evita lanes/nodos/edges duplicados al re-aceptar el gate o en el loop de pipeline).
+    {
+      const { data: alreadyLoaded } = await db()
+        .from('forge_project_nodes')
+        .select('id')
+        .eq('project_id', project_id)
+        .eq('blueprint_id', nextBp.id)
+        .eq('removed', false)
+        .limit(1)
+      if ((alreadyLoaded || []).length > 0) {
+        return res.json({ success: true, decision, next_blueprint: { id: nextBp.id, name: nextBp.name, phase: nextPhase }, already_loaded: true })
+      }
     }
 
     // ── Fan-out: detección type-driven (Instancing Brief v1.2) ──────────────────
@@ -882,68 +1178,15 @@ router.post('/nodes/:node_id/sessions/:session_id/generate-item-image', async (r
       return res.status(400).json({ success: false, error: `Output "${output_key}" no tiene image_gen habilitado` })
     }
 
-    const imageGenModel = outputDef.image_gen_model
-    if (!imageGenModel) {
-      return res.status(400).json({ success: false, error: `Output "${output_key}" no tiene image_gen_model definido` })
-    }
-
-    // Parsear "provider:model_o_workflow"
-    const colonIdx = imageGenModel.indexOf(':')
-    if (colonIdx < 0) {
-      return res.status(400).json({ success: false, error: `image_gen_model debe tener formato "provider:model" — recibido: "${imageGenModel}"` })
-    }
-    const provider   = imageGenModel.slice(0, colonIdx)
-    const modelOrWf  = imageGenModel.slice(colonIdx + 1)
-
-    const storagePath = `projects/${project_id}/item-images/${node.node_key}/${output_key}-${session_id}-${item_index}-${Date.now()}.png`
-
-    // Limpiar markdown del texto del ítem y construir prompt final con la condición de variación
-    const cleanText = item_text.trim()
-      .replace(/\*{1,2}([^*]+)\*{1,2}/g, '$1')  // quitar negrita/cursiva
-      .replace(/^[-*]\s+/, '')                    // quitar bullet inicial
-      .replace(/^(Variation\s+\d+:\s*)/i, '')     // quitar prefijo "Variation N:"
-    const imagePrompt = condition?.trim()
-      ? `${cleanText}\n\nAdditional visual requirement: ${condition.trim()}`
-      : cleanText
-
-    const { logExecution: logExec } = require('../services/execution-log.service')
     const memberId = req.headers['x-member-id'] || null
-    const imgStart = Date.now()
 
-    let result
-    if (provider === 'comfyui') {
-      const { generateImageComfyUI } = require('../services/providers/comfyui.provider')
-      result = await generateImageComfyUI(modelOrWf, imagePrompt, 1024, 1024, storagePath)
-    } else if (provider === 'openai') {
-      const { generateImageOpenAI } = require('../services/providers/openai.image.provider')
-      result = await generateImageOpenAI(modelOrWf, imagePrompt, 1024, 1024, storagePath)
-    } else if (provider === 'fal') {
-      const { generateImageFal } = require('../services/providers/fal.image.provider')
-      result = await generateImageFal(modelOrWf, imagePrompt, 1024, 1024, storagePath)
-    } else {
-      return res.status(400).json({ success: false, error: `Provider de imagen no soportado: "${provider}"` })
-    }
-
-    // Registrar costo estimado de generación de imagen (no bloqueante, nunca rompe el flujo)
-    try {
-      logExec({
-        project_id:   project_id,
-        node_id:      node_id,
-        session_id:   session_id,
-        triggered_by: memberId,
-        trigger_type: 'image_gen',
-        executor_type: provider === 'openai' ? 'openai_image' : provider,
-        provider,
-        model:        modelOrWf,
-        is_estimated: true,
-        duration_ms:  Date.now() - imgStart,
-        started_at:   new Date(imgStart).toISOString(),
-        status:       'success',
-        metadata:     { output_key, item_index, width: 1024, height: 1024, node_key: node.node_key },
-      })
-    } catch (logErr) {
-      console.error('[generate-item-image] logExec failed (non-fatal):', logErr.message)
-    }
+    // Núcleo de generación reutilizable (provider dispatch + cost log) en image-gen.service
+    const { generateOneImage } = require('../services/image-gen.service')
+    const result = await generateOneImage({
+      project_id, node_id, session_id, node_key: node.node_key,
+      output_key, image_gen_model: outputDef.image_gen_model,
+      item_index, item_text, condition, member_id: memberId,
+    })
 
     // Leer output_images actual, migrar si viene en formato viejo y hacer append
     const { data: sessionRow } = await db()
@@ -2793,23 +3036,62 @@ router.post('/run-validate', async (req, res, next) => {
   try {
     const { id: project_id } = req.params
 
+    // Alcance del run: pipeline (todo) | lane | blueprint. Default pipeline.
+    const { type: scopeType = 'pipeline', lane_id: scopeLaneId, blueprint_id: scopeBlueprintId } = req.body || {}
+
+    // Pre-gate lock: correr explícitamente una fase ya sellada (gate ACCEPT) está bloqueado en v1.
+    if (scopeType === 'blueprint' && scopeBlueprintId) {
+      if (await isBlueprintSealed(project_id, scopeBlueprintId)) {
+        return res.json({ success: true, valid: false, errors: [{
+          type:          'gate_sealed',
+          projectNodeId: '',
+          nodeKey:       '',
+          nodeTitle:     'Phase sealed',
+          reason:        'This phase was accepted at its gate — re-running its steps is locked',
+        }] })
+      }
+    }
+
     // Cargar todos los nodos del canvas
     const { data: pNodes } = await db()
       .from('forge_project_nodes')
-      .select('id, node_id, node_type, text_content, text_label, source_asset_id')
+      .select('id, node_id, node_type, text_content, text_label, source_asset_id, lane_id, blueprint_id, is_stale')
       .eq('project_id', project_id)
       .eq('removed', false)
 
-    const forgeNodes = (pNodes || []).filter(n => n.node_type === 'forge_node')
+    // Solo se validan los forge_nodes dentro del alcance — los demás se ignoran (no se ejecutan)
+    const scopedForgeNodes = (pNodes || [])
+      .filter(n => n.node_type === 'forge_node')
+      .filter(n => {
+        if (scopeType === 'lane')      return n.lane_id === scopeLaneId
+        if (scopeType === 'blueprint') return n.blueprint_id === scopeBlueprintId
+        return true  // pipeline
+      })
 
-    // Cargar definiciones de nodos (inputs required)
-    const nodeIds = forgeNodes.map(n => n.node_id)
+    // Cargar definiciones de nodos (inputs required + outputs para calcular pendientes)
+    const nodeIds = scopedForgeNodes.map(n => n.node_id)
     const { data: nodeDefs } = await db()
       .from('forge_nodes')
-      .select('id, node_key, title, inputs')
+      .select('id, node_key, title, inputs, outputs')
       .in('id', nodeIds)
 
     const defById = Object.fromEntries((nodeDefs || []).map(n => [n.id, n]))
+
+    // Validar SOLO los nodos que realmente correrán: ni sellados ni ya satisfechos (bug A).
+    // Un nodo de fase sellada o sin outputs pendientes no se ejecuta → no debe generar errores.
+    const distinctBpIds = [...new Set(scopedForgeNodes.map(n => n.blueprint_id).filter(Boolean))]
+    const sealedSet = new Set()
+    for (const bpId of distinctBpIds) {
+      if (await isBlueprintSealed(project_id, bpId)) sealedSet.add(bpId)
+    }
+    const forgeNodes = []
+    for (const n of scopedForgeNodes) {
+      if (sealedSet.has(n.blueprint_id)) continue
+      const dna = defById[n.node_id]
+      if (!dna) continue
+      const pending = await pendingOutputsForNode(project_id, n.node_id, n.is_stale, dna)
+      if (pending.length > 0) forgeNodes.push(n)
+    }
 
     // Cargar sesiones activas con mensajes de agente (intervención manual pendiente)
     const { data: activeSessions } = await db()
@@ -2921,6 +3203,194 @@ router.post('/run-validate', async (req, res, next) => {
   } catch (err) { next(err) }
 })
 
+// ─── POST /api/projects/:id/canvas/run-plan ──────────────────────
+// Plan de un Run de pipeline completo: qué gates cruza, si hay fan-out y costo estimado (#4).
+// El frontend lo usa para mostrar el modal de autorización antes de cruzar gates con auto-ACCEPT.
+// Solo el scope 'pipeline' cruza gates; lane/blueprint devuelven requires_authorization=false.
+router.post('/run-plan', async (req, res, next) => {
+  try {
+    const { id: project_id } = req.params
+    const { type: scopeType = 'pipeline' } = req.body || {}
+
+    // Secuencia canónica de fases — idéntica a la del gate ACCEPT
+    const PHASE_SEQUENCE = ['ideation', 'concept', 'preprod', 'production']
+    const { detectFanOut } = require('../services/fan-out.service')
+
+    // Decisión recordada por el usuario (run_config.gate_authorization con remember=true)
+    const { data: projRow } = await db()
+      .from('projects')
+      .select('run_config')
+      .eq('id', project_id)
+      .single()
+    const stored = projRow?.run_config?.gate_authorization || null
+    const remembered = stored?.remember ? { mode: stored.mode } : null
+
+    // lane/blueprint no cruzan gates → sin plan de autorización
+    if (scopeType !== 'pipeline') {
+      return res.json({ success: true, requires_authorization: false, phases: [], gates: [], estimated: null, remembered: null })
+    }
+
+    // Blueprint activo (última fila cargada) con su DNA completo
+    const { data: activeRow } = await db()
+      .from('forge_project_blueprints')
+      .select('blueprint_id, gate_decision, forge_blueprints(id, name, phase, gate, node_sequence)')
+      .eq('project_id', project_id)
+      .order('loaded_at', { ascending: false })
+      .limit(1)
+      .maybeSingle()
+
+    const activeBp = activeRow?.forge_blueprints || null
+    if (!activeBp) {
+      return res.json({ success: true, requires_authorization: false, phases: [], gates: [], estimated: null, remembered })
+    }
+
+    // Defaults por fase — son los que el gate ACCEPT carga en cada salto
+    const { data: defaults } = await db()
+      .from('forge_blueprints')
+      .select('id, name, phase, gate, node_sequence')
+      .eq('is_default', true)
+      .in('phase', PHASE_SEQUENCE)
+    const defaultByPhase = Object.fromEntries((defaults || []).map(b => [b.phase, b]))
+
+    // Cadena de fases desde la actual hasta el final. La fase actual usa el blueprint activo;
+    // las siguientes usan el default (lo que se cargaría al cruzar el gate).
+    const startIdx = PHASE_SEQUENCE.indexOf(activeBp.phase)
+    const chain = []
+    if (startIdx >= 0) {
+      chain.push({ ...activeBp, _isCurrent: true })
+      for (let i = startIdx + 1; i < PHASE_SEQUENCE.length; i++) {
+        const bp = defaultByPhase[PHASE_SEQUENCE[i]]
+        if (bp) chain.push({ ...bp, _isCurrent: false })
+      }
+    }
+
+    // Nodos pendientes (runnable) de la fase actual — los downstream aún no existen
+    async function countRunnable(blueprint_id) {
+      const { data: bpNodes } = await db()
+        .from('forge_project_nodes')
+        .select('node_id, is_stale')
+        .eq('project_id', project_id)
+        .eq('blueprint_id', blueprint_id)
+        .eq('node_type', 'forge_node')
+        .eq('removed', false)
+      const ids = (bpNodes || []).map(n => n.node_id)
+      if (!ids.length) return 0
+      const { data: sess } = await db()
+        .from('forge_sessions')
+        .select('node_id, status, created_at')
+        .eq('project_id', project_id)
+        .is('output_key', null)
+        .in('node_id', ids)
+        .order('created_at', { ascending: false })
+      const latest = {}
+      for (const s of (sess || [])) if (!(s.node_id in latest)) latest[s.node_id] = s.status
+      return (bpNodes || []).filter(n => {
+        const s = latest[n.node_id]
+        if (s === 'approved') return false
+        if (s === 'auto_approved' && !n.is_stale) return false
+        return true
+      }).length
+    }
+
+    // Costo promedio por ejecución de nodo (suma por sesión) — desde el log de ejecución
+    async function avgCostPerNode() {
+      const { data: logs } = await db()
+        .from('forge_execution_log')
+        .select('session_id, cost_usd')
+        .eq('project_id', project_id)
+        .eq('executor_type', 'llm')
+        .eq('status', 'success')
+        .order('started_at', { ascending: false })
+        .limit(500)
+      const bySession = {}
+      for (const l of (logs || [])) {
+        if (!l.session_id) continue
+        bySession[l.session_id] = (bySession[l.session_id] || 0) + (l.cost_usd || 0)
+      }
+      const totals = Object.values(bySession)
+      if (!totals.length) return 0.015  // default cuando no hay historial
+      return totals.reduce((a, b) => a + b, 0) / totals.length
+    }
+
+    const avgCost = await avgCostPerNode()
+
+    // Construir fases + gates + estimación. Fan-out solo es detectable en el gate inmediato
+    // (los outputs de fases futuras todavía no existen).
+    const phases = []
+    const gates  = []
+    let totalRuns = 0
+    let mult = 1  // multiplicador de lanes (se propaga hacia adelante cuando se conoce)
+
+    for (let i = 0; i < chain.length; i++) {
+      const bp = chain[i]
+      const nodeCount = bp._isCurrent
+        ? await countRunnable(bp.id)
+        : (bp.node_sequence || []).length
+
+      phases.push({
+        blueprint_id: bp.id,
+        name:         bp.name,
+        phase:        bp.phase,
+        node_count:   nodeCount,
+        is_current:   !!bp._isCurrent,
+        sealed:       bp._isCurrent ? activeRow.gate_decision === 'ACCEPT' : false,
+      })
+      totalRuns += nodeCount * mult
+
+      // Gate entre esta fase y la siguiente
+      const next = chain[i + 1]
+      if (next) {
+        const fan = await detectFanOut({
+          project_id,
+          current_blueprint_id: bp.id,
+          nextBlueprint:        next,
+          db,
+        })
+        gates.push({
+          blueprint_id: bp.id,
+          name:         bp.gate?.name || `${bp.phase} gate`,
+          will_fan_out: fan.willFanOut,
+          configured:   fan.configured,
+          item_count:   fan.itemCount,
+          item_type:    fan.itemType,
+        })
+        // Si este gate hace fan-out con N ítems, la fase siguiente corre N veces (lanes)
+        if (fan.willFanOut && fan.itemCount) mult *= fan.itemCount
+      }
+    }
+
+    res.json({
+      success:               true,
+      requires_authorization: gates.length > 0,
+      phases,
+      gates,
+      estimated: {
+        node_runs:         totalRuns,
+        avg_cost_per_node: parseFloat(avgCost.toFixed(6)),
+        cost_usd:          parseFloat((totalRuns * avgCost).toFixed(4)),
+        is_estimated:      true,
+      },
+      remembered,
+    })
+  } catch (err) { next(err) }
+})
+
+// ─── PATCH /api/projects/:id/canvas/run-config ───────────────────
+// Persiste la autorización de gates en projects.run_config (merge no destructivo) (#4).
+router.patch('/run-config', async (req, res, next) => {
+  try {
+    const { id: project_id } = req.params
+    const { data: projRow } = await db()
+      .from('projects')
+      .select('run_config')
+      .eq('id', project_id)
+      .single()
+    const merged = { ...(projRow?.run_config || {}), ...(req.body || {}) }
+    await db().from('projects').update({ run_config: merged }).eq('id', project_id)
+    res.json({ success: true, run_config: merged })
+  } catch (err) { next(err) }
+})
+
 // ─── POST /api/projects/:id/canvas/nodes/:project_node_id/auto-run ──
 // Ejecuta un nodo en modo autopilot y lo auto-aprueba como auto_approved
 router.post('/nodes/:project_node_id/auto-run', async (req, res, next) => {
@@ -2928,14 +3398,12 @@ router.post('/nodes/:project_node_id/auto-run', async (req, res, next) => {
     const { id: project_id, project_node_id } = req.params
     const { member_id } = req.body
 
-    const { buildSystemPrompt, runReActLoop, propagateStale } = require('../services/canvas-chat.service')
-    const { logExecution } = require('../services/execution-log.service')
-    const normalizeOutputSections = (text, defs) => text  // sin normalización en auto-run
+    const { propagateStale } = require('../services/canvas-chat.service')
 
     // Obtener el forge_node_id desde el project_node_id
     const { data: pNode } = await db()
       .from('forge_project_nodes')
-      .select('node_id, node_type')
+      .select('node_id, node_type, blueprint_id, is_stale')
       .eq('id', project_node_id)
       .eq('removed', false)
       .maybeSingle()
@@ -2944,89 +3412,61 @@ router.post('/nodes/:project_node_id/auto-run', async (req, res, next) => {
       return res.status(404).json({ success: false, error: 'Project node not found or not a forge_node' })
     }
 
+    // Guard: no re-ejecutar nodos de un blueprint cuyo gate ya fue ACCEPT (sellado).
+    // Es la garantía dura — protege re-runs directos y los del loop de pipeline (#5).
+    if (await isBlueprintSealed(project_id, pNode.blueprint_id)) {
+      return res.status(423).json({
+        success:    false,
+        error_code: 'gate_sealed',
+        error:      'This step belongs to a sealed phase — re-running is locked after the gate was accepted',
+      })
+    }
+
     const node_id = pNode.node_id
 
-    // Crear nueva sesión activa
-    const { data: session, error: sessErr } = await db()
-      .from('forge_sessions')
-      .insert({
-        project_id,
-        node_id,
-        status:          'active',
-        iteration_count: 0,
-        started_at:      new Date().toISOString(),
-        triggered_by:    member_id || null,
-      })
-      .select('id, iteration_count')
+    // DNA del nodo — para calcular qué outputs faltan
+    const { data: nodeDna } = await db()
+      .from('forge_nodes')
+      .select('id, outputs')
+      .eq('id', node_id)
       .single()
 
-    if (sessErr) throw sessErr
+    // Targets: un output explícito (re-run manual de un output) o TODOS los pendientes.
+    // Bug A: Run nunca rehace outputs ya aprobados — solo corre lo que falta o está stale.
+    // #8: se separan texto e imagen — el texto corre primero para que los outputs de
+    //     imagen tengan disponibles sus siblings_if_present al generar.
+    const { imageOutputsOf } = require('../services/image-gen.service')
+    const explicitKey = req.body.target_output_key || null
+    const imageKeys   = new Set(imageOutputsOf(nodeDna || {}).map(o => o.key))
 
-    const userMessage = 'Generate the output for this step'
+    let textTargets, imageTargets
+    if (explicitKey) {
+      // Re-run manual de un output concreto: rutea según su tipo
+      textTargets  = imageKeys.has(explicitKey) ? [] : [explicitKey]
+      imageTargets = imageKeys.has(explicitKey) ? [explicitKey] : []
+    } else {
+      textTargets  = await pendingOutputsForNode(project_id, node_id, pNode.is_stale, nodeDna || {})
+      imageTargets = await pendingImageOutputsForNode(project_id, node_id, pNode.is_stale, nodeDna || {})
+    }
 
-    // Componer system prompt
-    const { finalSystemPrompt, baseUserMsg, executorStr, activeTools, outputDefs, resolvedInputs, node } =
-      await buildSystemPrompt(db, { projectId: project_id, nodeId: node_id, sessionId: session.id, userMessage, targetOutputKey: req.body.target_output_key || null })
+    if (!textTargets.length && !imageTargets.length) {
+      // Nodo ya satisfecho — no se crea ninguna sesión ni se gasta costo
+      return res.json({ success: true, ran: [], skipped: true, message: 'No pending outputs — node already satisfied' })
+    }
 
-    // Ejecutar ReAct loop
-    const { replyText, allToolCalls, docUrl, docFormat, meta } = await runReActLoop({
-      finalSystemPrompt, baseUserMsg, executorStr, activeTools, resolvedInputs,
-      projectId: project_id, nodeId: node_id, nodeName: node.title,
-    })
+    // 1) Outputs de texto (secuencial) — sesiones per-output auto-aprobadas
+    const ran = []
+    for (const key of textTargets) {
+      ran.push(await executeOneOutput({ project_id, node_id, targetOutputKey: key, member_id }))
+    }
 
-    // Registrar costo (nunca rompe el flujo)
-    try { logExecution({
-      project_id,
-      node_id,
-      session_id:   session.id,
-      triggered_by: member_id || null,
-      trigger_type: 'auto_run',
-      executor_type:'llm',
-      provider:     meta?.provider   || null,
-      model:        meta?.model      || null,
-      tokens:       meta?.tokens_used || null,
-      duration_ms:  meta?.duration_ms || null,
-      started_at:   new Date(Date.now() - (meta?.duration_ms || 0)).toISOString(),
-      status:       'success',
-      metadata:     { node_key: node.node_key },
-    }) } catch (logErr) { console.error('[auto-run] logExecution failed (non-fatal):', logErr.message) }
+    // 2) Outputs de imagen (post-pass) — ya con los siblings de texto disponibles
+    const ranImages = []
+    for (const key of imageTargets) {
+      ranImages.push(await executeImageOutput({ project_id, node_id, targetOutputKey: key, member_id }))
+    }
 
-    // Persistir mensajes
-    await db()
-      .from('forge_messages')
-      .insert({ session_id: session.id, role: 'human', content: userMessage, order_index: 0, tool_calls: [] })
-
-    await db()
-      .from('forge_messages')
-      .insert({ session_id: session.id, role: 'agent', content: replyText, order_index: 1, tool_calls: allToolCalls.length ? allToolCalls : [] })
-
-    // Crear asset auto_approved
-    const { data: asset, error: assetErr } = await db()
-      .from('forge_assets')
-      .insert({
-        node_id,
-        project_id,
-        session_id:   session.id,
-        name:         `${node.title} — Output`,
-        format:       docUrl ? (docFormat === 'pptx' ? 'pptx' : 'docx') : 'markdown',
-        status:       'approved',
-        content:      replyText,
-        storage_url:  docUrl || null,
-        approved_by:  member_id || null,
-        approved_at:  new Date().toISOString(),
-      })
-      .select('id')
-      .single()
-
-    if (assetErr) throw assetErr
-
-    // Cerrar sesión como auto_approved
-    await db()
-      .from('forge_sessions')
-      .update({ status: 'auto_approved', output_asset_id: asset.id, completed_at: new Date().toISOString(), iteration_count: 1 })
-      .eq('id', session.id)
-
-    // Limpiar is_stale del nodo actual y propagar stale a descendientes
+    // Limpiar is_stale del nodo y propagar stale a descendientes (una sola vez)
     await db()
       .from('forge_project_nodes')
       .update({ is_stale: false })
@@ -3036,10 +3476,14 @@ router.post('/nodes/:project_node_id/auto-run', async (req, res, next) => {
 
     res.json({
       success:    true,
-      session_id: session.id,
-      reply:      replyText,
-      doc_url:    docUrl   || undefined,
-      doc_format: docFormat || undefined,
+      ran:        [...ran.map(r => r.output_key), ...ranImages.map(r => r.output_key)],
+      sessions:   ran,
+      images:     ranImages,  // [{ output_key, session_id, asset_id, images }]
+      // Compat con callers viejos: primer resultado
+      session_id: ran[0]?.session_id,
+      reply:      ran[0]?.reply,
+      doc_url:    ran[0]?.doc_url,
+      doc_format: ran[0]?.doc_format,
     })
   } catch (err) { next(err) }
 })

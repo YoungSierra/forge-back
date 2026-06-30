@@ -128,6 +128,131 @@ function parseItemsFromContent(content) {
   return extractSeedsFromAsset(content)
 }
 
+// ── Detección read-only de fan-out ───────────────────────────────────────────
+/**
+ * Detecta si el blueprint actual dispara fan-out hacia el siguiente, SIN crear nada.
+ * Reglas idénticas al gate ACCEPT: Connection output list<T> del blueprint actual
+ * que alimenta un input single<T> del siguiente. La usan el gate (#5) y el run-plan (#4).
+ *
+ * Devuelve:
+ *   { configured, willFanOut, itemCount, items, itemType, outputKey, gateProjectNodeId }
+ *   - configured  : existe el match de tipos list<T>→single<T> (haya o no datos aún)
+ *   - willFanOut  : configured Y hay ítems aprobados para instanciar (itemCount > 0)
+ *   - itemCount   : nº de ítems del list<T> aprobado (null si aún no hay output aprobado)
+ */
+async function detectFanOut({ project_id, current_blueprint_id, nextBlueprint, db }) {
+  const empty = { configured: false, willFanOut: false, itemCount: null, items: [], itemType: null, outputKey: null, gateProjectNodeId: null }
+
+  const { data: bpNodes } = await db()
+    .from('forge_project_nodes')
+    .select('id, node_id')
+    .eq('project_id', project_id)
+    .eq('blueprint_id', current_blueprint_id)
+    .eq('removed', false)
+
+  const bpNodeIds = (bpNodes || []).map(n => n.node_id).filter(Boolean)
+  if (!bpNodeIds.length) return empty
+
+  const { data: currentDna } = await db()
+    .from('forge_nodes')
+    .select('id, outputs')
+    .in('id', bpNodeIds)
+
+  const nextSeqNodeIds = (nextBlueprint?.node_sequence || []).map(s => s.node_id).filter(Boolean)
+  let nextDna = null
+  let configuredMatch = null  // primer match de tipos, aunque no haya datos aún
+
+  for (const node of (currentDna || [])) {
+    // Soporta formato v1.3.0 (array plano con type:'connection') y legacy (outputs.connections)
+    const rawOutputs = Array.isArray(node.outputs)
+      ? node.outputs
+      : Array.isArray(node.outputs?.connections) ? node.outputs.connections : []
+
+    const connOutputs = rawOutputs.filter(o =>
+      o.type === 'connection' || (typeof o.type === 'string' && o.type.startsWith('list<'))
+    )
+
+    for (const conn of connOutputs) {
+      const T = conn.format?.match(/^list<(.+)>$/)?.[1] ?? conn.type?.match(/^list<(.+)>$/)?.[1]
+      if (!T) continue
+      const connKey = conn.key ?? conn.name
+      if (!connKey) continue
+
+      // Verificar que el próximo blueprint tiene single<T> inputs
+      if (nextSeqNodeIds.length > 0) {
+        if (!nextDna) {
+          const { data } = await db().from('forge_nodes').select('id, inputs').in('id', nextSeqNodeIds)
+          nextDna = data || []
+        }
+        const hasSingleT = nextDna.some(n => {
+          const ports = Array.isArray(n.inputs) ? n.inputs : Array.isArray(n.inputs?.wired) ? n.inputs.wired : []
+          return ports.some(p => p.cardinality === 'single' && p.type === T)
+        })
+        if (!hasSingleT) continue
+      }
+
+      // Hay match de tipos — recordarlo aunque todavía no exista output aprobado
+      const gpn = (bpNodes || []).find(n => n.node_id === node.id)?.id ?? null
+      if (!configuredMatch) configuredMatch = { itemType: T, outputKey: connKey, gateProjectNodeId: gpn }
+
+      // Buscar asset aprobado para este Connection output (per-output primero, luego general)
+      let outputAssetId = null
+      const { data: perOutputSess } = await db()
+        .from('forge_sessions')
+        .select('output_asset_id')
+        .eq('project_id', project_id)
+        .eq('node_id', node.id)
+        .eq('output_key', connKey)
+        .in('status', ['approved', 'auto_approved'])
+        .limit(1)
+        .maybeSingle()
+
+      if (perOutputSess?.output_asset_id) {
+        outputAssetId = perOutputSess.output_asset_id
+      } else {
+        const { data: genSess } = await db()
+          .from('forge_sessions')
+          .select('output_asset_id')
+          .eq('project_id', project_id)
+          .eq('node_id', node.id)
+          .is('output_key', null)
+          .in('status', ['approved', 'auto_approved'])
+          .order('created_at', { ascending: false })
+          .limit(1)
+          .maybeSingle()
+        outputAssetId = genSess?.output_asset_id ?? null
+      }
+
+      if (!outputAssetId) continue
+
+      const { data: asset } = await db()
+        .from('forge_assets')
+        .select('content')
+        .eq('id', outputAssetId)
+        .single()
+
+      const items = parseItemsFromContent(asset?.content)
+      if (!items.length) continue
+
+      return {
+        configured:        true,
+        willFanOut:        true,
+        itemCount:         items.length,
+        items,
+        itemType:          T,
+        outputKey:         connKey,
+        gateProjectNodeId: gpn,
+      }
+    }
+  }
+
+  // Hubo match de tipos pero sin datos aprobados aún → configured sin willFanOut
+  if (configuredMatch) {
+    return { configured: true, willFanOut: false, itemCount: null, items: [], ...configuredMatch }
+  }
+  return empty
+}
+
 // ── Motor principal ────────────────────────────────────────────────────────────
 
 /**
@@ -350,4 +475,4 @@ async function fanOut({ project_id, gate_project_node_id, gate_output_key, nextB
   return { lanes_created: createdLanes.length, nodes_created: totalNodes }
 }
 
-module.exports = { fanOut, classifySequenceNodes, parseItemsFromContent, extractSeedsFromAsset, parseSeeds }
+module.exports = { fanOut, detectFanOut, classifySequenceNodes, parseItemsFromContent, extractSeedsFromAsset, parseSeeds }
