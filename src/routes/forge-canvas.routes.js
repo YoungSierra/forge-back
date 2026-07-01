@@ -514,7 +514,7 @@ router.get('/', async (req, res, next) => {
     // No se deriva de forge_project_blueprints porque esa tabla puede no tener fila
     // para fases cargadas vía fan-out, y acumula filas selladas de fases viejas
     // (rompía la resolución: devolvía Ideation sellada en vez de Concept viva).
-    const PHASE_SEQUENCE = ['ideation', 'concept', 'preprod', 'production']
+    const PHASE_SEQUENCE = ['ideation', 'concept', 'pre-production', 'production', 'live-ops']
     const loadedBpIds = [...new Set((projectNodes || []).map(n => n.blueprint_id).filter(Boolean))]
     let activeBlueprint = null
     if (loadedBpIds.length > 0) {
@@ -633,7 +633,7 @@ router.post('/gate', async (req, res, next) => {
     }
 
     // ACCEPT → buscar y cargar el siguiente blueprint por fase
-    const PHASE_SEQUENCE = ['ideation', 'concept', 'preprod', 'production']
+    const PHASE_SEQUENCE = ['ideation', 'concept', 'pre-production', 'production', 'live-ops']
 
     const { data: currentBp } = await db()
       .from('forge_blueprints')
@@ -2379,18 +2379,35 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
 })
 
 // ─── GET /api/projects/:id/canvas/nodes-catalog ──────────────
-// Lista todos los nodos activos disponibles para agregar al canvas
+// Lista los nodos activos disponibles para agregar al canvas.
+// Con ?include_preview=1 suma además los nodos preview (archived + metadata.preview=true),
+// que se revelan en el canvas con Ctrl+Alt+P — nunca aparecen en producción normal.
 router.get('/nodes-catalog', async (req, res, next) => {
   try {
+    const SEL = 'id, node_key, title, phase, purpose, executor, metadata'
+    const includePreview = req.query.include_preview === '1' || req.query.include_preview === 'true'
+
     const { data, error } = await db()
       .from('forge_nodes')
-      .select('id, node_key, title, phase, purpose, executor')
+      .select(SEL)
       .eq('status', 'active')
       .order('phase')
       .order('node_key')
-
     if (error) throw error
-    res.json({ success: true, nodes: data })
+    let nodes = data || []
+
+    if (includePreview) {
+      const { data: preview, error: pErr } = await db()
+        .from('forge_nodes')
+        .select(SEL)
+        .eq('status', 'archived')
+        .eq('metadata->>preview', 'true')
+        .order('node_key')
+      if (pErr) throw pErr
+      nodes = nodes.concat(preview || [])
+    }
+
+    res.json({ success: true, nodes })
   } catch (err) { next(err) }
 })
 
@@ -3213,7 +3230,7 @@ router.post('/run-plan', async (req, res, next) => {
     const { type: scopeType = 'pipeline' } = req.body || {}
 
     // Secuencia canónica de fases — idéntica a la del gate ACCEPT
-    const PHASE_SEQUENCE = ['ideation', 'concept', 'preprod', 'production']
+    const PHASE_SEQUENCE = ['ideation', 'concept', 'pre-production', 'production', 'live-ops']
     const { detectFanOut } = require('../services/fan-out.service')
 
     // Decisión recordada por el usuario (run_config.gate_authorization con remember=true)
