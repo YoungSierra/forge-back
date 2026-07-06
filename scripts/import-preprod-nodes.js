@@ -10,8 +10,9 @@
 const fs   = require('fs')
 const path = require('path')
 
+// Fuente canónica actual: v2 (NodeDNA v2.5.2). La v1 (2.4.1) quedó archivada como _v1.
 const SOURCE_DIR = process.argv[2] ||
-  'C:/Users/Admin/Documents/V57 Studio/Forge/Nodes Pre Produccion/Forge_PreProd_node_jsons'
+  'C:/Users/Admin/Documents/V57 Studio/Forge/Nodes Pre Produccion/Forge_PreProd_node_jsons_v2'
 const OUT_FILE = process.argv[3] ||
   path.join(__dirname, '..', 'src', 'migrations', '035_seed_preprod_nodes.sql')
 
@@ -68,6 +69,7 @@ function mapNode(doc) {
   // Campos nuevos v2.4.1 sin columna propia → metadata jsonb (aditivo, el motor lo ignora hoy)
   const metadata = {
     preview:     true,                    // etiqueta de "nodo en desarrollo" — reveal con Ctrl+Alt+P en canvas
+    dna_version: doc.version,             // versión NodeDNA de la fuente (ej. "2.5.2")
     node_type:   n.node_type,
     sub_phase:   n.sub_phase,
     group:       n.execution?.group,
