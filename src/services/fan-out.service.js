@@ -119,12 +119,32 @@ function extractSeedsFromAsset(content) {
  * Parsea el contenido de un asset como array de ítems del type_registry.
  * Intenta JSON primero; fallback a text parsing (concept_seed mínimo).
  */
+// Extrae el primer array JSON del contenido (con o sin fences ```json), aunque venga
+// rodeado de prosa. Devuelve el array parseado o null si no hay uno válido.
+function extractJsonArray(content) {
+  const fence = content.match(/```(?:json)?\s*([\s\S]*?)```/i)
+  const text  = fence ? fence[1] : content
+  const start = text.indexOf('[')
+  const end   = text.lastIndexOf(']')
+  if (start === -1 || end <= start) return null
+  try {
+    const arr = JSON.parse(text.slice(start, end + 1))
+    return Array.isArray(arr) ? arr : null
+  } catch (_) { return null }
+}
+
 function parseItemsFromContent(content) {
   if (!content) return []
+  // 1) Contenido JSON limpio (todo el asset es el array)
   try {
     const parsed = JSON.parse(content)
     if (Array.isArray(parsed) && parsed.length > 0) return parsed
   } catch (_) {}
+  // 2) JSON embebido: array dentro de fences ```json o rodeado de prosa (Divergence Pass, etc.)
+  //    Evita contar bullets de prosa como si fueran ítems.
+  const embedded = extractJsonArray(content)
+  if (embedded && embedded.length > 0) return embedded
+  // 3) Fallback: markdown de seeds parseado por líneas
   return extractSeedsFromAsset(content)
 }
 

@@ -3371,8 +3371,9 @@ router.post('/run-plan', async (req, res, next) => {
           item_count:   fan.itemCount,
           item_type:    fan.itemType,
         })
-        // Si este gate hace fan-out con N ítems, la fase siguiente corre N veces (lanes)
-        if (fan.willFanOut && fan.itemCount) mult *= fan.itemCount
+        // Si este gate hace fan-out con N ítems, la fase siguiente corre N veces (lanes).
+        // Cap a 5: el motor real (fan-out.service) limita a items.slice(0,5) lanes.
+        if (fan.willFanOut && fan.itemCount) mult *= Math.min(fan.itemCount, 5)
       }
     }
 
