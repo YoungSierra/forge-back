@@ -683,12 +683,14 @@ router.post('/gate', async (req, res, next) => {
 
       const { data: bpNodes } = await db()
         .from('forge_project_nodes')
-        .select('id, node_id')
+        .select('id, node_id, order_index')
         .eq('project_id', project_id)
         .eq('blueprint_id', blueprint_id)
         .eq('removed', false)
 
       const bpNodeIds = (bpNodes || []).map(n => n.node_id).filter(Boolean)
+      // order_index por node_id — para priorizar el GATE (último nodo) al elegir la fuente del fan-out
+      const orderByNodeId = Object.fromEntries((bpNodes || []).map(n => [n.node_id, n.order_index ?? 0]))
 
       let fanOutItems       = null
       let fanOutItemType    = null
@@ -704,7 +706,15 @@ router.post('/gate', async (req, res, next) => {
 
         const nextSeqNodeIds = (nextBp.node_sequence || []).map(s => s.node_id).filter(Boolean)
 
-        for (const node of (currentDna || [])) {
+        // Prioridad al GATE: recorrer los nodos del blueprint de MAYOR a MENOR order_index.
+        // Así el fan-out usa el output curado del gate (ej. 1.4 selected_seeds = la selección
+        // real) y NO el de un nodo anterior (ej. 1.1 concept_seeds), que también es
+        // list<concept_seed> pero contiene TODAS las seeds, no las que el usuario seleccionó.
+        const sortedDna = [...(currentDna || [])].sort(
+          (a, b) => (orderByNodeId[b.id] ?? 0) - (orderByNodeId[a.id] ?? 0)
+        )
+
+        for (const node of sortedDna) {
           // Soporta formato v1.3.0 (array plano con type:'connection') y legacy (outputs.connections)
           const rawOutputs = Array.isArray(node.outputs)
             ? node.outputs
@@ -1498,7 +1508,7 @@ function extractSection(content, sectionName) {
 router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req, res, next) => {
   try {
     const { id: project_id, node_id } = req.params
-    const { user_message, session_id, member_id, attachment_url, target_output_key = null, project_node_id: explicit_project_node_id = null } = req.body
+    let { user_message, session_id, member_id, attachment_url, target_output_key = null, project_node_id: explicit_project_node_id = null } = req.body
 
     if (!user_message?.trim()) {
       return res.status(400).json({ success: false, error: 'user_message es requerido' })
@@ -1519,6 +1529,14 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
     const normalizeOutput = o => ({ ...o, key: o.key || o.name, label: o.label || o.name || o.key })
     const allOutputDefs = (Array.isArray(node.outputs) ? node.outputs : []).map(normalizeOutput)
     const targetOutput  = target_output_key ? allOutputDefs.find(o => o.key === target_output_key) ?? null : null
+    // Guard: si viene un target_output_key que NO es un output real del nodo (ej. un input como
+    // visual_targets heredado de un focus stale en el front), tratarlo como sesión general. Evita
+    // crear una sesión per-output con un key inválido que luego rompe el UI (modal de outputs sin
+    // foco) y deja la respuesta del run general inaccesible.
+    if (target_output_key && !targetOutput) {
+      console.warn(`[forge-chat] target_output_key "${target_output_key}" no es output de ${node.node_key} — tratando como sesión general`)
+      target_output_key = null
+    }
     const directContext = node.inputs?.direct_context || ''
 
     // Buscar o crear sesión activa
@@ -1673,6 +1691,11 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
     function injectSkillVars(template, vars) {
       let result = template.replace(/\[([^\]]+)\]/g, (match, key) => {
         const normalized = key.toLowerCase().replace(/\s+/g, '_')
+        // Solo sustituir si la clave es una variable CONOCIDA; si no, dejar el texto intacto.
+        // Protege los marcadores del skill ([REQUIRED], [PROJECTED], [TO-FILL:eng], [goal]…)
+        // que antes se comían (→ vacío) y rompían las guías/fill-markers del template.
+        const known = Object.prototype.hasOwnProperty.call(vars, normalized) || Object.prototype.hasOwnProperty.call(vars, key)
+        if (!known) return match
         const value = vars[normalized] ?? vars[key]
         return (value != null && value !== '') ? value : ''
       })
@@ -1744,7 +1767,7 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
       .map((s, i) => {
         if (!skillTexts[i]) return ''
         const filledText = injectSkillVars(skillTexts[i], skillVars)
-        return `\n## Skill Reference: ${s}\n> This section is a GUIDE for your output structure. Do NOT reproduce these instructions verbatim in your response. Use the template to organize your content, but generate original text for each section.\n\n${filledText}`
+        return `\n## Skill Reference: ${s}\n> This is a GUIDE for HOW to build the output — it is NOT the output. Do NOT reproduce the guide itself: never output its own meta-sections (e.g. "When to use this", "Inputs", "Method", "Principles", "Worked example", "Output checklist", "Common mistakes", "Companion artifacts", "Playbook / Method", "A/B/C" headers) nor its instructions or examples. Produce the deliverable the task asks for, following this guidance. Only reuse EXACT field/section labels when the guide explicitly lists the fields of the DELIVERABLE itself (e.g. a GDD template's fields) — never the guide's own section names.\n\n${filledText}`
       })
       .filter(Boolean).join('\n')
 
@@ -2006,8 +2029,17 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
         .neq('format', 'png')
         .order('created_at', { ascending: false })
 
+      // No re-inyectar los outputs PROPIOS del nodo (ej. gdd_ref/gdd_complete): al regenerar,
+      // mostrarle al modelo su salida anterior lo ANCLA a la estructura vieja y la copia,
+      // pisando el field-spec del skill. asset.name = "NodeTitle — OutputLabel" (no == output_key).
+      const ownOutputAssetNames = new Set(
+        allOutputDefs.map(o => {
+          const label = typeof o === 'object' ? (o.label || o.name || o.key) : o
+          return `${node.title} — ${label}`.toLowerCase().trim()
+        })
+      )
       for (const asset of (siblingAssets || [])) {
-        if (asset.name === target_output_key) continue  // excluir el output objetivo
+        if (ownOutputAssetNames.has((asset.name || '').toLowerCase().trim())) continue
         const snippet = (asset.content || '').slice(0, 2000)
         if (snippet) existingNodeOutputs.push(`### ${asset.name}\n${snippet}`)
       }
@@ -2101,7 +2133,9 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
         model:           executorStr,
         rawText:         true,
         temperature:     0.7,
-        maxOutputTokens: 8192,
+        // 16K: documentos largos (GDD 14 secciones, TDD) se truncaban con 8192.
+        // Este es el path del chat interactivo — el de auto-run vive en runReActLoop.
+        maxOutputTokens: 16384,
       })
 
       meta      = result.meta
@@ -2184,22 +2218,31 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
     // Normalizar secciones estructuradas — independiente de cómo las formateó el LLM
     replyText = normalizeOutputSections(replyText, allOutputDefs)
 
-    // Si el nodo tiene doc_gen_docx y el LLM no la llamó por su cuenta, generar automáticamente
+    // Si el nodo tiene doc_gen_docx y el LLM no la llamó por su cuenta, generar automáticamente.
     const hasDocTool   = activeTools.includes('doc_gen_docx')
     const alreadyCalled = allToolCalls.some(tc => tc.tool === 'doc_gen_docx')
+    // Solo generar doc si NO hay target (run general → produce el asset doc) o si el target es un
+    // output de DOCUMENTO. Las connections (feel_statement, visual_targets, design_pillars…) son
+    // datos estructurados/texto corto, no documentos → nada de PDF ni botón de descarga para ellas.
+    const DOC_FORMATS   = ['document', 'pdf', 'doc', 'docx', 'pptx']
+    const targetIsDoc   = !targetOutput
+      || targetOutput.type === 'asset'
+      || DOC_FORMATS.includes((targetOutput.format || '').toLowerCase())
 
-    if (hasDocTool && !alreadyCalled && replyText.trim().length > 200) {
+    if (hasDocTool && !alreadyCalled && replyText.trim().length > 200 && targetIsDoc) {
       try {
         // Extraer solo la sección del output principal (format: document/pdf)
         // para no incluir outputs secundarios (light_pitches, etc.) en el PDF
         let docContent = replyText
+        // v1.3.0/v2.6.0 usan 'key'; legacy usaba 'name'. Resolver ambos para no romper.
+        const outKeyOf = o => typeof o === 'object' ? (o.key ?? o.name ?? '') : o
         const docOutputDef = allOutputDefs.find(o => {
           const fmt = typeof o === 'object' ? (o.format ?? '') : ''
-          return ['document', 'pdf', 'doc'].includes(fmt.toLowerCase())
+          return ['document', 'pdf', 'doc', 'docx', 'pptx'].includes(fmt.toLowerCase())
         }) || allOutputDefs[0]
 
         if (docOutputDef) {
-          const outName        = typeof docOutputDef === 'object' ? docOutputDef.name : docOutputDef
+          const outName        = outKeyOf(docOutputDef)
           const secondaryDefs  = allOutputDefs.filter(o => o !== docOutputDef)
 
           // Estrategia: localizar dónde empieza la primera sección SECUNDARIA y cortar ahí.
@@ -2208,7 +2251,8 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
           // los headings de secciones secundarias sí coinciden con variantes humanizadas.
           let cutIndex = -1
           for (const secDef of secondaryDefs) {
-            const secName = typeof secDef === 'object' ? secDef.name : secDef
+            const secName = outKeyOf(secDef)
+            if (!secName) continue
             const variants = [
               secName,
               secName.replace(/_/g, ' '),
@@ -2247,6 +2291,14 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
               console.log(`[forge-chat] auto doc_gen_docx — usando sección "${outName}" (${extracted.length} chars)`)
             }
           }
+        }
+
+        // Salvaguarda: si la extracción del output primario dejó un fragmento chico frente a la
+        // respuesta completa (ej. agarró un preámbulo del template del skill y cortó el cuerpo),
+        // descartarla y usar la respuesta completa. Mejor un doc con algo de más que casi vacío.
+        if (docContent.trim().length < Math.min(2000, replyText.trim().length * 0.5)) {
+          docContent = replyText
+          console.log(`[forge-chat] auto doc_gen_docx — extracción descartada (fragmento chico), usando respuesta completa (${replyText.trim().length} chars)`)
         }
 
         // Post-process: el LLM a veces reproduce placeholders literalmente en el output

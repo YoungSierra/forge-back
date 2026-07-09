@@ -23,7 +23,10 @@ async function callAnthropic(systemPrompt, userMessage, options = {}) {
     if (supportsTemperature) {
       createParams.temperature = options.temperature !== undefined ? options.temperature : 0.8
     }
-    response = await getClient().messages.create(createParams)
+    // Streaming: en generaciones largas (GDD/TDD, 16K tokens) el request NO-stream golpea
+    // el timeout del cliente HTTP del SDK ("Request timed out"). stream()+finalMessage()
+    // espera el fin y devuelve el mensaje ensamblado — mismo shape, sin ese timeout.
+    response = await getClient().messages.stream(createParams).finalMessage()
   } catch (err) {
     const status = err.status || err.statusCode
     if (status === 429) {

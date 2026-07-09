@@ -165,13 +165,14 @@ async function detectFanOut({ project_id, current_blueprint_id, nextBlueprint, d
 
   const { data: bpNodes } = await db()
     .from('forge_project_nodes')
-    .select('id, node_id')
+    .select('id, node_id, order_index')
     .eq('project_id', project_id)
     .eq('blueprint_id', current_blueprint_id)
     .eq('removed', false)
 
   const bpNodeIds = (bpNodes || []).map(n => n.node_id).filter(Boolean)
   if (!bpNodeIds.length) return empty
+  const orderByNodeId = Object.fromEntries((bpNodes || []).map(n => [n.node_id, n.order_index ?? 0]))
 
   const { data: currentDna } = await db()
     .from('forge_nodes')
@@ -182,7 +183,13 @@ async function detectFanOut({ project_id, current_blueprint_id, nextBlueprint, d
   let nextDna = null
   let configuredMatch = null  // primer match de tipos, aunque no haya datos aún
 
-  for (const node of (currentDna || [])) {
+  // Prioridad al GATE: mayor a menor order_index → usa el output curado del gate
+  // (ej. 1.4 selected_seeds), no el de un nodo anterior (ej. 1.1 concept_seeds).
+  const sortedDna = [...(currentDna || [])].sort(
+    (a, b) => (orderByNodeId[b.id] ?? 0) - (orderByNodeId[a.id] ?? 0)
+  )
+
+  for (const node of sortedDna) {
     // Soporta formato v1.3.0 (array plano con type:'connection') y legacy (outputs.connections)
     const rawOutputs = Array.isArray(node.outputs)
       ? node.outputs

@@ -239,13 +239,40 @@ function renderInline(doc, text, x, y, opts, fontSize, color) {
   }
 }
 
-// Agrupa líneas consecutivas en bloques tipados: heading, paragraph, bullet, numbered, table
+// Convierte caracteres box-drawing / flechas / bullets Unicode a ASCII para que la fuente
+// estándar del PDF (Courier/Helvetica, WinAnsi) los tenga. Sin esto, un diagrama ASCII-art
+// del LLM sale como basura (glifos inexistentes → '%'). El resto fuera de Latin-1 → '?'.
+function sanitizeMono(s) {
+  return String(s)
+    .replace(/[─━┄┅┈┉╌╍╴╶╸╺]/g, '-')
+    .replace(/[│┃┆┇┊┋╎╏╵╷╹╻]/g, '|')
+    .replace(/[┌-╋═-╬]/g, '+')
+    .replace(/[←-⇿]/g, '>')
+    .replace(/[▲△]/g, '^').replace(/[▼▽]/g, 'v')
+    .replace(/[►▶▸▹]/g, '>').replace(/[◄◀◂◃]/g, '<')
+    .replace(/[•▪●■◦⁃]/g, '*')
+    .replace(/[^\x20-\x7e\xa0-\xff]/g, '?')
+}
+
+// Agrupa líneas consecutivas en bloques tipados: heading, paragraph, bullet, numbered, table, code
 function groupLines(lines) {
   const blocks = []
   let i = 0
   while (i < lines.length) {
     const line = lines[i]
     if (!line.trim()) { i++; continue }
+
+    // Bloque de código cercado (```): preservar como monospace sin romper alineación.
+    // El LLM a veces dibuja mapas de relaciones/facciones como ASCII-art aquí dentro;
+    // así se renderiza preformateado en vez de destrozarse como párrafos proporcionales.
+    if (line.trimStart().startsWith('```')) {
+      i++ // saltar fence de apertura
+      const codeLines = []
+      while (i < lines.length && !lines[i].trimStart().startsWith('```')) { codeLines.push(lines[i]); i++ }
+      if (i < lines.length) i++ // saltar fence de cierre
+      if (codeLines.some(l => l.trim())) blocks.push({ type: 'code', lines: codeLines })
+      continue
+    }
 
     // Heading inline (cualquier # stray dentro del contenido de una sección)
     const hm = line.match(/^(#{1,4}) (.+)/)
@@ -337,8 +364,15 @@ function drawPageHeader(doc, title) {
 }
 
 async function docGenDocx(title, content, projectId, nodeId) {
-  // Limpiar trailing signoffs del LLM (texto después del último --- cerca del final)
   let cleanContent = content || title
+  // Quitar tags HTML sueltos (ej. <a name="§1"></a> que el LLM emite para un TOC navegable).
+  // El renderer es markdown→PDF y no los procesa, así que saldrían como texto literal.
+  // El patrón exige letra tras '<' para no tocar "< 40" ni "0<100" del contenido.
+  cleanContent = cleanContent.replace(/<\/?[a-zA-Z][^>]*>/g, '')
+  // Enlaces markdown [texto](url) → solo el texto. El PDF no hace links clickeables, y el
+  // modelo genera un TOC con [§1 Game Identity](#anchor) que si no saldría como sintaxis cruda.
+  cleanContent = cleanContent.replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+  // Limpiar trailing signoffs del LLM (texto después del último --- cerca del final)
   const lastHr = cleanContent.lastIndexOf('\n---\n')
   if (lastHr !== -1 && cleanContent.length - lastHr < 800) {
     cleanContent = cleanContent.slice(0, lastHr)
@@ -358,22 +392,40 @@ async function docGenDocx(title, content, projectId, nodeId) {
 
     // ── Portada ───────────────────────────────────────────────────────────────
     const h1 = sections.find(s => s.level === 1)
-    // Subtitle: primera línea de metadata corta (con · o <100 chars), no párrafos de contenido
     const firstSection = sections.find(s => s.level >= 2)
+    const stripEmphasis = s => s.replace(/\*\*/g, '').trim()
+    // Subtitle preferido: la línea de metadata con separador '·' (ej. "V57 Studio · Juego · v0.1 ·
+    // 2025"), que suele venir en **bold** — se limpian los marcadores. Puede estar en h1 o 1ª sección.
+    const isMetaLine = l => {
+      const t = stripEmphasis(l)
+      return t && t.includes('·') && t.length < 100 && !/^#{1,4} /.test(t)
+    }
+    // Fallback: primera línea corta que no sea heading/HR/lista/fence/bold/número de sección.
     const isSubLine = l => {
       const t = l.trim()
       return t
         && !/^#{1,4} /.test(t)         // no heading
         && !/^[-*_]{3,}\s*$/.test(t)   // no HR
+        && !/^[-*•]\s/.test(t)         // no ítem de lista (ej. entradas de TOC)
         && !t.startsWith('**')         // no párrafo bold
+        && !t.startsWith('[')          // no enlace/entrada de índice suelta
+        && !t.startsWith('```')        // no fence de código (ej. ```yaml de un bloque inicial)
+        && !/^§?\d+[\s.·]/.test(t)     // no línea que arranca con número de sección (§1, 1.)
         && t.length < 100              // corto — es metadata, no cuerpo
     }
-    const subtitle = h1?.lines?.find(isSubLine)?.trim()
-      ?? firstSection?.lines?.find(isSubLine)?.trim()
-      ?? ''
+    const metaLine = h1?.lines?.find(isMetaLine) ?? firstSection?.lines?.find(isMetaLine)
+    const subtitle = metaLine
+      ? stripEmphasis(metaLine)
+      : (h1?.lines?.find(isSubLine)?.trim() ?? firstSection?.lines?.find(isSubLine)?.trim() ?? '')
     drawCover(doc, docType, gameTitle || h1?.title || title, subtitle)
 
-    const contentSections = sections.filter(s => s.level >= 2)
+    let contentSections = sections.filter(s => s.level >= 2)
+    // Sin secciones ## — renderizar el cuerpo disponible (nivel-1 o todo el texto) para no dejar
+    // el PDF en portada vacía (outputs cortos/sin headings, ej. feel_statement).
+    if (!contentSections.length) {
+      const body = (h1?.lines?.some(l => l.trim()) ? h1.lines : cleanContent.split('\n')).filter(l => l.trim())
+      if (body.length) contentSections = [{ level: 2, title: '', lines: body }]
+    }
     if (!contentSections.length) return
 
     // ── Primera página de contenido ───────────────────────────────────────────
@@ -398,7 +450,7 @@ async function docGenDocx(title, content, projectId, nodeId) {
         .replace(/_/g, ' ')
         .replace(/\b\w/g, c => c.toUpperCase())
 
-      if (section.level === 2) {
+      if (sectionLabel && section.level === 2) {
         // H2 — barra ember + título grande + línea separadora
         doc.rect(MARGIN, y + 3, 4, 16).fill(PDF_EMBER)
         doc.font('Helvetica-Bold').fontSize(15).fillColor(PDF_TEXT)
@@ -406,7 +458,7 @@ async function docGenDocx(title, content, projectId, nodeId) {
         y = doc.y + 8
         doc.rect(MARGIN, y, CONTENT_W, 0.5).fill(PDF_LINE)
         y += 12
-      } else {
+      } else if (sectionLabel) {
         doc.font('Helvetica-Bold').fontSize(11).fillColor(PDF_H3_CLR)
           .text(sectionLabel, MARGIN, y, { width: CONTENT_W })
         y = doc.y + 8
@@ -443,6 +495,16 @@ async function docGenDocx(title, content, projectId, nodeId) {
           renderInline(doc, block.text, MARGIN + 20, y, { width: CONTENT_W - 20, lineGap: 3 }, 10, PDF_TEXT)
           y = doc.y + 5
 
+        } else if (block.type === 'code') {
+          // Preformateado monospace — preserva saltos de línea y alineación (ASCII-art, snippets).
+          for (const raw of block.lines) {
+            checkPageBreak(16)
+            doc.font('Courier').fontSize(8).fillColor(PDF_TEXT)
+              .text(sanitizeMono(raw) || ' ', MARGIN, y, { width: CONTENT_W, lineBreak: false })
+            y = doc.y + 2
+          }
+          y += 8
+
         } else if (block.type === 'paragraph') {
           renderInline(doc, block.text, MARGIN, y, { width: CONTENT_W, lineGap: 3 }, 10, PDF_TEXT)
           y = doc.y + 5
@@ -467,7 +529,12 @@ async function docGenDocx(title, content, projectId, nodeId) {
             doc.rect(MARGIN, y + rowH, CONTENT_W, 0.5).fill(PDF_LINE)
 
             for (let ci = 0; ci < colCount; ci++) {
-              const cellText = row[ci] ?? ''
+              // Las celdas se dibujan en una sola fuente (sin runs), así que quitamos los
+              // marcadores markdown (**bold**, *italic*, `code`) para que no salgan literales.
+              const cellText = String(row[ci] ?? '')
+                .replace(/\*\*([^*]+)\*\*/g, '$1')
+                .replace(/\*([^*]+)\*/g, '$1')
+                .replace(/`([^`]+)`/g, '$1')
               const cx       = MARGIN + ci * colW
               doc.font(isHeader ? 'Helvetica-Bold' : 'Helvetica')
                 .fontSize(9)

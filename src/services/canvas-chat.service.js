@@ -9,6 +9,10 @@ function injectVars(template, vars) {
 function injectSkillVars(template, vars) {
   let result = template.replace(/\[([^\]]+)\]/g, (match, key) => {
     const normalized = key.toLowerCase().replace(/\s+/g, '_')
+    // Solo sustituir variables CONOCIDAS; corchetes no-variables ([REQUIRED], [PROJECTED],
+    // [goal]…) se dejan intactos — antes se comían y rompían los marcadores del template.
+    const known = Object.prototype.hasOwnProperty.call(vars, normalized) || Object.prototype.hasOwnProperty.call(vars, key)
+    if (!known) return match
     const value = vars[normalized] ?? vars[key]
     return (value != null && value !== '') ? value : ''
   })
@@ -133,7 +137,7 @@ async function buildSystemPrompt(db, { projectId, nodeId, sessionId, userMessage
     .map((s, i) => {
       if (!skillTexts[i]) return ''
       const filledText = injectSkillVars(skillTexts[i], skillVars)
-      return `\n## Skill Reference: ${s}\n> This section is a GUIDE for your output structure. Do NOT reproduce these instructions verbatim in your response. Use the template to organize your content, but generate original text for each section.\n\n${filledText}`
+      return `\n## Skill Reference: ${s}\n> This is a GUIDE for HOW to build the output — it is NOT the output. Do NOT reproduce the guide itself: never output its own meta-sections (e.g. "When to use this", "Inputs", "Method", "Principles", "Worked example", "Output checklist", "Common mistakes", "Companion artifacts", "Playbook / Method", "A/B/C" headers) nor its instructions or examples. Produce the deliverable the task asks for, following this guidance. Only reuse EXACT field/section labels when the guide explicitly lists the fields of the DELIVERABLE itself (e.g. a GDD template's fields) — never the guide's own section names.\n\n${filledText}`
     })
     .filter(Boolean).join('\n')
 
@@ -381,7 +385,10 @@ async function runReActLoop({ finalSystemPrompt, baseUserMsg, executorStr, activ
 
   for (let iter = 0; iter < MAX_TOOL_ITERS; iter++) {
     const result = await callLLM(finalSystemPrompt, currentUserMsg, {
-      model: executorStr, rawText: true, temperature: 0.7, maxOutputTokens: 8192,
+      // 16K de techo: documentos largos (GDD 14 secciones, TDD) se truncaban con 8192.
+      // Es un límite, no un objetivo — solo se paga por lo generado; 16384 es seguro
+      // cross-provider (32K excede el cap de salida de algunos modelos groq/openai).
+      model: executorStr, rawText: true, temperature: 0.7, maxOutputTokens: 16384,
     })
     meta      = result.meta
     replyText = typeof result.data === 'string' ? result.data : JSON.stringify(result.data)
