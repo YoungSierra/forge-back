@@ -115,7 +115,7 @@ function mapNode(doc) {
     constraints: dna.constraints || '',
     tools:  (dna.tools || []).filter(t => IMPLEMENTED_TOOLS.has(t)),  // descarta stubs/no-configuradas
     skills: dna.skills || [],
-    executor: { type: 'llm' },     // el motor ejecuta todo como LLM; node_type real vive en metadata
+    executor: { type: 'llm', model: 'anthropic:claude-sonnet-4-6' },  // modelo por default; node_type real vive en metadata
     inputs, outputs, metadata,
     _ports:   wired.map(w => w.key),
     _outkeys: outputs.map(o => o.key),
