@@ -3,6 +3,7 @@ const router     = express.Router({ mergeParams: true })
 const multer     = require('multer')
 const { db }     = require('../services/supabase.service')
 const { autoWire, cleanupAndRewire } = require('../services/auto-wire.service')
+const { extractSection } = require('../utils/extract-section')
 
 // ─── ¿El blueprint está sellado? (gate ACCEPT) ───────────────────────────────
 // forge_project_blueprints acumula varias filas por blueprint (historial de loads).
@@ -1493,15 +1494,6 @@ router.get('/nodes/:node_id/session', async (req, res, next) => {
 })
 
 // ─── Helper: extraer una sección por heading de un documento markdown ─────────
-function extractSection(content, sectionName) {
-  const escaped = sectionName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-  const startRx = new RegExp(`^##\\s+${escaped}\\s*$`, 'im')
-  const match   = startRx.exec(content)
-  if (!match) return null
-  const after       = content.slice(match.index + match[0].length)
-  const nextSection = /^##\s+/im.exec(after)
-  return nextSection ? after.slice(0, nextSection.index).trim() : after.trim()
-}
 
 // ─── POST /api/projects/:id/canvas/nodes/:node_id/chat ────────
 // Conversación multi-turno con un nodo usando forge_sessions/forge_messages
@@ -1839,170 +1831,16 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
       currentPNode = pnByNode
     }
 
-    let resolvedInputs = []
-    const injectedPngUrls   = new Set() // evitar duplicados de PNG cuando hay múltiples edges del mismo nodo
-    const seenSourceNodeIds = new Set() // evitar inyectar el mismo nodo upstream dos veces (múltiples edges)
-
-    if (currentPNode) {
-      // 1. Outputs de nodos conectados por edge
-      let incomingEdges = []
-      try {
-        const { data: edgeData } = await db()
-          .from('forge_project_edges')
-          .select('source_node_id, source_handle')
-          .eq('project_id', project_id)
-          .eq('target_node_id', currentPNode.id)
-        incomingEdges = edgeData || []
-      } catch { /* tabla no migrada aún */ }
-
-      for (const edge of incomingEdges) {
-        if (seenSourceNodeIds.has(edge.source_node_id)) continue
-        seenSourceNodeIds.add(edge.source_node_id)
-        const { data: sourcePNode } = await db()
-          .from('forge_project_nodes')
-          .select(`
-            node_id, node_type, source_asset_id,
-            text_label, text_content,
-            forge_nodes(title, outputs),
-            forge_project_library_assets(display_name, extracted_text, storage_url, asset_type)
-          `)
-          .eq('id', edge.source_node_id)
-          .maybeSingle()
-
-        if (!sourcePNode) continue
-
-        if ((sourcePNode.node_type || 'forge_node') === 'library_asset') {
-          // Asset-node: usar datos del library asset directamente
-          const lib = sourcePNode.forge_project_library_assets
-          if (!lib) continue
-          if (lib.extracted_text) {
-            const snippet = lib.extracted_text.slice(0, 3000) + (lib.extracted_text.length > 3000 ? '\n[truncated]' : '')
-            resolvedInputs.push(`### ${lib.display_name} (library asset)\n${snippet}`)
-          } else if (lib.asset_type === 'image') {
-            resolvedInputs.push(`### ${lib.display_name} (image reference)\nURL: ${lib.storage_url}`)
-          }
-        } else if (sourcePNode.node_type === 'text_input') {
-          // Text-input node: texto libre escrito por el usuario en el canvas
-          const label   = sourcePNode.text_label   || 'Text Input'
-          const content = (sourcePNode.text_content || '').trim()
-          if (content) resolvedInputs.push(`### ${label}\n${content}`)
-        } else {
-          // Forge-node: buscar output de texto aprobado o auto_approved (excluir PNG)
-          const { data: asset } = await db()
-            .from('forge_assets')
-            .select('content, storage_url')
-            .eq('project_id', project_id)
-            .eq('node_id', sourcePNode.node_id)
-            .in('status', ['approved', 'auto_approved'])
-            .neq('format', 'png')
-            .order('created_at', { ascending: false })
-            .limit(1)
-            .maybeSingle()
-
-          if (asset?.content) {
-            const nodeTitle  = sourcePNode.forge_nodes?.title ?? 'Upstream node'
-            const outputs    = sourcePNode.forge_nodes?.outputs ?? []
-            let   content    = asset.content
-            let   slotLabel  = nodeTitle
-
-            // Si el edge apunta a un output slot específico, extraer solo esa sección
-            const srcHandle = edge.source_handle
-            if (srcHandle?.startsWith('out-')) {
-              const handleVal = srcHandle.slice(4) // "out-concept_seeds" → "concept_seeds"
-              // Buscar por key (v1.3.0) o name (legacy) o por índice
-              const outputDef = outputs.find(o => (o.key || o.name) === handleVal)
-                ?? outputs[parseInt(handleVal, 10)]
-              if (outputDef) {
-                const sectionKey = outputDef.key || outputDef.name
-                const extracted  = sectionKey ? extractSection(content, sectionKey) : null
-                if (extracted) {
-                  content   = extracted
-                  slotLabel = `${nodeTitle} → ${outputDef.label || sectionKey}`
-                }
-              }
-            }
-
-            const snippet = content.slice(0, 3000) + (content.length > 3000 ? '\n[truncated]' : '')
-            resolvedInputs.push(`### ${slotLabel}\n${snippet}`)
-          }
-
-          // Inyectar imágenes PNG aprobadas o auto_approved del nodo upstream
-          const { data: pngAssets } = await db()
-            .from('forge_assets')
-            .select('name, storage_url')
-            .eq('project_id', project_id)
-            .eq('node_id', sourcePNode.node_id)
-            .in('status', ['approved', 'auto_approved'])
-            .eq('format', 'png')
-            .not('storage_url', 'is', null)
-
-          for (const png of (pngAssets || [])) {
-            if (png.storage_url && !injectedPngUrls.has(png.storage_url)) {
-              injectedPngUrls.add(png.storage_url)
-              resolvedInputs.push(`### ${png.name} (generated image)\nURL: ${png.storage_url}`)
-            }
-          }
-
-          // Fallback: si no hay PNGs en forge_assets, leer output_images de la sesión aprobada
-          // (cubre casos donde el accept fue anterior al fix del formato variations[])
-          if ((pngAssets || []).length === 0) {
-            const { data: approvedSession } = await db()
-              .from('forge_sessions')
-              .select('output_images, forge_nodes(title, outputs)')
-              .eq('project_id', project_id)
-              .eq('node_id', sourcePNode.node_id)
-              .eq('status', 'approved')
-              .order('created_at', { ascending: false })
-              .limit(1)
-              .maybeSingle()
-
-            if (approvedSession?.output_images) {
-              const nodeTitle2  = approvedSession.forge_nodes?.title ?? nodeTitle ?? 'Node'
-              const pngOutputs  = (approvedSession.forge_nodes?.outputs || [])
-                .filter(o => (o.format === 'png' || o.format === 'image') && o.image_gen)
-              const raw = approvedSession.output_images
-
-              for (const outDef of pngOutputs) {
-                const items = Array.isArray(raw[outDef.name]) ? raw[outDef.name] : []
-                for (const item of items) {
-                  const urls = Array.isArray(item.variations)
-                    ? item.variations.map(v => v.url).filter(Boolean)
-                    : item.image_url ? [item.image_url] : []
-                  for (const url of urls) {
-                    if (!injectedPngUrls.has(url)) {
-                      injectedPngUrls.add(url)
-                      resolvedInputs.push(`### ${nodeTitle2} — ${outDef.name} (generated image)\nURL: ${url}`)
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-
-      // 2. Library assets asignados explícitamente
-      const { data: libInputs } = await db()
-        .from('forge_project_node_inputs')
-        .select(`
-          input_label,
-          forge_project_library_assets ( display_name, extracted_text, storage_url, asset_type )
-        `)
-        .eq('project_node_id', currentPNode.id)
-        .eq('source_type', 'library_asset')
-        .order('order_index')
-
-      for (const inp of (libInputs || [])) {
-        const lib = inp.forge_project_library_assets
-        if (!lib) continue
-        if (lib.extracted_text) {
-          const snippet = lib.extracted_text.slice(0, 3000) + (lib.extracted_text.length > 3000 ? '\n[truncated]' : '')
-          resolvedInputs.push(`### ${lib.display_name} (external reference)\n${snippet}`)
-        } else if (lib.asset_type === 'image') {
-          resolvedInputs.push(`### ${lib.display_name} (image reference)\nURL: ${lib.storage_url}`)
-        }
-      }
-    }
+    // Inputs de edges + library assets: resolvedor compartido con buildSystemPrompt (preview),
+    // para que el preview refleje exactamente lo que se genera. Aplica scoping uses.inputs y cap alto.
+    const { resolveNodeInputs } = require('../services/canvas-chat.service')
+    const resolvedInputs = currentPNode
+      ? await resolveNodeInputs(db, { projectId: project_id, currentPNodeId: currentPNode.id, targetOutput })
+      : []
+    // Cap para attachments de sesión (los inputs de edge/library ya los capó resolveNodeInputs).
+    const INPUT_CAP = 120000
+    // Anclaje de estilo para hermanos NO declarados como dependencia (ver canvas-chat.service.js).
+    const ANCHOR_CAP = 2000
 
     // Inyectar bound_item_ref al inicio de inputs si el nodo es una instancia de lane
     // bound_item_ref es JSONB — formatear a texto legible para el LLM
@@ -2029,19 +1867,33 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
         .neq('format', 'png')
         .order('created_at', { ascending: false })
 
-      // No re-inyectar los outputs PROPIOS del nodo (ej. gdd_ref/gdd_complete): al regenerar,
-      // mostrarle al modelo su salida anterior lo ANCLA a la estructura vieja y la copia,
-      // pisando el field-spec del skill. asset.name = "NodeTitle — OutputLabel" (no == output_key).
-      const ownOutputAssetNames = new Set(
-        allOutputDefs.map(o => {
-          const label = typeof o === 'object' ? (o.label || o.name || o.key) : o
-          return `${node.title} — ${label}`.toLowerCase().trim()
-        })
-      )
-      for (const asset of (siblingAssets || [])) {
-        if (ownOutputAssetNames.has((asset.name || '').toLowerCase().trim())) continue
-        const snippet = (asset.content || '').slice(0, 2000)
-        if (snippet) existingNodeOutputs.push(`### ${asset.name}\n${snippet}`)
+      const labelOf = o => (typeof o === 'object' ? (o.label || o.name || o.key) : o)
+      const assetNameFor = key => {
+        const od = allOutputDefs.find(o => (o.key || o.name) === key)
+        return `${node.title} — ${labelOf(od || key)}`.toLowerCase().trim()
+      }
+      // Si el output objetivo declara uses.siblings_if_present[], inyectar ESOS outputs hermanos
+      // COMPLETOS (no truncados): es una dependencia explícita, no anclaje. Caso clave: los ADI
+      // (adi_segmentation) necesitan el master `art_direction_document` verbatim para extraer por número.
+      const siblingsAllowed = targetOutput?.uses?.siblings_if_present ?? null
+      if (siblingsAllowed && siblingsAllowed.length) {
+        const wantNames = new Set(siblingsAllowed.map(assetNameFor))
+        for (const asset of (siblingAssets || [])) {
+          if (!wantNames.has((asset.name || '').toLowerCase().trim())) continue
+          const c = asset.content || ''
+          const snippet = c.slice(0, INPUT_CAP) + (c.length > INPUT_CAP ? '\n[truncated]' : '')
+          if (snippet) existingNodeOutputs.push(`### ${asset.name}\n${snippet}`)
+        }
+      } else {
+        // Default: NO re-inyectar los outputs PROPIOS del nodo (ej. gdd_ref/gdd_complete): al
+        // regenerar, mostrarle al modelo su salida anterior lo ANCLA a la estructura vieja y la copia,
+        // pisando el field-spec del skill. asset.name = "NodeTitle — OutputLabel" (no == output_key).
+        const ownOutputAssetNames = new Set(allOutputDefs.map(o => `${node.title} — ${labelOf(o)}`.toLowerCase().trim()))
+        for (const asset of (siblingAssets || [])) {
+          if (ownOutputAssetNames.has((asset.name || '').toLowerCase().trim())) continue
+          const snippet = (asset.content || '').slice(0, ANCHOR_CAP)
+          if (snippet) existingNodeOutputs.push(`### ${asset.name}\n${snippet}`)
+        }
       }
     }
 
@@ -2072,12 +1924,12 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
     const attachmentParts = [
       ...(sessionAttachments || []).map(att =>
         att.extracted_text
-          ? `### ${att.file_name}\n${att.extracted_text.slice(0, 3000)}${att.extracted_text.length > 3000 ? '\n[truncated]' : ''}`
+          ? `### ${att.file_name}\n${att.extracted_text.slice(0, INPUT_CAP)}${att.extracted_text.length > INPUT_CAP ? '\n[truncated]' : ''}`
           : `### ${att.file_name}\nURL: ${att.storage_url}`
       ),
       ...(pendingAttachment ? [
         pendingAttachment.extracted_text
-          ? `### ${pendingAttachment.file_name}\n${pendingAttachment.extracted_text.slice(0, 3000)}${pendingAttachment.extracted_text.length > 3000 ? '\n[truncated]' : ''}`
+          ? `### ${pendingAttachment.file_name}\n${pendingAttachment.extracted_text.slice(0, INPUT_CAP)}${pendingAttachment.extracted_text.length > INPUT_CAP ? '\n[truncated]' : ''}`
           : `### ${pendingAttachment.file_name}\nURL: ${pendingAttachment.storage_url}`
       ] : []),
     ]
@@ -2133,9 +1985,11 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
         model:           executorStr,
         rawText:         true,
         temperature:     0.7,
-        // 16K: documentos largos (GDD 14 secciones, TDD) se truncaban con 8192.
-        // Este es el path del chat interactivo — el de auto-run vive en runReActLoop.
-        maxOutputTokens: 16384,
+        // 64K (máximo de Sonnet 4.x): outputs engineering-grade completos en UNA respuesta —
+        // mechanics_engineering con 8 mecánicas §B/§C + §B-S ≈ 30K tokens; el TDD buildable
+        // completo también entra. Evita truncado/continuación (que rompe el "Accept as output",
+        // que toma solo el último mensaje). Este es el path del chat interactivo.
+        maxOutputTokens: 64000,
       })
 
       meta      = result.meta
@@ -2241,7 +2095,13 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
           return ['document', 'pdf', 'doc', 'docx', 'pptx'].includes(fmt.toLowerCase())
         }) || allOutputDefs[0]
 
-        if (docOutputDef) {
+        // En modo FOCUS (targetOutput seteado) el LLM produjo UN solo documento completo con muchas
+        // sub-secciones (§0, §1, §2…): NO recortar — el recorte por outputs secundarios solo aplica
+        // al run GENERAL (varios outputs emitidos como "## <output>"). Recortar en focus dejaba el
+        // PDF con solo la 1ª sección (bug ADD: §0 nomás).
+        if (targetOutput) {
+          console.log(`[forge-chat] auto doc_gen_docx — focus "${outKeyOf(targetOutput)}" → doc completo (${docContent.length} chars)`)
+        } else if (docOutputDef) {
           const outName        = outKeyOf(docOutputDef)
           const secondaryDefs  = allOutputDefs.filter(o => o !== docOutputDef)
 
@@ -2270,18 +2130,10 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
           }
 
           if (cutIndex > 100) {
-            let primaryContent = replyText.slice(0, cutIndex).trim()
-
-            // Afinar: el output primario para el PDF siempre es la PRIMERA sección H2.
-            // Si hay más de un ## heading en primaryContent, cortar en el segundo —
-            // las secciones extra (high_level_concept, etc.) quedan excluidas.
-            const allH2 = [...primaryContent.matchAll(/^##\s+.+$/gim)]
-            if (allH2.length > 1 && allH2[1].index > 100) {
-              primaryContent = primaryContent.slice(0, allH2[1].index).trim()
-              console.log(`[forge-chat] doc_gen_docx — refinado al primer H2 (${primaryContent.length} chars)`)
-            }
-
-            docContent = primaryContent
+            // Cortar donde empieza el PRIMER output secundario (por nombre). El documento primario
+            // conserva TODAS sus sub-secciones ## (§0, §1, …). NO recortar al 2º ## — eso mutilaba
+            // el doc dejando solo la 1ª sección.
+            docContent = replyText.slice(0, cutIndex).trim()
             console.log(`[forge-chat] auto doc_gen_docx — cortado antes de sección secundaria (${docContent.length} chars)`)
           } else {
             // Fallback: extracción exacta de la sección primaria
@@ -2296,9 +2148,9 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
         // Salvaguarda: si la extracción del output primario dejó un fragmento chico frente a la
         // respuesta completa (ej. agarró un preámbulo del template del skill y cortó el cuerpo),
         // descartarla y usar la respuesta completa. Mejor un doc con algo de más que casi vacío.
-        if (docContent.trim().length < Math.min(2000, replyText.trim().length * 0.5)) {
+        if (docContent.trim().length < Math.max(2000, replyText.trim().length * 0.5)) {
           docContent = replyText
-          console.log(`[forge-chat] auto doc_gen_docx — extracción descartada (fragmento chico), usando respuesta completa (${replyText.trim().length} chars)`)
+          console.log(`[forge-chat] auto doc_gen_docx — extracción descartada (fragmento < 50% del output), usando respuesta completa (${replyText.trim().length} chars)`)
         }
 
         // Post-process: el LLM a veces reproduce placeholders literalmente en el output

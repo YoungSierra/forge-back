@@ -2,6 +2,8 @@
 
 // Lógica compartida entre el endpoint de chat y el auto-run
 
+const { extractSection } = require('../utils/extract-section')
+
 function injectVars(template, vars) {
   return template.replace(/\[(\w+)\]/g, (_, key) => vars[key] ?? `[${key}]`)
 }
@@ -20,6 +22,227 @@ function injectSkillVars(template, vars) {
   result = result.replace(/^\s*·\s*/gm, '')
   result = result.replace(/\s*·\s*$/gm, '')
   return result
+}
+
+// Cap alto por input: los docs estructurados que consume aguas abajo (mechanics_engineering
+// → §B del TDD, GDD, visual_targets) deben llegar COMPLETOS. 120K chars ≈ 30K tokens/input.
+const INPUT_CAP = 120000
+
+// Cap corto para outputs hermanos NO declarados como dependencia: son sólo un anclaje de estilo,
+// no una fuente a transcribir. Los declarados en uses.siblings_if_present[] van con INPUT_CAP.
+const ANCHOR_CAP = 2000
+
+/**
+ * Resuelve los inputs de un nodo del canvas para el system prompt: outputs de nodos upstream
+ * conectados por edge (extrayendo la sección del output slot y aplicando el scoping
+ * targetOutput.uses.inputs), imágenes PNG upstream, y library assets asignados explícitamente.
+ *
+ * Único resolvedor compartido entre el endpoint /chat (run real) y buildSystemPrompt (preview
+ * /session), para que el preview refleje EXACTAMENTE lo que se genera. Antes existían dos copias
+ * divergentes: el preview no extraía secciones y algunos inputs se truncaban a 3000 chars,
+ * cortando docs estructurados (mechanics_engineering ~73KB) a la mitad de su 1ª sección.
+ *
+ * @returns {Promise<string[]>} bloques markdown "### label\ncontent" listos para el prompt.
+ */
+async function resolveNodeInputs(db, { projectId, currentPNodeId, targetOutput }) {
+  const resolvedInputs    = []
+  const injectedPngUrls   = new Set()  // dedup PNG cuando hay múltiples edges del mismo nodo
+  const seenInputKeys     = new Set()  // dedup por (nodo + output): cada output es un asset aparte
+  const seenPngNodeIds    = new Set()  // inyectar PNGs una sola vez por nodo upstream
+
+  // 1. Outputs de nodos conectados por edge
+  let incomingEdges = []
+  try {
+    const { data: edgeData } = await db()
+      .from('forge_project_edges')
+      .select('source_node_id, source_handle, target_handle')
+      .eq('project_id', projectId)
+      .eq('target_node_id', currentPNodeId)
+    incomingEdges = edgeData || []
+  } catch { /* tabla no migrada aún */ }
+
+  // Scoping por output: si el output declara uses.inputs[], inyectar SOLO esos inputs. Evita que
+  // outputs mecánicos (ui_screens/scene_manifest) se contaminen con la narrativa (world/characters),
+  // que trae nombres de mecánicas viejos y hace driftear al modelo.
+  const usesInputs = targetOutput?.uses?.inputs ?? null
+  if (usesInputs !== null) {
+    incomingEdges = incomingEdges.filter(edge =>
+      usesInputs.includes((edge.target_handle || '').replace(/^in-/, '')))
+  }
+
+  for (const edge of incomingEdges) {
+    // Dedup por (nodo + output): un nodo con varios outputs (p.ej. 3.9 → ui_screens, scene_manifest,
+    // visual_targets) los guarda como assets SEPARADOS; deduplicar solo por nodo perdería todos menos uno.
+    const outputKey = edge.source_handle?.startsWith('out-') ? edge.source_handle.slice(4) : null
+    const dedupKey  = `${edge.source_node_id}::${outputKey ?? '*'}`
+    if (seenInputKeys.has(dedupKey)) continue
+    seenInputKeys.add(dedupKey)
+
+    const { data: sourcePNode } = await db()
+      .from('forge_project_nodes')
+      .select(`
+        node_id, node_type, source_asset_id,
+        text_label, text_content,
+        forge_nodes(title, outputs),
+        forge_project_library_assets(display_name, extracted_text, storage_url, asset_type)
+      `)
+      .eq('id', edge.source_node_id)
+      .maybeSingle()
+    if (!sourcePNode) continue
+
+    if ((sourcePNode.node_type || 'forge_node') === 'library_asset') {
+      const lib = sourcePNode.forge_project_library_assets
+      if (!lib) continue
+      if (lib.extracted_text) {
+        const snippet = lib.extracted_text.slice(0, INPUT_CAP) + (lib.extracted_text.length > INPUT_CAP ? '\n[truncated]' : '')
+        resolvedInputs.push(`### ${lib.display_name} (library asset)\n${snippet}`)
+      } else if (lib.asset_type === 'image') {
+        resolvedInputs.push(`### ${lib.display_name} (image reference)\nURL: ${lib.storage_url}`)
+      }
+    } else if (sourcePNode.node_type === 'text_input') {
+      const label   = sourcePNode.text_label   || 'Text Input'
+      const content = (sourcePNode.text_content || '').trim()
+      if (content) resolvedInputs.push(`### ${label}\n${content}`)
+    } else {
+      // Forge-node: resolver el asset del OUTPUT específico que referencia el edge. Cada output se
+      // guarda como asset aparte con name = "${título} — ${label}", así que se busca por ese name.
+      // Si no existe (docs legacy combinados en un solo asset con secciones ##), se cae al asset más
+      // reciente del nodo + extractSection.
+      const nodeTitle = sourcePNode.forge_nodes?.title ?? 'Upstream node'
+      const outputs   = sourcePNode.forge_nodes?.outputs ?? []
+      const outputDef = outputKey
+        ? (outputs.find(o => (o.key || o.name) === outputKey) ?? outputs[parseInt(outputKey, 10)] ?? null)
+        : null
+      const outputLabel = outputDef ? (outputDef.label || outputDef.name || outputDef.key) : null
+
+      let content   = null
+      let slotLabel = nodeTitle
+
+      // 1) Asset del output específico, por name exacto
+      if (outputLabel) {
+        const { data: byName } = await db()
+          .from('forge_assets')
+          .select('content')
+          .eq('project_id', projectId)
+          .eq('node_id', sourcePNode.node_id)
+          .eq('name', `${nodeTitle} — ${outputLabel}`)
+          .in('status', ['approved', 'auto_approved'])
+          .neq('format', 'png')
+          .order('created_at', { ascending: false })
+          .limit(1)
+          .maybeSingle()
+        if (byName?.content) {
+          content   = byName.content
+          slotLabel = `${nodeTitle} → ${outputLabel}`
+        }
+      }
+
+      // 2) Fallback: asset más reciente del nodo (+ extractSection si el edge apunta a un output)
+      if (content === null) {
+        const { data: recent } = await db()
+          .from('forge_assets')
+          .select('content')
+          .eq('project_id', projectId)
+          .eq('node_id', sourcePNode.node_id)
+          .in('status', ['approved', 'auto_approved'])
+          .neq('format', 'png')
+          .order('created_at', { ascending: false })
+          .limit(1)
+          .maybeSingle()
+        if (recent?.content) {
+          content = recent.content
+          const sectionKey = outputDef ? (outputDef.key || outputDef.name) : null
+          const extracted  = sectionKey ? extractSection(content, sectionKey) : null
+          if (extracted) {
+            content   = extracted
+            slotLabel = `${nodeTitle} → ${outputLabel || sectionKey}`
+          }
+        }
+      }
+
+      if (content !== null) {
+        const snippet = content.slice(0, INPUT_CAP) + (content.length > INPUT_CAP ? '\n[truncated]' : '')
+        resolvedInputs.push(`### ${slotLabel}\n${snippet}`)
+      }
+
+      // Imágenes PNG del nodo: inyectar una sola vez por nodo fuente (los edges por-output lo repiten)
+      if (seenPngNodeIds.has(sourcePNode.node_id)) continue
+      seenPngNodeIds.add(sourcePNode.node_id)
+
+      // Imágenes PNG aprobadas/auto_approved del nodo upstream
+      const { data: pngAssets } = await db()
+        .from('forge_assets')
+        .select('name, storage_url')
+        .eq('project_id', projectId)
+        .eq('node_id', sourcePNode.node_id)
+        .in('status', ['approved', 'auto_approved'])
+        .eq('format', 'png')
+        .not('storage_url', 'is', null)
+
+      for (const png of (pngAssets || [])) {
+        if (png.storage_url && !injectedPngUrls.has(png.storage_url)) {
+          injectedPngUrls.add(png.storage_url)
+          resolvedInputs.push(`### ${png.name} (generated image)\nURL: ${png.storage_url}`)
+        }
+      }
+
+      // Fallback: si no hay PNGs en forge_assets, leer output_images de la sesión aprobada
+      // (cubre accepts previos al fix del formato variations[]).
+      if ((pngAssets || []).length === 0) {
+        const { data: approvedSession } = await db()
+          .from('forge_sessions')
+          .select('output_images, forge_nodes(title, outputs)')
+          .eq('project_id', projectId)
+          .eq('node_id', sourcePNode.node_id)
+          .eq('status', 'approved')
+          .order('created_at', { ascending: false })
+          .limit(1)
+          .maybeSingle()
+
+        if (approvedSession?.output_images) {
+          const nodeTitle2 = approvedSession.forge_nodes?.title ?? sourcePNode.forge_nodes?.title ?? 'Node'
+          const pngOutputs = (approvedSession.forge_nodes?.outputs || [])
+            .filter(o => (o.format === 'png' || o.format === 'image') && o.image_gen)
+          const raw = approvedSession.output_images
+          for (const outDef of pngOutputs) {
+            const items = Array.isArray(raw[outDef.name]) ? raw[outDef.name] : []
+            for (const item of items) {
+              const urls = Array.isArray(item.variations)
+                ? item.variations.map(v => v.url).filter(Boolean)
+                : item.image_url ? [item.image_url] : []
+              for (const url of urls) {
+                if (!injectedPngUrls.has(url)) {
+                  injectedPngUrls.add(url)
+                  resolvedInputs.push(`### ${nodeTitle2} — ${outDef.name} (generated image)\nURL: ${url}`)
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // 2. Library assets asignados explícitamente al nodo
+  const { data: libInputs } = await db()
+    .from('forge_project_node_inputs')
+    .select(`input_label, forge_project_library_assets(display_name, extracted_text, storage_url, asset_type)`)
+    .eq('project_node_id', currentPNodeId)
+    .eq('source_type', 'library_asset')
+    .order('order_index')
+
+  for (const inp of (libInputs || [])) {
+    const lib = inp.forge_project_library_assets
+    if (!lib) continue
+    if (lib.extracted_text) {
+      const snippet = lib.extracted_text.slice(0, INPUT_CAP) + (lib.extracted_text.length > INPUT_CAP ? '\n[truncated]' : '')
+      resolvedInputs.push(`### ${lib.display_name} (external reference)\n${snippet}`)
+    } else if (lib.asset_type === 'image') {
+      resolvedInputs.push(`### ${lib.display_name} (image reference)\nURL: ${lib.storage_url}`)
+    }
+  }
+
+  return resolvedInputs
 }
 
 /**
@@ -186,130 +409,9 @@ async function buildSystemPrompt(db, { projectId, nodeId, sessionId, userMessage
     .eq('removed', false)
     .maybeSingle()
 
-  let resolvedInputs = []
-  const injectedPngUrls = new Set()
-
-  if (currentPNode) {
-    let incomingEdges = []
-    try {
-      const { data: edgeData } = await db()
-        .from('forge_project_edges')
-        .select('source_node_id, source_handle, target_handle')
-        .eq('project_id', projectId)
-        .eq('target_node_id', currentPNode.id)
-      incomingEdges = edgeData || []
-    } catch { /* tabla no migrada aún */ }
-
-    // v1.4.0: filtrar inputs por uses.inputs[] del output específico
-    const usesInputs = targetOutput?.uses?.inputs ?? null
-    if (usesInputs !== null) {
-      incomingEdges = incomingEdges.filter(edge => {
-        const inputKey = (edge.target_handle || '').replace(/^in-/, '')
-        return usesInputs.includes(inputKey)
-      })
-    }
-
-    const seenSourceNodeIds = new Set()
-    for (const edge of incomingEdges) {
-      // Dedup: un solo entry por nodo upstream, sin importar cuántos edges vengan de él
-      if (seenSourceNodeIds.has(edge.source_node_id)) continue
-      seenSourceNodeIds.add(edge.source_node_id)
-
-      const { data: sourcePNode } = await db()
-        .from('forge_project_nodes')
-        .select(`
-          node_id, node_type, source_asset_id,
-          text_label, text_content,
-          forge_nodes(title, outputs),
-          forge_project_library_assets(display_name, extracted_text, storage_url, asset_type)
-        `)
-        .eq('id', edge.source_node_id)
-        .maybeSingle()
-
-      if (!sourcePNode) continue
-
-      if ((sourcePNode.node_type || 'forge_node') === 'library_asset') {
-        const lib = sourcePNode.forge_project_library_assets
-        if (!lib) continue
-        if (lib.extracted_text) {
-          const snippet = lib.extracted_text.slice(0, 3000) + (lib.extracted_text.length > 3000 ? '\n[truncated]' : '')
-          resolvedInputs.push(`### ${lib.display_name} (library asset)\n${snippet}`)
-        } else if (lib.asset_type === 'image') {
-          resolvedInputs.push(`### ${lib.display_name} (image reference)\nURL: ${lib.storage_url}`)
-        }
-      } else if (sourcePNode.node_type === 'text_input') {
-        const label   = sourcePNode.text_label   || 'Text Input'
-        const content = (sourcePNode.text_content || '').trim()
-        if (content) resolvedInputs.push(`### ${label}\n${content}`)
-      } else {
-        // Forge-node: buscar output aprobado o auto_approved más reciente
-        const { data: asset } = await db()
-          .from('forge_assets')
-          .select('content, storage_url')
-          .eq('project_id', projectId)
-          .eq('node_id', sourcePNode.node_id)
-          .in('status', ['approved', 'auto_approved'])
-          .neq('format', 'png')
-          .order('created_at', { ascending: false })
-          .limit(1)
-          .maybeSingle()
-
-        if (asset?.content) {
-          const nodeTitle = sourcePNode.forge_nodes?.title ?? 'Upstream node'
-          const outputs   = sourcePNode.forge_nodes?.outputs ?? []
-          let   content   = asset.content
-          let   slotLabel = nodeTitle
-
-          const srcHandle = edge.source_handle
-          if (srcHandle?.startsWith('out-')) {
-            const handleVal = srcHandle.slice(4)
-            const outputDef = outputs.find(o => o.name === handleVal) ?? outputs[parseInt(handleVal, 10)]
-            if (outputDef?.name) {
-              slotLabel = `${nodeTitle} → ${outputDef.name}`
-            }
-          }
-
-          const snippet = content.slice(0, 3000) + (content.length > 3000 ? '\n[truncated]' : '')
-          resolvedInputs.push(`### ${slotLabel}\n${snippet}`)
-        }
-
-        const { data: pngAssets } = await db()
-          .from('forge_assets')
-          .select('name, storage_url')
-          .eq('project_id', projectId)
-          .eq('node_id', sourcePNode.node_id)
-          .in('status', ['approved', 'auto_approved'])
-          .eq('format', 'png')
-          .not('storage_url', 'is', null)
-
-        for (const png of (pngAssets || [])) {
-          if (png.storage_url && !injectedPngUrls.has(png.storage_url)) {
-            injectedPngUrls.add(png.storage_url)
-            resolvedInputs.push(`### ${png.name} (generated image)\nURL: ${png.storage_url}`)
-          }
-        }
-      }
-    }
-
-    // Library assets asignados explícitamente
-    const { data: libInputs } = await db()
-      .from('forge_project_node_inputs')
-      .select(`input_label, forge_project_library_assets(display_name, extracted_text, storage_url, asset_type)`)
-      .eq('project_node_id', currentPNode.id)
-      .eq('source_type', 'library_asset')
-      .order('order_index')
-
-    for (const inp of (libInputs || [])) {
-      const lib = inp.forge_project_library_assets
-      if (!lib) continue
-      if (lib.extracted_text) {
-        const snippet = lib.extracted_text.slice(0, 3000) + (lib.extracted_text.length > 3000 ? '\n[truncated]' : '')
-        resolvedInputs.push(`### ${lib.display_name} (external reference)\n${snippet}`)
-      } else if (lib.asset_type === 'image') {
-        resolvedInputs.push(`### ${lib.display_name} (image reference)\nURL: ${lib.storage_url}`)
-      }
-    }
-  }
+  const resolvedInputs = currentPNode
+    ? await resolveNodeInputs(db, { projectId, currentPNodeId: currentPNode.id, targetOutput })
+    : []
 
   const { getToolsBlock } = require('./tools.service')
   const activeTools      = Array.isArray(node.tools) && node.tools.length ? node.tools : []
@@ -328,15 +430,36 @@ async function buildSystemPrompt(db, { projectId, nodeId, sessionId, userMessage
       .neq('format', 'png')
       .order('created_at', { ascending: false })
 
-    // v1.4.0: solo inyectar siblings declarados en uses.siblings_if_present[]
+    // El asset se llama "NodeTitle — OutputLabel", NUNCA el output_key: hay que reconstruir ese
+    // nombre para poder matchear. (Antes se comparaba contra name.replace(/\s+/g,'_'), que produce
+    // "core_gameplay_—_mechanic_specs" y no matcheaba NUNCA un siblings_if_present:["mechanic_specs"]
+    // ⇒ el filtro no filtraba y todo hermano entraba truncado a 2000.)
+    const labelOf = o => (typeof o === 'object' ? (o.label || o.name || o.key) : o)
+    const assetNameFor = key => {
+      const od = outputDefs.find(o => (o.key || o.name) === key)
+      return `${node.title} — ${labelOf(od || key)}`.toLowerCase().trim()
+    }
+
     const siblingsAllowed = targetOutput?.uses?.siblings_if_present ?? null
-    for (const asset of (nodeAssets || [])) {
-      const assetKey = (asset.name || '').toLowerCase().replace(/\s+/g, '_')
-      if (targetOutputKey && assetKey === targetOutputKey) continue
-      if (siblingsAllowed !== null && !siblingsAllowed.includes(assetKey)) continue
-      if (asset.content) {
-        const snippet = asset.content.slice(0, 2000) + (asset.content.length > 2000 ? '\n[truncated]' : '')
-        existingNodeOutputs.push(`### ${asset.name} (this node — existing output)\n${snippet}`)
+    if (siblingsAllowed && siblingsAllowed.length) {
+      // Dependencia explícita: va COMPLETO. Truncarlo a 2000 hacía que el output re-derivara de cero
+      // lo que no alcanzaba a ver (caso 3.2: mechanics_engineering veía el 7% de mechanic_specs).
+      const wantNames = new Set(siblingsAllowed.map(assetNameFor))
+      for (const asset of (nodeAssets || [])) {
+        if (!wantNames.has((asset.name || '').toLowerCase().trim())) continue
+        const c = asset.content || ''
+        if (!c) continue
+        const snippet = c.slice(0, INPUT_CAP) + (c.length > INPUT_CAP ? '\n[truncated]' : '')
+        existingNodeOutputs.push(`### ${asset.name} (this node — declared dependency)\n${snippet}`)
+      }
+    } else {
+      // Default: NO re-inyectar los outputs PROPIOS del nodo — al regenerar, mostrarle al modelo su
+      // salida anterior lo ancla a la estructura vieja y la copia, pisando el field-spec del skill.
+      const ownOutputAssetNames = new Set(outputDefs.map(o => `${node.title} — ${labelOf(o)}`.toLowerCase().trim()))
+      for (const asset of (nodeAssets || [])) {
+        if (ownOutputAssetNames.has((asset.name || '').toLowerCase().trim())) continue
+        const snippet = (asset.content || '').slice(0, ANCHOR_CAP)
+        if (snippet) existingNodeOutputs.push(`### ${asset.name} (this node — existing output)\n${snippet}`)
       }
     }
   }
@@ -388,7 +511,7 @@ async function runReActLoop({ finalSystemPrompt, baseUserMsg, executorStr, activ
       // 16K de techo: documentos largos (GDD 14 secciones, TDD) se truncaban con 8192.
       // Es un límite, no un objetivo — solo se paga por lo generado; 16384 es seguro
       // cross-provider (32K excede el cap de salida de algunos modelos groq/openai).
-      model: executorStr, rawText: true, temperature: 0.7, maxOutputTokens: 16384,
+      model: executorStr, rawText: true, temperature: 0.7, maxOutputTokens: 64000,
     })
     meta      = result.meta
     replyText = typeof result.data === 'string' ? result.data : JSON.stringify(result.data)
@@ -494,4 +617,4 @@ async function propagateStale(db, projectId, projectNodeId) {
   }
 }
 
-module.exports = { buildSystemPrompt, runReActLoop, propagateStale, injectVars, injectSkillVars }
+module.exports = { buildSystemPrompt, resolveNodeInputs, runReActLoop, propagateStale, injectVars, injectSkillVars }
