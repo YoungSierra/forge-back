@@ -254,6 +254,41 @@ function sanitizeMono(s) {
     .replace(/[^\x20-\x7e\xa0-\xff]/g, '?')
 }
 
+// Sanitiza texto NORMAL (prosa, headings, celdas de tabla) para la fuente WinAnsi del PDF
+// (Helvetica): mapea glifos que NO existen en esa fuente — emojis, flechas, comparadores
+// matemáticos — a equivalentes ASCII. A diferencia de sanitizeMono (para code, que arrasa a
+// '?'), PRESERVA la puntuación tipográfica que WinAnsi sí renderiza: em/en dash, comillas
+// curvas, elipsis, bullet •, ·, ×, °, §, y los acentos Latin-1 (é/ñ/ü…). Sin esto, un ✅ salía
+// como ' y un ↔ como !" (reporte de arte).
+function sanitizeText(s) {
+  if (!s) return s
+  return String(s)
+    // check / status emoji  → texto
+    .replace(/[✅✔✓☑]/g, '[OK]')       // ✅ ✔ ✓ ☑
+    .replace(/[❌✖✗✘☒]/g, '[X]')  // ❌ ✖ ✗ ✘ ☒
+    .replace(/[⚠❗❕‼]/g, '[!]')        // ⚠ ❗ ❕ ‼
+    // flechas → ASCII
+    .replace(/[↔⇔]/g, '<->')                    // ↔ ⇔
+    .replace(/[→⇒➡⮕]/g, '->')         // → ⇒ ➡ ⮕
+    .replace(/[←⇐]/g, '<-')                     // ← ⇐
+    .replace(/[↑⇑]/g, '^').replace(/[↓⇓]/g, 'v') // ↑⇑  ↓⇓
+    // comparadores matemáticos frecuentes en specs
+    .replace(/≥/g, '>=').replace(/≤/g, '<=')    // ≥ ≤
+    .replace(/≠/g, '!=').replace(/≈/g, '~')     // ≠ ≈
+    // triángulos/círculos geométricos (no WinAnsi) → ASCII
+    .replace(/[▲▴▶▸►]/g, '>').replace(/[▼▾]/g, 'v')
+    .replace(/[◀◂◄]/g, '<')
+    .replace(/[●○■▪◦]/g, '*')    // ● ○ ■ ▪ ◦  (• U+2022 se preserva: WinAnsi lo tiene)
+    // selectores de variación / ZWJ de secuencias emoji
+    .replace(/[︎️‍]/g, '')
+    // catch-all: emoji/dingbats/símbolos sueltos que la fuente no puede dibujar → se eliminan.
+    // Rangos elegidos para NO tocar box-drawing (2500-259F), puntuación general (2000-206F:
+    // dashes, comillas, elipsis, bullet) ni Latin-1.
+    .replace(/[☀-➿⬀-⯿]/g, '')         // misc symbols + dingbats + flechas grandes
+    .replace(/[←-⇿]/g, '-')                     // flechas restantes → '-'
+    .replace(/[\u{1F000}-\u{1FAFF}]/gu, '')               // emoji pictográficos
+}
+
 // Agrupa líneas consecutivas en bloques tipados: heading, paragraph, bullet, numbered, table, code
 function groupLines(lines) {
   const blocks = []
@@ -377,6 +412,10 @@ async function docGenDocx(title, content, projectId, nodeId) {
   if (lastHr !== -1 && cleanContent.length - lastHr < 800) {
     cleanContent = cleanContent.slice(0, lastHr)
   }
+  // Glifos fuera de WinAnsi (emoji/flechas/≥≤) → ASCII, en un solo punto: cubre portada,
+  // headings, prosa y celdas. No toca sintaxis markdown (| # * `) ni box-drawing (eso lo
+  // resuelve sanitizeMono en los bloques de code). Ver sanitizeText.
+  cleanContent = sanitizeText(cleanContent)
 
   const sections = parseMarkdownSections(cleanContent)
 
@@ -514,36 +553,61 @@ async function docGenDocx(title, content, projectId, nodeId) {
           const allRows  = [header, ...rows]
           const colCount = Math.max(...allRows.map(r => r.length))
           const colW     = CONTENT_W / colCount
-          const rowH     = 20
           const cellPad  = 5
+          const minRowH  = 20
+          const fontSize = 9
 
-          checkPageBreak(rowH * (allRows.length + 1) + 10)
+          // Quita marcadores markdown (las celdas se dibujan en una sola fuente, sin runs).
+          const clean = s => String(s ?? '')
+            .replace(/\*\*([^*]+)\*\*/g, '$1')
+            .replace(/\*([^*]+)\*/g, '$1')
+            .replace(/`([^`]+)`/g, '$1')
+
+          // Alto real de cada fila: se mide el texto ENVUELTO de cada celda al ancho de columna
+          // y la fila crece a la celda más alta. Antes rowH era fijo (20pt) y el texto se
+          // recortaba con ellipsis — las celdas largas salían cortadas (reporte de arte).
+          const measureRow = (row, isHeader) => {
+            doc.font(isHeader ? 'Helvetica-Bold' : 'Helvetica').fontSize(fontSize)
+            let maxH = 0
+            for (let ci = 0; ci < colCount; ci++) {
+              const h = doc.heightOfString(clean(row[ci]), { width: colW - cellPad * 2, lineGap: 1 })
+              if (h > maxH) maxH = h
+            }
+            return Math.max(minRowH, maxH + cellPad * 2)
+          }
 
           for (let ri = 0; ri < allRows.length; ri++) {
             const row      = allRows[ri]
             const isHeader = ri === 0
+            const rowH     = measureRow(row, isHeader)
+
+            // Salto de página por fila (con su alto real). Si arranca página nueva, re-dibuja
+            // la fila de encabezado para no perder los títulos de columna al continuar la tabla.
+            const before = y
             checkPageBreak(rowH + 8)
+            if (y !== before && !isHeader) {
+              const hH = measureRow(header, true)
+              doc.rect(MARGIN, y, CONTENT_W, hH).fill(PDF_EMBER)
+              doc.rect(MARGIN, y + hH, CONTENT_W, 0.5).fill(PDF_LINE)
+              for (let ci = 0; ci < colCount; ci++) {
+                doc.font('Helvetica-Bold').fontSize(fontSize).fillColor('#ffffff')
+                  .text(clean(header[ci]), MARGIN + ci * colW + cellPad, y + cellPad, { width: colW - cellPad * 2, lineGap: 1 })
+              }
+              y += hH
+            }
 
             doc.rect(MARGIN, y, CONTENT_W, rowH)
               .fill(isHeader ? PDF_EMBER : ri % 2 === 0 ? PDF_SUBTLE : PDF_BG)
             doc.rect(MARGIN, y + rowH, CONTENT_W, 0.5).fill(PDF_LINE)
 
             for (let ci = 0; ci < colCount; ci++) {
-              // Las celdas se dibujan en una sola fuente (sin runs), así que quitamos los
-              // marcadores markdown (**bold**, *italic*, `code`) para que no salgan literales.
-              const cellText = String(row[ci] ?? '')
-                .replace(/\*\*([^*]+)\*\*/g, '$1')
-                .replace(/\*([^*]+)\*/g, '$1')
-                .replace(/`([^`]+)`/g, '$1')
-              const cx       = MARGIN + ci * colW
+              const cx = MARGIN + ci * colW
               doc.font(isHeader ? 'Helvetica-Bold' : 'Helvetica')
-                .fontSize(9)
+                .fontSize(fontSize)
                 .fillColor(isHeader ? '#ffffff' : PDF_TEXT)
-                .text(cellText, cx + cellPad, y + cellPad, {
-                  width:     colW - cellPad * 2,
-                  height:    rowH - cellPad,
-                  ellipsis:  true,
-                  lineBreak: false,
+                .text(clean(row[ci]), cx + cellPad, y + cellPad, {
+                  width:   colW - cellPad * 2,
+                  lineGap: 1,
                 })
             }
             y += rowH
