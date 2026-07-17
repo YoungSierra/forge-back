@@ -2079,9 +2079,17 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
     // output de DOCUMENTO. Las connections (feel_statement, visual_targets, design_pillars…) son
     // datos estructurados/texto corto, no documentos → nada de PDF ni botón de descarga para ellas.
     const DOC_FORMATS   = ['document', 'pdf', 'doc', 'docx', 'pptx']
-    const targetIsDoc   = !targetOutput
+    const IMAGE_FORMATS = ['png', 'png[]', 'image', 'image[]']
+    // Un output de IMAGEN (image_gen / format png) NO es documento aunque su type sea 'asset': su
+    // salida es la imagen que produce ComfyUI, no un PDF. Sin este guard el doc_gen generaba una
+    // "hoja de prompts" en PDF y el botón "Descargar PDF" para un output que es puramente png.
+    const targetIsImage = !!targetOutput
+      && (targetOutput.image_gen === true || IMAGE_FORMATS.includes((targetOutput.format || '').toLowerCase()))
+    const targetIsDoc   = !targetIsImage && (
+      !targetOutput
       || targetOutput.type === 'asset'
       || DOC_FORMATS.includes((targetOutput.format || '').toLowerCase())
+    )
 
     if (hasDocTool && !alreadyCalled && replyText.trim().length > 200 && targetIsDoc) {
       try {

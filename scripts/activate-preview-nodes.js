@@ -9,10 +9,12 @@
 // ?include_preview=1 vía Ctrl+Alt+P buscando archived + metadata->>preview='true'; con
 // preview=false dejan de matchear esa 2ª query. Deja de hacer falta el atajo.
 //
-// ⚠ DESPUÉS DE APLICAR: correr `node scripts/regen-041-from-db.js --write`.
-//    La 041 hace metadata=EXCLUDED.metadata en su ON CONFLICT y `preview` vive DENTRO de
-//    metadata ⇒ re-correr la 041 sin re-snapshotear devuelve preview:true. (`status` no corre
-//    ese riesgo: está deliberadamente excluido del UPDATE.)
+// Lo único que importa es el flip de `status`. La 041 lo respeta (está excluido de su ON
+// CONFLICT DO UPDATE), así que el flip es permanente. El `preview` sí lo revierte la 041
+// (metadata=EXCLUDED.metadata, con {"preview":true} hardcodeado), pero eso es INOFENSIVO:
+// status='archived' es la condición PRIMARIA de la query de preview, así que con el nodo en
+// 'active' el flag no puede hacer nada. Apagarlo es cosmético; re-snapshotear la 041 después
+// (`regen-041-from-db.js --write`) es opcional, solo para que el archivo quede prolijo.
 //
 // Uso:  node scripts/activate-preview-nodes.js            → dry-run, no escribe
 //       node scripts/activate-preview-nodes.js --write    → aplica
@@ -75,7 +77,10 @@ const cmp = (a, b) => (ver(a)[0] - ver(b)[0]) || ((ver(a)[1] ?? 0) - (ver(b)[1] 
   console.log(`  verificado: status!=active → ${malStatus.length}   preview=true → ${malPreview.length}`)
   if (malStatus.length) console.log('    ' + malStatus.map(n => n.node_key + ':' + n.status).join(', '))
 
-  console.log('\n⚠ SIGUIENTE PASO OBLIGATORIO:')
-  console.log('    node scripts/regen-041-from-db.js --write')
-  console.log('    (si no, la próxima corrida de la 041 devuelve preview:true — pisa metadata)')
+  console.log('\nOpcional, solo prolijidad: node scripts/regen-041-from-db.js --write')
+  console.log('  La 041 hace metadata=EXCLUDED.metadata con {"preview":true} hardcodeado, así que')
+  console.log('  el día que se corra devuelve el flag. Es INOFENSIVO: la query de preview')
+  console.log("  (forge-canvas.routes.js:2307) exige status='archived' como condición PRIMARIA, y")
+  console.log("  status no se pisa en el UPDATE de la 041. Con status='active' el flag es metadata")
+  console.log('  muerta: no oculta ni duplica nada. Lo único que importa acá es el flip de status.')
 })().catch(e => { console.error(e); process.exit(1) })
