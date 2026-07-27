@@ -21,6 +21,21 @@ function db() {
   return _db
 }
 
+// Cliente scopeado al USUARIO (anon key + su JWT). Postgres aplica RLS con auth.uid() del token.
+// Frente 3: usar SOLO para lecturas de usuario donde queremos la cerradura de la BD (etapa 2).
+// El resto de la app sigue con db() (service-role, BYPASSRLS).
+function dbAsUser(token) {
+  return createClient(
+    process.env.SUPABASE_URL,
+    process.env.SUPABASE_ANON_KEY,
+    {
+      db:     { schema: 'v57' },
+      auth:   { persistSession: false, autoRefreshToken: false },
+      global: { headers: { Authorization: `Bearer ${token}` } },
+    }
+  ).schema('v57')
+}
+
 async function testConnection() {
   const { error } = await db().from('projects').select('id').limit(1)
   if (error) throw error
@@ -33,4 +48,4 @@ function calculateCost(tokens_used) {
   return parseFloat((input_cost + output_cost).toFixed(6))
 }
 
-module.exports = { db, getClient, testConnection, TEST_MEMBER_ID, calculateCost }
+module.exports = { db, dbAsUser, getClient, testConnection, TEST_MEMBER_ID, calculateCost }

@@ -1,4 +1,5 @@
 const { db } = require('./supabase.service')
+const { chargeForOperation } = require('./credits.service')
 
 // ─── Precios por proveedor/modelo (USD por 1M tokens) ────────────────────────
 // Fuente: pricing oficial de cada provider a mayo 2026
@@ -77,8 +78,16 @@ function logExecution(params) {
         }
       }
 
-      await db().from('forge_execution_log').insert({
+      // Derivar la organización del proyecto (para etiquetar el log y cobrar el crédito)
+      let org_id = null
+      if (project_id) {
+        const { data: p } = await db().from('projects').select('org_id').eq('id', project_id).maybeSingle()
+        org_id = p?.org_id ?? null
+      }
+
+      const { data: logRow } = await db().from('forge_execution_log').insert({
         project_id,
+        org_id,
         node_id,
         session_id,
         blueprint_id,
@@ -97,7 +106,16 @@ function logExecution(params) {
         status,
         error_code,
         metadata,
-      })
+      }).select('id').single()
+
+      // Frente 4: cobrar a la organización con margen (costo real -> credito). Solo si hay costo y org.
+      if (org_id && finalCost > 0) {
+        try {
+          await chargeForOperation({ orgId: org_id, rawCostUsd: finalCost, executionLogId: logRow?.id ?? null, createdBy: triggered_by })
+        } catch (e) {
+          console.error('[credits] charge failed:', e.message)
+        }
+      }
     } catch (e) {
       console.error('[execution-log] insert failed:', e.message)
     }

@@ -21,6 +21,7 @@ const adminRoutes        = require('./routes/admin.routes')
 const adminConfigsRoutes = require('./routes/admin.configs.routes')
 const adminPromptsRoutes    = require('./routes/admin.prompts.routes')
 const adminSkillsRoutes     = require('./routes/admin.skills.routes')
+const adminOrgsRoutes       = require('./routes/admin.orgs.routes')
 const imageReferenceRoutes  = require('./routes/image-reference.routes')
 const charaterRoutes              = require('./routes/charaters.routes')
 const modelingCharactersRoutes    = require('./routes/modeling-characters.routes')
@@ -35,7 +36,10 @@ const pipelineRoutes        = require('./routes/pipeline.routes')
 const pipelineRunRoutes     = require('./routes/pipeline-run.routes')
 const { catalogRouter: actionNodesCatalogRoutes, projectRouter: actionNodesProjectRoutes } = require('./routes/action-nodes.routes')
 const chatRoutes            = require('./routes/chat.routes')
-const { requireAdmin }   = require('./middleware/requireAdmin')
+const { requirePlatformAdmin } = require('./middleware/requirePlatformAdmin')
+const { requireAuth } = require('./middleware/requireAuth')
+const { requireOrgAdmin } = require('./middleware/requireOrgAdmin')
+const orgAdminRoutes        = require('./routes/org-admin.routes')
 const forgeNodesRoutes      = require('./routes/forge-nodes.routes')
 const forgeBlueprintsRoutes = require('./routes/forge-blueprints.routes')
 const forgeCanvasRoutes     = require('./routes/forge-canvas.routes')
@@ -71,6 +75,18 @@ app.get('/api/health/db', async (req, res) => {
 })
 
 // Routes
+
+// ── Frente 2 (Multi-Org): gate de autenticación sobre TODO /api/projects (incluye /canvas y /library).
+// La identidad sale del JWT de Supabase (requireAuth), no de datos del cliente.
+// EXCEPCIÓN: rutas que sirven ARCHIVOS al navegador (img/model en <img>/<model-viewer>, /play en
+// iframe) se cargan sin headers → no pueden llevar el token → pasan sin gate por ahora (se apoyan en
+// UUIDs no adivinables; endurecer con URLs firmadas más adelante).
+const ASSET_PASSTHROUGH = /\/play$|\/library\/[^/]+\/file$/
+app.use('/api/projects', (req, res, next) => {
+  if (ASSET_PASSTHROUGH.test((req.originalUrl || '').split('?')[0])) return next()
+  return requireAuth(req, res, next)
+})
+
 app.use('/api/generate', gddRoutes)
 app.use('/api/projects', projectsRoutes)
 app.use('/api/projects', imageReferenceRoutes)
@@ -81,14 +97,16 @@ app.use('/api/assets', assetsRoutes)
 app.use('/api/validate', validationRoutes)
 app.use('/api/members', membersRoutes)
 app.use('/api/feedback', feedbackRoutes)
-app.use('/api/admin', requireAdmin, adminRoutes)
-app.use('/api/admin', requireAdmin, adminConfigsRoutes)
-app.use('/api/admin', requireAdmin, adminPromptsRoutes)
-app.use('/api/admin', requireAdmin, adminSkillsRoutes)
-app.use('/api/admin/forge/nodes',      requireAdmin, forgeNodesRoutes)
-app.use('/api/admin/forge/blueprints', requireAdmin, forgeBlueprintsRoutes)
-app.use('/api/admin/analytics',        requireAdmin, analyticsRoutes)
-app.use('/api/admin',                  requireAdmin, changelogAdminRoutes)
+app.use('/api/admin', requirePlatformAdmin, adminRoutes)
+app.use('/api/admin', requirePlatformAdmin, adminConfigsRoutes)
+app.use('/api/admin', requirePlatformAdmin, adminPromptsRoutes)
+app.use('/api/admin', requirePlatformAdmin, adminSkillsRoutes)
+app.use('/api/admin', requirePlatformAdmin, adminOrgsRoutes)
+app.use('/api/org',   requireAuth, requireOrgAdmin, orgAdminRoutes)
+app.use('/api/admin/forge/nodes',      requirePlatformAdmin, forgeNodesRoutes)
+app.use('/api/admin/forge/blueprints', requirePlatformAdmin, forgeBlueprintsRoutes)
+app.use('/api/admin/analytics',        requirePlatformAdmin, analyticsRoutes)
+app.use('/api/admin',                  requirePlatformAdmin, changelogAdminRoutes)
 app.use('/api/changelog',              changelogPublicRoutes)
 app.use('/api/projects/:id/canvas',   forgeCanvasRoutes)
 app.use('/api/projects/:id/library',  forgeLibraryRoutes)

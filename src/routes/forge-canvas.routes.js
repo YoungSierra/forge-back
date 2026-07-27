@@ -4,6 +4,20 @@ const multer     = require('multer')
 const { db }     = require('../services/supabase.service')
 const { autoWire, cleanupAndRewire } = require('../services/auto-wire.service')
 const { extractSection } = require('../utils/extract-section')
+const { canRun } = require('../services/credits.service')
+
+// Frente 4: gate de crédito. Bloquea correr un nodo si la org del proyecto no tiene saldo.
+// Devuelve true si se puede seguir; si no, responde 402 y devuelve false.
+async function creditGate(project_id, res) {
+  const { data: proj } = await db().from('projects').select('org_id').eq('id', project_id).maybeSingle()
+  if (!proj?.org_id) return true // sin org (dato viejo) -> no bloquear
+  const { ok, balance } = await canRun(proj.org_id)
+  if (!ok) {
+    res.status(402).json({ success: false, error: 'Insufficient credits to run. Please top up.', code: 'NO_CREDIT', balance })
+    return false
+  }
+  return true
+}
 
 // ─── ¿El blueprint está sellado? (gate ACCEPT) ───────────────────────────────
 // forge_project_blueprints acumula varias filas por blueprint (historial de loads).
@@ -1506,6 +1520,9 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
       return res.status(400).json({ success: false, error: 'user_message es requerido' })
     }
 
+    // Frente 4: gate de crédito ANTES de correr el LLM (bloquea sin gastar)
+    if (!(await creditGate(project_id, res))) return
+
     // Obtener definición del nodo para componer el prompt y resolver el modelo
     const { data: node, error: nodeErr } = await db()
       .from('forge_nodes')
@@ -2419,6 +2436,38 @@ router.post('/add-node', async (req, res, next) => {
       }
     }
 
+    // ── Fix orden-independiente del arrastre: normalizar order_index de los nodos SUELTOS
+    // (forge_node sin blueprint y sin lane) según su node_key. Así el auto-wire conecta
+    // productor→consumidor sin importar en qué orden se arrastraron (ej. 2.2 después de 3.1).
+    // Es una PERMUTACIÓN de los order_index que esos nodos YA ocupan: no crea valores nuevos,
+    // no toca nodos de blueprint ni de lanes/fan-out, no colisiona con nada.
+    const { data: looseNodes } = await db()
+      .from('forge_project_nodes')
+      .select('id, order_index, forge_nodes(node_key)')
+      .eq('project_id', project_id)
+      .eq('node_type', 'forge_node')
+      .is('blueprint_id', null)
+      .is('lane_id', null)
+      .or('removed.is.null,removed.eq.false')
+
+    if (looseNodes && looseNodes.length > 1) {
+      // nkOrder: "3.2" → 3002, "3.10" → 3010, "2.2" → 2002 (ordena entre fases y dentro de fase)
+      const nkOrder = k => {
+        const [maj, min] = String(k || '').split('.').map(x => parseInt(x, 10) || 0)
+        return maj * 1000 + min
+      }
+      const slots  = looseNodes.map(n => n.order_index).sort((a, b) => a - b)
+      const sorted = [...looseNodes].sort(
+        (a, b) => nkOrder(a.forge_nodes?.node_key) - nkOrder(b.forge_nodes?.node_key)
+      )
+      for (let i = 0; i < sorted.length; i++) {
+        if (sorted[i].order_index !== slots[i]) {
+          await db().from('forge_project_nodes').update({ order_index: slots[i] }).eq('id', sorted[i].id)
+        }
+      }
+      console.log('[add-node] normalizados', sorted.length, 'nodos sueltos por node_key')
+    }
+
     // Limpiar edges auto-wired para recalcular óptimos con el nuevo nodo en el canvas
     await db().from('forge_project_edges').delete().eq('project_id', project_id).eq('is_auto', true)
     try {
@@ -2965,6 +3014,9 @@ router.post('/run-validate', async (req, res, next) => {
   try {
     const { id: project_id } = req.params
 
+    // Frente 4: gate de crédito antes de correr el pipeline
+    if (!(await creditGate(project_id, res))) return
+
     // Alcance del run: pipeline (todo) | lane | blueprint. Default pipeline.
     const { type: scopeType = 'pipeline', lane_id: scopeLaneId, blueprint_id: scopeBlueprintId } = req.body || {}
 
@@ -3327,6 +3379,9 @@ router.post('/nodes/:project_node_id/auto-run', async (req, res, next) => {
   try {
     const { id: project_id, project_node_id } = req.params
     const { member_id } = req.body
+
+    // Frente 4: gate de crédito antes de correr el nodo
+    if (!(await creditGate(project_id, res))) return
 
     const { propagateStale } = require('../services/canvas-chat.service')
 

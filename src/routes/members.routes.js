@@ -1,14 +1,25 @@
 const express = require('express')
 const router = express.Router()
 const { db } = require('../services/supabase.service')
+const { requireAuth } = require('../middleware/requireAuth')
 
-// GET /api/members/search?q=query
-router.get('/search', async (req, res, next) => {
+// GET /api/members/search?q=query — directorio SCOPEADO a la organización activa (Frente 2).
+// Antes devolvía TODOS los miembros de la instancia (filtración entre orgs).
+router.get('/search', requireAuth, async (req, res, next) => {
   try {
     const { q = '' } = req.query
+    const orgId = req.auth.activeOrgId
+    if (!orgId) return res.json({ success: true, members: [] })
+
+    // ids de miembros de la org activa
+    const { data: om } = await db().from('org_members').select('member_id').eq('org_id', orgId)
+    const ids = (om || []).map(r => r.member_id)
+    if (!ids.length) return res.json({ success: true, members: [] })
+
     const { data, error } = await db()
       .from('members')
       .select('id, display_name, avatar_url, role')
+      .in('id', ids)
       .ilike('display_name', `%${q}%`)
       .limit(20)
 

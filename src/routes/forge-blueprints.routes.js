@@ -5,8 +5,10 @@ const { db }  = require('../services/supabase.service')
 // ─── GET /api/admin/forge/blueprints ─────────────────────────
 router.get('/', async (req, res, next) => {
   try {
+    // El BMS del super-admin maneja SOLO los blueprints estándar de V57 (org_id NULL).
+    // Los propios de cada org (org_id != NULL) se gestionan en la consola de esa org, no acá.
     const { phase } = req.query
-    let query = db().from('forge_blueprints').select('*').order('phase').order('name')
+    let query = db().from('forge_blueprints').select('*').is('org_id', null).order('phase').order('name')
     if (phase) query = query.eq('phase', phase)
 
     const { data, error } = await query
@@ -42,12 +44,14 @@ router.post('/', async (req, res, next) => {
       return res.status(400).json({ success: false, error: 'blueprint_key, name y phase son requeridos' })
     }
 
-    // Si is_default=true, quitar default de otros blueprints de la misma fase
+    // Si is_default=true, quitar default de otros blueprints ESTÁNDAR de la misma fase
+    // (no tocar los de las orgs — cada org tiene su propio default por fase)
     if (is_default) {
       await db()
         .from('forge_blueprints')
         .update({ is_default: false })
         .eq('phase', phase)
+        .is('org_id', null)
         .eq('is_default', true)
     }
 
@@ -103,6 +107,7 @@ router.patch('/:id', async (req, res, next) => {
           .from('forge_blueprints')
           .update({ is_default: false })
           .eq('phase', current.phase)
+          .is('org_id', null)
           .eq('is_default', true)
           .neq('id', req.params.id)
       }

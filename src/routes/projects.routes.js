@@ -3,9 +3,11 @@ const path = require('path')
 const fs = require('fs')
 const archiver = require('archiver')
 const router = express.Router()
-const { db, TEST_MEMBER_ID, calculateCost } = require('../services/supabase.service')
+const { db, dbAsUser, TEST_MEMBER_ID, calculateCost } = require('../services/supabase.service')
 const { ensureProjectDir, getAssetUrl, slugify, STORAGE_BASE, getFromStorage } = require('../services/storage.service')
 const { autoWire } = require('../services/auto-wire.service')
+const { requireAuth } = require('../middleware/requireAuth')
+const { assertProjectAccess } = require('../services/access.service')
 
 const STEP_ORDER = ['step_1_concept', 'sprites', 'levels', 'code', 'audio', 'step_6_export']
 
@@ -18,17 +20,12 @@ function normalizeEngine(raw) {
   return 'unity'
 }
 
-// GET /api/projects?auth_user_id=xxx
+// GET /api/projects — lista de proyectos del usuario, scopeada a su organización activa.
+// La identidad viene de requireAuth (gate montado en index.js sobre /api/projects), NO de la URL.
 router.get('/', async (req, res, next) => {
   try {
-    const { auth_user_id } = req.query
-
-    // Resolve member_id from auth_user_id, fallback to TEST_MEMBER_ID
-    let memberId = TEST_MEMBER_ID
-    if (auth_user_id) {
-      const { data: member } = await db().from('members').select('id').eq('auth_user_id', auth_user_id).single()
-      if (member) memberId = member.id
-    }
+    const memberId = req.auth.memberId
+    const orgId    = req.auth.activeOrgId
 
     // Get project_ids where user is a project_member (not owner)
     const { data: memberRows } = await db()
@@ -37,10 +34,15 @@ router.get('/', async (req, res, next) => {
       .eq('member_id', memberId)
     const memberProjectIds = (memberRows || []).map(r => r.project_id)
 
-    let query = db()
+    // Frente 3 etapa 2: la lista va por dbAsUser -> RLS filtra por org en la BD (2ª cerradura).
+    // Los filtros de abajo (org activa, owner/compartidos) se suman por encima.
+    let query = dbAsUser(req.auth.token)
       .from('projects')
       .select('*, assets(id, review_status), generation_jobs(id, current_step, status), forge_sessions(id, status, node_id), forge_project_nodes(id, removed, node_type), updated_at')
       .order('created_at', { ascending: false })
+
+    // Aislamiento por organización (Frente 2): solo proyectos de la org activa
+    if (orgId) query = query.eq('org_id', orgId)
 
     if (memberProjectIds.length > 0) {
       query = query.or(`owner_member_id.eq.${memberId},id.in.(${memberProjectIds.join(',')})`)
@@ -148,11 +150,21 @@ router.put('/:id/canvas', async (req, res, next) => {
 })
 
 // GET /api/projects/:id
-router.get('/:id', async (req, res, next) => {
+router.get('/:id', requireAuth, async (req, res, next) => {
   try {
     const { id } = req.params
 
-    const { data: project, error: pErr } = await db()
+    // Cerradura de acceso (Frente 2): el proyecto debe ser de la org activa del usuario
+    // (o el usuario es super-admin de plataforma). Antes este endpoint no verificaba NADA.
+    try {
+      await assertProjectAccess(id, req.auth)
+    } catch (e) {
+      return res.status(e.status || 403).json({ success: false, error: e.message, code: e.code || 'FORBIDDEN' })
+    }
+
+    // Frente 3 etapa 2: la lectura del proyecto va por dbAsUser -> RLS la filtra en la BD (2ª cerradura,
+    // además del assertProjectAccess de arriba). Los hijos (jobs/assets/exports) siguen por service-role.
+    const { data: project, error: pErr } = await dbAsUser(req.auth.token)
       .from('projects')
       .select('*')
       .eq('id', id)
