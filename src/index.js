@@ -54,6 +54,26 @@ const app = express()
 
 app.use(cors({ origin: FRONTEND_URL, credentials: true }))
 app.use(morgan('dev'))
+
+// Webhook de pagos (Stripe) — DEBE ir ANTES de express.json() para tener el body CRUDO
+// (Stripe verifica la firma sobre el raw body). Los créditos se acreditan solo aquí, tras el pago
+// confirmado por la pasarela -> nunca se regalan desde el front.
+app.post('/api/webhooks/stripe', express.raw({ type: '*/*' }), async (req, res) => {
+  try {
+    const { parseWebhook, PROVIDER } = require('./services/payments.service')
+    const { addCredits } = require('./services/credits.service')
+    const evt = parseWebhook({ rawBody: req.body, signature: req.headers['stripe-signature'] })
+    if (evt?.orgId && evt.amountUsd > 0) {
+      await addCredits({ orgId: evt.orgId, amountUsd: evt.amountUsd, paymentProvider: PROVIDER, externalRef: evt.externalRef })
+      console.log(`[payments] +$${evt.amountUsd} creditos -> org ${evt.orgId} (ref ${evt.externalRef})`)
+    }
+    res.json({ received: true })
+  } catch (e) {
+    console.error('[payments webhook]', e.message)
+    res.status(400).send(`Webhook Error: ${e.message}`)
+  }
+})
+
 app.use(express.json({ limit: '10mb' }))
 
 // Static file serving for generated assets

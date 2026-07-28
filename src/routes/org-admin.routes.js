@@ -7,6 +7,7 @@ const express = require('express')
 const router = express.Router()
 const { db, getClient } = require('../services/supabase.service')
 const { getStatus } = require('../services/credits.service')
+const { createCheckout } = require('../services/payments.service')
 
 // ── Miembros de MI org (5.4) ──
 router.get('/members', async (req, res, next) => {
@@ -85,6 +86,23 @@ router.get('/ledger', async (req, res, next) => {
       .eq('org_id', req.auth.activeOrgId).order('created_at', { ascending: false }).limit(200)
     if (error) return res.status(500).json({ success: false, error: error.message })
     res.json({ success: true, transactions: data || [] })
+  } catch (err) { next(err) }
+})
+
+// Comprar créditos vía pasarela (Stripe). Crea la sesión y devuelve la URL para redirigir.
+// Los créditos se acreditan cuando llega el webhook confirmado (no acá) -> nunca se regalan.
+router.post('/credits/checkout', async (req, res, next) => {
+  try {
+    const orgId = req.auth.activeOrgId
+    const { amount_usd } = req.body
+    if (!amount_usd || Number(amount_usd) <= 0) return res.status(400).json({ success: false, error: 'amount_usd must be > 0' })
+    const { data: org } = await db().from('organizations').select('name').eq('id', orgId).maybeSingle()
+    const front = process.env.FRONTEND_URL || 'http://localhost:3000'
+    const r = await createCheckout({
+      orgId, orgName: org?.name || 'Organization', amountUsd: Number(amount_usd),
+      successUrl: `${front}/org?paid=1`, cancelUrl: `${front}/org?canceled=1`,
+    })
+    res.json({ success: true, url: r.url })
   } catch (err) { next(err) }
 })
 

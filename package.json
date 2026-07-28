@@ -28,6 +28,7 @@
     "pdfkit": "^0.18.0",
     "pngjs": "^7.0.0",
     "pptxgenjs": "^4.0.1",
+    "stripe": "^22.3.2",
     "together-ai": "^0.39.0"
   },
   "devDependencies": {
