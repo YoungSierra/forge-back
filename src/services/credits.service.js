@@ -13,19 +13,46 @@ async function getBalance(orgId) {
   return Number(data?.credit_balance ?? 0)
 }
 
-// Gate PRE-ejecución: ¿la org puede correr una operación? Bloquea si el saldo llegó a 0.
-async function canRun(orgId) {
+// Gate PRE-ejecución: ¿se puede correr una operación? Bloquea si el saldo de la org llegó a 0, o si el
+// proyecto/miembro alcanzó su sub-tope opcional (en su propio período: mensual/total). El más restrictivo
+// manda -> devuelve la razón exacta del bloqueo. projectId/memberId son opcionales.
+async function canRun(orgId, { projectId = null, memberId = null } = {}) {
   const balance = await getBalance(orgId)
-  return { ok: balance > 0, balance }
+  if (balance <= 0) return { ok: false, reason: 'ORG', balance }
+
+  if (projectId) {
+    const { data: p } = await db().from('projects').select('credit_cap_usd, credit_cap_period').eq('id', projectId).maybeSingle()
+    if (p && p.credit_cap_usd != null) {
+      const period = p.credit_cap_period || 'monthly'
+      const { data: spend } = await db().rpc('project_spend', { p_project: projectId, p_period: period })
+      if (Number(spend) >= Number(p.credit_cap_usd)) {
+        return { ok: false, reason: 'PROJECT_CAP', balance, cap: Number(p.credit_cap_usd), spent: Number(spend), period }
+      }
+    }
+  }
+
+  if (memberId) {
+    const { data: om } = await db().from('org_members').select('credit_cap_usd, credit_cap_period').eq('org_id', orgId).eq('member_id', memberId).maybeSingle()
+    if (om && om.credit_cap_usd != null) {
+      const period = om.credit_cap_period || 'monthly'
+      const { data: spend } = await db().rpc('member_spend', { p_org: orgId, p_member: memberId, p_period: period })
+      if (Number(spend) >= Number(om.credit_cap_usd)) {
+        return { ok: false, reason: 'MEMBER_CAP', balance, cap: Number(om.credit_cap_usd), spent: Number(spend), period }
+      }
+    }
+  }
+
+  return { ok: true, balance }
 }
 
 // Cobra una operación: aplica margen (por org), descuenta y registra en el libro mayor.
 // rawCostUsd = costo real del proveedor (típicamente forge_execution_log.cost_usd).
+// projectId etiqueta el consumo para el gasto por proyecto (sub-topes).
 // Devuelve { newBalance, alert: 'depleted' | 'low' | null }.
-async function chargeForOperation({ orgId, rawCostUsd, executionLogId = null, createdBy = null }) {
+async function chargeForOperation({ orgId, rawCostUsd, executionLogId = null, createdBy = null, projectId = null }) {
   if (!orgId) return null
   const { data, error } = await db().rpc('apply_credit_charge', {
-    p_org: orgId, p_raw: Number(rawCostUsd || 0), p_exec: executionLogId, p_by: createdBy,
+    p_org: orgId, p_raw: Number(rawCostUsd || 0), p_exec: executionLogId, p_by: createdBy, p_project: projectId,
   })
   if (error) throw error
   const newBalance = Number(data)

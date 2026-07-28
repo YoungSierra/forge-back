@@ -14,7 +14,7 @@ function client() {
 
 // Crea una sesión de Checkout (hosted). El saldo es USD-equivalente, así que amountUsd == créditos.
 // Devuelve { url, id }. La org queda en metadata para saber a quién acreditar en el webhook.
-async function createCheckout({ orgId, orgName, amountUsd, successUrl, cancelUrl }) {
+async function createCheckout({ orgId, orgName, amountUsd, successUrl, cancelUrl, customerEmail }) {
   const session = await client().checkout.sessions.create({
     mode: 'payment',
     line_items: [{
@@ -25,6 +25,11 @@ async function createCheckout({ orgId, orgName, amountUsd, successUrl, cancelUrl
         product_data: { name: `Forge credits — ${orgName}` },
       },
     }],
+    // Genera una factura (invoice PDF con nº, ítems y datos) por cada compra; Stripe la envía por email
+    // si "Email finalized invoices" está activo. El recibo de pago se activa aparte en el Dashboard.
+    invoice_creation: { enabled: true, invoice_data: { description: `Forge credit top-up — ${orgName}` } },
+    // Prefija el email de facturación de la org (si no hay, Checkout lo pide en la página de pago)
+    ...(customerEmail ? { customer_email: customerEmail } : {}),
     metadata: { org_id: orgId, amount_usd: String(amountUsd) },
     success_url: successUrl,
     cancel_url:  cancelUrl,

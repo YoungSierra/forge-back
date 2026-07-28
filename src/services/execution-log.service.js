@@ -111,7 +111,7 @@ function logExecution(params) {
       // Frente 4: cobrar a la organización con margen (costo real -> credito). Solo si hay costo y org.
       if (org_id && finalCost > 0) {
         try {
-          await chargeForOperation({ orgId: org_id, rawCostUsd: finalCost, executionLogId: logRow?.id ?? null, createdBy: triggered_by })
+          await chargeForOperation({ orgId: org_id, rawCostUsd: finalCost, executionLogId: logRow?.id ?? null, createdBy: triggered_by, projectId: project_id })
         } catch (e) {
           console.error('[credits] charge failed:', e.message)
         }

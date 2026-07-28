@@ -6,14 +6,19 @@ const { autoWire, cleanupAndRewire } = require('../services/auto-wire.service')
 const { extractSection } = require('../utils/extract-section')
 const { canRun } = require('../services/credits.service')
 
-// Frente 4: gate de crédito. Bloquea correr un nodo si la org del proyecto no tiene saldo.
-// Devuelve true si se puede seguir; si no, responde 402 y devuelve false.
-async function creditGate(project_id, res) {
+// Frente 4: gate de crédito. Bloquea correr un nodo si la org no tiene saldo, o si el proyecto/miembro
+// alcanzó su sub-tope (el más restrictivo manda). Devuelve true si se puede seguir; si no, responde 402.
+async function creditGate(project_id, res, memberId = null) {
   const { data: proj } = await db().from('projects').select('org_id').eq('id', project_id).maybeSingle()
   if (!proj?.org_id) return true // sin org (dato viejo) -> no bloquear
-  const { ok, balance } = await canRun(proj.org_id)
-  if (!ok) {
-    res.status(402).json({ success: false, error: 'Insufficient credits to run. Please top up.', code: 'NO_CREDIT', balance })
+  const r = await canRun(proj.org_id, { projectId: project_id, memberId })
+  if (!r.ok) {
+    const msg = r.reason === 'PROJECT_CAP'
+      ? `This project reached its ${r.period === 'total' ? 'total' : 'monthly'} spending cap. Ask an org admin to raise it.`
+      : r.reason === 'MEMBER_CAP'
+        ? `You reached your ${r.period === 'total' ? 'total' : 'monthly'} spending cap. Ask an org admin to raise it.`
+        : 'Insufficient credits to run. Please top up.'
+    res.status(402).json({ success: false, error: msg, code: 'NO_CREDIT', reason: r.reason, balance: r.balance, cap: r.cap, spent: r.spent })
     return false
   }
   return true
@@ -1521,7 +1526,7 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
     }
 
     // Frente 4: gate de crédito ANTES de correr el LLM (bloquea sin gastar)
-    if (!(await creditGate(project_id, res))) return
+    if (!(await creditGate(project_id, res, req.auth?.memberId))) return
 
     // Obtener definición del nodo para componer el prompt y resolver el modelo
     const { data: node, error: nodeErr } = await db()
@@ -3015,7 +3020,7 @@ router.post('/run-validate', async (req, res, next) => {
     const { id: project_id } = req.params
 
     // Frente 4: gate de crédito antes de correr el pipeline
-    if (!(await creditGate(project_id, res))) return
+    if (!(await creditGate(project_id, res, req.auth?.memberId))) return
 
     // Alcance del run: pipeline (todo) | lane | blueprint. Default pipeline.
     const { type: scopeType = 'pipeline', lane_id: scopeLaneId, blueprint_id: scopeBlueprintId } = req.body || {}
@@ -3381,7 +3386,7 @@ router.post('/nodes/:project_node_id/auto-run', async (req, res, next) => {
     const { member_id } = req.body
 
     // Frente 4: gate de crédito antes de correr el nodo
-    if (!(await creditGate(project_id, res))) return
+    if (!(await creditGate(project_id, res, req.auth?.memberId))) return
 
     const { propagateStale } = require('../services/canvas-chat.service')
 

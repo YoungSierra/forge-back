@@ -14,13 +14,19 @@ router.get('/members', async (req, res, next) => {
   try {
     const orgId = req.auth.activeOrgId
     const { data: oms } = await db().from('org_members')
-      .select('id, org_role, joined_at, member_id, members(id, display_name, auth_user_id)')
+      .select('id, org_role, joined_at, member_id, credit_cap_usd, credit_cap_period, members(id, display_name, auth_user_id)')
       .eq('org_id', orgId)
     const { data: authData } = await getClient().auth.admin.listUsers({ perPage: 1000 })
     const emailById = Object.fromEntries((authData?.users || []).map(u => [u.id, u.email]))
-    const members = (oms || []).map(o => ({
-      org_member_id: o.id, member_id: o.member_id, org_role: o.org_role, joined_at: o.joined_at,
-      display_name: o.members?.display_name, email: emailById[o.members?.auth_user_id] || null,
+    // Gasto por miembro en su propio período (para mostrar consumo vs tope)
+    const members = await Promise.all((oms || []).map(async o => {
+      const period = o.credit_cap_period || 'monthly'
+      const { data: spend } = await db().rpc('member_spend', { p_org: orgId, p_member: o.member_id, p_period: period })
+      return {
+        org_member_id: o.id, member_id: o.member_id, org_role: o.org_role, joined_at: o.joined_at,
+        display_name: o.members?.display_name, email: emailById[o.members?.auth_user_id] || null,
+        credit_cap_usd: o.credit_cap_usd, credit_cap_period: period, spent: Number(spend || 0),
+      }
     }))
     res.json({ success: true, members })
   } catch (err) { next(err) }
@@ -45,16 +51,77 @@ router.post('/members', async (req, res, next) => {
   } catch (err) { next(err) }
 })
 
-// cambiar rol de un miembro de MI org
+// cambiar rol y/o sub-tope de crédito de un miembro de MI org
 router.patch('/members/:memberId', async (req, res, next) => {
   try {
     const orgId = req.auth.activeOrgId
     const { memberId } = req.params
-    const { org_role } = req.body
-    if (!['owner', 'admin', 'member', 'viewer'].includes(org_role)) return res.status(400).json({ success: false, error: 'invalid org_role' })
-    const { data, error } = await db().from('org_members').update({ org_role }).eq('org_id', orgId).eq('member_id', memberId).select('id, org_role').single()
+    const { org_role, credit_cap_usd, credit_cap_period } = req.body
+    const updates = {}
+    if (org_role !== undefined) {
+      if (!['owner', 'admin', 'member', 'viewer'].includes(org_role)) return res.status(400).json({ success: false, error: 'invalid org_role' })
+      updates.org_role = org_role
+    }
+    if (credit_cap_usd !== undefined) {  // '' o null -> quitar el tope
+      updates.credit_cap_usd = (credit_cap_usd === '' || credit_cap_usd === null) ? null : Number(credit_cap_usd)
+      if (updates.credit_cap_usd != null && !(updates.credit_cap_usd >= 0)) return res.status(400).json({ success: false, error: 'credit_cap_usd must be >= 0' })
+    }
+    if (credit_cap_period !== undefined) {
+      if (!['monthly', 'total'].includes(credit_cap_period)) return res.status(400).json({ success: false, error: 'invalid credit_cap_period' })
+      updates.credit_cap_period = credit_cap_period
+    }
+    if (Object.keys(updates).length === 0) return res.status(400).json({ success: false, error: 'nothing to update' })
+    const { data, error } = await db().from('org_members').update(updates).eq('org_id', orgId).eq('member_id', memberId).select('id, org_role, credit_cap_usd, credit_cap_period').single()
     if (error) return res.status(400).json({ success: false, error: error.message })
     res.json({ success: true, org_member: data })
+  } catch (err) { next(err) }
+})
+
+// ── Proyectos de MI org + sub-topes de crédito (con búsqueda por nombre + paginación) ──
+// El gasto por proyecto se calcula SOLO para la página visible (evita N llamadas en orgs grandes).
+router.get('/projects', async (req, res, next) => {
+  try {
+    const orgId = req.auth.activeOrgId
+    const search = String(req.query.search || '').trim()
+    const page = Math.max(0, parseInt(req.query.page, 10) || 0)
+    const pageSize = Math.min(50, Math.max(1, parseInt(req.query.pageSize, 10) || 10))
+    let q = db().from('projects')
+      .select('id, name, credit_cap_usd, credit_cap_period, created_at', { count: 'exact' })
+      .eq('org_id', orgId)
+    if (search) q = q.ilike('name', `%${search}%`)
+    const { data, count, error } = await q
+      .order('created_at', { ascending: false })
+      .range(page * pageSize, page * pageSize + pageSize - 1)
+    if (error) return res.status(500).json({ success: false, error: error.message })
+    const projects = await Promise.all((data || []).map(async p => {
+      const period = p.credit_cap_period || 'monthly'
+      const { data: spend } = await db().rpc('project_spend', { p_project: p.id, p_period: period })
+      return { ...p, credit_cap_period: period, spent: Number(spend || 0) }
+    }))
+    res.json({ success: true, projects, total: count ?? 0, page, pageSize })
+  } catch (err) { next(err) }
+})
+
+router.patch('/projects/:id', async (req, res, next) => {
+  try {
+    const orgId = req.auth.activeOrgId
+    const { data: proj } = await db().from('projects').select('org_id').eq('id', req.params.id).maybeSingle()
+    if (!proj) return res.status(404).json({ success: false, error: 'Project not found' })
+    if (proj.org_id !== orgId) return res.status(403).json({ success: false, error: 'Not your organization project' })
+    const { credit_cap_usd, credit_cap_period } = req.body
+    const updates = {}
+    if (credit_cap_usd !== undefined) {
+      updates.credit_cap_usd = (credit_cap_usd === '' || credit_cap_usd === null) ? null : Number(credit_cap_usd)
+      if (updates.credit_cap_usd != null && !(updates.credit_cap_usd >= 0)) return res.status(400).json({ success: false, error: 'credit_cap_usd must be >= 0' })
+    }
+    if (credit_cap_period !== undefined) {
+      if (!['monthly', 'total'].includes(credit_cap_period)) return res.status(400).json({ success: false, error: 'invalid credit_cap_period' })
+      updates.credit_cap_period = credit_cap_period
+    }
+    if (Object.keys(updates).length === 0) return res.status(400).json({ success: false, error: 'nothing to update' })
+    const { data, error } = await db().from('projects').update(updates).eq('id', req.params.id).select('id, credit_cap_usd, credit_cap_period').single()
+    if (error) return res.status(400).json({ success: false, error: error.message })
+    res.json({ success: true, project: data })
   } catch (err) { next(err) }
 })
 
@@ -96,10 +163,11 @@ router.post('/credits/checkout', async (req, res, next) => {
     const orgId = req.auth.activeOrgId
     const { amount_usd } = req.body
     if (!amount_usd || Number(amount_usd) <= 0) return res.status(400).json({ success: false, error: 'amount_usd must be > 0' })
-    const { data: org } = await db().from('organizations').select('name').eq('id', orgId).maybeSingle()
+    const { data: org } = await db().from('organizations').select('name, billing_email').eq('id', orgId).maybeSingle()
     const front = process.env.FRONTEND_URL || 'http://localhost:3000'
     const r = await createCheckout({
       orgId, orgName: org?.name || 'Organization', amountUsd: Number(amount_usd),
+      customerEmail: org?.billing_email || undefined,
       successUrl: `${front}/org?paid=1`, cancelUrl: `${front}/org?canceled=1`,
     })
     res.json({ success: true, url: r.url })
