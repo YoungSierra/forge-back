@@ -1,7 +1,7 @@
 const express = require('express')
 const multer  = require('multer')
 const router  = express.Router({ mergeParams: true })
-const { db }  = require('../services/supabase.service')
+const { db, dbAsUser } = require('../services/supabase.service')
 const { uploadToStorage }       = require('../services/storage.service')
 const { extractText, detectAssetType } = require('../services/extraction.service')
 
@@ -13,8 +13,9 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 200
 router.get('/', async (req, res, next) => {
   try {
     const { id: project_id } = req.params
+    const asUser = dbAsUser(req.auth.token)  // RLS: librería del proyecto como el usuario
 
-    const { data, error } = await db()
+    const { data, error } = await asUser
       .from('forge_project_library_assets')
       .select('id, display_name, description, file_name, mime_type, file_size_bytes, asset_type, storage_url, extracted_text, created_at')
       .eq('project_id', project_id)
@@ -167,6 +168,9 @@ router.delete('/:asset_id', async (req, res, next) => {
 router.get('/project-assets', async (req, res, next) => {
   try {
     const { id: project_id } = req.params
+    // NOTA: sigue en service-role a propósito — se une a tablas legacy (assets/asset_versions) que
+    // están por deprecarse y no tienen RLS. Enforcement de esta vista queda como pendiente (junto con
+    // el gate de /api/assets). Ver plan multi-org.
 
     // ── forge_assets (nuevo sistema) ──────────────────────────────────────────
     const { data: forgeAssets } = await db()

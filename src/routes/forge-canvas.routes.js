@@ -1,7 +1,7 @@
 const express    = require('express')
 const router     = express.Router({ mergeParams: true })
 const multer     = require('multer')
-const { db }     = require('../services/supabase.service')
+const { db, dbAsUser } = require('../services/supabase.service')
 const { autoWire, cleanupAndRewire } = require('../services/auto-wire.service')
 const { extractSection } = require('../utils/extract-section')
 const { canRun } = require('../services/credits.service')
@@ -377,9 +377,12 @@ function normalizeOutputSections(text, outputDefs) {
 router.get('/', async (req, res, next) => {
   try {
     const { id: project_id } = req.params
+    // RLS (Frente 3 etapa 2): esta vista corre como el USUARIO -> Postgres filtra por org en cada
+    // lectura. Handler read-only, así que todo va por asUser. Un proyecto de otra org devuelve vacío.
+    const asUser = dbAsUser(req.auth.token)
 
     // Nodos activos del canvas — forge_nodes y asset-nodes
-    const { data: projectNodes, error: nodesError } = await db()
+    const { data: projectNodes, error: nodesError } = await asUser
       .from('forge_project_nodes')
       .select(`
         id, order_index, added_at,
@@ -406,7 +409,7 @@ router.get('/', async (req, res, next) => {
     // Una fila ACCEPT en cualquiera de las (posibles varias) filas del blueprint lo sella.
     const sealedBpIds = new Set()
     {
-      const { data: allBpRows } = await db()
+      const { data: allBpRows } = await asUser
         .from('forge_project_blueprints')
         .select('blueprint_id, gate_decision')
         .eq('project_id', project_id)
@@ -425,7 +428,7 @@ router.get('/', async (req, res, next) => {
       // Intenta con output_key; si falla (migración 027 pendiente) reintenta sin ella
       let rawSessions = []
       {
-        const { data, error } = await db()
+        const { data, error } = await asUser
           .from('forge_sessions')
           .select('id, node_id, output_key, status, iteration_count, started_at, completed_at, output_asset_id, output_images')
           .eq('project_id', project_id)
@@ -434,7 +437,7 @@ router.get('/', async (req, res, next) => {
 
         if (error) {
           // Columna output_key no existe aún — fallback sin ella
-          const { data: data2, error: err2 } = await db()
+          const { data: data2, error: err2 } = await asUser
             .from('forge_sessions')
             .select('id, node_id, status, iteration_count, started_at, completed_at, output_asset_id, output_images')
             .eq('project_id', project_id)
@@ -473,7 +476,7 @@ router.get('/', async (req, res, next) => {
       .filter(s => s.status === 'active' && !s.output_asset_id)
       .map(s => s.id)
     if (activeSessIds.length > 0) {
-      const { data: agentMsgs } = await db()
+      const { data: agentMsgs } = await asUser
         .from('forge_messages')
         .select('session_id')
         .in('session_id', activeSessIds)
@@ -489,7 +492,7 @@ router.get('/', async (req, res, next) => {
 
     let outputAssetsMap = {}
     if (outputAssetIds.length > 0) {
-      const { data: outputAssets } = await db()
+      const { data: outputAssets } = await asUser
         .from('forge_assets')
         .select('id, name, format, storage_url, content')
         .in('id', outputAssetIds)
@@ -538,7 +541,7 @@ router.get('/', async (req, res, next) => {
     const loadedBpIds = [...new Set((projectNodes || []).map(n => n.blueprint_id).filter(Boolean))]
     let activeBlueprint = null
     if (loadedBpIds.length > 0) {
-      const { data: bpDefs } = await db()
+      const { data: bpDefs } = await asUser
         .from('forge_blueprints')
         .select('id, blueprint_key, name, phase, gate')
         .in('id', loadedBpIds)
@@ -549,7 +552,7 @@ router.get('/', async (req, res, next) => {
         .pop() || null
       if (live) {
         // gate_decision de esa fase: sellada si ALGUNA fila es ACCEPT (puede haber varias)
-        const { data: gdRows } = await db()
+        const { data: gdRows } = await asUser
           .from('forge_project_blueprints')
           .select('gate_decision')
           .eq('project_id', project_id)
@@ -564,7 +567,7 @@ router.get('/', async (req, res, next) => {
     // Edges persistidos en DB (tabla puede no existir si la migración aún no se corrió)
     let edges = []
     try {
-      const { data: edgeRows, error: edgeError } = await db()
+      const { data: edgeRows, error: edgeError } = await asUser
         .from('forge_project_edges')
         .select('id, source_node_id, target_node_id, source_handle, target_handle')
         .eq('project_id', project_id)
@@ -582,7 +585,7 @@ router.get('/', async (req, res, next) => {
     } catch (e) { console.error('[forge-canvas] GET edges unexpected error:', e.message) }
 
     // Canvas layout guardado (posiciones de nodos) — se escribe en tabla 'projects'
-    const { data: projectRow } = await db()
+    const { data: projectRow } = await asUser
       .from('projects')
       .select('canvas_layout')
       .eq('id', project_id)
@@ -591,7 +594,7 @@ router.get('/', async (req, res, next) => {
     // Lanes del proyecto (tabla puede no existir si la migración 029 no se corrió aún)
     let lanes = []
     try {
-      const { data: lanesData } = await db()
+      const { data: lanesData } = await asUser
         .from('forge_lanes')
         .select('id, lane_key, label, color, bound_item_ref')
         .eq('project_id', project_id)
@@ -1336,8 +1339,9 @@ router.get('/nodes/:node_id/session', async (req, res, next) => {
   try {
     const { id: project_id, node_id } = req.params
     const { output_key = null } = req.query
+    const asUser = dbAsUser(req.auth.token)  // RLS: lecturas del nodo como el usuario
 
-    let baseQuery = db()
+    let baseQuery = asUser
       .from('forge_sessions')
       .select('id, status, iteration_count, started_at, completed_at, output_asset_id, output_images')
       .eq('project_id', project_id)
@@ -1367,7 +1371,7 @@ router.get('/nodes/:node_id/session', async (req, res, next) => {
 
     // Si no hay sesión general, buscar per-output sessions con imágenes o assets
     if (!session) {
-      const { data: perOutSessions } = await db()
+      const { data: perOutSessions } = await asUser
         .from('forge_sessions')
         .select('id, output_key, output_images, output_asset_id, status')
         .eq('project_id', project_id)
@@ -1391,7 +1395,7 @@ router.get('/nodes/:node_id/session', async (req, res, next) => {
       let perOutAsset = null
       for (const ps of perOutSessions) {
         if (ps.output_asset_id) {
-          const { data: aData } = await db()
+          const { data: aData } = await asUser
             .from('forge_assets')
             .select('id, name, format, content, storage_url')
             .eq('id', ps.output_asset_id)
@@ -1413,14 +1417,14 @@ router.get('/nodes/:node_id/session', async (req, res, next) => {
       })
     }
 
-    const { data: msgs } = await db()
+    const { data: msgs } = await asUser
       .from('forge_messages')
       .select('id, role, content, order_index, tool_calls')
       .eq('session_id', session.id)
       .order('order_index')
 
     // Cargar attachments de la sesión agrupados por message_id
-    const { data: attachments } = await db()
+    const { data: attachments } = await asUser
       .from('forge_attachments')
       .select('message_id, file_name, mime_type, file_size_bytes, storage_url')
       .eq('session_id', session.id)
@@ -1448,14 +1452,14 @@ router.get('/nodes/:node_id/session', async (req, res, next) => {
     let asset = null
     let imageAssets = []
     if (session.output_asset_id) {
-      const { data: assetData } = await db()
+      const { data: assetData } = await asUser
         .from('forge_assets')
         .select('id, name, format, content, storage_url')
         .eq('id', session.output_asset_id)
         .maybeSingle()
       asset = assetData
 
-      const { data: imgData } = await db()
+      const { data: imgData } = await asUser
         .from('forge_assets')
         .select('id, name, storage_url')
         .eq('session_id', session.id)
@@ -1467,7 +1471,7 @@ router.get('/nodes/:node_id/session', async (req, res, next) => {
     // Fallback: si no hay asset pero la sesión estaba aprobada, reconstruir desde el último mensaje del agente
     // Solo aplica a sesiones aprobadas — evita bloquear el botón Accept en sesiones activas
     if (!asset && (session.status === 'approved' || session.status === 'auto_approved')) {
-      const { data: lastAgentMsg } = await db()
+      const { data: lastAgentMsg } = await asUser
         .from('forge_messages')
         .select('content')
         .eq('session_id', session.id)
@@ -1493,7 +1497,7 @@ router.get('/nodes/:node_id/session', async (req, res, next) => {
     }
 
     // Merge de output_images de per-output sessions (si existen)
-    const { data: perOutForMerge } = await db()
+    const { data: perOutForMerge } = await asUser
       .from('forge_sessions')
       .select('output_images')
       .eq('project_id', project_id)
@@ -2614,8 +2618,9 @@ router.put('/edges', async (req, res) => {
 router.get('/all-inputs', async (req, res, next) => {
   try {
     const { id: project_id } = req.params
+    const asUser = dbAsUser(req.auth.token)  // RLS: inputs del proyecto como el usuario
 
-    const { data, error } = await db()
+    const { data, error } = await asUser
       .from('forge_project_node_inputs')
       .select(`
         id, project_node_id, input_key, input_label, is_required, source_type, order_index,
@@ -2636,8 +2641,9 @@ router.get('/all-inputs', async (req, res, next) => {
 router.get('/nodes/:project_node_id/inputs', async (req, res, next) => {
   try {
     const { project_node_id } = req.params
+    const asUser = dbAsUser(req.auth.token)  // RLS: inputs del nodo como el usuario (filtra por su project_id)
 
-    const { data, error } = await db()
+    const { data, error } = await asUser
       .from('forge_project_node_inputs')
       .select(`
         id, input_key, input_label, is_required, source_type, order_index,
@@ -2659,8 +2665,9 @@ router.get('/nodes/:project_node_id/inputs', async (req, res, next) => {
 router.get('/nodes/:project_node_id/context-inputs', async (req, res, next) => {
   try {
     const { id: project_id, project_node_id } = req.params
+    const asUser = dbAsUser(req.auth.token)  // RLS: contexto del nodo como el usuario
 
-    const { data: pNode, error: pnErr } = await db()
+    const { data: pNode, error: pnErr } = await asUser
       .from('forge_project_nodes')
       .select('id, bound_item_ref')
       .eq('id', project_node_id)
@@ -2689,7 +2696,7 @@ router.get('/nodes/:project_node_id/context-inputs', async (req, res, next) => {
     // 2. Edges entrantes (outputs de nodos upstream conectados por edge)
     let incomingEdges = []
     try {
-      const { data: edgeData } = await db()
+      const { data: edgeData } = await asUser
         .from('forge_project_edges')
         .select('source_node_id, source_handle')
         .eq('project_id', project_id)
@@ -2703,7 +2710,7 @@ router.get('/nodes/:project_node_id/context-inputs', async (req, res, next) => {
     for (const edge of incomingEdges) {
       if (seenSourceNodes.has(edge.source_node_id)) continue
       seenSourceNodes.add(edge.source_node_id)
-      const { data: srcPN } = await db()
+      const { data: srcPN } = await asUser
         .from('forge_project_nodes')
         .select(`
           node_id, node_type, text_label, text_content,
@@ -2727,7 +2734,7 @@ router.get('/nodes/:project_node_id/context-inputs', async (req, res, next) => {
         if (content) inputs.push({ label: srcPN.text_label || 'Text Input', content, source: 'edge', source_project_node_id: edge.source_node_id, output_key: null })
       } else {
         // Forge-node: buscar asset aprobado
-        const { data: asset } = await db()
+        const { data: asset } = await asUser
           .from('forge_assets')
           .select('content')
           .eq('project_id', project_id)
@@ -2768,7 +2775,7 @@ router.get('/nodes/:project_node_id/context-inputs', async (req, res, next) => {
         }
 
         // PNGs aprobados del nodo upstream
-        const { data: pngAssets } = await db()
+        const { data: pngAssets } = await asUser
           .from('forge_assets')
           .select('name, storage_url')
           .eq('project_id', project_id)
@@ -2788,7 +2795,7 @@ router.get('/nodes/:project_node_id/context-inputs', async (req, res, next) => {
     }
 
     // 3. Library assets asignados explícitamente al nodo
-    const { data: libInputs } = await db()
+    const { data: libInputs } = await asUser
       .from('forge_project_node_inputs')
       .select(`
         input_label,
