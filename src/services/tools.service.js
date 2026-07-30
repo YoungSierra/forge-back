@@ -275,6 +275,8 @@ function sanitizeText(s) {
     // comparadores matemáticos frecuentes en specs
     .replace(/≥/g, '>=').replace(/≤/g, '<=')    // ≥ ≤
     .replace(/≠/g, '!=').replace(/≈/g, '~')     // ≠ ≈
+    // em/en/figure dash (— – ‒ ―) → '-' : aunque están en WinAnsi, pdfkit los rinde como '?'
+    .replace(/[‒–—―]/g, '-')
     // triángulos/círculos geométricos (no WinAnsi) → ASCII
     .replace(/[▲▴▶▸►]/g, '>').replace(/[▼▾]/g, 'v')
     .replace(/[◀◂◄]/g, '<')
@@ -283,7 +285,7 @@ function sanitizeText(s) {
     .replace(/[︎️‍]/g, '')
     // catch-all: emoji/dingbats/símbolos sueltos que la fuente no puede dibujar → se eliminan.
     // Rangos elegidos para NO tocar box-drawing (2500-259F), puntuación general (2000-206F:
-    // dashes, comillas, elipsis, bullet) ni Latin-1.
+    // comillas, elipsis, bullet) ni Latin-1. (Los dashes largos sí se convierten arriba.)
     .replace(/[☀-➿⬀-⯿]/g, '')         // misc symbols + dingbats + flechas grandes
     .replace(/[←-⇿]/g, '-')                     // flechas restantes → '-'
     .replace(/[\u{1F000}-\u{1FAFF}]/gu, '')               // emoji pictográficos
@@ -399,7 +401,10 @@ function drawPageHeader(doc, title) {
 }
 
 async function docGenDocx(title, content, projectId, nodeId) {
-  let cleanContent = content || title
+  const { jsonToMarkdown } = require('./json-display')
+  // Si el output es JSON estructurado (ej. concept_data del 2.2), renderizarlo LEGIBLE (headings +
+  // bullets) en vez de volcar el JSON crudo al PDF. Si no es JSON, se usa el contenido tal cual.
+  let cleanContent = jsonToMarkdown(content) ?? content ?? title
   // Quitar tags HTML sueltos (ej. <a name="§1"></a> que el LLM emite para un TOC navegable).
   // El renderer es markdown→PDF y no los procesa, así que saldrían como texto literal.
   // El patrón exige letra tras '<' para no tocar "< 40" ni "0<100" del contenido.
