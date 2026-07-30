@@ -225,6 +225,7 @@ router.post('/', async (req, res, next) => {
         target_engine: 'unity',
         status: 'draft',
         owner_member_id: actorId,
+        org_id: req.auth?.activeOrgId ?? null,  // sin esto el proyecto nace huérfano -> la RLS lo oculta
         concept: { pipeline: {} }
       })
       .select()
