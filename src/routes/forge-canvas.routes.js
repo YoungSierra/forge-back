@@ -1938,7 +1938,10 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
     const llmVisibleTools = activeTools.filter(t => t !== 'doc_gen_docx')
     const toolsBlock      = getToolsBlock(llmVisibleTools)
 
-    const systemPrompt = [layer1, ...layer2Parts, toolsBlock].filter(Boolean).join('\n\n')
+    // Fecha actual para el LLM: sin esto usa su corte de entrenamiento (ej. un scan competitivo
+    // dice "as of June 2025"). Le damos la fecha real para toda afirmación time-sensitive.
+    const dateBlock = `The current date is ${new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })}. Use it as "today" for any time-sensitive or recency statement (market data, "as of", "current year", competitive scans); do NOT rely on your training cutoff.`
+    const systemPrompt = [dateBlock, layer1, ...layer2Parts, toolsBlock].filter(Boolean).join('\n\n')
 
     // ── Layer 3: session attachments (Reference Injection) ────────
     const { data: sessionAttachments } = await db()

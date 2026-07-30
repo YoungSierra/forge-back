@@ -476,7 +476,10 @@ async function buildSystemPrompt(db, { projectId, nodeId, sessionId, userMessage
     existingNodeOutputs.length ? `## Existing outputs from this node\n${existingNodeOutputs.join('\n\n')}` : '',
   ].filter(Boolean)
 
-  const systemPrompt = [layer1, ...layer2Parts, toolsBlock].filter(Boolean).join('\n\n')
+  // Fecha actual para el LLM (mismo criterio que el handler de chat): evita que use su corte de
+  // entrenamiento en afirmaciones time-sensitive (ej. "as of June 2025" en un scan competitivo).
+  const dateBlock = `The current date is ${new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })}. Use it as "today" for any time-sensitive or recency statement (market data, "as of", "current year", competitive scans); do NOT rely on your training cutoff.`
+  const systemPrompt = [dateBlock, layer1, ...layer2Parts, toolsBlock].filter(Boolean).join('\n\n')
 
   const finalSystemPrompt = attachmentParts.length
     ? systemPrompt + '\n\n## Attached references\n' + attachmentParts.join('\n\n')
