@@ -186,26 +186,32 @@ async function resolveNodeInputs(db, { projectId, currentPNodeId, targetOutput }
         }
       }
 
-      // Fallback: si no hay PNGs en forge_assets, leer output_images de la sesión aprobada
-      // (cubre accepts previos al fix del formato variations[]).
+      // Fallback: si no hay PNGs en forge_assets, leer output_images de las sesiones aprobadas.
+      // OJO: en el modelo per-output cada output vive en SU PROPIA sesión (ej. orientation_images y
+      // image_prompts son sesiones distintas), así que hay que juntar output_images de TODAS.
       if ((pngAssets || []).length === 0) {
-        const { data: approvedSession } = await db()
+        const { data: approvedSessions } = await db()
           .from('forge_sessions')
           .select('output_images, forge_nodes(title, outputs)')
           .eq('project_id', projectId)
           .eq('node_id', sourcePNode.node_id)
-          .eq('status', 'approved')
+          .in('status', ['approved', 'auto_approved'])
           .order('created_at', { ascending: false })
-          .limit(1)
-          .maybeSingle()
 
-        if (approvedSession?.output_images) {
-          const nodeTitle2 = approvedSession.forge_nodes?.title ?? sourcePNode.forge_nodes?.title ?? 'Node'
-          const pngOutputs = (approvedSession.forge_nodes?.outputs || [])
+        if (approvedSessions?.length) {
+          const nodeTitle2 = approvedSessions[0].forge_nodes?.title ?? sourcePNode.forge_nodes?.title ?? 'Node'
+          const pngOutputs = (approvedSessions[0].forge_nodes?.outputs || [])
             .filter(o => (o.format === 'png' || o.format === 'image') && o.image_gen)
-          const raw = approvedSession.output_images
+          // Merge de output_images de todas las sesiones (la primera no-vacía por clave; están ordenadas desc)
+          const merged = {}
+          for (const s of approvedSessions) {
+            for (const [k, v] of Object.entries(s.output_images || {})) {
+              if (merged[k] == null) merged[k] = v
+            }
+          }
           for (const outDef of pngOutputs) {
-            const items = Array.isArray(raw[outDef.name]) ? raw[outDef.name] : []
+            const okey  = outDef.key || outDef.name  // los outputs usan 'key' (no 'name') -> output_images se indexa por key
+            const items = Array.isArray(merged[okey]) ? merged[okey] : []
             for (const item of items) {
               const urls = Array.isArray(item.variations)
                 ? item.variations.map(v => v.url).filter(Boolean)
@@ -213,7 +219,7 @@ async function resolveNodeInputs(db, { projectId, currentPNodeId, targetOutput }
               for (const url of urls) {
                 if (!injectedPngUrls.has(url)) {
                   injectedPngUrls.add(url)
-                  resolvedInputs.push(`### ${nodeTitle2} — ${outDef.name} (generated image)\nURL: ${url}`)
+                  resolvedInputs.push(`### ${nodeTitle2} — ${outDef.label || okey} (generated image)\nURL: ${url}`)
                 }
               }
             }
