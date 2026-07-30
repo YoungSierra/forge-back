@@ -109,4 +109,17 @@ router.get('/orgs/:orgId/ledger', async (req, res, next) => {
   } catch (err) { next(err) }
 })
 
+// GET /api/admin/orgs/:orgId/blueprints — blueprints PROPIOS de la org (oversight read-only del super-admin)
+router.get('/orgs/:orgId/blueprints', async (req, res, next) => {
+  try {
+    const { orgId } = req.params
+    const { data, error } = await db().from('forge_blueprints')
+      .select('id, blueprint_key, name, phase, description, is_default, node_sequence, edges, gate, created_by, created_at, updated_at')
+      .eq('org_id', orgId)
+      .order('phase')
+    if (error) return res.status(500).json({ success: false, error: error.message })
+    res.json({ success: true, blueprints: data || [] })
+  } catch (err) { next(err) }
+})
+
 module.exports = router
