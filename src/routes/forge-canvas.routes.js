@@ -2664,7 +2664,7 @@ router.get('/nodes/:project_node_id/inputs', async (req, res, next) => {
 
 // ─── GET /api/projects/:id/canvas/nodes/:project_node_id/context-inputs ──────
 // Devuelve los inputs resueltos de un nodo para el panel de contexto del chat.
-// Solo se llama para nodos gate — misma lógica de resolución que el chat, sin llamar al LLM.
+// Disponible en todos los nodos — misma lógica de resolución que el chat, sin llamar al LLM.
 router.get('/nodes/:project_node_id/context-inputs', async (req, res, next) => {
   try {
     const { id: project_id, project_node_id } = req.params
