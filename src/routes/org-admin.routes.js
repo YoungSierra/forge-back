@@ -51,6 +51,33 @@ router.post('/members', async (req, res, next) => {
   } catch (err) { next(err) }
 })
 
+// invitar usuario a MI org por correo (mismo flujo /auth/accept que el super-admin)
+router.post('/members/invite', async (req, res, next) => {
+  try {
+    const orgId = req.auth.activeOrgId
+    const { email, org_role = 'member' } = req.body
+    if (!email) return res.status(400).json({ success: false, error: 'email is required' })
+    if (!['admin', 'member', 'viewer'].includes(org_role)) return res.status(400).json({ success: false, error: 'invalid org_role' })
+
+    const client = getClient()
+    const redirectTo = `${process.env.FRONTEND_URL}/auth/accept`
+    const { data: authData, error: authError } = await client.auth.admin.inviteUserByEmail(email, {
+      redirectTo,
+      data: { pending_org_role: org_role, pending_org_id: orgId },
+    })
+    if (authError) return res.status(400).json({ success: false, error: authError.message })
+
+    // El trigger crea la fila en members; la buscamos para linkearla a la org.
+    const authUserId = authData.user.id
+    const { data: member } = await db().from('members').select('id').eq('auth_user_id', authUserId).maybeSingle()
+    if (!member) return res.status(500).json({ success: false, error: 'member row not created yet, retry' })
+
+    const { error: omErr } = await db().from('org_members').insert({ org_id: orgId, member_id: member.id, org_role })
+    if (omErr) return res.status(400).json({ success: false, error: omErr.message })
+    res.json({ success: true, invited: true, member: { member_id: member.id, email, org_role } })
+  } catch (err) { next(err) }
+})
+
 // cambiar rol y/o sub-tope de crédito de un miembro de MI org
 router.patch('/members/:memberId', async (req, res, next) => {
   try {

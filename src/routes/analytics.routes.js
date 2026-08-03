@@ -6,13 +6,14 @@ const { db }  = require('../services/supabase.service')
 // Totales globales con filtro opcional de fecha y proyecto
 router.get('/summary', async (req, res, next) => {
   try {
-    const { from, to, project_id } = req.query
+    const { from, to, project_id, org_id } = req.query
 
     let q = db().from('forge_execution_log').select('cost_usd, duration_ms, input_tokens, output_tokens, cached_tokens, status, executor_type')
 
     if (from)       q = q.gte('created_at', from)
     if (to)         q = q.lte('created_at', to)
     if (project_id) q = q.eq('project_id', project_id)
+    if (org_id)     q = q.eq('org_id', org_id)
 
     const { data, error } = await q
     if (error) return res.status(500).json({ success: false, error: error.message })
@@ -45,14 +46,15 @@ router.get('/summary', async (req, res, next) => {
 // Desglose agrupado — group_by: project | member | provider | day
 router.get('/breakdown', async (req, res, next) => {
   try {
-    const { group_by = 'project', from, to, project_id } = req.query
+    const { group_by = 'project', from, to, project_id, org_id } = req.query
 
     let q = db().from('forge_execution_log')
-      .select('cost_usd, duration_ms, input_tokens, output_tokens, cached_tokens, status, executor_type, provider, model, project_id, triggered_by, created_at')
+      .select('cost_usd, duration_ms, input_tokens, output_tokens, cached_tokens, status, executor_type, provider, model, project_id, org_id, triggered_by, created_at')
 
     if (from)       q = q.gte('created_at', from)
     if (to)         q = q.lte('created_at', to)
     if (project_id) q = q.eq('project_id', project_id)
+    if (org_id)     q = q.eq('org_id', org_id)
 
     const { data, error } = await q.order('created_at', { ascending: false }).limit(5000)
     if (error) return res.status(500).json({ success: false, error: error.message })
@@ -62,24 +64,30 @@ router.get('/breakdown', async (req, res, next) => {
     // Obtener nombres de proyectos y miembros para enriquecer la respuesta
     const projectIds = [...new Set(rows.map(r => r.project_id).filter(Boolean))]
     const memberIds  = [...new Set(rows.map(r => r.triggered_by).filter(Boolean))]
+    const orgIds     = [...new Set(rows.map(r => r.org_id).filter(Boolean))]
 
-    const [projectsRes, membersRes] = await Promise.all([
+    const [projectsRes, membersRes, orgsRes] = await Promise.all([
       projectIds.length
         ? db().from('projects').select('id, name').in('id', projectIds)
         : Promise.resolve({ data: [] }),
       memberIds.length
         ? db().from('members').select('id, display_name').in('id', memberIds)
         : Promise.resolve({ data: [] }),
+      orgIds.length
+        ? db().from('organizations').select('id, name').in('id', orgIds)
+        : Promise.resolve({ data: [] }),
     ])
 
     const projectNames = Object.fromEntries((projectsRes.data || []).map(p => [p.id, p.name]))
     const memberNames  = Object.fromEntries((membersRes.data  || []).map(m => [m.id, m.display_name]))
+    const orgNames     = Object.fromEntries((orgsRes.data     || []).map(o => [o.id, o.name]))
 
     // Función de agrupamiento
     const getKey = (row) => {
       switch (group_by) {
         case 'project':  return row.project_id  || 'unknown'
         case 'member':   return row.triggered_by || 'unknown'
+        case 'org':      return row.org_id || 'unknown'
         case 'provider': return `${row.provider || 'unknown'}:${row.model || ''}`
         case 'day':      return (row.created_at || '').slice(0, 10)
         default:         return 'unknown'
@@ -90,6 +98,7 @@ router.get('/breakdown', async (req, res, next) => {
       switch (group_by) {
         case 'project':  return projectNames[key] || key
         case 'member':   return memberNames[key]  || key
+        case 'org':      return key === 'unknown' ? 'Sin organización' : (orgNames[key] || key)
         case 'provider': return key
         case 'day':      return key
         default:         return key
@@ -135,7 +144,7 @@ router.get('/breakdown', async (req, res, next) => {
 // Logs detallados paginados
 router.get('/logs', async (req, res, next) => {
   try {
-    const { page = 1, limit = 50, from, to, project_id, executor_type, status } = req.query
+    const { page = 1, limit = 50, from, to, project_id, org_id, executor_type, status } = req.query
     const pageNum  = Math.max(1, parseInt(page))
     const pageSize = Math.min(200, Math.max(1, parseInt(limit)))
     const offset   = (pageNum - 1) * pageSize
@@ -146,6 +155,7 @@ router.get('/logs', async (req, res, next) => {
     if (from)          q = q.gte('created_at', from)
     if (to)            q = q.lte('created_at', to)
     if (project_id)    q = q.eq('project_id', project_id)
+    if (org_id)        q = q.eq('org_id', org_id)
     if (executor_type) q = q.eq('executor_type', executor_type)
     if (status)        q = q.eq('status', status)
 
@@ -186,6 +196,28 @@ router.get('/projects-list', async (req, res, next) => {
       }
     }
     res.json({ success: true, projects })
+  } catch (err) { next(err) }
+})
+
+// ─── GET /api/admin/analytics/orgs-list ──────────────────────────────────────
+// Lista de organizaciones que tienen logs (para el filtro del selector)
+router.get('/orgs-list', async (req, res, next) => {
+  try {
+    const { data, error } = await db()
+      .from('forge_execution_log')
+      .select('org_id')
+      .not('org_id', 'is', null)
+      .limit(5000)
+
+    if (error) return res.status(500).json({ success: false, error: error.message })
+
+    const ids = [...new Set((data || []).map(r => r.org_id))]
+    let orgs = []
+    if (ids.length) {
+      const { data: os } = await db().from('organizations').select('id, name').in('id', ids)
+      orgs = (os || []).map(o => ({ id: o.id, name: o.name || o.id }))
+    }
+    res.json({ success: true, orgs })
   } catch (err) { next(err) }
 })
 
