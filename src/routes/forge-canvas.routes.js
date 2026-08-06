@@ -1901,7 +1901,10 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
       // Si el output objetivo declara uses.siblings_if_present[], inyectar ESOS outputs hermanos
       // COMPLETOS (no truncados): es una dependencia explícita, no anclaje. Caso clave: los ADI
       // (adi_segmentation) necesitan el master `art_direction_document` verbatim para extraer por número.
-      const siblingsAllowed = targetOutput?.uses?.siblings_if_present ?? null
+      // Se aceptan LAS DOS claves — v2.9.0 declara `siblings` en vez de `siblings_if_present`, y
+      // leyendo sólo la segunda esos outputs caen al else, que excluye los outputs propios del nodo
+      // ⇒ nunca ven su fuente. Ver el mismo fix en canvas-chat.service.js.
+      const siblingsAllowed = targetOutput?.uses?.siblings_if_present ?? targetOutput?.uses?.siblings ?? null
       if (siblingsAllowed && siblingsAllowed.length) {
         const wantNames = new Set(siblingsAllowed.map(assetNameFor))
         for (const asset of (siblingAssets || [])) {
@@ -1930,18 +1933,21 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
     ].filter(Boolean)
 
     // ── Ensamblar system prompt ───────────────────────────────────
-    const { getToolsBlock, parseToolCalls, executeTool } = require('../services/tools.service')
+    const { getToolsBlock, getDocPolicyBlock, isDataDump, parseToolCalls, executeTool } = require('../services/tools.service')
 
     const activeTools = Array.isArray(node.tools) && node.tools.length ? node.tools : []
     // doc_gen_docx se ejecuta automáticamente — no exponerla al LLM para evitar alucinaciones
     // doc_gen_pptx sí se expone: el modelo es responsable de llamarla con contenido + imágenes
     const llmVisibleTools = activeTools.filter(t => t !== 'doc_gen_docx')
     const toolsBlock      = getToolsBlock(llmVisibleTools)
+    // Esconderla NO alcanza: hay que decirle que no tiene con qué generar archivos, o improvisa
+    // un script y finge la ejecución (ver getDocPolicyBlock).
+    const docPolicyBlock  = getDocPolicyBlock(activeTools)
 
     // Fecha actual para el LLM: sin esto usa su corte de entrenamiento (ej. un scan competitivo
     // dice "as of June 2025"). Le damos la fecha real para toda afirmación time-sensitive.
     const dateBlock = `The current date is ${new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })}. Use it as "today" for any time-sensitive or recency statement (market data, "as of", "current year", competitive scans); do NOT rely on your training cutoff.`
-    const systemPrompt = [dateBlock, layer1, ...layer2Parts, toolsBlock].filter(Boolean).join('\n\n')
+    const systemPrompt = [dateBlock, layer1, ...layer2Parts, toolsBlock, docPolicyBlock].filter(Boolean).join('\n\n')
 
     // ── Layer 3: session attachments (Reference Injection) ────────
     const { data: sessionAttachments } = await db()
@@ -2120,7 +2126,11 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
       || DOC_FORMATS.includes((targetOutput.format || '').toLowerCase())
     )
 
-    if (hasDocTool && !alreadyCalled && replyText.trim().length > 200 && targetIsDoc) {
+    // Un payload de datos cercado no es un documento: el PDF sale como volcado ilegible.
+    const targetIsDump = isDataDump(replyText)
+    if (targetIsDump) console.log('[forge-chat] auto doc_gen_docx OMITIDO — la respuesta es un bloque de datos, no un documento')
+
+    if (hasDocTool && !alreadyCalled && replyText.trim().length > 200 && targetIsDoc && !targetIsDump) {
       try {
         // Extraer solo la sección del output principal (format: document/pdf)
         // para no incluir outputs secundarios (light_pitches, etc.) en el PDF
@@ -2207,8 +2217,15 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
           .replace(/^\s*·\s+/gm, '')
           .replace(/\s+·\s*$/gm, '')
 
+        // docGenDocx parte el título en el primer ' — ': izquierda = etiqueta de portada, derecha =
+        // título grande. Sin el nombre del OUTPUT, los dos PDFs de un mismo nodo (ej. concept_data y
+        // concept_document del 2.2) salían con portada idéntica y parecían el mismo archivo.
+        const outLabelOf   = o => (typeof o === 'object' ? (o.label || o.name || o.key || '') : String(o || ''))
+        const targetLabel  = targetOutput ? outLabelOf(targetOutput) : ''
+        const docTypeLabel = targetLabel ? `${node.title} · ${targetLabel}` : node.title
+
         const docResult = await executeTool('doc_gen_docx', {
-          title:   `${node.title} — ${project?.name ?? 'Document'}`,
+          title:   `${docTypeLabel} — ${project?.name ?? 'Document'}`,
           content: docContent,
         }, { project_id, node_id })
 

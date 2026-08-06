@@ -45,6 +45,40 @@ const TOOL_SCHEMAS = {
   },
 }
 
+// doc_gen_docx se le ESCONDE al LLM (el motor la corre solo sobre la respuesta). Sin decírselo,
+// un prompt de DNA que pide "produce the ... docx" deja al modelo sin forma de cumplir y termina
+// escribiendo un script de python-docx y FINGIENDO que lo ejecutó ("Saved -> /tmp/x.docx"), con
+// el documento real atrapado dentro de los strings del código (caso 2.2 Concept Development,
+// feedback de Miguel 05-ago-2026). Este bloque le dice explícitamente cuál es el contrato.
+function getDocPolicyBlock(tools) {
+  if (!Array.isArray(tools) || !tools.includes('doc_gen_docx')) return ''
+  return [
+    '## Document delivery',
+    'This node exports a PDF automatically from your reply. You have NO code execution and NO file system.',
+    '- NEVER write a script (python-docx, docx, reportlab, pandoc, LaTeX...) to build the document.',
+    '- NEVER claim a file was saved or generated, and never reference a path such as /tmp/....',
+    '- Write the document ITSELF, as markdown, directly in your reply.',
+    '- Put every section under a "## " heading: anything before the first "## " heading is dropped from the PDF.',
+  ].join('\n')
+}
+
+// ¿La respuesta es esencialmente UN BLOQUE DE DATOS (yaml/json cercado) en vez de un documento?
+// Un output de tipo connection suele emitir su payload entero dentro de ``` — hacerle un PDF da un
+// volcado monoespaciado de varias páginas que nadie puede leer (feedback #2: el 3.0 emite el §A
+// completo en ```yaml, 12K chars con 20 de prosa). No es culpa del renderer: no hay documento que
+// renderizar. Se exige prosa despreciable FUERA de los fences Y que el fence domine el contenido,
+// para no tocar documentos que legítimamente llevan mucho YAML (TDD §C, GDD) pero además prosa.
+function isDataDump(text) {
+  const s = String(text || '')
+  if (s.length < 200) return false
+  let fenced = 0
+  for (const m of s.matchAll(/```[\s\S]*?```/g)) fenced += m[0].length
+  const prose = s.split(/```[\s\S]*?```/).join('')
+    .replace(/^#{1,4} .*$/gm, '')
+    .replace(/\s+/g, ' ').trim().length
+  return prose < 400 && fenced / s.length > 0.8
+}
+
 // Genera el bloque de instrucciones de tools para el system prompt
 function getToolsBlock(tools) {
   if (!tools || !tools.length) return ''
@@ -424,6 +458,22 @@ async function docGenDocx(title, content, projectId, nodeId) {
 
   const sections = parseMarkdownSections(cleanContent)
 
+  // Vista SIN bloques de código, usada SOLO para elegir la portada (título grande + subtítulo).
+  // Adentro de un fence hay líneas que parecen markdown y contaminaban la tapa: comentarios de
+  // python (`# -- Page setup`) que parsean como heading nivel-1, y strings con '·' que el
+  // detector de metadata tomaba como subtítulo — el PDF del 2.2 salió con una línea de código
+  // impresa en la portada (feedback 05-ago-2026). El CUERPO sí sigue renderizando los bloques.
+  const stripFences = txt => {
+    const out = []
+    let inFence = false
+    for (const l of String(txt).split('\n')) {
+      if (/^\s*(```|~~~)/.test(l)) { inFence = !inFence; continue }
+      if (!inFence) out.push(l)
+    }
+    return out.join('\n')
+  }
+  const coverSections = parseMarkdownSections(stripFences(cleanContent))
+
   // Separar "Pitch Document" de "NOCLIP III" para la portada
   const dashIdx  = title.indexOf(' — ')
   const docType  = dashIdx !== -1 ? title.slice(0, dashIdx)  : title
@@ -435,14 +485,16 @@ async function docGenDocx(title, content, projectId, nodeId) {
     const CONTENT_W = W - MARGIN * 2
 
     // ── Portada ───────────────────────────────────────────────────────────────
-    const h1 = sections.find(s => s.level === 1)
-    const firstSection = sections.find(s => s.level >= 2)
+    // Portada: leer de coverSections (sin bloques de código), no de sections.
+    const h1 = coverSections.find(s => s.level === 1)
+    const firstSection = coverSections.find(s => s.level >= 2)
     const stripEmphasis = s => s.replace(/\*\*/g, '').trim()
     // Subtitle preferido: la línea de metadata con separador '·' (ej. "V57 Studio · Juego · v0.1 ·
     // 2025"), que suele venir en **bold** — se limpian los marcadores. Puede estar en h1 o 1ª sección.
     const isMetaLine = l => {
       const t = stripEmphasis(l)
       return t && t.includes('·') && t.length < 100 && !/^#{1,4} /.test(t)
+        && !t.startsWith('|')          // no fila de tabla: "| Mecánicas | A · B · C |" no es metadata
     }
     // Fallback: primera línea corta que no sea heading/HR/lista/fence/bold/número de sección.
     const isSubLine = l => {
@@ -453,14 +505,18 @@ async function docGenDocx(title, content, projectId, nodeId) {
         && !/^[-*•]\s/.test(t)         // no ítem de lista (ej. entradas de TOC)
         && !t.startsWith('**')         // no párrafo bold
         && !t.startsWith('[')          // no enlace/entrada de índice suelta
+        && !t.startsWith('|')          // no fila de tabla
         && !t.startsWith('```')        // no fence de código (ej. ```yaml de un bloque inicial)
         && !/^§?\d+[\s.·]/.test(t)     // no línea que arranca con número de sección (§1, 1.)
         && t.length < 100              // corto — es metadata, no cuerpo
     }
-    const metaLine = h1?.lines?.find(isMetaLine) ?? firstSection?.lines?.find(isMetaLine)
+    const h1Lines    = h1?.lines ?? []
+    const firstLines = firstSection?.lines ?? []
+
+    const metaLine = h1Lines.find(isMetaLine) ?? firstLines.find(isMetaLine)
     const subtitle = metaLine
       ? stripEmphasis(metaLine)
-      : (h1?.lines?.find(isSubLine)?.trim() ?? firstSection?.lines?.find(isSubLine)?.trim() ?? '')
+      : (h1Lines.find(isSubLine)?.trim() ?? firstLines.find(isSubLine)?.trim() ?? '')
     drawCover(doc, docType, gameTitle || h1?.title || title, subtitle)
 
     let contentSections = sections.filter(s => s.level >= 2)
@@ -1717,4 +1773,4 @@ async function executeTool(name, args, context = {}) {
   }
 }
 
-module.exports = { getToolsBlock, parseToolCalls, executeTool }
+module.exports = { getToolsBlock, getDocPolicyBlock, isDataDump, parseToolCalls, executeTool }

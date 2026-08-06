@@ -65,9 +65,33 @@ async function resolveNodeInputs(db, { projectId, currentPNodeId, targetOutput }
   // outputs mecánicos (ui_screens/scene_manifest) se contaminen con la narrativa (world/characters),
   // que trae nombres de mecánicas viejos y hace driftear al modelo.
   const usesInputs = targetOutput?.uses?.inputs ?? null
-  if (usesInputs !== null) {
-    incomingEdges = incomingEdges.filter(edge =>
-      usesInputs.includes((edge.target_handle || '').replace(/^in-/, '')))
+  if (usesInputs !== null && !usesInputs.length) {
+    // `uses.inputs: []` es una declaración EXPLÍCITA de "este output no consume upstream": deriva
+    // de sus siblings (p.ej. 3.8/gdd_ref sale de gdd_complete). Distinto de la clave ausente, que
+    // significa "sin scoping" y deja pasar todo. No confundirlas: si acá dejáramos pasar los
+    // genéricos, gdd_ref se comería ~350K de upstream que no le corresponden.
+    incomingEdges = []
+  } else if (usesInputs !== null) {
+    // Un edge dibujado a mano nodo→nodo no lleva puerto: sus handles son 'out'/'in' pelados (los
+    // tipados son 'out-<key>'/'in-<key>'). Contrastarlos contra uses.inputs los descartaba SIEMPRE
+    // ⇒ el cable se veía en el canvas y no transmitía nada. Caso medido: el 30-jul el 3.8 sólo
+    // tenía edges genéricos y resolvió 0 inputs, así que el LLM terminó pidiendo que le pegaran
+    // los documentos a mano (feedback #4/#5 de Miguel).
+    const portOf = e => {
+      const th = e.target_handle || ''
+      return th.startsWith('in-') ? th.slice(3) : null
+    }
+    // Nodos que YA entran por un puerto permitido: para esos, el edge genérico es redundante.
+    const scopedSources = new Set(
+      incomingEdges.filter(e => { const p = portOf(e); return p !== null && usesInputs.includes(p) })
+                   .map(e => e.source_node_id)
+    )
+    incomingEdges = incomingEdges.filter(edge => {
+      const port = portOf(edge)
+      if (port !== null) return usesInputs.includes(port)
+      // Genérico: honrarlo salvo que ese nodo ya aporte por un puerto declarado (evita duplicar).
+      return !scopedSources.has(edge.source_node_id)
+    })
   }
 
   for (const edge of incomingEdges) {
@@ -419,7 +443,7 @@ async function buildSystemPrompt(db, { projectId, nodeId, sessionId, userMessage
     ? await resolveNodeInputs(db, { projectId, currentPNodeId: currentPNode.id, targetOutput })
     : []
 
-  const { getToolsBlock } = require('./tools.service')
+  const { getToolsBlock, getDocPolicyBlock } = require('./tools.service')
   const activeTools      = Array.isArray(node.tools) && node.tools.length ? node.tools : []
   const llmVisibleTools  = activeTools.filter(t => t !== 'doc_gen_docx')
   const toolsBlock       = getToolsBlock(llmVisibleTools)
@@ -446,7 +470,12 @@ async function buildSystemPrompt(db, { projectId, nodeId, sessionId, userMessage
       return `${node.title} — ${labelOf(od || key)}`.toLowerCase().trim()
     }
 
-    const siblingsAllowed = targetOutput?.uses?.siblings_if_present ?? null
+    // Se aceptan LAS DOS claves: el DNA histórico usa `siblings_if_present`, pero los outputs que
+    // trajo v2.9.0 (3.8/gdd_complete, 3.9/add_source_md + ADIs, 3.12/tdd_complete, 3.13/vs_spec_*)
+    // declaran `siblings`. Leyendo sólo la primera, esos 12 outputs caían al else — que EXCLUYE los
+    // outputs propios del nodo — y por lo tanto NO veían su fuente declarada ni una vez (misma
+    // falla que el 3.2 en bug_32_divergencia_mechanics, reintroducida por la clave equivocada).
+    const siblingsAllowed = targetOutput?.uses?.siblings_if_present ?? targetOutput?.uses?.siblings ?? null
     if (siblingsAllowed && siblingsAllowed.length) {
       // Dependencia explícita: va COMPLETO. Truncarlo a 2000 hacía que el output re-derivara de cero
       // lo que no alcanzaba a ver (caso 3.2: mechanics_engineering veía el 7% de mechanic_specs).
@@ -479,7 +508,7 @@ async function buildSystemPrompt(db, { projectId, nodeId, sessionId, userMessage
   // Fecha actual para el LLM (mismo criterio que el handler de chat): evita que use su corte de
   // entrenamiento en afirmaciones time-sensitive (ej. "as of June 2025" en un scan competitivo).
   const dateBlock = `The current date is ${new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })}. Use it as "today" for any time-sensitive or recency statement (market data, "as of", "current year", competitive scans); do NOT rely on your training cutoff.`
-  const systemPrompt = [dateBlock, layer1, ...layer2Parts, toolsBlock].filter(Boolean).join('\n\n')
+  const systemPrompt = [dateBlock, layer1, ...layer2Parts, toolsBlock, getDocPolicyBlock(activeTools)].filter(Boolean).join('\n\n')
 
   const finalSystemPrompt = attachmentParts.length
     ? systemPrompt + '\n\n## Attached references\n' + attachmentParts.join('\n\n')
@@ -558,10 +587,17 @@ async function runReActLoop({ finalSystemPrompt, baseUserMsg, executorStr, activ
   // Auto doc_gen_docx si el nodo lo tiene y el LLM no lo llamó
   const hasDocxTool      = activeTools.includes('doc_gen_docx')
   const docxAlreadyCalled = allToolCalls.some(tc => tc.tool === 'doc_gen_docx')
-  if (hasDocxTool && !docxAlreadyCalled && replyText.trim().length > 200) {
+  const { isDataDump } = require('./tools.service')
+  if (hasDocxTool && !docxAlreadyCalled && replyText.trim().length > 200 && !isDataDump(replyText)) {
     try {
       const { executeTool: et } = require('./tools.service')
-      const docResult = await et('doc_gen_docx', { title: nodeName, content: replyText }, { project_id: projectId, node_id: nodeId })
+      // Incluir el OUTPUT en el título: si no, todos los PDFs del mismo nodo salen con portada
+      // idéntica y parecen el mismo archivo (ver el mismo fix en forge-canvas.routes).
+      const outLabel = targetOutput
+        ? (typeof targetOutput === 'object' ? (targetOutput.label || targetOutput.name || targetOutput.key || '') : String(targetOutput))
+        : ''
+      const docTitle = outLabel ? `${nodeName} · ${outLabel}` : nodeName
+      const docResult = await et('doc_gen_docx', { title: docTitle, content: replyText }, { project_id: projectId, node_id: nodeId })
       if (docResult.success && docResult.url) {
         docUrl    = docResult.url
         docFormat = docResult.format || 'pdf'
