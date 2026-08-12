@@ -1572,6 +1572,11 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
     const normalizeOutput = o => ({ ...o, key: o.key || o.name, label: o.label || o.name || o.key })
     const allOutputDefs = (Array.isArray(node.outputs) ? node.outputs : []).map(normalizeOutput)
     const targetOutput  = target_output_key ? allOutputDefs.find(o => o.key === target_output_key) ?? null : null
+    // Un output `assembly` lo compone el ensamblador desde su plantilla: nunca llega al modelo.
+    // Todo lo que se arma para el LLM —skills desde R2, inputs resueltos, outputs hermanos, el
+    // system prompt entero— es trabajo tirado, y el log imprime una "LLM call" que jamás ocurre.
+    // El ensamblador resuelve sus propias fuentes aparte (resolveAssemblyPools).
+    const isAssembly = targetOutput?.assembly === true
     // Guard: si viene un target_output_key que NO es un output real del nodo (ej. un input como
     // visual_targets heredado de un focus stale en el front), tratarlo como sesión general. Evita
     // crear una sesión per-output con un key inválido que luego rompe el UI (modal de outputs sin
@@ -1804,7 +1809,7 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
     }
 
     // Cargar skills desde R2: skills/{skill_key}.md
-    const skillDefs  = Array.isArray(node.skills) ? node.skills : []
+    const skillDefs  = isAssembly ? [] : (Array.isArray(node.skills) ? node.skills : [])
     const skillTexts = await Promise.all(skillDefs.map(s => getSkill(s)))
     const skillsBlock = skillDefs
       .map((s, i) => {
@@ -1885,7 +1890,7 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
     // Inputs de edges + library assets: resolvedor compartido con buildSystemPrompt (preview),
     // para que el preview refleje exactamente lo que se genera. Aplica scoping uses.inputs y cap alto.
     const { resolveNodeInputs } = require('../services/canvas-chat.service')
-    const resolvedInputs = currentPNode
+    const resolvedInputs = (currentPNode && !isAssembly)
       ? await resolveNodeInputs(db, { projectId: project_id, currentPNodeId: currentPNode.id, targetOutput })
       : []
     // Cap para attachments de sesión (los inputs de edge/library ya los capó resolveNodeInputs).
@@ -1908,7 +1913,7 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
 
     // Outputs existentes de este mismo nodo (para modo output-focused y standalone)
     const existingNodeOutputs = []
-    if (allOutputDefs.length) {
+    if (allOutputDefs.length && !isAssembly) {
       const { data: siblingAssets } = await db()
         .from('forge_assets')
         .select('name, content')
@@ -1958,7 +1963,7 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
     ].filter(Boolean)
 
     // ── Ensamblar system prompt ───────────────────────────────────
-    const { getToolsBlock, getDocPolicyBlock, isDataDump, parseToolCalls, executeTool } = require('../services/tools.service')
+    const { getToolsBlock, getDocPolicyBlock, willExportDoc, isDataDump, parseToolCalls, executeTool } = require('../services/tools.service')
 
     const activeTools = Array.isArray(node.tools) && node.tools.length ? node.tools : []
     // doc_gen_docx se ejecuta automáticamente — no exponerla al LLM para evitar alucinaciones
@@ -1966,8 +1971,9 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
     const llmVisibleTools = activeTools.filter(t => t !== 'doc_gen_docx')
     const toolsBlock      = getToolsBlock(llmVisibleTools)
     // Esconderla NO alcanza: hay que decirle que no tiene con qué generar archivos, o improvisa
-    // un script y finge la ejecución (ver getDocPolicyBlock).
-    const docPolicyBlock  = getDocPolicyBlock(activeTools)
+    // un script y finge la ejecución (ver getDocPolicyBlock). Se omite si este output no se
+    // exporta (una connection no se renderea): prometer un PDF que no llega es instrucción falsa.
+    const docPolicyBlock  = getDocPolicyBlock(activeTools, targetOutput)
 
     // Fecha actual para el LLM: sin esto usa su corte de entrenamiento (ej. un scan competitivo
     // dice "as of June 2025"). Le damos la fecha real para toda afirmación time-sensitive.
@@ -2016,20 +2022,23 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
     const toolsList  = activeTools.length                                  ? activeTools.join(', ') : null
     const skillsList = Array.isArray(node.skills) && node.skills.length ? node.skills.join(', ')  : null
 
-    console.log('\n─── [forge-chat] LLM call ───────────────────────────')
-    console.log(`  node:         ${node.node_key} — ${node.title}`)
-    console.log(`  model:        ${executorStr}`)
-    console.log(`  prompt src:   ${targetOutput?.prompt ? `output:${targetOutput.key}` : node.default_prompt ? 'default_prompt' : r2Prompt ? 'R2' : 'DNA composed'}${targetOutput ? ` [target: ${targetOutput.key}]` : ''}`)
-    console.log(`  project:      ${project?.name ?? '(sin nombre)'}`)
-    console.log(`  tools:        ${toolsList ?? '(none)'}`)
-    console.log(`  skills:       ${skillsList ?? '(none)'}`)
-    console.log(`  inputs:       ${resolvedInputs.length} referencia(s) — ${resolvedInputs.length ? resolvedInputs.map(d => d.split('\n')[0].replace('### ', '')).join(', ') : '(none)'}`)
-    console.log(`  attachments:  ${attachmentParts.length} adjunto(s) en sesión`)
-    console.log(`  system prompt (${finalSystemPrompt.length} chars):\n${finalSystemPrompt}`)
+    // El ensamble imprime su propio banner más abajo; este describiría una llamada que no ocurre.
+    if (!isAssembly) {
+      console.log('\n─── [forge-chat] LLM call ───────────────────────────')
+      console.log(`  node:         ${node.node_key} — ${node.title}`)
+      console.log(`  model:        ${executorStr}`)
+      console.log(`  prompt src:   ${targetOutput?.prompt ? `output:${targetOutput.key}` : node.default_prompt ? 'default_prompt' : r2Prompt ? 'R2' : 'DNA composed'}${targetOutput ? ` [target: ${targetOutput.key}]` : ''}`)
+      console.log(`  project:      ${project?.name ?? '(sin nombre)'}`)
+      console.log(`  tools:        ${toolsList ?? '(none)'}`)
+      console.log(`  skills:       ${skillsList ?? '(none)'}`)
+      console.log(`  inputs:       ${resolvedInputs.length} referencia(s) — ${resolvedInputs.length ? resolvedInputs.map(d => d.split('\n')[0].replace('### ', '')).join(', ') : '(none)'}`)
+      console.log(`  attachments:  ${attachmentParts.length} adjunto(s) en sesión`)
+      console.log(`  system prompt (${finalSystemPrompt.length} chars):\n${finalSystemPrompt}`)
 
-    console.log(`  history msgs: ${historyMsgs?.length ?? 0}`)
-    console.log(`  user message: ${user_message.trim().slice(0, 120)}${user_message.length > 120 ? '…' : ''}`)
-    console.log('─────────────────────────────────────────────────────\n')
+      console.log(`  history msgs: ${historyMsgs?.length ?? 0}`)
+      console.log(`  user message: ${user_message.trim().slice(0, 120)}${user_message.length > 120 ? '…' : ''}`)
+      console.log('─────────────────────────────────────────────────────\n')
+    }
 
     // ── ReAct loop — ejecuta hasta que el LLM no emita más tool_calls ────────
     const MAX_TOOL_ITERS  = 5
@@ -2188,18 +2197,12 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
     // Solo generar doc si NO hay target (run general → produce el asset doc) o si el target es un
     // output de DOCUMENTO. Las connections (feel_statement, visual_targets, design_pillars…) son
     // datos estructurados/texto corto, no documentos → nada de PDF ni botón de descarga para ellas.
-    const DOC_FORMATS   = ['document', 'pdf', 'doc', 'docx', 'pptx']
-    const IMAGE_FORMATS = ['png', 'png[]', 'image', 'image[]']
-    // Un output de IMAGEN (image_gen / format png) NO es documento aunque su type sea 'asset': su
-    // salida es la imagen que produce ComfyUI, no un PDF. Sin este guard el doc_gen generaba una
-    // "hoja de prompts" en PDF y el botón "Descargar PDF" para un output que es puramente png.
-    const targetIsImage = !!targetOutput
-      && (targetOutput.image_gen === true || IMAGE_FORMATS.includes((targetOutput.format || '').toLowerCase()))
-    const targetIsDoc   = !targetIsImage && (
-      !targetOutput
-      || targetOutput.type === 'asset'
-      || DOC_FORMATS.includes((targetOutput.format || '').toLowerCase())
-    )
+    // Un output de IMAGEN (image_gen / format png) tampoco es documento aunque su type sea 'asset':
+    // su salida es la imagen que produce ComfyUI. Sin ese guard el doc_gen generaba una "hoja de
+    // prompts" en PDF y el botón "Descargar PDF" para un output que es puramente png.
+    // Mismo predicado que decide si el prompt lleva el bloque de política de documento — vive en
+    // tools.service para que las dos decisiones no puedan contradecirse.
+    const targetIsDoc = willExportDoc(targetOutput)
 
     // Un payload de datos cercado no es un documento: el PDF sale como volcado ilegible.
     const targetIsDump = isDataDump(replyText)

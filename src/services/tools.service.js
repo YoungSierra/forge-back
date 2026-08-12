@@ -45,13 +45,30 @@ const TOOL_SCHEMAS = {
   },
 }
 
+const DOC_FORMATS   = ['document', 'pdf', 'doc', 'docx', 'pptx']
+const IMAGE_FORMATS = ['png', 'png[]', 'image', 'image[]']
+
+// ¿El motor va a exportar un documento de la respuesta de ESTE output? Un output `connection`
+// (p.ej. 3.13/vs_spec) viaja por cable a los nodos de abajo: no se renderea. Sin output objetivo
+// se asume que sí, que es el comportamiento histórico del chat de nodo.
+// Único lugar donde se decide: lo consultan el disparo automático de doc_gen_docx Y el bloque de
+// política de abajo. Si se duplica, uno de los dos deriva y el prompt promete un PDF que no llega.
+function willExportDoc(targetOutput) {
+  const fmt = String(targetOutput?.format || '').toLowerCase()
+  if (targetOutput && (targetOutput.image_gen === true || IMAGE_FORMATS.includes(fmt))) return false
+  return !targetOutput || targetOutput.type === 'asset' || DOC_FORMATS.includes(fmt)
+}
+
 // doc_gen_docx se le ESCONDE al LLM (el motor la corre solo sobre la respuesta). Sin decírselo,
 // un prompt de DNA que pide "produce the ... docx" deja al modelo sin forma de cumplir y termina
 // escribiendo un script de python-docx y FINGIENDO que lo ejecutó ("Saved -> /tmp/x.docx"), con
 // el documento real atrapado dentro de los strings del código (caso 2.2 Concept Development,
 // feedback de Miguel 05-ago-2026). Este bloque le dice explícitamente cuál es el contrato.
-function getDocPolicyBlock(tools) {
+// Sólo se inyecta si de verdad va a haber export: prometerle un PDF a un output que no se rendera
+// es una instrucción falsa (se veía en 3.13/vs_spec, que es `connection`).
+function getDocPolicyBlock(tools, targetOutput) {
   if (!Array.isArray(tools) || !tools.includes('doc_gen_docx')) return ''
+  if (!willExportDoc(targetOutput)) return ''
   return [
     '## Document delivery',
     'This node exports a PDF automatically from your reply. You have NO code execution and NO file system.',
@@ -1773,4 +1790,4 @@ async function executeTool(name, args, context = {}) {
   }
 }
 
-module.exports = { getToolsBlock, getDocPolicyBlock, isDataDump, parseToolCalls, executeTool }
+module.exports = { getToolsBlock, getDocPolicyBlock, willExportDoc, isDataDump, parseToolCalls, executeTool }

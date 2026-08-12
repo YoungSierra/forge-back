@@ -28,6 +28,12 @@ function injectSkillVars(template, vars) {
 // → §B del TDD, GDD, visual_targets) deben llegar COMPLETOS. 120K chars ≈ 30K tokens/input.
 const INPUT_CAP = 120000
 
+// El asset guarda el nombre "<título del nodo> — <label del output>" TAL COMO ESTABAN el día que
+// se generó, y v2.9.0 renombró títulos y labels ("UX / UI Design — Hud Layout" contra el actual
+// "UX/UI Design — HUD Layout"). Normalizar (minúsculas, sin espacios) absorbe esa deriva sin
+// aflojar el match. Lo usan los dos resolvedores: el de inputs del LLM y el del ensamblador.
+const normAssetName = s => String(s || '').toLowerCase().replace(/\s+/g, '')
+
 // Cap corto para outputs hermanos NO declarados como dependencia: son sólo un anclaje de estilo,
 // no una fuente a transcribir. Los declarados en uses.siblings_if_present[] van con INPUT_CAP.
 const ANCHOR_CAP = 2000
@@ -142,22 +148,28 @@ async function resolveNodeInputs(db, { projectId, currentPNodeId, targetOutput }
       let content   = null
       let slotLabel = nodeTitle
 
-      // 1) Asset del output específico, por name exacto
-      if (outputLabel) {
-        const { data: byName } = await db()
+      // 1) Asset del output específico. Se identifica por el output_key de SU SESIÓN, que es el
+      //    contrato; forge_assets no guarda el key, sólo un `name` de presentación
+      //    ("<título> — <label>") congelado el día que se generó. Buscar por ese name se rompió
+      //    con el rename de v2.9.0 — el asset dice "UX / UI Design — Hud Layout" y el DNA pide
+      //    "UX/UI Design — HUD Layout" — y caía al fallback inyectando OTRO output por el puerto.
+      //    El name normalizado queda de respaldo para assets viejos sin sesión por output.
+      if (outputKey || outputLabel) {
+        const { data: cand } = await db()
           .from('forge_assets')
-          .select('content')
+          .select('name, content, forge_sessions!session_id(output_key)')
           .eq('project_id', projectId)
           .eq('node_id', sourcePNode.node_id)
-          .eq('name', `${nodeTitle} — ${outputLabel}`)
           .in('status', ['approved', 'auto_approved'])
           .neq('format', 'png')
           .order('created_at', { ascending: false })
-          .limit(1)
-          .maybeSingle()
-        if (byName?.content) {
-          content   = byName.content
-          slotLabel = `${nodeTitle} → ${outputLabel}`
+
+        const want  = outputLabel ? normAssetName(`${nodeTitle} — ${outputLabel}`) : null
+        const match = (outputKey && (cand || []).find(a => a.forge_sessions?.output_key === outputKey))
+                   || (want     && (cand || []).find(a => normAssetName(a.name) === want))
+        if (match?.content) {
+          content   = match.content
+          slotLabel = `${nodeTitle} → ${outputLabel || outputKey}`
         }
       }
 
@@ -677,12 +689,7 @@ async function propagateStale(db, projectId, projectNodeId) {
 async function resolveAssemblyPools(db, { projectId, currentPNodeId, node, outputDefs }) {
   const inputs = {}, siblings = {}
 
-  // El asset guarda el nombre "<título del nodo> — <label del output>" TAL COMO ESTABAN el día
-  // que se generó. Títulos y labels cambiaron con v2.9.0 ("UX / UI Design — Hud Layout" contra
-  // "UX/UI Design — HUD Layout"), así que comparar por igualdad exacta pierde todo asset
-  // anterior al cambio y el ensamble corta por "falta contenido" cuando en realidad está.
-  // Normalizar (minúsculas, sin espacios) absorbe esa deriva sin aflojar el match.
-  const norm = s => String(s || '').toLowerCase().replace(/\s+/g, '')
+  const norm = normAssetName
 
   const { data: edges } = await db()
     .from('forge_project_edges')
@@ -712,22 +719,24 @@ async function resolveAssemblyPools(db, { projectId, currentPNodeId, node, outpu
 
     const { data: cand } = await db()
       .from('forge_assets')
-      .select('name, content')
+      .select('name, content, forge_sessions!session_id(output_key)')
       .eq('project_id', projectId)
       .eq('node_id', src.node_id)
       .in('status', ['approved', 'auto_approved'])
       .neq('format', 'png')
       .order('created_at', { ascending: false })
 
+    // Por output_key de la sesión (el contrato); el name normalizado queda de respaldo.
     const want  = norm(`${src.forge_nodes?.title} — ${label}`)
-    const asset = (cand || []).find(a => norm(a.name) === want)
+    const asset = (cand || []).find(a => a.forge_sessions?.output_key === outKey)
+               || (cand || []).find(a => norm(a.name) === want)
 
     if (asset?.content) inputs[portKey] = asset.content
   }
 
   const { data: own } = await db()
     .from('forge_assets')
-    .select('name, content')
+    .select('name, content, forge_sessions!session_id(output_key)')
     .eq('project_id', projectId)
     .eq('node_id', node.id)
     .in('status', ['approved', 'auto_approved'])
@@ -739,7 +748,8 @@ async function resolveAssemblyPools(db, { projectId, currentPNodeId, node, outpu
     const k = def.key || def.name
     if (!k) continue
     const want = norm(`${node.title} — ${labelOf(def)}`)
-    const hit = (own || []).find(a => norm(a.name) === want)
+    const hit = (own || []).find(a => a.forge_sessions?.output_key === k)
+             || (own || []).find(a => norm(a.name) === want)
     if (hit?.content) siblings[k] = hit.content
   }
 
