@@ -129,22 +129,79 @@ router.patch('/:id/review', async (req, res, next) => {
   }
 })
 
+// ─── Tema visual del proyecto ────────────────────────────────────────────────
+// El moodboard se pinta con la identidad del proyecto cuando existe. Hoy la única fuente real
+// es la paleta bloqueada que emite el 3.9 dentro del style_guide, en prosa; se extraen sus hex.
+// Si el proyecto todavía no llegó a tener dirección de arte, se devuelve el tema neutro y el
+// moodboard se ve sobrio en vez de disfrazado de otro juego.
+//
+// `motion` es el arquetipo de animación. Todavía no hay de dónde deducirlo, así que siempre
+// sale 'neutral'; cuando exista el campo por proyecto se resuelve acá y el front no cambia.
+const NEUTRAL_THEME = { accent: '#7d8493', colors: ['#7d8493'], motion: 'neutral', source: 'default' }
+
+async function resolveProjectTheme(projectId) {
+  if (!projectId) return NEUTRAL_THEME
+  try {
+    const { data } = await db()
+      .from('forge_assets')
+      .select('name, content, forge_nodes(node_key)')
+      .eq('project_id', projectId)
+      .in('status', ['approved', 'auto_approved'])
+      .not('content', 'is', null)
+      .order('created_at', { ascending: false })
+
+    // El style_guide es la fuente canónica de la paleta; el resto del ADI sirve de respaldo.
+    const isGuide = a => /style\s*guide/i.test(a.name || '')
+    const art     = (data || []).filter(a => a.forge_nodes?.node_key === '3.9')
+    const src     = art.find(isGuide) || art[0]
+    if (!src?.content) return NEUTRAL_THEME
+
+    // Se prioriza la zona de la paleta: ahí los hex son los roles, no ejemplos sueltos.
+    const i     = src.content.search(/color\s+language|closed\s+palette|§\s*0\.4/i)
+    const scope = i >= 0 ? src.content.slice(i, i + 2500) : src.content.slice(0, 4000)
+    const hexes = [...new Set((scope.match(/#[0-9A-Fa-f]{6}\b/g) || []).map(h => h.toUpperCase()))]
+    if (hexes.length < 2) return NEUTRAL_THEME
+
+    // El acento es el color con más luz: el primero suele ser el fondo oscuro del documento.
+    const lum = h => {
+      const n = parseInt(h.slice(1), 16)
+      return 0.2126 * ((n >> 16) & 255) + 0.7152 * ((n >> 8) & 255) + 0.0722 * (n & 255)
+    }
+    const palette = hexes.slice(0, 6)
+    const accent  = [...palette].sort((a, b) => lum(b) - lum(a))[0]
+
+    return { accent, colors: palette, motion: 'neutral', source: 'style_guide' }
+  } catch {
+    return NEUTRAL_THEME   // el tema es decoración: nunca debe romper el listado
+  }
+}
+
 // ─── GET /api/assets/project-assets?project_id=xxx ───────────────────────────
 // Lista unificada: forge_assets (nuevo) + assets legacy, normalizados.
 // project_id es opcional — sin él trae todos los proyectos.
 router.get('/project-assets', async (req, res, next) => {
   try {
     const { project_id } = req.query
+    // `media=1` — vista visual (moodboard): solo activos que se ven, y sin traer `content`.
+    // Un documento de este proyecto pesa hasta 109 KB en ese campo; el listado completo son
+    // ~1,4 MB de texto que la galería nunca muestra. Con el filtro, viaja el metadato y la URL.
+    const mediaOnly = req.query.media === '1' || req.query.media === 'true'
+    // Los documentos entran al moodboard porque tienen su propia pestaña (Docs), pero SIEMPRE
+    // sin el campo `content`: lo que pesaba era el texto, no la fila.
+    const MEDIA_FORMATS = ['image', 'png', 'jpg', 'jpeg', 'model_3d', 'glb', 'video', 'mp4', 'audio']
+    const DOC_FORMATS   = ['document', 'docx', 'pdf', 'pptx']
 
     // ── forge_assets ──────────────────────────────────────────────────────────
     let forgeQuery = db()
       .from('forge_assets')
       .select(`
-        id, name, format, status, storage_url, content, approved_at, created_at,
+        id, name, format, status, storage_url, ${mediaOnly ? '' : 'content,'} approved_at, created_at,
         node_id, project_id,
         forge_nodes ( node_key, title, phase )
       `)
       .order('approved_at', { ascending: false, nullsFirst: false })
+
+    if (mediaOnly) forgeQuery = forgeQuery.in('format', [...MEDIA_FORMATS, ...DOC_FORMATS])
 
     if (project_id) forgeQuery = forgeQuery.eq('project_id', project_id)
 
@@ -297,10 +354,58 @@ router.get('/project-assets', async (req, res, next) => {
       }
     }
 
-    const unified = [...forgeNormalized, ...legacyNormalized, ...generatedNormalized]
+    // ── librería del proyecto (Refs) ───────────────────────────────────────────
+    // Archivos que subió el usuario: no pertenecen a ningún nodo, son del PROYECTO, y
+    // cualquier nodo puede referenciarlos conectándolos como `library_asset` en el canvas.
+    // Solo se listan en la vista de medios; la librería de activos ya los muestra por su lado.
+    const libraryNormalized = []
+    if (mediaOnly && project_id) {
+      const { data: lib } = await db()
+        .from('forge_project_library_assets')
+        .select('id, display_name, file_name, mime_type, asset_type, storage_url, created_at')
+        .eq('project_id', project_id)
+        .order('created_at', { ascending: false })
+
+      for (const a of (lib || [])) {
+        if (!a.storage_url) continue
+        const mime = String(a.mime_type || '')
+        const fmt  = mime.startsWith('image/') ? 'image'
+                   : mime.startsWith('video/') ? 'video'
+                   : mime.startsWith('audio/') ? 'audio'
+                   : a.asset_type === 'model_3d' ? 'model_3d'
+                   : /pdf|word|presentation|markdown|text/.test(mime) ? 'document'
+                   : null
+        if (!fmt) continue
+
+        libraryNormalized.push({
+          id:          a.id,
+          source:      'library',
+          name:        a.display_name || a.file_name,
+          project_id,
+          node_key:    null,          // sin nodo: es del proyecto
+          node_title:  'Library',
+          phase:       null,
+          format:      fmt,
+          status:      'library',
+          storage_url: a.storage_url,
+          content:     null,
+          created_at:  a.created_at,
+          versions:    [],
+        })
+      }
+    }
+
+    let unified = [...forgeNormalized, ...legacyNormalized, ...generatedNormalized, ...libraryNormalized]
       .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
 
-    res.json({ success: true, assets: unified })
+    // El normalizado de legacy deriva el formato del step_key y cae en 'document' por defecto,
+    // así que el filtro de la query no alcanza: hay que volver a pasarlo sobre el resultado.
+    if (mediaOnly) unified = unified.filter(a => [...MEDIA_FORMATS, ...DOC_FORMATS].includes(a.format) && a.storage_url)
+
+    // El tema solo lo pide el moodboard; no se calcula para la librería de activos.
+    const theme = mediaOnly ? await resolveProjectTheme(project_id) : undefined
+
+    res.json({ success: true, assets: unified, ...(theme ? { theme } : {}) })
   } catch (err) { next(err) }
 })
 
