@@ -165,11 +165,59 @@ async function getSkill(key) {
   return text
 }
 
+// ── Plantillas de ensamble — mismo patrón que los skills ─────────────────────
+// Un output marcado con `assembly: true` no lo genera el LLM: lo compone el
+// ensamblador siguiendo una plantilla de slots. La plantilla se resuelve POR
+// (node_key, output_key) — las propias plantillas declaran for_node/for_output —
+// bajo la convención de id `tpl_<node con _>_<output>`.
+// Fuente: R2 primero (para poder editarlas sin desplegar), disco como respaldo.
+let _tplCache    = {}
+let _tplInflight = {}
+
+function templateIdFor(nodeKey, outputKey) {
+  return `tpl_${String(nodeKey).replace(/\./g, '_')}_${outputKey}`
+}
+
+async function _loadTemplate(id) {
+  // 1) R2
+  try {
+    const text = await fetchFromR2(`assembly_templates/${id}.json`)
+    console.log(`[promptService] template "${id}" → R2 (${text.length} chars)`)
+    return JSON.parse(text)
+  } catch (err) {
+    console.log(`[promptService] template "${id}" no está en R2 (${err.message}); probando disco`)
+  }
+  // 2) Disco (las plantillas del piloto viven acá)
+  try {
+    const fs = require('fs'), path = require('path')
+    const p = path.join(__dirname, '..', 'assembly_templates', `${id}.json`)
+    const tpl = JSON.parse(fs.readFileSync(p, 'utf8'))
+    console.log(`[promptService] template "${id}" → disco`)
+    return tpl
+  } catch {
+    console.warn(`[promptService] template "${id}" no encontrado ni en R2 ni en disco`)
+    return null
+  }
+}
+
+async function getTemplate(nodeKey, outputKey) {
+  const id = templateIdFor(nodeKey, outputKey)
+  if (_tplCache[id] !== undefined) return _tplCache[id]
+  if (!_tplInflight[id]) {
+    _tplInflight[id] = _loadTemplate(id).then(t => { delete _tplInflight[id]; return t })
+  }
+  const tpl = await _tplInflight[id]
+  _tplCache[id] = tpl
+  return tpl
+}
+
 function invalidatePrompts() {
   _cache         = {}
   _inflight      = {}
   _skillCache    = {}
   _skillInflight = {}
+  _tplCache      = {}
+  _tplInflight   = {}
 }
 
-module.exports = { getPrompt, getSkill, invalidatePrompts }
+module.exports = { getPrompt, getSkill, getTemplate, templateIdFor, invalidatePrompts }

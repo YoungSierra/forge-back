@@ -1,0 +1,169 @@
+{
+  "template_id": "tpl_gdd_complete_v1",
+  "for_node": "3.8",
+  "for_output": "gdd_complete",
+  "renderer": "docx (rendered from gdd_source_md per v2.8.0 template-first)",
+  "derived_from": "live 3.8 master prompt section map ('§1 Game Identity from concept_data · §2 Design Pillars from 3.1 · ...') + GDD_Template canonical structure. ENGINEER MUST VALIDATE section headings against GDD_Template.md before wiring.",
+  "notes": "from namespace: 'input:' = wired connection from upstream node; 'sibling:' = own-node output. Glue slots are the ONLY LLM-touched slots, never required, capped tokens, no new proper nouns (QA Pass 3).",
+  "slots": [
+    {
+      "id": "§0",
+      "heading": "Executive Summary",
+      "from": [
+        "input:concept_data",
+        "input:design_pillars",
+        "input:core_loop"
+      ],
+      "mode": "glue",
+      "required": false,
+      "glue_rules": {
+        "max_tokens": 300,
+        "instruction": "connect, do not invent; no new proper nouns"
+      }
+    },
+    {
+      "id": "§1",
+      "heading": "Game Identity",
+      "from": "input:concept_data",
+      "mode": "copy",
+      "required": true
+    },
+    {
+      "id": "§2",
+      "heading": "Design Pillars",
+      "from": "input:design_pillars",
+      "mode": "copy",
+      "required": true
+    },
+    {
+      "id": "§3.1",
+      "heading": "Core Loop",
+      "from": "input:core_loop",
+      "mode": "copy",
+      "required": true
+    },
+    {
+      "id": "§3.2",
+      "heading": "Mechanics",
+      "from": "input:mechanic_specs",
+      "mode": "repeat",
+      "required": true,
+      "repeat_rules": {
+        "order_by": "stable section id (P-5)",
+        "one_subsection_per_item": true
+      }
+    },
+    {
+      "id": "§4.1",
+      "heading": "Progression",
+      "from": "input:progression_sys",
+      "mode": "copy",
+      "required": true
+    },
+    {
+      "id": "§4.2",
+      "heading": "Economy",
+      "from": "input:economy_design",
+      "mode": "copy",
+      "required": true
+    },
+    {
+      "id": "§4.3",
+      "heading": "Stats & Abilities",
+      "from": "input:player_stats",
+      "mode": "copy",
+      "required": true
+    },
+    {
+      "id": "§4.4",
+      "heading": "Item Catalog",
+      "from": "input:item_catalog",
+      "mode": "repeat",
+      "required": true
+    },
+    {
+      "id": "§5.1",
+      "heading": "World & Lore",
+      "from": "input:world_lore",
+      "mode": "copy",
+      "required": true
+    },
+    {
+      "id": "§5.2",
+      "heading": "Narrative Arc",
+      "from": "input:narrative_arc",
+      "mode": "copy",
+      "required": true
+    },
+    {
+      "id": "§5.3",
+      "heading": "Factions",
+      "from": "input:faction_map",
+      "mode": "copy",
+      "required": true
+    },
+    {
+      "id": "§5.4",
+      "heading": "Environments",
+      "from": "input:environments_x4",
+      "mode": "repeat",
+      "required": true
+    },
+    {
+      "id": "§5.5",
+      "heading": "Dialogue System",
+      "from": "input:dialogue_system",
+      "mode": "copy",
+      "required": true
+    },
+    {
+      "id": "§6.1",
+      "heading": "Level Design",
+      "from": "input:level_map",
+      "mode": "copy",
+      "required": true
+    },
+    {
+      "id": "§6.2",
+      "heading": "Encounters",
+      "from": "input:encounter_design",
+      "mode": "copy",
+      "required": true
+    },
+    {
+      "id": "§7",
+      "heading": "Characters",
+      "from": "input:char_profiles",
+      "mode": "repeat",
+      "required": true
+    },
+    {
+      "id": "§8.1",
+      "heading": "HUD & UI",
+      "from": "input:hud_layout",
+      "mode": "copy",
+      "required": true
+    },
+    {
+      "id": "§8.2",
+      "heading": "Feedback Systems",
+      "from": "input:feedback_system",
+      "mode": "copy",
+      "required": true
+    },
+    {
+      "id": "§9",
+      "heading": "Section Bridges",
+      "from": [
+        "input:design_pillars",
+        "input:core_loop"
+      ],
+      "mode": "glue",
+      "required": false,
+      "glue_rules": {
+        "max_tokens": 150,
+        "instruction": "connect, do not invent; no new proper nouns"
+      }
+    }
+  ]
+}

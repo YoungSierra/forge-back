@@ -1092,6 +1092,31 @@ router.post('/nodes/:node_id/accept', async (req, res, next) => {
       ? `${node.title} — ${outputDef.label || outputDef.name || outputKey}`
       : `${node.title} — Output`
 
+    // El front manda doc_url/doc_format en el body, pero si el usuario acepta desde una vista que
+    // no los tiene en estado (recarga de página, otro modal), el archivo YA generado se pierde: el
+    // asset queda 'markdown' con storage_url null aunque el PDF/PPTX exista en R2 — y el botón de
+    // descarga nunca aparece. El backend puede recuperarlo solo: el resultado de la herramienta
+    // quedó guardado en tool_calls del mensaje del agente de esa misma sesión.
+    let docUrlFinal = doc_url, docFormatFinal = doc_format
+    if (!docUrlFinal && session_id) {
+      const { data: msgs } = await db()
+        .from('forge_messages')
+        .select('tool_calls')
+        .eq('session_id', session_id)
+        .eq('role', 'agent')
+        .order('created_at', { ascending: false })
+      outer: for (const m of (msgs || [])) {
+        for (const tc of (Array.isArray(m.tool_calls) ? m.tool_calls : [])) {
+          if (/^doc_gen_(docx|pptx)$/.test(tc?.tool || '') && tc?.result?.url) {
+            docUrlFinal    = tc.result.url
+            docFormatFinal = tc.result.format || (tc.tool === 'doc_gen_pptx' ? 'pptx' : 'pdf')
+            console.log(`[accept] doc_url recuperado de tool_calls: ${docUrlFinal}`)
+            break outer
+          }
+        }
+      }
+    }
+
     // Crear el forge_asset con el contenido de texto aceptado
     const { data: asset, error: assetErr } = await db()
       .from('forge_assets')
@@ -1100,10 +1125,10 @@ router.post('/nodes/:node_id/accept', async (req, res, next) => {
         project_id,
         session_id,
         name:           assetName,
-        format:         doc_url ? (doc_format === 'pptx' ? 'pptx' : 'docx') : 'markdown',
+        format:         docUrlFinal ? (docFormatFinal === 'pptx' ? 'pptx' : 'docx') : 'markdown',
         status:         'approved',
         content:        content.trim(),
-        storage_url:    doc_url || null,
+        storage_url:    docUrlFinal || null,
         approved_by:    member_id || null,
         approved_at:    new Date().toISOString(),
       })
@@ -2015,7 +2040,57 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
     let   docUrl          = null
     let   docFormat       = null
 
-    for (let iter = 0; iter < MAX_TOOL_ITERS; iter++) {
+    // ── Despacho POR OUTPUT ───────────────────────────────────────────────────
+    // Un output marcado `assembly: true` NO lo genera el LLM: lo compone el ensamblador
+    // siguiendo su plantilla de slots. Es determinista, cuesta 0 tokens y si falta una
+    // fuente requerida corta antes de producir nada (hard-block) en vez de inventarla.
+    // El resto de los outputs sigue el camino de siempre.
+    let assemblyReport = null
+    const docWarnings = []
+    const asmKey = targetOutput ? (targetOutput.key ?? targetOutput.name) : null
+
+    if (targetOutput?.assembly === true) {
+      const { getTemplate, templateIdFor } = require('../services/prompt.service')
+      const { assemble, defaultGlue }      = require('../services/assembler.service')
+      const { resolveAssemblyPools }       = require('../services/canvas-chat.service')
+
+      const tpl = await getTemplate(node.node_key, asmKey)
+      if (!tpl) {
+        return res.status(422).json({ success: false, error:
+          `El output ${node.node_key}/${asmKey} está marcado como assembly pero no existe su plantilla (${templateIdFor(node.node_key, asmKey)}).` })
+      }
+
+      const pools = await resolveAssemblyPools(db, {
+        projectId: project_id, currentPNodeId: currentPNode?.id, node, outputDefs: allOutputDefs,
+      })
+      const r = await assemble(tpl, pools.inputs, pools.siblings, { glue: defaultGlue })
+      const glued = r.manifest.slots.filter(s => s.llm_generated).length
+
+      console.log('\n─── [forge-chat] ENSAMBLE (por plantilla) ───────────')
+      console.log(`  nodo/output:  ${node.node_key}/${asmKey}`)
+      console.log(`  plantilla:    ${tpl.template_id} (${tpl.slots.length} slots)`)
+      console.log(`  inputs:       ${Object.keys(pools.inputs).join(', ') || '(ninguno)'}`)
+      console.log(`  siblings:     ${Object.keys(pools.siblings).join(', ') || '(ninguno)'}`)
+      console.log(`  slots llenos: ${r.manifest.slots.filter(s => s.filled).length}/${r.manifest.slots.length}  (${glued} por pegamento LLM)`)
+      console.log(`  verificador:  ${r.verifier.filter(v => v.pass).length}/${r.verifier.length}  ·  gate: ${r.gate}`)
+      console.log('─────────────────────────────────────────────────────\n')
+
+      if (!r.gate) {
+        return res.status(422).json({
+          success: false,
+          error: 'El ensamble no pasó el gate: falta contenido requerido. No se generó nada.',
+          missing_required: r.manifest.missing_required,
+          verifier: r.verifier,
+          hint: 'Aprobá primero los outputs que alimentan esos slots y volvé a ejecutar.',
+        })
+      }
+
+      replyText      = r.assembled
+      assemblyReport = { manifest: r.manifest, verifier: r.verifier }
+      meta = { provider: 'assembler', model: tpl.template_id, tokens_used: null, duration_ms: 0 }
+    }
+
+    for (let iter = 0; !assemblyReport && iter < MAX_TOOL_ITERS; iter++) {
       const result = await callLLM(finalSystemPrompt, currentUserMsg, {
         model:           executorStr,
         rawText:         true,
@@ -2258,6 +2333,16 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
           images:  pngImageUrls,
         }, { project_id, node_id })
 
+        // Un deck sin una sola imagen es formalmente válido y comercialmente inútil, y hasta ahora
+        // salía en silencio: el 2.5 de Horror_casual_game generó 12 slides con cero arte porque el
+        // 2.4 todavía no había producido las orientation_images. No se bloquea -un deck de texto
+        // sigue sirviendo como borrador- pero se avisa, para que nadie lo mande creyendo que está
+        // completo. Las imágenes llegan por los cables de entrada, no desde los assets del nodo.
+        if (!pngImageUrls.length) {
+          console.warn('[forge-chat] doc_gen_pptx SIN IMÁGENES — ningún input upstream aportó PNG; el deck sale solo con texto')
+          docWarnings.push('El deck se generó sin ninguna imagen: ningún nodo conectado aportó arte. Revisá que el 2.4 haya generado sus imágenes y que esté conectado antes de presentarlo.')
+        }
+
         if (pptxResult.success && pptxResult.url) {
           docUrl    = pptxResult.url
           docFormat = 'pptx'
@@ -2326,6 +2411,10 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
       meta,
       doc_url:    docUrl    ?? undefined,
       doc_format: docFormat ?? undefined,
+      // Trazabilidad del ensamble: qué slot se llenó desde qué fuente y cuál pasó por el
+      // LLM de pegamento. Sin esto, un documento compuesto por código es una caja negra.
+      assembly:   assemblyReport ?? undefined,
+      warnings:   docWarnings.length ? docWarnings : undefined,
       attachment: pendingAttachment ? {
         file_name:       pendingAttachment.file_name,
         mime_type:       pendingAttachment.mime_type,

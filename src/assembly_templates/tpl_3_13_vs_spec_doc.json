@@ -1,0 +1,17 @@
+{
+  "template_id": "tpl_vs_spec_doc_v1",
+  "for_node": "3.13",
+  "for_output": "vs_spec_doc",
+  "renderer": "docx",
+  "derived_from": "live prompt 'Write the VS spec document, identical to the connection' (forge_nodes_rows_30072026)",
+  "notes": "Pilot 0: minimal end-to-end validation of engine + manifest + verifier. One copy slot, zero glue, zero LLM tokens.",
+  "slots": [
+    {
+      "id": "§ALL",
+      "heading": "Vertical Slice Specification",
+      "from": "sibling:vs_spec",
+      "mode": "copy",
+      "required": true
+    }
+  ]
+}

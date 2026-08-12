@@ -662,4 +662,88 @@ async function propagateStale(db, projectId, projectNodeId) {
   }
 }
 
-module.exports = { buildSystemPrompt, resolveNodeInputs, runReActLoop, propagateStale, injectVars, injectSkillVars }
+/**
+ * Bolsas de contenido para el ENSAMBLADOR, indexadas POR CLAVE (no formateadas como prompt).
+ * Distinto de resolveNodeInputs, que devuelve bloques markdown listos para el system prompt:
+ * acá el ensamblador necesita poder pedir "input:world_lore" o "sibling:gdd_source_md" y
+ * recibir ese contenido exacto, sin encabezados ni recortes.
+ *
+ *   inputs[<puerto>]   = contenido del asset upstream conectado a ese puerto por un edge tipado
+ *   siblings[<output>] = contenido del asset propio del nodo para ese output, ya aprobado
+ *
+ * Sólo se miran edges TIPADOS (in-<key>): un cable generico no dice a que puerto entra, y el
+ * ensamblador necesita la clave exacta para resolver el slot.
+ */
+async function resolveAssemblyPools(db, { projectId, currentPNodeId, node, outputDefs }) {
+  const inputs = {}, siblings = {}
+
+  // El asset guarda el nombre "<título del nodo> — <label del output>" TAL COMO ESTABAN el día
+  // que se generó. Títulos y labels cambiaron con v2.9.0 ("UX / UI Design — Hud Layout" contra
+  // "UX/UI Design — HUD Layout"), así que comparar por igualdad exacta pierde todo asset
+  // anterior al cambio y el ensamble corta por "falta contenido" cuando en realidad está.
+  // Normalizar (minúsculas, sin espacios) absorbe esa deriva sin aflojar el match.
+  const norm = s => String(s || '').toLowerCase().replace(/\s+/g, '')
+
+  const { data: edges } = await db()
+    .from('forge_project_edges')
+    .select('source_node_id, source_handle, target_handle')
+    .eq('project_id', projectId)
+    .eq('target_node_id', currentPNodeId)
+
+  for (const e of (edges || [])) {
+    const th = e.target_handle || ''
+    if (!th.startsWith('in-')) continue
+    const portKey = th.slice(3)
+    if (inputs[portKey]) continue
+    const outKey = (e.source_handle || '').startsWith('out-') ? e.source_handle.slice(4) : null
+    if (!outKey) continue
+
+    const { data: src } = await db()
+      .from('forge_project_nodes')
+      .select('node_id, forge_nodes(title, outputs)')
+      .eq('id', e.source_node_id)
+      .maybeSingle()
+    if (!src?.node_id) continue
+
+    const defs  = src.forge_nodes?.outputs ?? []
+    const def   = defs.find(o => (o.key || o.name) === outKey)
+    if (!def) continue
+    const label = def.label || def.name || def.key
+
+    const { data: cand } = await db()
+      .from('forge_assets')
+      .select('name, content')
+      .eq('project_id', projectId)
+      .eq('node_id', src.node_id)
+      .in('status', ['approved', 'auto_approved'])
+      .neq('format', 'png')
+      .order('created_at', { ascending: false })
+
+    const want  = norm(`${src.forge_nodes?.title} — ${label}`)
+    const asset = (cand || []).find(a => norm(a.name) === want)
+
+    if (asset?.content) inputs[portKey] = asset.content
+  }
+
+  const { data: own } = await db()
+    .from('forge_assets')
+    .select('name, content')
+    .eq('project_id', projectId)
+    .eq('node_id', node.id)
+    .in('status', ['approved', 'auto_approved'])
+    .neq('format', 'png')
+    .order('created_at', { ascending: false })
+
+  const labelOf = o => (typeof o === 'object' ? (o.label || o.name || o.key) : o)
+  for (const def of (outputDefs || [])) {
+    const k = def.key || def.name
+    if (!k) continue
+    const want = norm(`${node.title} — ${labelOf(def)}`)
+    const hit = (own || []).find(a => norm(a.name) === want)
+    if (hit?.content) siblings[k] = hit.content
+  }
+
+  return { inputs, siblings }
+}
+
+module.exports = { buildSystemPrompt, resolveNodeInputs, resolveAssemblyPools, runReActLoop, propagateStale, injectVars, injectSkillVars }

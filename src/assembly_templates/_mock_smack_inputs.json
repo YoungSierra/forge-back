@@ -1,0 +1,20 @@
+{
+  "char_profiles": "### CHAR-01 The Swimmer\nMinimal high-contrast silhouette; observer of the ecosystem.\n### CHAR-02 The Elder Bloom\nGiant jellyfish; appears once per run; presence only, no interaction.",
+  "concept_data": "## Game Identity\n- Title: SMACK\n- Platform: PC (Steam)\n- Genre: vertical-ascent momentum game [PROPOSED]\n- One-liner: bounce from jellyfish to jellyfish to reach the surface before the current pulls you back down.\n- Source: Smack.pdf (p.1)",
+  "core_loop": "## Core Loop\nLaunch → time bounce on a bell → chain clean smacks (combo) → avoid tentacles → beat the current to the surface.",
+  "design_pillars": "## Pillars\n1. **Flow over Perfection** — momentum matters more than pixel-perfect precision.\n2. **Living Cathedral** — every jellyfish reacts; none are static props.\n3. **The Sting is Learned** — tentacles punish, but always telegraphed.\n4. **Rise, Never Rush** — grace beats speed; speed without grace is penalized.\n\nAnti-pillars: not a rage-game; not procedural-first; not beat-locked.\nFeel statement: \"like exhaling through a chandelier of light.\" [PROPOSED]",
+  "dialogue_system": "## Dialogue\nNone by design (silent narrative).",
+  "economy_design": "## Economy\nNone (premium SP title). No currencies, no IAP. [PROPOSED]",
+  "encounter_design": "## Encounters\nNamed patterns: The Curtain, The Chandelier, The Gauntlet, The Bloom. One signature encounter every 100m.",
+  "environments_x4": "### ENV-01 Abyss (−500m→−300m)\nDark, sparse jellyfish.\n### ENV-02 Twilight (−300m→−100m)\nMedium density, first colorful species.\n### ENV-03 Reef Ceiling (−100m→−20m)\nExtreme density, hazard zone.\n### ENV-04 Surface (−20m→0)\nLight through water, climax.",
+  "faction_map": "## Factions\nNone. The Current acts as an invisible antagonist manifested as descending particles. [PROPOSED]",
+  "feedback_system": "## Feedback\nTentacle telegraphs 400ms [TUNE]; combo = visual intensity + music layers; depth = darkening.",
+  "hud_layout": "## HUD\nNear-invisible: best height (corner), combo (diegetic under player), depth as screen-edge gradient — never a number.",
+  "item_catalog": "### ITEM-01 none\nNo inventory items at launch. Species = collection layer, not items. [PROPOSED]",
+  "level_map": "## Level Structure\nCurated base layout per biome; jellyfish spawns randomized within rules, seeded. [PROPOSED]",
+  "mechanic_specs": "### MEC-01 Bell Bounce\nTiming window 180ms [TUNE]; perfect window 60ms [TUNE] → 1.25× height [TUNE].\n### MEC-02 Tentacle Slip\nBrush = −15% velocity [TUNE]; direct hit = 2m knockback [TUNE], no death (Pillar 3).\n### MEC-03 Combo Flow\nEach clean smack ×1.05 score [TUNE]; decay 2s [TUNE].\n### MEC-04 Depth Pressure\nPer 20m below best height: darkness +5%, velocity ceiling −10% [TUNE].\n### MEC-05 Surface Rush\nFinal 50m: no tentacles, music climax, decorative bell bloom.",
+  "narrative_arc": "## Arc\nDescent (tutorial) → Ascent (main) → Surface (climax). No dialogue, no cutscenes.",
+  "player_stats": "## Stats\nVelocity, best height (persistent), combo multiplier. No RPG stats.",
+  "progression_sys": "## Progression — Blooms\nEach run permanently unlocks jellyfish species (15 at launch [PROPOSED]); progression = variety, not power.",
+  "world_lore": "## World\nA glowing ocean cathedral. Silent narrative — told through biome design only."
+}
