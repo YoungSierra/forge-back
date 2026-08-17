@@ -1,3 +1,9 @@
+// Bloques de visión cuando hay imágenes; el string de siempre cuando no. Ver vision.format.
+const contenidoUsuario = (options, texto) =>
+  options.images?.length
+    ? require('../vision.format').contenidoOpenAI(options.images, texto)
+    : texto
+
 const Groq = require('groq-sdk')
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY })
@@ -15,7 +21,7 @@ async function callGroq(systemPrompt, userMessage, options = {}) {
       ...(options.rawText ? {} : { response_format: { type: 'json_object' } }),
       messages: [
         { role: 'system', content: systemPrompt },
-        { role: 'user', content: userMessage }
+        { role: 'user', content: contenidoUsuario(options, userMessage) }
       ]
     })
   } catch (err) {

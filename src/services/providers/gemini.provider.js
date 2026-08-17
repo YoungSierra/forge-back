@@ -19,7 +19,13 @@ async function callGemini(systemPrompt, userMessage, options = {}) {
   let result
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
-      result = await geminiModel.generateContent(userMessage)
+      // Gemini no usa bloques de mensaje sino PARTES del contenido. Sin imágenes se le pasa el
+      // string de siempre, que el SDK envuelve solo.
+      result = await geminiModel.generateContent(
+        options.images?.length
+          ? require('../vision.format').partesGemini(options.images, userMessage)
+          : userMessage,
+      )
       break
     } catch (apiErr) {
       const status = apiErr.status ?? apiErr.httpStatus

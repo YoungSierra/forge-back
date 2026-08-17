@@ -87,6 +87,41 @@ router.get('/', async (req, res, next) => {
   }
 })
 
+// ─── GET /api/assets/:id/content ─────────────────────────────────────────────
+// El texto completo de UN documento. El listado del moodboard va sin `content` a propósito
+// —son ~1,4 MB de texto que la galería no muestra— así que el detalle lo pide cuando hace
+// falta, de a uno. Sirve tanto para un output del pipeline como para algo subido a la librería.
+router.get('/:id/content', async (req, res, next) => {
+  try {
+    const { id } = req.params
+
+    const { data: forge } = await db()
+      .from('forge_assets')
+      .select('name, content, format')
+      .eq('id', id)
+      .maybeSingle()
+    if (forge?.content) {
+      return res.json({ success: true, name: forge.name, format: forge.format, content: forge.content })
+    }
+
+    const { data: lib } = await db()
+      .from('forge_project_library_assets')
+      .select('display_name, file_name, extracted_text, mime_type')
+      .eq('id', id)
+      .maybeSingle()
+    if (lib?.extracted_text) {
+      return res.json({
+        success: true,
+        name: lib.display_name || lib.file_name,
+        format: /markdown/.test(lib.mime_type || '') ? 'markdown' : 'document',
+        content: lib.extracted_text,
+      })
+    }
+
+    res.status(404).json({ success: false, error: 'No content for this asset', code: 'NOT_FOUND' })
+  } catch (err) { next(err) }
+})
+
 // PATCH /api/assets/:id/review
 router.patch('/:id/review', async (req, res, next) => {
   try {
@@ -138,6 +173,33 @@ router.patch('/:id/review', async (req, res, next) => {
 // `motion` es el arquetipo de animación. Todavía no hay de dónde deducirlo, así que siempre
 // sale 'neutral'; cuando exista el campo por proyecto se resuelve acá y el front no cambia.
 const NEUTRAL_THEME = { accent: '#7d8493', colors: ['#7d8493'], motion: 'neutral', source: 'default' }
+
+// El asomo de un documento viaja como MARKDOWN CRUDO, no como texto pelado. La miniatura y el
+// detalle lo renderizan con el mismo componente, así el documento se ve igual desde el primer
+// momento y no hay salto de "texto ilegible" a "markdown" cuando llega el contenido completo.
+//
+// Se corta en un límite de línea y se descartan los bloques que quedarían partidos: media tabla
+// o un fence de código sin cerrar se renderizan peor que no estar.
+function recortarMd(texto, tope = 900) {
+  const t = String(texto || '').trim()
+  if (!t) return null
+  if (t.length <= tope) return t
+
+  let corte = t.slice(0, tope)
+  corte = corte.slice(0, Math.max(corte.lastIndexOf('\n'), 1))   // hasta el último salto entero
+
+  const lineas = corte.split('\n')
+  // Una tabla necesita cabecera + separador para renderizar; si el corte la dejó a medias, fuera.
+  while (lineas.length && /^\s*\|/.test(lineas[lineas.length - 1])) {
+    const quedan = lineas.filter(l => /^\s*\|/.test(l)).length
+    if (quedan > 2) break
+    lineas.pop()
+  }
+  // Fence de código impar = quedó abierto.
+  if ((lineas.join('\n').match(/```/g) || []).length % 2) lineas.push('```')
+
+  return lineas.join('\n').trim() || null
+}
 
 async function resolveProjectTheme(projectId) {
   if (!projectId) return NEUTRAL_THEME
@@ -222,6 +284,18 @@ router.get('/project-assets', async (req, res, next) => {
       }
     }
 
+    // La tarjeta de un documento muestra sus primeras líneas, así que en modo media hace falta
+    // un asomo del texto — pero solo de los documentos. Se pide en una consulta aparte y no la
+    // primera para que las imágenes, los modelos y el video no arrastren texto que nadie mira.
+    let previewMap = {}
+    if (mediaOnly) {
+      const docIds = (forgeAssets || []).filter(a => DOC_FORMATS.includes(a.format)).map(a => a.id)
+      if (docIds.length) {
+        const { data: docs } = await db().from('forge_assets').select('id, content').in('id', docIds)
+        for (const d of (docs || [])) previewMap[d.id] = recortarMd(d.content)
+      }
+    }
+
     const forgeNormalized = (forgeAssets || []).map(a => ({
       id:          a.id,
       source:      'forge',
@@ -234,6 +308,7 @@ router.get('/project-assets', async (req, res, next) => {
       status:      a.status,
       storage_url: a.storage_url ?? null,
       content:     a.content     ?? null,
+      preview:     previewMap[a.id] ?? null,
       created_at:  a.approved_at ?? a.created_at,
       versions:    (forgeVersionsMap[a.id] || []).map(v => ({
         id:             v.id,
@@ -362,7 +437,7 @@ router.get('/project-assets', async (req, res, next) => {
     if (mediaOnly && project_id) {
       const { data: lib } = await db()
         .from('forge_project_library_assets')
-        .select('id, display_name, file_name, mime_type, asset_type, storage_url, created_at')
+        .select('id, display_name, file_name, mime_type, asset_type, storage_url, created_at, extracted_text')
         .eq('project_id', project_id)
         .order('created_at', { ascending: false })
 
@@ -389,6 +464,9 @@ router.get('/project-assets', async (req, res, next) => {
           status:      'library',
           storage_url: a.storage_url,
           content:     null,
+          // Lo que subió el usuario ya trae su texto extraído; se usa el mismo asomo que en
+          // los documentos del pipeline para que la tarjeta se vea igual venga de donde venga.
+          preview:     fmt === 'document' ? recortarMd(a.extracted_text) : null,
           created_at:  a.created_at,
           versions:    [],
         })

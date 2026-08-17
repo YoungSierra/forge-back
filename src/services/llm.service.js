@@ -28,7 +28,19 @@ async function callLLM(systemPrompt, userMessage, options = {}) {
     temperature: options.temperature !== undefined ? options.temperature : 0.8,
   }
 
-  console.log(`[LLM] Step: ${step || 'default'} | Provider: ${provider} | Model: ${model}`)
+  // Cada proveedor con visión tiene su propio formato — ver vision.format. Los que no la
+  // soportan (minimax, mimo) reciben solo texto: mandarles bloques los rompería. El modelo de un
+  // nodo se cambia desde el admin, así que este caso puede aparecer sin tocar código.
+  const { soportaVision } = require('./vision.format')
+  if (callOptions.images?.length && !soportaVision(provider)) {
+    console.warn(`[LLM] ${callOptions.images.length} imagen(es) descartadas: "${provider}" no acepta visión`)
+    delete callOptions.images
+  }
+
+  console.log(
+    `[LLM] Step: ${step || 'default'} | Provider: ${provider} | Model: ${model}` +
+    (callOptions.images?.length ? ` | ${callOptions.images.length} imagen(es)` : ''),
+  )
 
   let result
   switch (provider) {

@@ -1,3 +1,9 @@
+// Bloques de visión cuando hay imágenes; el string de siempre cuando no. Ver vision.format.
+const contenidoUsuario = (options, texto) =>
+  options.images?.length
+    ? require('../vision.format').contenidoOpenAI(options.images, texto)
+    : texto
+
 const OpenAI = require('openai')
 
 let _client = null
@@ -21,7 +27,7 @@ async function callOpenAI(systemPrompt, userMessage, options = {}) {
     model,
     messages: [
       { role: 'system', content: systemPrompt },
-      { role: 'user',   content: userMessage },
+      { role: 'user',   content: contenidoUsuario(options, userMessage) },
     ],
     ...(options.rawText ? {} : { response_format: { type: 'json_object' } }),
     [tokenKey]: options.maxOutputTokens || 8192,

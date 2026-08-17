@@ -50,7 +50,10 @@ const ANCHOR_CAP = 2000
  *
  * @returns {Promise<string[]>} bloques markdown "### label\ncontent" listos para el prompt.
  */
-async function resolveNodeInputs(db, { projectId, currentPNodeId, targetOutput }) {
+// `visualRefs` es una bolsa de salida: acá se anotan las referencias que el modelo tiene que
+// VER, no solo leer. Va aparte del texto porque los strings resueltos alimentan el prompt y
+// estas van como bloques de imagen. El llamador que no la pase sigue funcionando igual.
+async function resolveNodeInputs(db, { projectId, currentPNodeId, targetOutput, visualRefs = [] }) {
   const resolvedInputs    = []
   const injectedPngUrls   = new Set()  // dedup PNG cuando hay múltiples edges del mismo nodo
   const seenInputKeys     = new Set()  // dedup por (nodo + output): cada output es un asset aparte
@@ -114,7 +117,7 @@ async function resolveNodeInputs(db, { projectId, currentPNodeId, targetOutput }
         node_id, node_type, source_asset_id,
         text_label, text_content,
         forge_nodes(title, outputs),
-        forge_project_library_assets(display_name, extracted_text, storage_url, asset_type)
+        forge_project_library_assets(display_name, extracted_text, storage_url, asset_type, mime_type)
       `)
       .eq('id', edge.source_node_id)
       .maybeSingle()
@@ -126,8 +129,14 @@ async function resolveNodeInputs(db, { projectId, currentPNodeId, targetOutput }
       if (lib.extracted_text) {
         const snippet = lib.extracted_text.slice(0, INPUT_CAP) + (lib.extracted_text.length > INPUT_CAP ? '\n[truncated]' : '')
         resolvedInputs.push(`### ${lib.display_name} (library asset)\n${snippet}`)
+        // Un documento aporta su texto Y sus imágenes embebidas: el key art de un pitch es
+        // contexto visual, no adorno.
+        visualRefs.push({ label: lib.display_name, docUrl: lib.storage_url, docMime: lib.mime_type })
       } else if (lib.asset_type === 'image') {
+        // La URL sigue en el texto (la usan el frontend y los tools). Lo que hace que el MODELO
+        // la vea es esta anotación.
         resolvedInputs.push(`### ${lib.display_name} (image reference)\nURL: ${lib.storage_url}`)
+        visualRefs.push({ label: lib.display_name, imageUrl: lib.storage_url })
       }
     } else if (sourcePNode.node_type === 'text_input') {
       const label   = sourcePNode.text_label   || 'Text Input'
@@ -219,6 +228,7 @@ async function resolveNodeInputs(db, { projectId, currentPNodeId, targetOutput }
         if (png.storage_url && !injectedPngUrls.has(png.storage_url)) {
           injectedPngUrls.add(png.storage_url)
           resolvedInputs.push(`### ${png.name} (generated image)\nURL: ${png.storage_url}`)
+          visualRefs.push({ label: png.name, imageUrl: png.storage_url })
         }
       }
 
@@ -268,7 +278,7 @@ async function resolveNodeInputs(db, { projectId, currentPNodeId, targetOutput }
   // 2. Library assets asignados explícitamente al nodo
   const { data: libInputs } = await db()
     .from('forge_project_node_inputs')
-    .select(`input_label, forge_project_library_assets(display_name, extracted_text, storage_url, asset_type)`)
+    .select(`input_label, forge_project_library_assets(display_name, extracted_text, storage_url, asset_type, mime_type)`)
     .eq('project_node_id', currentPNodeId)
     .eq('source_type', 'library_asset')
     .order('order_index')
@@ -279,8 +289,10 @@ async function resolveNodeInputs(db, { projectId, currentPNodeId, targetOutput }
     if (lib.extracted_text) {
       const snippet = lib.extracted_text.slice(0, INPUT_CAP) + (lib.extracted_text.length > INPUT_CAP ? '\n[truncated]' : '')
       resolvedInputs.push(`### ${lib.display_name} (external reference)\n${snippet}`)
+      visualRefs.push({ label: lib.display_name, docUrl: lib.storage_url, docMime: lib.mime_type })
     } else if (lib.asset_type === 'image') {
       resolvedInputs.push(`### ${lib.display_name} (image reference)\nURL: ${lib.storage_url}`)
+      visualRefs.push({ label: lib.display_name, imageUrl: lib.storage_url })
     }
   }
 
@@ -451,8 +463,9 @@ async function buildSystemPrompt(db, { projectId, nodeId, sessionId, userMessage
     .eq('removed', false)
     .maybeSingle()
 
+  const visualRefs = []   // referencias que el modelo tiene que VER (ver vision.service)
   const resolvedInputs = currentPNode
-    ? await resolveNodeInputs(db, { projectId, currentPNodeId: currentPNode.id, targetOutput })
+    ? await resolveNodeInputs(db, { projectId, currentPNodeId: currentPNode.id, targetOutput, visualRefs })
     : []
 
   const { getToolsBlock, getDocPolicyBlock } = require('./tools.service')
@@ -537,14 +550,14 @@ async function buildSystemPrompt(db, { projectId, nodeId, sessionId, userMessage
 
   const executorStr = node.executor?.model || process.env.DEFAULT_MODEL
 
-  return { finalSystemPrompt, baseUserMsg, executorStr, activeTools, outputDefs, resolvedInputs, node, targetOutput }
+  return { finalSystemPrompt, baseUserMsg, executorStr, activeTools, outputDefs, resolvedInputs, visualRefs, node, targetOutput }
 }
 
 /**
  * Ejecuta el ReAct loop: LLM + herramientas.
  * Devuelve { replyText, allToolCalls, docUrl, docFormat, meta }
  */
-async function runReActLoop({ finalSystemPrompt, baseUserMsg, executorStr, activeTools, resolvedInputs = [], projectId, nodeId, nodeName = '' }) {
+async function runReActLoop({ finalSystemPrompt, baseUserMsg, executorStr, activeTools, resolvedInputs = [], visualRefs = [], projectId, nodeId, nodeName = '' }) {
   const { callLLM }                          = require('./llm.service')
   const { parseToolCalls, executeTool }      = require('./tools.service')
 
@@ -556,8 +569,15 @@ async function runReActLoop({ finalSystemPrompt, baseUserMsg, executorStr, activ
   let docUrl           = null
   let docFormat        = null
 
+  // Se bajan UNA vez, antes del bucle: reenviarlas en cada iteración de herramientas
+  // multiplicaría el costo de input sin agregar nada nuevo a la conversación.
+  const { collectVisualRefs } = require('./vision.service')
+  const { images: visionImages, nota: visionNota } = await collectVisualRefs(visualRefs)
+  if (visionNota) currentUserMsg += visionNota
+
   for (let iter = 0; iter < MAX_TOOL_ITERS; iter++) {
     const result = await callLLM(finalSystemPrompt, currentUserMsg, {
+      images: visionImages,
       // 16K de techo: documentos largos (GDD 14 secciones, TDD) se truncaban con 8192.
       // Es un límite, no un objetivo — solo se paga por lo generado; 16384 es seguro
       // cross-provider (32K excede el cap de salida de algunos modelos groq/openai).

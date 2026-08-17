@@ -103,11 +103,11 @@ async function executeOneOutput({ project_id, node_id, targetOutputKey, member_i
 
   const userMessage = 'Generate the output for this step'
 
-  const { finalSystemPrompt, baseUserMsg, executorStr, activeTools, resolvedInputs, node } =
+  const { finalSystemPrompt, baseUserMsg, executorStr, activeTools, resolvedInputs, visualRefs, node } =
     await buildSystemPrompt(db, { projectId: project_id, nodeId: node_id, sessionId: session.id, userMessage, targetOutputKey })
 
   const { replyText, allToolCalls, docUrl, docFormat, meta } = await runReActLoop({
-    finalSystemPrompt, baseUserMsg, executorStr, activeTools, resolvedInputs,
+    finalSystemPrompt, baseUserMsg, executorStr, activeTools, resolvedInputs, visualRefs,
     projectId: project_id, nodeId: node_id, nodeName: node.title,
   })
 
@@ -203,11 +203,11 @@ async function executeImageOutput({ project_id, node_id, targetOutputKey, member
 
   const userMessage = 'Generate the output for this step'
 
-  const { finalSystemPrompt, baseUserMsg, executorStr, activeTools, resolvedInputs, node } =
+  const { finalSystemPrompt, baseUserMsg, executorStr, activeTools, resolvedInputs, visualRefs, node } =
     await buildSystemPrompt(db, { projectId: project_id, nodeId: node_id, sessionId: session.id, userMessage, targetOutputKey })
 
   const { replyText, allToolCalls, meta } = await runReActLoop({
-    finalSystemPrompt, baseUserMsg, executorStr, activeTools, resolvedInputs,
+    finalSystemPrompt, baseUserMsg, executorStr, activeTools, resolvedInputs, visualRefs,
     projectId: project_id, nodeId: node_id, nodeName: node.title,
   })
 
@@ -1890,8 +1890,10 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
     // Inputs de edges + library assets: resolvedor compartido con buildSystemPrompt (preview),
     // para que el preview refleje exactamente lo que se genera. Aplica scoping uses.inputs y cap alto.
     const { resolveNodeInputs } = require('../services/canvas-chat.service')
+    // Las referencias que el modelo tiene que VER se recogen acá y viajan aparte del texto.
+    const visualRefs = []
     const resolvedInputs = (currentPNode && !isAssembly)
-      ? await resolveNodeInputs(db, { projectId: project_id, currentPNodeId: currentPNode.id, targetOutput })
+      ? await resolveNodeInputs(db, { projectId: project_id, currentPNodeId: currentPNode.id, targetOutput, visualRefs })
       : []
     // Cap para attachments de sesión (los inputs de edge/library ya los capó resolveNodeInputs).
     const INPUT_CAP = 120000
@@ -2000,6 +2002,18 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
       ] : []),
     ]
 
+    // Los adjuntos del chat son un camino APARTE de los inputs del grafo, y también traen
+    // material visual: un PDF de pitch adjuntado como contexto lleva su key art adentro, y una
+    // imagen adjuntada directamente no tiene por qué llegar como una URL en un texto.
+    for (const att of [...(sessionAttachments || []), ...(pendingAttachment ? [pendingAttachment] : [])]) {
+      if (!att.storage_url) continue
+      if (String(att.mime_type || '').startsWith('image/')) {
+        visualRefs.push({ label: att.file_name, imageUrl: att.storage_url })
+      } else {
+        visualRefs.push({ label: att.file_name, docUrl: att.storage_url, docMime: att.mime_type })
+      }
+    }
+
     const finalSystemPrompt = attachmentParts.length
       ? systemPrompt + '\n\n## Attached references\n' + attachmentParts.join('\n\n')
       : systemPrompt
@@ -2099,8 +2113,17 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
       meta = { provider: 'assembler', model: tpl.template_id, tokens_used: null, duration_ms: 0 }
     }
 
+    // Se bajan una sola vez, antes del bucle: reenviarlas en cada iteración de herramientas
+    // multiplicaría el costo sin agregar nada.
+    const { collectVisualRefs } = require('../services/vision.service')
+    const { images: visionImages, nota: visionNota } = assemblyReport
+      ? { images: [], nota: '' }
+      : await collectVisualRefs(visualRefs)
+    if (visionNota) currentUserMsg += visionNota
+
     for (let iter = 0; !assemblyReport && iter < MAX_TOOL_ITERS; iter++) {
       const result = await callLLM(finalSystemPrompt, currentUserMsg, {
+        images:          visionImages,
         model:           executorStr,
         rawText:         true,
         temperature:     0.7,
@@ -2827,7 +2850,7 @@ router.get('/nodes/:project_node_id/context-inputs', async (req, res, next) => {
         .select(`
           node_id, node_type, text_label, text_content,
           forge_nodes(title, outputs),
-          forge_project_library_assets(display_name, extracted_text, storage_url, asset_type)
+          forge_project_library_assets(display_name, extracted_text, storage_url, asset_type, mime_type)
         `)
         .eq('id', edge.source_node_id)
         .maybeSingle()
@@ -2837,9 +2860,14 @@ router.get('/nodes/:project_node_id/context-inputs', async (req, res, next) => {
         const lib = srcPN.forge_project_library_assets
         if (!lib) continue
         if (lib.extracted_text) {
-          inputs.push({ label: lib.display_name, content: lib.extracted_text, source: 'edge', source_project_node_id: edge.source_node_id, output_key: null })
+          // Un PDF aporta su texto Y sus imágenes embebidas: el key art de un pitch es contexto
+          // visual, no decoración. `docUrl`/`docMime` los cosecha después vision.service.
+          inputs.push({ label: lib.display_name, content: lib.extracted_text, source: 'edge', source_project_node_id: edge.source_node_id, output_key: null,
+                        docUrl: lib.storage_url, docMime: lib.mime_type })
         } else if (lib.asset_type === 'image') {
-          inputs.push({ label: lib.display_name, content: `![${lib.display_name}](${lib.storage_url})`, source: 'edge', isImage: true, source_project_node_id: edge.source_node_id, output_key: null })
+          // El markdown se conserva: lo usa el frontend para pintar la miniatura y los tools
+          // para pasar la URL. `imageUrl` es lo que hace que el MODELO la vea.
+          inputs.push({ label: lib.display_name, content: `![${lib.display_name}](${lib.storage_url})`, source: 'edge', isImage: true, imageUrl: lib.storage_url, source_project_node_id: edge.source_node_id, output_key: null })
         }
       } else if (srcPN.node_type === 'text_input') {
         const content = (srcPN.text_content || '').trim()
@@ -2900,7 +2928,7 @@ router.get('/nodes/:project_node_id/context-inputs', async (req, res, next) => {
           if (png.storage_url && !injectedPngUrls.has(png.storage_url)) {
             injectedPngUrls.add(png.storage_url)
             // Formato markdown para que el frontend lo renderice como imagen inline
-            inputs.push({ label: png.name, content: `![${png.name}](${png.storage_url})`, source: 'edge', isImage: true, source_project_node_id: edge.source_node_id, output_key: null })
+            inputs.push({ label: png.name, content: `![${png.name}](${png.storage_url})`, source: 'edge', isImage: true, imageUrl: png.storage_url, source_project_node_id: edge.source_node_id, output_key: null })
           }
         }
       }
@@ -2911,7 +2939,7 @@ router.get('/nodes/:project_node_id/context-inputs', async (req, res, next) => {
       .from('forge_project_node_inputs')
       .select(`
         input_label,
-        forge_project_library_assets(display_name, extracted_text, storage_url, asset_type)
+        forge_project_library_assets(display_name, extracted_text, storage_url, asset_type, mime_type)
       `)
       .eq('project_node_id', pNode.id)
       .eq('source_type', 'library_asset')
@@ -2921,9 +2949,10 @@ router.get('/nodes/:project_node_id/context-inputs', async (req, res, next) => {
       const lib = inp.forge_project_library_assets
       if (!lib) continue
       if (lib.extracted_text) {
-        inputs.push({ label: lib.display_name, content: lib.extracted_text, source: 'library' })
+        inputs.push({ label: lib.display_name, content: lib.extracted_text, source: 'library',
+                      docUrl: lib.storage_url, docMime: lib.mime_type })
       } else if (lib.asset_type === 'image') {
-        inputs.push({ label: lib.display_name, content: `![${lib.display_name}](${lib.storage_url})`, source: 'library', isImage: true })
+        inputs.push({ label: lib.display_name, content: `![${lib.display_name}](${lib.storage_url})`, source: 'library', isImage: true, imageUrl: lib.storage_url })
       }
     }
 

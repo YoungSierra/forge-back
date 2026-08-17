@@ -1,5 +1,5 @@
 const AdmZip  = require('adm-zip')
-const pdfParse = require('pdf-parse')
+const { PDFParse } = require('pdf-parse')
 const mammoth  = require('mammoth')
 
 // ─── Dispatcher principal ─────────────────────────────────────────────────────
@@ -32,13 +32,24 @@ async function extractText(buffer, mimeType) {
 
 // ─── PDF ──────────────────────────────────────────────────────────────────────
 
+// pdf-parse v2 dejó de exportar una función y pasó a exportar la clase `PDFParse`. El código
+// viejo llamaba `pdfParse(buffer)`, que tiraba "pdfParse is not a function"; el catch se lo
+// tragaba y devolvía null. Resultado: TODO PDF subido quedaba sin texto, en silencio — y sin
+// texto, un PDF adjuntado como contexto no aporta nada y el modelo rellena.
 async function extractPdf(buffer) {
+  let parser
   try {
-    const data = await pdfParse(buffer)
-    return data.text?.trim() || null
+    parser = new PDFParse({ data: buffer })
+    const { text } = await parser.getText()
+    // pdf-parse antepone "-- N of M --" en cada página: es andamiaje del extractor, no del
+    // documento, y en el prompt de un nodo se lee como si fuera contenido.
+    const limpio = String(text || '').replace(/^--\s*\d+\s+of\s+\d+\s*--\s*$/gm, '').trim()
+    return limpio || null
   } catch (err) {
     console.error('[extraction] PDF parse failed:', err.message)
     return null
+  } finally {
+    await parser?.destroy?.().catch(() => {})
   }
 }
 

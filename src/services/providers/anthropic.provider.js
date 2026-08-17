@@ -36,13 +36,20 @@ async function callAnthropic(systemPrompt, userMessage, options = {}) {
   // Junta todos los bloques de texto del mensaje (robusto a múltiples content blocks).
   const extractText = r => (r.content || []).filter(b => b.type === 'text').map(b => b.text).join('')
 
+  // Las referencias visuales viajan como bloques de imagen, ANTES del texto: el modelo lee
+  // mejor cuando ve primero el material y después la consigna. Sin `options.images` el mensaje
+  // sigue siendo el string de siempre — este camino no cambia para nadie más.
+  const content = options.images?.length
+    ? require('../vision.format').contenidoAnthropic(options.images, userMessage)
+    : userMessage
+
   let response
   try {
     const createParams = {
       model,
       max_tokens: maxTokens,
       system:     systemPrompt,
-      messages:   [{ role: 'user', content: userMessage }],
+      messages:   [{ role: 'user', content }],
     }
     if (supportsTemperature) createParams.temperature = temperature
     // Streaming: en generaciones largas el request NO-stream golpea el timeout del cliente HTTP
@@ -92,7 +99,10 @@ async function callAnthropic(systemPrompt, userMessage, options = {}) {
         max_tokens: maxTokens,
         system:     systemPrompt,
         messages:   [
-          { role: 'user',      content: userMessage },
+          // El MISMO contenido que la primera vuelta, imágenes incluidas. Si acá se mandara solo
+          // el texto, la continuación seguiría escribiendo sin ver las referencias y se
+          // contradiría con lo que ya llevaba escrito. Cuesta reenviarlas; salir mal cuesta más.
+          { role: 'user',      content },
           { role: 'assistant', content: prefill },
         ],
       }
