@@ -22,6 +22,29 @@ const BUCKET_CONFIG = {
 
 const DEFAULT_BUCKET = 'forge-assets'
 
+// Un bucket es un NOMBRE, no una URL. Confundirlos es fácil porque cada bucket tiene además su
+// URL pública, y las dos variables viven juntas — en producción `CF_R2_FEEDBACK_BUCKET` terminó
+// con la URL adentro. El SDK sí lo rechazaba, pero recién al subir y con un error que no nombra
+// la variable culpable, así que el fallo quedó escondido CUATRO MESES: cada captura de feedback
+// se perdía en silencio y el reporte llegaba sin imagen.
+//
+// Se revisa al cargar el módulo, que es cuando alguien está mirando el arranque, y se dice qué
+// variable arreglar. No se lanza: un bucket mal configurado no debe impedir levantar el servidor.
+const VARIABLES = {
+  'forge-assets':         'CF_R2_BUCKET',
+  'feedback-screenshots': 'CF_R2_FEEDBACK_BUCKET',
+}
+
+for (const [clave, cfg] of Object.entries(BUCKET_CONFIG)) {
+  if (/[:/]/.test(cfg.name)) {
+    console.error(
+      `[storage] ${VARIABLES[clave]} contiene una URL ("${cfg.name}") y debe contener el NOMBRE ` +
+      `del bucket (p. ej. "${clave}"). La URL pública va en ${VARIABLES[clave].replace('_BUCKET', '_PUBLIC_URL')}. ` +
+      `Mientras tanto, toda subida a "${clave}" va a fallar.`,
+    )
+  }
+}
+
 function getR2Client() {
   return new S3Client({
     region: 'auto',
