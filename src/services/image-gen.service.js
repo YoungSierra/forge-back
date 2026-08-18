@@ -145,4 +145,106 @@ async function generateOneImage({
   return { url: result.url, provider, model: modelOrWf }
 }
 
-module.exports = { imageOutputsOf, parseOutputItems, cleanItemText, generateOneImage }
+// ─── Despacho de un DECK (workflows `per_page`) ───────────────────────────────
+// El modelo de arriba —un ítem, una llamada, una imagen— no sirve para los decks del 3.20: su
+// workflow no es "una imagen por invocación", son 34 páginas fijas dentro del MISMO grafo, cada
+// una con su plantilla y su prompt. Llamarlo 34 veces está mal por construcción; se manda UN
+// job con las 34 páginas ya pobladas y las imágenes llegan progresivamente.
+//
+// Los prompts los arma `composeDeck` desde los documentos del proyecto, no el LLM: son ~6.000
+// caracteres por página, y pedirle a un modelo que emita 34 de esos en una respuesta (~200.000
+// caracteres) no es viable. El LLM sigue haciendo su trabajo en el nodo; lo que se resuelve por
+// código es el poblado, que es determinista y verificable.
+//
+// Portado de `Moodboard/prueba_guia_completa.js`, que ya corrió 32/32 en 247 s.
+async function generateDeck({
+  db, project_id, node_id, session_id, node_key, output_key,
+  image_gen_model, deck, member_id, onPage,
+}) {
+  const { composeDeck } = require('./slide-composer.service')
+  const { getWorkflowByName } = require('./config.service')
+  const { uploadToStorage } = require('./storage.service')
+
+  const colonIdx = String(image_gen_model || '').indexOf(':')
+  if (colonIdx < 0) throw new Error(`image_gen_model debe ser "provider:workflow" — recibido: "${image_gen_model}"`)
+  const provider = image_gen_model.slice(0, colonIdx)
+  const wfName   = image_gen_model.slice(colonIdx + 1)
+  if (provider !== 'comfyui') throw new Error(`Un deck solo se despacha por comfyui, no por "${provider}"`)
+
+  const entry = await getWorkflowByName(wfName)
+  if (!entry) throw new Error(`Workflow no registrado: "${wfName}"`)
+  if (entry.inject_config?.mode !== 'per_page') {
+    throw new Error(`El workflow "${wfName}" no está marcado per_page; no es un deck`)
+  }
+
+  // 1. Poblar: se clona el grafo y se le escribe a cada página su prompt.
+  const armado = await composeDeck({ db, projectId: project_id, deck })
+  const wf = JSON.parse(JSON.stringify(entry.workflow_json))
+  for (const p of armado.paginas) {
+    if (wf[p.prompt_node]?.inputs) wf[p.prompt_node].inputs.prompt = p.prompt
+  }
+  const porSaveNode = Object.fromEntries(armado.paginas.map(p => [p.save_node, p]))
+
+  const BASE = (process.env.COMFYUI_BASE_URL || '').replace(/\/$/, '')
+  const KEY  = process.env.COMFYUI_API_KEY
+  const H    = () => ({ 'Content-Type': 'application/json', ...(KEY ? { Authorization: `Bearer ${KEY}` } : {}) })
+
+  const t0  = Date.now()
+  const res = await fetch(`${BASE}/api/prompt`, {
+    method: 'POST', headers: H(),
+    body: JSON.stringify({ prompt: wf, ...(KEY ? { extra_data: { api_key_comfy_org: KEY } } : {}) }),
+  })
+  const txt = await res.text()
+  if (!res.ok) throw new Error(`ComfyUI rechazó el deck: ${res.status} ${txt.slice(0, 400)}`)
+  const jobId = JSON.parse(txt).prompt_id
+
+  // 2. Poll con descarga PROGRESIVA: cada página se sube apenas llega, así una caída a mitad
+  //    de camino no pierde lo ya rendido.
+  const paginas = []
+  const vistos  = new Set()
+  const total   = armado.paginas.length
+  for (let it = 0; it < 480 && vistos.size < total; it++) {
+    await new Promise(r => setTimeout(r, 5000))
+    let j = null
+    try { j = await (await fetch(`${BASE}/api/jobs/${jobId}`, { headers: H() })).json() } catch { continue }
+    const estado = j?.status || j?.execution_status || ''
+
+    for (const [nodeId, nd] of Object.entries(j?.outputs || {})) {
+      for (const f of (nd?.images || [])) {
+        if (!f.filename || vistos.has(f.filename)) continue
+        vistos.add(f.filename)
+        const pag = porSaveNode[nodeId]
+        const url = `${BASE}/api/view?filename=${encodeURIComponent(f.filename)}` +
+                    `&subfolder=${encodeURIComponent(f.subfolder || '')}&type=${f.type || 'output'}`
+        try {
+          const ir = await fetch(url, { headers: KEY ? { Authorization: `Bearer ${KEY}` } : {}, redirect: 'follow' })
+          if (!ir.ok) continue
+          const buf  = Buffer.from(await ir.arrayBuffer())
+          const dest = `projects/${project_id}/deck/${node_key}/${output_key}/${pag?.nombre || f.filename}.png`
+          const url2 = await uploadToStorage(buf, dest, 'image/png')
+          const item = { index: (pag?.indice ?? paginas.length + 1) - 1, name: pag?.nombre || f.filename, url: url2 }
+          paginas.push(item)
+          onPage?.(item, vistos.size, total)
+        } catch (e) { console.error('[deck] página perdida:', e.message) }
+      }
+    }
+    if (/error|fail/i.test(estado) && it > 3) break
+    if (/completed|success/i.test(estado) && vistos.size >= total) break
+  }
+
+  try {
+    logExecution({
+      project_id, node_id, session_id,
+      triggered_by: member_id || null,
+      trigger_type: 'image_gen', executor_type: 'comfyui', provider: 'comfyui', model: wfName,
+      is_estimated: true, duration_ms: Date.now() - t0,
+      started_at: new Date(t0).toISOString(),
+      status: paginas.length === total ? 'success' : 'partial',
+      metadata: { output_key, node_key, deck, jobId, paginas: paginas.length, esperadas: total },
+    })
+  } catch (e) { console.error('[deck] logExec falló (no fatal):', e.message) }
+
+  return { jobId, paginas, esperadas: total, segundos: Math.round((Date.now() - t0) / 1000), avisos: armado.avisos }
+}
+
+module.exports = { imageOutputsOf, parseOutputItems, cleanItemText, generateOneImage, generateDeck }
