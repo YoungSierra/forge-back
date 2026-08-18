@@ -224,6 +224,23 @@ async function generateDeck({
           const url2 = await uploadToStorage(buf, dest, 'image/png')
           const item = { index: (pag?.indice ?? paginas.length + 1) - 1, name: pag?.nombre || f.filename, url: url2 }
           paginas.push(item)
+
+          // Se anota en la sesión apenas llega, no al final: es lo que lee el modal del nodo
+          // (`forge_sessions.output_images`), y escribirlo progresivamente hace que las páginas
+          // aparezcan mientras el deck todavía se está rindiendo. Sin esto el nodo corre, sube
+          // las imágenes y en pantalla no se ve nada.
+          if (session_id) {
+            try {
+              await db().from('forge_sessions').update({
+                output_images: {
+                  [output_key]: [...paginas]
+                    .sort((x, y) => x.index - y.index)
+                    .map(p => ({ index: p.index, name: p.name, variations: [{ url: p.url, condition: null }] })),
+                },
+              }).eq('id', session_id)
+            } catch (e) { console.error('[deck] no se pudo anotar la página en la sesión:', e.message) }
+          }
+
           onPage?.(item, vistos.size, total)
         } catch (e) { console.error('[deck] página perdida:', e.message) }
       }
