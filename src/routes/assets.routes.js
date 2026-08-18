@@ -483,7 +483,17 @@ router.get('/project-assets', async (req, res, next) => {
     // El tema solo lo pide el moodboard; no se calcula para la librería de activos.
     const theme = mediaOnly ? await resolveProjectTheme(project_id) : undefined
 
-    res.json({ success: true, assets: unified, ...(theme ? { theme } : {}) })
+    // Paginación del RESULTADO, no de la consulta: se unen cuatro fuentes y se ordenan por
+    // fecha, así que no hay forma de paginar en SQL sin rehacer el endpoint. Medido hoy, el
+    // proyecto más cargado son 41 activos y el payload ~11 KB, así que el moodboard no la
+    // necesita y sigue pidiendo todo — el tope existe para la llamada SIN `project_id`, que
+    // recorre los 34 proyectos. Sin `limit` el comportamiento es el de siempre.
+    const total  = unified.length
+    const limit  = Number.parseInt(req.query.limit, 10)
+    const offset = Number.parseInt(req.query.offset, 10) || 0
+    if (Number.isFinite(limit) && limit > 0) unified = unified.slice(offset, offset + limit)
+
+    res.json({ success: true, assets: unified, total, ...(theme ? { theme } : {}) })
   } catch (err) { next(err) }
 })
 

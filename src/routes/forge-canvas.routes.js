@@ -1304,13 +1304,18 @@ router.post('/nodes/:node_id/sessions/:session_id/generate-item-image', async (r
 })
 
 // ─── POST /api/projects/:id/canvas/nodes/:node_id/generate-pdf ─
-// Genera (o devuelve cached) el PDF del output aprobado del nodo
+// Genera (o devuelve cached) el PDF de UN output del nodo.
+//
+// Antes tomaba la sesión aprobada más reciente sin mirar de qué output era, así que en un nodo
+// con varios outputs siempre devolvía el mismo archivo: en el 2.1, el del pitch_document
+// estuvieras parado donde estuvieras. El PDF se genera la primera vez que lo piden y queda
+// guardado en el asset, así que la segunda llamada no vuelve a renderizar.
 router.post('/nodes/:node_id/generate-pdf', async (req, res, next) => {
   try {
     const { id: project_id, node_id } = req.params
+    const { output_key = null, project_node_id = null } = req.body ?? {}
 
-    // Buscar sesión aprobada más reciente con asset
-    const { data: session } = await db()
+    let q = db()
       .from('forge_sessions')
       .select('id, output_asset_id, status')
       .eq('project_id', project_id)
@@ -1318,10 +1323,28 @@ router.post('/nodes/:node_id/generate-pdf', async (req, res, next) => {
       .in('status', ['approved', 'auto_approved'])
       .order('completed_at', { ascending: false })
       .limit(1)
-      .maybeSingle()
+
+    // Con fan-out el mismo nodo del catálogo vive en varios lanes; sin acotar por instancia se
+    // devolvería el documento del lane vecino. Igual que en GET /session.
+    if (project_node_id) q = q.eq('project_node_id', project_node_id)
+
+    let session = null
+    if (output_key) {
+      const { data, error } = await q.eq('output_key', output_key).maybeSingle()
+      // La columna output_key puede no existir en instalaciones viejas: se cae al comportamiento
+      // de antes en vez de romper la descarga.
+      session = error ? (await q.maybeSingle()).data : data
+    } else {
+      session = (await q.maybeSingle()).data
+    }
 
     if (!session?.output_asset_id) {
-      return res.status(404).json({ success: false, error: 'No approved session with asset found' })
+      return res.status(404).json({
+        success: false,
+        error: output_key
+          ? `El output "${output_key}" no tiene un documento aprobado del que sacar PDF`
+          : 'No approved session with asset found',
+      })
     }
 
     const { data: asset } = await db()
