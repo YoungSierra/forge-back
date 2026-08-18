@@ -73,17 +73,41 @@ async function classifySequenceNodes(sequence, itemType, db) {
  * Parsea líneas de lista a objetos concept_seed mínimos.
  * Soporta "- Variation N: Title: desc" y "- Title: desc"
  */
+// Un título puede CONTENER dos puntos. El caso real: "- SMACK: Drift: A meditative endless
+// diver donde…" — el primer par separa el juego del concepto, el segundo separa el título de la
+// descripción. Cortando en el primero, los dos seeds de un fan-out quedaban llamados "SMACK" y
+// los dos lanes se veían idénticos, aunque los conceptos fueran distintos.
+//
+// Tampoco sirve cortar en el último: hay descripciones con dos puntos adentro. Se corta en el
+// ÚLTIMO que todavía deje algo con forma de título — corto y de pocas palabras. Una descripción
+// nunca lo es, así que el punto de corte queda del lado correcto sin depender del contenido.
+const TITULO_MAX_CHARS    = 60
+const TITULO_MAX_PALABRAS = 6
+
+function partirTituloYDescripcion(texto) {
+  let corte = -1
+  for (let i = texto.indexOf(':'); i !== -1; i = texto.indexOf(':', i + 1)) {
+    const izq = texto.slice(0, i).trim()
+    if (izq.length > TITULO_MAX_CHARS) break
+    if (izq.split(/\s+/).length > TITULO_MAX_PALABRAS) break
+    corte = i
+  }
+  if (corte === -1) return [texto.trim(), '']
+  return [texto.slice(0, corte).trim(), texto.slice(corte + 1).trim()]
+}
+
 function parseSeeds(content) {
   if (!content) return []
   const seeds = []
   for (const line of content.split('\n')) {
-    const m = line.match(/^[-*]\s*(?:Variation\s+\d+:\s*)?([^:\n]+?)(?:\s*:\s*(.+?))?[\s]*$/)
-    const title = m?.[1]?.trim()
+    const m = line.match(/^[-*]\s*(?:Variation\s+\d+:\s*)?(.+)$/)
+    if (!m) continue
+    const [title, resto] = partirTituloYDescripcion(m[1])
     // Ignorar bullets de análisis con bold markers (**Hook:**, **Audience fit:** etc.)
-    if (!title || title.length <= 2 || title.startsWith('**') || title.startsWith('*')) continue
+    if (!title || title.length <= 2 || title.startsWith('*')) continue
     seeds.push({
       title,
-      one_liner: m[2]?.trim() || title,
+      one_liner: resto || title,
       rationale: '',
     })
   }

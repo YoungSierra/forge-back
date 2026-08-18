@@ -557,7 +557,95 @@ async function buildSystemPrompt(db, { projectId, nodeId, sessionId, userMessage
  * Ejecuta el ReAct loop: LLM + herramientas.
  * Devuelve { replyText, allToolCalls, docUrl, docFormat, meta }
  */
-async function runReActLoop({ finalSystemPrompt, baseUserMsg, executorStr, activeTools, resolvedInputs = [], visualRefs = [], projectId, nodeId, nodeName = '' }) {
+// Título de un ítem, normalizado para comparar entre nodos: el 1.4 reescribe el formato pero
+// conserva el nombre ("**SMACK: Drift**", "1. SMACK: Drift", "SMACK: Drift —" son el mismo).
+const tituloDeItem = s => String(s || '')
+  .replace(/^[\s\-*#>]+/, '')
+  .replace(/^\d+[.)]\s*/, '')
+  .replace(/\*+/g, '')
+  .split(/\s+[—–-]\s+|\n/)[0]
+  .split(':').slice(0, 2).join(':')
+  .toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()
+
+/**
+ * Imágenes para incrustar al pie de cada ítem del documento, en el orden en que salen.
+ *
+ * Primero las propias: un output con `image_gen` guarda una por ítem en `output_images`, por
+ * índice. Si no tiene —el caso del 1.4, que selecciona pero no genera— se buscan AGUAS ARRIBA,
+ * en los nodos que lo alimentan, y se emparejan POR TÍTULO.
+ *
+ * El título y no el índice porque un nodo de selección devuelve un subconjunto y puede
+ * reordenarlo: de cinco seeds, si sobreviven el 2º y el 5º, el índice 0 del documento sería el
+ * seed 1 del origen y le pondríamos la imagen de otro. Sin coincidencia de título no se pone
+ * nada — un ítem sin imagen es mejor que un ítem con la imagen equivocada.
+ */
+async function resolverImagenesDeItems({ db, projectId, nodeId, sessionId, outKey, contenido }) {
+  const parseItems = txt => require('./fan-out.service').parseItemsFromContent(txt || '')
+  const imagenes = []
+  if (!outKey) return imagenes
+
+  // 1) Propias
+  if (sessionId) {
+    const { data: sess } = await db().from('forge_sessions')
+      .select('output_images').eq('id', sessionId).maybeSingle()
+    const propios = parseItems(contenido)
+    for (const it of (sess?.output_images?.[outKey] || [])) {
+      const url = it?.variations?.length ? it.variations[it.variations.length - 1]?.url : it?.url
+      const src = propios[it?.index]
+      if (url) imagenes.push({ title: src?.title ?? src ?? '', url })
+    }
+    if (imagenes.length) return imagenes
+  }
+
+  // 2) Heredadas: se arma el índice título → imagen con lo que produjeron los nodos upstream.
+  const { data: pnode } = await db().from('forge_project_nodes')
+    .select('id').eq('project_id', projectId).eq('node_id', nodeId).eq('removed', false).maybeSingle()
+  if (!pnode) return imagenes
+
+  const { data: edges } = await db().from('forge_project_edges')
+    .select('source_node_id').eq('project_id', projectId).eq('target_node_id', pnode.id)
+  if (!edges?.length) return imagenes
+
+  const porTitulo = new Map()
+  for (const e of edges) {
+    const { data: src } = await db().from('forge_project_nodes')
+      .select('node_id').eq('id', e.source_node_id).maybeSingle()
+    if (!src) continue
+    const { data: sesiones } = await db().from('forge_sessions')
+      .select('output_key, output_images, output_asset_id')
+      .eq('project_id', projectId).eq('node_id', src.node_id)
+      .not('output_images', 'is', null)
+
+    for (const s of (sesiones || [])) {
+      for (const [k, items] of Object.entries(s.output_images || {})) {
+        // El texto de los ítems del origen, para saber a qué título corresponde cada índice.
+        const { data: asset } = await db().from('forge_assets')
+          .select('content').eq('project_id', projectId).eq('node_id', src.node_id)
+          .order('created_at', { ascending: false }).limit(1).maybeSingle()
+        const origen = asset?.content ? parseItems(asset.content) : []
+        for (const it of (items || [])) {
+          const url = it?.variations?.length ? it.variations[it.variations.length - 1]?.url : it?.url
+          const t   = tituloDeItem(origen[it?.index]?.title ?? origen[it?.index] ?? '')
+          if (url && t) porTitulo.set(t, url)
+        }
+        void k
+      }
+    }
+  }
+  if (!porTitulo.size) return imagenes
+
+  // Y ahora, en el orden de ESTE documento: solo los ítems que sobrevivieron.
+  // Solo los ítems que sobrevivieron en ESTE documento, en su orden.
+  for (const it of parseItems(contenido)) {
+    const t = tituloDeItem(it?.title ?? it)
+    const u = t ? porTitulo.get(t) : null
+    if (u) imagenes.push({ title: it?.title ?? it, url: u })
+  }
+  return imagenes
+}
+
+async function runReActLoop({ finalSystemPrompt, baseUserMsg, executorStr, activeTools, resolvedInputs = [], visualRefs = [], projectId, nodeId, nodeName = '', sessionId = null, targetOutput = null }) {
+  const { db } = require('./supabase.service')
   const { callLLM }                          = require('./llm.service')
   const { parseToolCalls, executeTool }      = require('./tools.service')
 
@@ -629,7 +717,18 @@ async function runReActLoop({ finalSystemPrompt, baseUserMsg, executorStr, activ
         ? (typeof targetOutput === 'object' ? (targetOutput.label || targetOutput.name || targetOutput.key || '') : String(targetOutput))
         : ''
       const docTitle = outLabel ? `${nodeName} · ${outLabel}` : nodeName
-      const docResult = await et('doc_gen_docx', { title: docTitle, content: replyText }, { project_id: projectId, node_id: nodeId })
+
+      // Imágenes para incrustar al pie de cada ítem del PDF, en el orden en que salen.
+      const outKey = typeof targetOutput === 'object' ? targetOutput?.key : null
+      const itemImages = await resolverImagenesDeItems({
+        db, projectId, nodeId, sessionId, outKey, contenido: replyText,
+      })
+
+      const docResult = await et(
+        'doc_gen_docx',
+        { title: docTitle, content: replyText, item_images: itemImages },
+        { project_id: projectId, node_id: nodeId },
+      )
       if (docResult.success && docResult.url) {
         docUrl    = docResult.url
         docFormat = docResult.format || 'pdf'
@@ -776,4 +875,5 @@ async function resolveAssemblyPools(db, { projectId, currentPNodeId, node, outpu
   return { inputs, siblings }
 }
 
-module.exports = { buildSystemPrompt, resolveNodeInputs, resolveAssemblyPools, runReActLoop, propagateStale, injectVars, injectSkillVars }
+module.exports = {
+  resolverImagenesDeItems, buildSystemPrompt, resolveNodeInputs, resolveAssemblyPools, runReActLoop, propagateStale, injectVars, injectSkillVars }

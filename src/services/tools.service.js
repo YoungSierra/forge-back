@@ -451,7 +451,10 @@ function drawPageHeader(doc, title) {
   doc.rect(60, 28, W - 120, 0.5).fill(PDF_LINE)
 }
 
-async function docGenDocx(title, content, projectId, nodeId) {
+// `itemImages` son las imágenes que el propio output generó, en el orden de sus ítems: la del
+// seed 1 en la posición 0, la del 2 en la 1. Se dibuja cada una al cerrar su ítem numerado, que
+// es donde el lector la espera. Sin ellas el PDF sale como siempre.
+async function docGenDocx(title, content, projectId, nodeId, itemImages = []) {
   const { jsonToMarkdown } = require('./json-display')
   // Si el output es JSON estructurado (ej. concept_data del 2.2), renderizarlo LEGIBLE (headings +
   // bullets) en vez de volcar el JSON crudo al PDF. Si no es JSON, se usa el contenido tal cual.
@@ -495,6 +498,27 @@ async function docGenDocx(title, content, projectId, nodeId) {
   const dashIdx  = title.indexOf(' — ')
   const docType  = dashIdx !== -1 ? title.slice(0, dashIdx)  : title
   const gameTitle = dashIdx !== -1 ? title.slice(dashIdx + 3) : ''
+
+  // Las imágenes se bajan ANTES de maquetar: pdfkit dibuja de forma síncrona dentro del
+  // callback y no se puede esperar una descarga ahí adentro sin desordenar las páginas.
+  // Cada imagen viene con el TÍTULO de su ítem, no solo con su posición: el ancla en el
+  // documento puede ser un encabezado ("### 1. SMACK: Drift") o una viñeta
+  // ("- **SMACK: Drift** — advances…") según qué nodo lo escriba, y la posición no coincide
+  // cuando un nodo de selección devuelve un subconjunto reordenado.
+  const { tituloDeItem } = require('../utils/item-title')
+  const porTitulo = new Map()
+  for (const it of (itemImages || [])) {
+    const url = typeof it === 'string' ? it : it?.url
+    if (!url) continue
+    try {
+      const r = await fetch(url)
+      if (!r.ok) continue
+      const buf = Buffer.from(await r.arrayBuffer())
+      const t   = tituloDeItem(typeof it === 'string' ? '' : it?.title)
+      if (t) porTitulo.set(t, buf)
+    } catch { /* una imagen que no baja no bloquea el documento */ }
+  }
+  if (itemImages?.length) console.log(`[doc_gen] ${porTitulo.size}/${itemImages.length} imagen(es) listas para incrustar`)
 
   const buffer = await pdfBuffer(doc => {
     const W         = doc.page.width
@@ -551,6 +575,55 @@ async function docGenDocx(title, content, projectId, nodeId) {
     drawPageHeader(doc, title)
     let y = 44
 
+    // La imagen que un ítem generó va JUSTO DEBAJO de su título.
+    //
+    // El primer intento fue ponerla al cierre del bloque, que es donde uno la espera al leer.
+    // No funciona con esta estructura: `gaps_for_downstream` no abre sección propia, así que
+    // vive dentro de `## concept_seeds` y "el final del último seed" cae después de la tabla de
+    // huecos — la imagen quedaba desubicada. Bajo el título el punto es inequívoco.
+    // Alto que ocupará la imagen de un ítem, o 0 si no tiene. Se consulta ANTES de escribir el
+    // título para poder saltar de página con él: si se salta después, el título queda solo al
+    // pie de una hoja y la imagen abre la siguiente, con media página en blanco en el medio.
+    // Se consume al usarla: el mismo título puede aparecer dos veces en un documento (el 1.4
+    // lo nombra al justificar y otra vez al listar) y la imagen va solo en la primera.
+    const buscarImagen = texto => {
+      const t = tituloDeItem(texto)
+      return t && porTitulo.has(t) ? { t, buf: porTitulo.get(t) } : null
+    }
+
+    function altoImagenDeItem(texto, x) {
+      const hit = buscarImagen(texto)
+      if (!hit) return 0
+      try {
+        const im = doc.openImage(hit.buf)
+        return im.height * ((CONTENT_W - (x - MARGIN)) / im.width)
+      } catch { return 0 }
+    }
+
+    function dibujarImagenDeItem(texto, x) {
+      const hit = buscarImagen(texto)
+      if (!hit) return
+      porTitulo.delete(hit.t)
+      const buf = hit.buf
+      // A todo el ancho de la caja de texto (475 pt en A4 con márgenes de 60). Es una imagen de
+      // concepto: chica no cumple ninguna función. Un cuadrado ocupa entonces 475 de alto, que
+      // no entra bajo el título — por eso el salto de página de abajo es la regla, no la
+      // excepción: la imagen abre página y se ve entera.
+      const ancho = CONTENT_W - (x - MARGIN)
+      let alto = 0
+      try { const im = doc.openImage(buf); alto = im.height * (ancho / im.width) } catch { return }
+      if (!(alto > 0)) return
+      // El espacio ya se reservó junto con el título; esto solo cubre el caso de una imagen
+      // dibujada fuera de ese camino (una lista numerada de verdad).
+      if (y + alto > doc.page.height - 60) checkPageBreak(alto + 40)
+      try {
+        doc.image(buf, x, y + 6, { width: ancho })
+        y += alto + 16
+      } catch (e) {
+        console.warn('[doc_gen] no se pudo incrustar la imagen de', hit.t, e.message)
+      }
+    }
+
     function checkPageBreak(needed = 80) {
       if (y > doc.page.height - needed) {
         doc.addPage({ margin: 0, size: 'A4' })
@@ -593,24 +666,32 @@ async function docGenDocx(title, content, projectId, nodeId) {
         } else if (block.type === 'heading') {
           // Heading dentro de una sección (###, ####, o # stray)
           const lvl      = block.level
+          // Un encabezado numerado abre un ítem ("### 1. SMACK: Drift"). Antes de escribirlo se
+          // cierra el anterior, que es donde va su imagen.
           const fontSize = lvl <= 1 ? 16 : lvl === 2 ? 13 : lvl === 3 ? 11 : 10
           const color    = lvl <= 1 ? PDF_TEXT : PDF_H3_CLR
-          checkPageBreak(fontSize + 20)
+          // El título arrastra a su imagen: se reserva el espacio de los dos juntos, para que
+          // no quede el encabezado solo al pie de una hoja y la imagen abriendo la siguiente.
+          checkPageBreak(fontSize + 20 + (altoImagenDeItem(block.text, MARGIN) ? altoImagenDeItem(block.text, MARGIN) + 26 : 0))
           doc.font('Helvetica-Bold').fontSize(fontSize).fillColor(color)
             .text(block.text, MARGIN, y, { width: CONTENT_W })
           y = doc.y + (lvl <= 2 ? 10 : 6)
+          dibujarImagenDeItem(block.text, MARGIN)
 
         } else if (block.type === 'bullet') {
           // Bullet cuadrado ember
           doc.rect(MARGIN + 2, y + 5, 4, 4).fill(PDF_EMBER)
           renderInline(doc, block.text, MARGIN + 14, y, { width: CONTENT_W - 14, lineGap: 3 }, 10, PDF_TEXT)
           y = doc.y + 5
+          dibujarImagenDeItem(block.text, MARGIN + 14)
 
         } else if (block.type === 'numbered') {
           doc.font('Helvetica-Bold').fontSize(10).fillColor(PDF_EMBER)
             .text(`${block.num}.`, MARGIN, y, { width: 16, lineBreak: false })
           renderInline(doc, block.text, MARGIN + 20, y, { width: CONTENT_W - 20, lineGap: 3 }, 10, PDF_TEXT)
           y = doc.y + 5
+
+          dibujarImagenDeItem(block.text, MARGIN + 20)
 
         } else if (block.type === 'code') {
           // Preformateado monospace — preserva saltos de línea y alineación (ASCII-art, snippets).
@@ -623,8 +704,13 @@ async function docGenDocx(title, content, projectId, nodeId) {
           y += 8
 
         } else if (block.type === 'paragraph') {
+          // Un párrafo también puede abrir un ítem: el 1.4 los nombra así —
+          // "**SMACK: Drift** — advances because…"— en vez de con encabezado o viñeta.
+          const altoImg = altoImagenDeItem(block.text, MARGIN)
+          if (altoImg) checkPageBreak(altoImg + 60)
           renderInline(doc, block.text, MARGIN, y, { width: CONTENT_W, lineGap: 3 }, 10, PDF_TEXT)
           y = doc.y + 5
+          dibujarImagenDeItem(block.text, MARGIN)
 
         } else if (block.type === 'table') {
           const { header, rows } = block
@@ -1776,7 +1862,7 @@ async function executeTool(name, args, context = {}) {
 
     case 'doc_gen_docx':
       if (!args.content) return { success: false, error: 'content is required' }
-      return docGenDocx(args.title || 'Document', args.content, context.project_id, context.node_id)
+      return docGenDocx(args.title || 'Document', args.content, context.project_id, context.node_id, args.item_images || [])
 
     case 'doc_gen_pptx':
       if (!args.content) return { success: false, error: 'content is required' }

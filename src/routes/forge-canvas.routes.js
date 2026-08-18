@@ -103,12 +103,13 @@ async function executeOneOutput({ project_id, node_id, targetOutputKey, member_i
 
   const userMessage = 'Generate the output for this step'
 
-  const { finalSystemPrompt, baseUserMsg, executorStr, activeTools, resolvedInputs, visualRefs, node } =
+  const { finalSystemPrompt, baseUserMsg, executorStr, activeTools, resolvedInputs, visualRefs, node, targetOutput } =
     await buildSystemPrompt(db, { projectId: project_id, nodeId: node_id, sessionId: session.id, userMessage, targetOutputKey })
 
   const { replyText, allToolCalls, docUrl, docFormat, meta } = await runReActLoop({
     finalSystemPrompt, baseUserMsg, executorStr, activeTools, resolvedInputs, visualRefs,
     projectId: project_id, nodeId: node_id, nodeName: node.title,
+    sessionId: session.id, targetOutput,
   })
 
   try { logExecution({
@@ -203,12 +204,13 @@ async function executeImageOutput({ project_id, node_id, targetOutputKey, member
 
   const userMessage = 'Generate the output for this step'
 
-  const { finalSystemPrompt, baseUserMsg, executorStr, activeTools, resolvedInputs, visualRefs, node } =
+  const { finalSystemPrompt, baseUserMsg, executorStr, activeTools, resolvedInputs, visualRefs, node, targetOutput } =
     await buildSystemPrompt(db, { projectId: project_id, nodeId: node_id, sessionId: session.id, userMessage, targetOutputKey })
 
   const { replyText, allToolCalls, meta } = await runReActLoop({
     finalSystemPrompt, baseUserMsg, executorStr, activeTools, resolvedInputs, visualRefs,
     projectId: project_id, nodeId: node_id, nodeName: node.title,
+    sessionId: session.id, targetOutput,
   })
 
   // Log del run LLM (no bloqueante)
@@ -420,7 +422,11 @@ router.get('/', async (req, res, next) => {
 
     // Sesiones por nodo: generales (output_key null) y por output específico
     const nodeIds = (projectNodes || []).filter(pn => pn.node_id).map(pn => pn.node_id)
-    let sessionsByNodeId = {}           // node_id → última sesión general
+    // Por INSTANCIA: es lo que separa un lane de otro cuando ambos corren el mismo nodo.
+    let sessionsByPNodeId       = {}    // project_node_id → última sesión general
+    let outputSessionsByPNodeId = {}    // project_node_id → { [output_key]: última sesión }
+    // Respaldo para lo anterior al fan-out, que no tiene project_node_id.
+    let sessionsByNodeId       = {}     // node_id → última sesión general
     let outputSessionsByNodeId = {}     // node_id → { [output_key]: última sesión }
     let sessionsWithAgentMsg = new Set()
 
@@ -430,7 +436,7 @@ router.get('/', async (req, res, next) => {
       {
         const { data, error } = await asUser
           .from('forge_sessions')
-          .select('id, node_id, output_key, status, iteration_count, started_at, completed_at, output_asset_id, output_images')
+          .select('id, node_id, project_node_id, output_key, status, iteration_count, started_at, completed_at, output_asset_id, output_images')
           .eq('project_id', project_id)
           .in('node_id', nodeIds)
           .order('created_at', { ascending: false })
@@ -439,7 +445,7 @@ router.get('/', async (req, res, next) => {
           // Columna output_key no existe aún — fallback sin ella
           const { data: data2, error: err2 } = await asUser
             .from('forge_sessions')
-            .select('id, node_id, status, iteration_count, started_at, completed_at, output_asset_id, output_images')
+            .select('id, node_id, project_node_id, status, iteration_count, started_at, completed_at, output_asset_id, output_images')
             .eq('project_id', project_id)
             .in('node_id', nodeIds)
             .order('created_at', { ascending: false })
@@ -450,24 +456,35 @@ router.get('/', async (req, res, next) => {
         }
       }
 
+      // Se indexa por INSTANCIA (project_node_id), no por nodo del catálogo. Con fan-out, los
+      // lanes instancian el mismo nodo: indexando por node_id los dos lanes recibían la MISMA
+      // sesión, así que el lane B mostraba la conversación y el output del lane A — se trabajaba
+      // un concepto creyendo estar en el otro. La sesión ya guardaba su project_node_id; lo que
+      // faltaba era usarlo al leer.
+      //
+      // Las sesiones anteriores al fan-out no tienen project_node_id: se guardan aparte, por
+      // node_id, y se usan como respaldo. Sin eso se perdería el historial de todo lo previo.
       for (const s of rawSessions) {
         if (s.output_images) s.output_images = migrateOutputImages(s.output_images)
+        const clave  = s.project_node_id || s.node_id
+        const destino = s.output_key
+          ? (s.project_node_id ? outputSessionsByPNodeId : outputSessionsByNodeId)
+          : (s.project_node_id ? sessionsByPNodeId       : sessionsByNodeId)
+
         if (s.output_key) {
-          // Sesión específica de un output — una por output_key por nodo
-          if (!outputSessionsByNodeId[s.node_id]) outputSessionsByNodeId[s.node_id] = {}
-          if (!outputSessionsByNodeId[s.node_id][s.output_key]) {
-            outputSessionsByNodeId[s.node_id][s.output_key] = s
-          }
-        } else {
-          // Sesión general del nodo
-          if (!sessionsByNodeId[s.node_id]) sessionsByNodeId[s.node_id] = s
+          if (!destino[clave]) destino[clave] = {}
+          if (!destino[clave][s.output_key]) destino[clave][s.output_key] = s
+        } else if (!destino[clave]) {
+          destino[clave] = s
         }
       }
     }
 
     // Todas las sesiones activas para detectar crash (sin asset, con mensajes de agente)
     const allSessions = [
+      ...Object.values(sessionsByPNodeId),
       ...Object.values(sessionsByNodeId),
+      ...Object.values(outputSessionsByPNodeId).flatMap(m => Object.values(m)),
       ...Object.values(outputSessionsByNodeId).flatMap(m => Object.values(m)),
     ]
 
@@ -503,12 +520,16 @@ router.get('/', async (req, res, next) => {
 
     const nodes = (projectNodes || []).map(pn => {
       const nodeType     = pn.node_type || 'forge_node'
-      const session      = nodeType === 'forge_node' ? (sessionsByNodeId[pn.node_id] || null) : null
+      const session      = nodeType === 'forge_node'
+        ? (sessionsByPNodeId[pn.id] || sessionsByNodeId[pn.node_id] || null)
+        : null
       const output_asset = session?.output_asset_id ? (outputAssetsMap[session.output_asset_id] ?? null) : null
       const has_content  = !!(output_asset || (session && sessionsWithAgentMsg.has(session.id)))
 
       // Construir mapa de sesiones por output_key
-      const outputSessMap = nodeType === 'forge_node' ? (outputSessionsByNodeId[pn.node_id] ?? {}) : {}
+      const outputSessMap = nodeType === 'forge_node'
+        ? (outputSessionsByPNodeId[pn.id] ?? outputSessionsByNodeId[pn.node_id] ?? {})
+        : {}
       const output_sessions = {}
       for (const [ok, os] of Object.entries(outputSessMap)) {
         const oa = os.output_asset_id ? (outputAssetsMap[os.output_asset_id] ?? null) : null
@@ -1363,7 +1384,7 @@ router.post('/nodes/:node_id/generate-pdf', async (req, res, next) => {
 router.get('/nodes/:node_id/session', async (req, res, next) => {
   try {
     const { id: project_id, node_id } = req.params
-    const { output_key = null } = req.query
+    const { output_key = null, project_node_id = null } = req.query
     const asUser = dbAsUser(req.auth.token)  // RLS: lecturas del nodo como el usuario
 
     let baseQuery = asUser
@@ -1373,6 +1394,12 @@ router.get('/nodes/:node_id/session', async (req, res, next) => {
       .eq('node_id', node_id)
       .order('created_at', { ascending: false })
       .limit(1)
+
+    // Con fan-out, cada lane instancia el MISMO nodo del catálogo: sin acotar por instancia, el
+    // lane B abría la sesión del lane A y se trabajaba un concepto creyendo estar en el otro.
+    // Solo se acota cuando el front manda la instancia; sin ella se conserva el comportamiento
+    // de siempre, que es lo que necesitan los proyectos anteriores al fan-out.
+    if (project_node_id) baseQuery = baseQuery.eq('project_node_id', project_node_id)
 
     // Filtrar por output_key si la columna existe; si falla, cae al más reciente
     let session = null
