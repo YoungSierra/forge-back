@@ -186,21 +186,112 @@ async function pendingImageOutputsForNode(project_id, node_id, isStale, node) {
 // Corre el ReAct del output (produce los prompts según su ADN, con siblings ya
 // disponibles si se corrió después de los outputs de texto), parsea N ítems y
 // genera 1 imagen por ítem. Persiste en forge_sessions.output_images Y forge_assets.
-async function executeImageOutput({ project_id, node_id, targetOutputKey, member_id }) {
+async function executeImageOutput({ project_id, node_id, targetOutputKey, member_id, project_node_id = null }) {
   const { buildSystemPrompt, runReActLoop } = require('../services/canvas-chat.service')
   const { logExecution } = require('../services/execution-log.service')
-  const { parseOutputItems, generateOneImage } = require('../services/image-gen.service')
+  const { parseOutputItems, generateOneImage, esDeck, generateDeck } = require('../services/image-gen.service')
 
   // Sesión enfocada en este output de imagen
   const { data: session, error: sessErr } = await db()
     .from('forge_sessions')
     .insert({
-      project_id, node_id, output_key: targetOutputKey, status: 'active',
+      project_id, node_id, output_key: targetOutputKey, status: 'active', project_node_id,
       iteration_count: 0, started_at: new Date().toISOString(), triggered_by: member_id || null,
     })
     .select('id')
     .single()
   if (sessErr) throw sessErr
+
+  // ── Rama DECK ──────────────────────────────────────────────────────────────
+  // Un deck no se enumera ni se pide de a una: sus páginas son nodos fijos del mismo grafo y
+  // van en un solo job. Se corta ANTES del LLM porque acá no hay nada que enumerar — el poblado
+  // sale de los documentos aprobados, no de una respuesta del modelo.
+  {
+    const { data: dna } = await db().from('forge_nodes').select('node_key,title,outputs').eq('id', node_id).single()
+    const def = (Array.isArray(dna?.outputs) ? dna.outputs : []).find(o => (o.key || o.name) === targetOutputKey)
+
+    if (await esDeck(def)) {
+      const r = await generateDeck({
+        db, project_id, node_id, session_id: session.id, node_key: dna.node_key,
+        output_key: targetOutputKey, image_gen_model: def.image_gen_model, member_id,
+      })
+
+      // El chat del nodo lleva el parte de lo que hizo el motor. No es una conversación
+      // simulada: es el reporte de la composición, que es justo lo que hay que poder auditar.
+      const parte = [
+        `Composed and dispatched **${r.paginas.length}/${r.esperadas}** pages in ${r.segundos}s (single job \`${r.jobId}\`).`,
+        '',
+        "Pages are populated from the project's approved documents by name, not written by a model —",
+        'the result can be audited page by page against the source.',
+        r.huecos.length
+          ? `\n**${r.huecos.length} page(s) with no source upstream** — rendered with the gap declared, never invented:\n` +
+            r.huecos.map(h => `- ${h.pagina}: ${h.falta.join(', ')}`).join('\n')
+          : '\nEvery page found its source.',
+        r.avisos.length ? `\n**Warnings:**\n${r.avisos.map(a => `- ${a}`).join('\n')}` : '',
+      ].filter(Boolean).join('\n')
+
+      await db().from('forge_messages').insert({ session_id: session.id, role: 'human', content: 'Generate the output for this step', order_index: 0, tool_calls: [] })
+      await db().from('forge_messages').insert({ session_id: session.id, role: 'agent',  content: parte, order_index: 1, tool_calls: [] })
+
+      // Una fila por página, para que el moodboard y los nodos de aguas abajo las encuentren.
+      const base = `${dna.title} — ${def.label || def.name || targetOutputKey}`
+      let primero = null
+      for (const p of r.paginas.sort((a, b) => a.index - b.index)) {
+        const { data: asset } = await db().from('forge_assets').insert({
+          node_id, project_id, session_id: session.id, name: `${base} ${p.name}`,
+          format: 'png', status: 'approved', storage_url: p.url,
+          approved_by: member_id || null, approved_at: new Date().toISOString(),
+        }).select('id').single()
+        if (!primero) primero = asset?.id || null
+      }
+
+      await db().from('forge_sessions').update({
+        status: r.paginas.length === r.esperadas ? 'auto_approved' : 'active',
+        output_asset_id: primero, completed_at: new Date().toISOString(), iteration_count: 1,
+      }).eq('id', session.id)
+
+      // ── El prompt set, escrito por quien de verdad lo produjo ────────────────
+      // La DNA lo declara como trabajo del LLM, pero son ~6.000 caracteres por página: un
+      // modelo no emite 34 de esos. Lo llena el compositor con los prompts que REALMENTE se
+      // despacharon, así el output sirve para lo único que importa — auditar qué se pidió.
+      // El hermano sale de la propia DNA (`uses.siblings_if_present`), no de una lista a mano.
+      for (const hermano of (def.uses?.siblings_if_present || [])) {
+        const hDef = dna.outputs.find(o => (o.key || o.name) === hermano)
+        if (!hDef || hDef.type !== 'connection') continue
+
+        const { data: yaHay } = await db().from('forge_sessions').select('id')
+          .eq('project_id', project_id).eq('node_id', node_id).eq('output_key', hermano)
+          .in('status', ['approved', 'auto_approved']).maybeSingle()
+        if (yaHay) continue
+
+        const cuerpo = [
+          `# ${hDef.label || hermano}`,
+          '',
+          `${r.prompts.length} prompts dispatched to \`${def.image_gen_model}\` in job \`${r.jobId}\`.`,
+          'Populated from the approved project documents by section name — not written by a model.',
+          '',
+          ...r.prompts.map(p => `## ${String(p.indice).padStart(2, '0')} · ${p.nombre}\n\n\`\`\`\n${p.prompt}\n\`\`\``),
+        ].join('\n')
+
+        const { data: hSes } = await db().from('forge_sessions').insert({
+          project_id, node_id, output_key: hermano, status: 'auto_approved', project_node_id,
+          iteration_count: 1, started_at: new Date().toISOString(), completed_at: new Date().toISOString(),
+          triggered_by: member_id || null,
+        }).select('id').single()
+
+        const { data: hAsset } = await db().from('forge_assets').insert({
+          node_id, project_id, session_id: hSes.id,
+          name: `${dna.title} — ${hDef.label || hermano}`,
+          format: 'markdown', status: 'approved', content: cuerpo,
+          approved_by: member_id || null, approved_at: new Date().toISOString(),
+        }).select('id').single()
+
+        await db().from('forge_sessions').update({ output_asset_id: hAsset?.id || null }).eq('id', hSes.id)
+      }
+
+      return { output_key: targetOutputKey, session_id: session.id, asset_id: primero, images: r.paginas.length }
+    }
+  }
 
   const userMessage = 'Generate the output for this step'
 
@@ -3627,14 +3718,39 @@ router.post('/nodes/:project_node_id/auto-run', async (req, res, next) => {
     const explicitKey = req.body.target_output_key || null
     const imageKeys   = new Set(imageOutputsOf(nodeDna || {}).map(o => o.key))
 
+    // `production: "deferred"` — el output se produce en otra etapa y NUNCA bloquea al nodo.
+    // El Art Bible es el caso: compone arte de producción aprobado, que en pre-producción no
+    // existe. Sin este filtro, un Run despacharía sus 18 páginas contra ComfyUI para nada.
+    // Un re-run explícito sí lo permite: si alguien lo pide por su clave, sabe lo que hace.
+    const diferidos = new Set(
+      (Array.isArray(nodeDna?.outputs) ? nodeDna.outputs : [])
+        .filter(o => o.production === 'deferred')
+        .map(o => o.key || o.name)
+    )
+
+    // El prompt set de un deck NO se le pide al LLM: lo escribe el compositor con los prompts
+    // que realmente se despacharon. Son ~6.000 caracteres por página; pedirle 34 a un modelo es
+    // quemar tokens para producir algo que nadie usa. Se resuelve en la corrida del deck.
+    const { esDeck } = require('../services/image-gen.service')
+    const porDeck = new Set()
+    for (const o of (Array.isArray(nodeDna?.outputs) ? nodeDna.outputs : [])) {
+      if (!(await esDeck(o))) continue
+      for (const h of (o.uses?.siblings_if_present || [])) {
+        const hDef = nodeDna.outputs.find(x => (x.key || x.name) === h)
+        if (hDef?.type === 'connection') porDeck.add(h)
+      }
+    }
+
     let textTargets, imageTargets
     if (explicitKey) {
       // Re-run manual de un output concreto: rutea según su tipo
       textTargets  = imageKeys.has(explicitKey) ? [] : [explicitKey]
       imageTargets = imageKeys.has(explicitKey) ? [explicitKey] : []
     } else {
-      textTargets  = await pendingOutputsForNode(project_id, node_id, pNode.is_stale, nodeDna || {})
-      imageTargets = await pendingImageOutputsForNode(project_id, node_id, pNode.is_stale, nodeDna || {})
+      textTargets  = (await pendingOutputsForNode(project_id, node_id, pNode.is_stale, nodeDna || {}))
+        .filter(k => !diferidos.has(k) && !porDeck.has(k))
+      imageTargets = (await pendingImageOutputsForNode(project_id, node_id, pNode.is_stale, nodeDna || {}))
+        .filter(k => !diferidos.has(k))
     }
 
     if (!textTargets.length && !imageTargets.length) {
@@ -3651,7 +3767,9 @@ router.post('/nodes/:project_node_id/auto-run', async (req, res, next) => {
     // 2) Outputs de imagen (post-pass) — ya con los siblings de texto disponibles
     const ranImages = []
     for (const key of imageTargets) {
-      ranImages.push(await executeImageOutput({ project_id, node_id, targetOutputKey: key, member_id }))
+      // La instancia va con la sesión: con fan-out el mismo nodo del catálogo vive en varios
+      // lanes, y sin esto el modal del lane B mostraría lo que produjo el lane A.
+      ranImages.push(await executeImageOutput({ project_id, node_id, targetOutputKey: key, member_id, project_node_id }))
     }
 
     // Limpiar is_stale del nodo y propagar stale a descendientes (una sola vez)

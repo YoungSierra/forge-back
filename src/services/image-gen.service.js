@@ -145,6 +145,19 @@ async function generateOneImage({
   return { url: result.url, provider, model: modelOrWf }
 }
 
+// ¿Este output es un DECK? Lo decide el workflow que declara la DNA, no una lista de node_keys:
+// si está registrado `per_page`, sus páginas van en un solo job. Devuelve false ante cualquier
+// duda —modelo mal formado, workflow sin registrar— para que el camino de siempre siga andando.
+async function esDeck(outDef) {
+  const modelo = outDef?.image_gen_model
+  if (!modelo || !String(modelo).startsWith('comfyui:')) return false
+  try {
+    const { getWorkflowByName } = require('./config.service')
+    const entry = await getWorkflowByName(String(modelo).slice('comfyui:'.length))
+    return entry?.inject_config?.mode === 'per_page'
+  } catch { return false }
+}
+
 // ─── Despacho de un DECK (workflows `per_page`) ───────────────────────────────
 // El modelo de arriba —un ítem, una llamada, una imagen— no sirve para los decks del 3.20: su
 // workflow no es "una imagen por invocación", son 34 páginas fijas dentro del MISMO grafo, cada
@@ -161,7 +174,7 @@ async function generateDeck({
   db, project_id, node_id, session_id, node_key, output_key,
   image_gen_model, deck, member_id, onPage,
 }) {
-  const { composeDeck } = require('./slide-composer.service')
+  const { composeDeck, DECKS } = require('./slide-composer.service')
   const { getWorkflowByName } = require('./config.service')
   const { uploadToStorage } = require('./storage.service')
 
@@ -170,6 +183,11 @@ async function generateDeck({
   const provider = image_gen_model.slice(0, colonIdx)
   const wfName   = image_gen_model.slice(colonIdx + 1)
   if (provider !== 'comfyui') throw new Error(`Un deck solo se despacha por comfyui, no por "${provider}"`)
+
+  // El deck se deduce del workflow que declara la DNA: quien llama no tiene por qué saber que
+  // `V57_STUDIO_ArtStyleGuide_Template` se llama 'asg' acá adentro.
+  deck = deck || Object.entries(DECKS).find(([, c]) => c.workflow === wfName)?.[0]
+  if (!deck) throw new Error(`No hay deck registrado para el workflow "${wfName}"`)
 
   const entry = await getWorkflowByName(wfName)
   if (!entry) throw new Error(`Workflow no registrado: "${wfName}"`)
@@ -261,7 +279,20 @@ async function generateDeck({
     })
   } catch (e) { console.error('[deck] logExec falló (no fatal):', e.message) }
 
-  return { jobId, paginas, esperadas: total, segundos: Math.round((Date.now() - t0) / 1000), avisos: armado.avisos }
+  // Los huecos viajan con el resultado: son lo que hay que ver ANTES de aprobar, no algo que se
+  // descubre tres semanas después mirando una página en blanco.
+  const huecos = armado.paginas
+    .filter(p => p.faltantes.length)
+    .map(p => ({ pagina: p.nombre, falta: p.faltantes }))
+
+  return {
+    jobId, paginas, esperadas: total, huecos,
+    // Lo que REALMENTE se le mandó a ComfyUI. Es el contenido del prompt set: el output existe
+    // para poder auditar qué se pidió, y hasta ahora se lo pedíamos a un modelo que no puede
+    // escribirlo. Se emite el que se usó.
+    prompts: armado.paginas.map(p => ({ indice: p.indice, nombre: p.nombre, prompt: p.prompt })),
+    segundos: Math.round((Date.now() - t0) / 1000), avisos: armado.avisos,
+  }
 }
 
-module.exports = { imageOutputsOf, parseOutputItems, cleanItemText, generateOneImage, generateDeck }
+module.exports = { imageOutputsOf, parseOutputItems, cleanItemText, generateOneImage, generateDeck, esDeck }
