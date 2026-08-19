@@ -316,6 +316,9 @@ router.get('/project-assets', async (req, res, next) => {
         version_number: v.version_number,
         is_current:     v.is_current,
         model_used:     v.metadata?.model_used ?? null,
+        // Aprobada es distinto de vigente: una version puede estar a la vista sin haber sido
+        // elegida. Vive en metadata para no migrar una columna.
+        approved_at:    v.metadata?.approved_at ?? null,
         created_at:     v.created_at,
       })),
     }))
