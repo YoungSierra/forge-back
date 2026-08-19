@@ -172,7 +172,7 @@ async function esDeck(outDef) {
 // Portado de `Moodboard/prueba_guia_completa.js`, que ya corrió 32/32 en 247 s.
 async function generateDeck({
   db, project_id, node_id, session_id, node_key, output_key,
-  image_gen_model, deck, member_id, onPage,
+  image_gen_model, deck, member_id, onPage, fills = null, solo = null, outDef = null,
 }) {
   const { composeDeck, DECKS } = require('./slide-composer.service')
   const { getWorkflowByName } = require('./config.service')
@@ -195,12 +195,45 @@ async function generateDeck({
     throw new Error(`El workflow "${wfName}" no está marcado per_page; no es un deck`)
   }
 
+  // ¿Qué páginas del workflow le tocan a este output? El ASG se parte en 31 de contenido + 3 de
+  // síntesis sobre el MISMO workflow, así que sin acotar cada output renderizaría las 34.
+  //
+  // Tiene que venir declarado en `outDef.pages`. NO se deduce: probamos las dos vías obvias y las
+  // dos fallan. Por número, porque el prompt de la síntesis dice «summarise the other 31» y ese
+  // 31 se cuela como si fuera una página. Por nombre, porque la pasada A no nombra sus slides
+  // —solo da rangos— y la B las llama distinto que el workflow («One-Page Style Summary» contra
+  // `26_OnePageSummary`). Adivinar acá cuesta renderizar 34 páginas cuando querías 3.
+  if (!solo && outDef?.image_count && outDef.image_count !== entry.inject_config.pages.length) {
+    throw new Error(
+      `El output "${output_key}" declara ${outDef.image_count} de las ${entry.inject_config.pages.length} ` +
+      `páginas del workflow, pero no dice CUÁLES. Hace falta el campo \`pages\` en la DNA del output.`)
+  }
+
   // 1. Poblar: se clona el grafo y se le escribe a cada página su prompt.
-  const armado = await composeDeck({ db, projectId: project_id, deck })
-  const wf = JSON.parse(JSON.stringify(entry.workflow_json))
+  const armado = await composeDeck({ db, projectId: project_id, deck, fills, solo })
+  let wf = JSON.parse(JSON.stringify(entry.workflow_json))
   for (const p of armado.paginas) {
     if (wf[p.prompt_node]?.inputs) wf[p.prompt_node].inputs.prompt = p.prompt
   }
+
+  // Con subconjunto hay que PODAR el grafo: si se manda entero, ComfyUI renderiza las 34 páginas
+  // aunque solo queramos 31. Se conservan los nodos alcanzables desde los SaveImage elegidos,
+  // caminando hacia atrás por los inputs — así sirve igual para el Art Bible, cuyas páginas
+  // cuelgan de un ImageBatch con dos LoadImage.
+  if (solo) {
+    const vivos = new Set()
+    const pendientes = armado.paginas.map(p => p.save_node)
+    while (pendientes.length) {
+      const id = pendientes.pop()
+      if (!id || vivos.has(id) || !wf[id]) continue
+      vivos.add(id)
+      for (const v of Object.values(wf[id].inputs || {})) {
+        if (Array.isArray(v) && typeof v[0] === 'string') pendientes.push(v[0])
+      }
+    }
+    wf = Object.fromEntries(Object.entries(wf).filter(([id]) => vivos.has(id)))
+  }
+
   const porSaveNode = Object.fromEntries(armado.paginas.map(p => [p.save_node, p]))
 
   const BASE = (process.env.COMFYUI_BASE_URL || '').replace(/\/$/, '')

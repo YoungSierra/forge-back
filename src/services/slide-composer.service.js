@@ -320,6 +320,63 @@ function resolverEtiqueta(etiqueta, mapa, assets, ambito = null) {
   return null
 }
 
+// ── FILLS (v2.9.7) ───────────────────────────────────────────────────────────
+// El diseño de Pedro, y es mejor que el nuestro. Nosotros copiábamos secciones enteras del ADD
+// en CADA slide: prompts de hasta 29.773 de un límite de 32.000, con la página 19 recortada a
+// mano. Él midió la causa real — el límite es de ENTRADA a ComfyUI, y el digest se pega en las 34
+// páginas, así que su tamaño se multiplica. Medido en el deck del GDD: 21 prompts, 44.240 chars,
+// promedio 2.106, y el 77% de dos prompts cualesquiera es idéntico. Lo variable son ~490 chars.
+//
+// Entonces el LLM escribe FILLS, nunca prompts: un digest de 1.200 chars una sola vez + una línea
+// de 250 por slide. El ensamblado es determinista — mismos fills, mismo prompt byte a byte.
+//
+// Lo elegante es que los fills son EXACTAMENTE los valores de los placeholders que ya parseamos.
+// Así que el mecanismo no cambia: cambia de dónde sale el valor. Por eso el compositor acepta las
+// dos fuentes y, sin fills, sigue comportándose como hasta hoy — que es lo que permite publicar
+// este código ANTES de tocar la DNA en la base.
+const LIMITE_DIGEST = 1200
+const LIMITE_LINEA  = 250
+
+// Los fills llegan como texto del LLM: las 4 líneas de identidad y una `This slide — X:` por
+// página. Se devuelven como mapa etiqueta → valor, con la misma normalización que usa el intake,
+// para que un guion largo o una mayúscula no rompan la correspondencia.
+function parsearFills(texto) {
+  const m = new Map()
+  // Las etiquetas que venian como `This slide - X` son de UNA pagina; el resto es el digest, que
+  // se repite en todas. La distincion importa para medir cada limite contra lo suyo.
+  m.propias = new Set()
+  if (!texto) return m
+  let etiqueta = null, buffer = []
+  const cerrar = () => {
+    if (!etiqueta) return
+    m.set(etiqueta, buffer.join('\n').trim())
+    buffer = []
+  }
+  for (const linea of String(texto).split('\n')) {
+    const mm = linea.match(/^\s*(?:[-*]\s*)?(?:\*\*)?([^:*\n]{2,80}?)(?:\*\*)?:\s*(.*)$/)
+    if (mm && !/^https?$/i.test(mm[1].trim())) {
+      cerrar()
+      const cruda = mm[1].trim()
+      etiqueta = cruda.replace(/^This slide\s*(?:image)?\s*[—–-]?\s*/i, '').trim()
+      if (/^This slide[\s—–-]/i.test(cruda + ' ')) m.propias.add(normalizar(etiqueta))
+      buffer = mm[2] ? [mm[2].trim()] : []
+    } else if (etiqueta && linea.trim()) {
+      buffer.push(linea.trim())
+    }
+  }
+  cerrar()
+  return m
+}
+
+// Busca en los fills tolerando diferencias de forma en la etiqueta.
+function fillDe(fills, etiqueta) {
+  if (!fills?.size) return null
+  if (fills.has(etiqueta)) return fills.get(etiqueta)
+  const buscado = normalizar(etiqueta)
+  for (const [k, v] of fills) if (normalizar(k) === buscado) return v
+  return null
+}
+
 /**
  * Compone las N páginas de un deck.
  *
@@ -327,9 +384,12 @@ function resolverEtiqueta(etiqueta, mapa, assets, ambito = null) {
  * @param {Function} o.db          cliente de supabase.service
  * @param {string}  o.projectId
  * @param {string}  o.deck         'asg' | 'gdd' | 'artbible'
+ * @param {string}  [o.fills]      texto del output `*_fills` (v2.9.7). Sin esto se extrae del
+ *                                 documento fuente, que es el comportamiento anterior.
+ * @param {number[]} [o.solo]      índices de página (1-based) a componer — para las dos pasadas
  * @returns {Promise<{deck, workflow, paginas, avisos}>}
  */
-async function composeDeck({ db, projectId, deck = 'asg' }) {
+async function composeDeck({ db, projectId, deck = 'asg', fills = null, solo = null }) {
   const cfg = DECKS[deck]
   if (!cfg) throw new Error(`deck desconocido: ${deck}`)
 
@@ -357,8 +417,25 @@ async function composeDeck({ db, projectId, deck = 'asg' }) {
   }
 
   const mapa = deck === 'gdd' ? MAPA_GDD : MAPA_ASG
+  const mapaFills = parsearFills(fills)
+
+  // Control de tamano de los fills: son un limite de la DNA, no una sugerencia. El digest se
+  // multiplica por cada pagina, asi que pasarse aca es lo que hace fallar el workflow entero.
+  if (mapaFills.size) {
+    const digest = [...mapaFills.entries()]
+      .filter(([k]) => !mapaFills.propias.has(normalizar(k)))
+      .reduce((n, [, v]) => n + v.length, 0)
+    if (digest > LIMITE_DIGEST) avisos.push(`el digest mide ${digest} chars y el límite es ${LIMITE_DIGEST}`)
+    for (const [k, v] of mapaFills) {
+      if (mapaFills.propias.has(normalizar(k)) && v.length > LIMITE_LINEA) {
+        avisos.push(`la línea de "${k}" mide ${v.length} chars y el límite es ${LIMITE_LINEA}`)
+      }
+    }
+  }
 
   const paginas = paginasCfg.map((p, i) => {
+    // Subconjunto: las dos pasadas del ASG comparten workflow (31 de contenido + 3 de sintesis)
+    if (solo && !solo.includes(i + 1)) return null
     const prompt = wf[p.prompt_node]?.inputs?.prompt || ''
     const intake = parsearIntake(prompt)
     const pag = {
@@ -380,7 +457,15 @@ async function composeDeck({ db, projectId, deck = 'asg' }) {
     // los consume en secuencia, así el template conserva su formato y las líneas con varios
     // campos (la 13, personajes) no se rompen.
     const valores = intake.campos.map(c => {
-      const r = resolverEtiqueta(c.etiqueta, mapa, assets, c.ambito)
+      // Los fills mandan cuando estan: son lo que el LLM escribio para ESTE deck. Sin ellos se
+      // extrae del documento, que es como venia funcionando antes de v2.9.7.
+      // La línea de una página puede venir rotulada con la etiqueta del intake («Color System»)
+      // o con el nombre del archivo («09_ColorSystem»). El LLM usa cualquiera de las dos, así que
+      // se aceptan ambas en vez de exigirle una forma que no controlamos.
+      const desdeFills = fillDe(mapaFills, c.etiqueta) ?? (c.propia ? fillDe(mapaFills, p.name) : null)
+      const r = desdeFills != null
+        ? { texto: desdeFills, via: 'fills' }
+        : resolverEtiqueta(c.etiqueta, mapa, assets, c.ambito)
       if (r?.noAplica) {
         // No es un gap del proyecto: nadie debe producirlo aguas arriba.
         pag.llenos.push({ etiqueta: c.etiqueta, via: 'no aplica' })
@@ -433,10 +518,37 @@ async function composeDeck({ db, projectId, deck = 'asg' }) {
     return pag
   })
 
-  return { deck, workflow: cfg.workflow, fuente: cfg.fuente, paginas, avisos }
+  // `solo` deja huecos en el arreglo (una pasada compone su subconjunto); se descartan acá para
+  // que quien consuma reciba solo páginas reales.
+  const vivas = paginas.filter(Boolean)
+
+  // Verificación de tamaño ANTES de despachar, que es lo que pide la DNA: el límite es de entrada
+  // a ComfyUI y una sola página excedida hace fallar el job entero.
+  for (const p of vivas) {
+    if (p.prompt.length > LIMITE) avisos.push(`página ${p.indice} ${p.nombre}: ${p.prompt.length} chars > ${LIMITE}`)
+  }
+
+  // La medición de los fills viaja con el resultado: es lo que hay que poder mirar antes de
+  // despachar, y lo mismo que va a mostrar el panel de revisión.
+  const medida = mapaFills.size ? (() => {
+    const propias = [...mapaFills.entries()].filter(([k]) => mapaFills.propias.has(normalizar(k)))
+    const digest  = [...mapaFills.entries()].filter(([k]) => !mapaFills.propias.has(normalizar(k)))
+    return {
+      digest_chars: digest.reduce((n, [, v]) => n + v.length, 0),
+      digest_limite: LIMITE_DIGEST,
+      lineas: propias.length,
+      linea_max: propias.reduce((n, [, v]) => Math.max(n, v.length), 0),
+      linea_limite: LIMITE_LINEA,
+    }
+  })() : null
+
+  return { deck, workflow: cfg.workflow, fuente: cfg.fuente, paginas: vivas, avisos, fills: medida }
 }
 
-module.exports = { composeDeck, parsearIntake, seccionPorNombre, DECKS, MAPA_ASG, MAPA_GDD }
+module.exports = {
+  composeDeck, parsearIntake, parsearFills, seccionPorNombre,
+  DECKS, MAPA_ASG, MAPA_GDD, LIMITE_DIGEST, LIMITE_LINEA, LIMITE,
+}
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
 if (require.main === module) {

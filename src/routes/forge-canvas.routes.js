@@ -186,6 +186,76 @@ async function pendingImageOutputsForNode(project_id, node_id, isStale, node) {
 // Corre el ReAct del output (produce los prompts según su ADN, con siblings ya
 // disponibles si se corrió después de los outputs de texto), parsea N ítems y
 // genera 1 imagen por ítem. Persiste en forge_sessions.output_images Y forge_assets.
+// ─── Output ENSAMBLADO (`assembly: true`) ─────────────────────────────────────
+// No llama al LLM: compone. Para el prompt set de un deck eso significa andamiaje del workflow
+// copiado tal cual + los fills que escribió el modelo. Mismos fills, mismo resultado byte a byte.
+//
+// De qué deck es lo dice la DNA: se busca el output de imagen que declara a ESTE como su hermano.
+// Así no hay una lista de claves a mano que se desincronice cuando cambien los nombres.
+async function executeAssemblyOutput({ project_id, node_id, targetOutputKey, member_id, project_node_id = null, nodeDna }) {
+  const { composeDeck, DECKS } = require('../services/slide-composer.service')
+
+  const outs = Array.isArray(nodeDna?.outputs) ? nodeDna.outputs : []
+  const def  = outs.find(o => (o.key || o.name) === targetOutputKey)
+  const img  = outs.find(o => o.image_gen && (o.uses?.siblings_if_present || []).includes(targetOutputKey))
+  if (!img?.image_gen_model) {
+    throw new Error(`"${targetOutputKey}" es assembly pero ningún output de imagen lo declara como hermano`)
+  }
+  const wfName = String(img.image_gen_model).replace(/^comfyui:/, '')
+  const deck   = Object.entries(DECKS).find(([, c]) => c.workflow === wfName)?.[0]
+  if (!deck) throw new Error(`No hay deck registrado para el workflow "${wfName}"`)
+
+  // Los fills, que son la única entrada variable
+  let fills = null
+  for (const h of (def.uses?.siblings_if_present || [])) {
+    const { data: hs } = await db().from('forge_sessions').select('output_asset_id')
+      .eq('project_id', project_id).eq('node_id', node_id).eq('output_key', h)
+      .in('status', ['approved', 'auto_approved']).order('completed_at', { ascending: false })
+      .limit(1).maybeSingle()
+    if (!hs?.output_asset_id) continue
+    const { data: a } = await db().from('forge_assets').select('content').eq('id', hs.output_asset_id).single()
+    if (a?.content) { fills = a.content; break }
+  }
+
+  const r = await composeDeck({ db, projectId: project_id, deck, fills })
+
+  const cuerpo = [
+    `# ${def.label || targetOutputKey}`,
+    '',
+    `${r.paginas.length} prompts listos para despacho · workflow \`${wfName}\`.`,
+    fills
+      ? 'Andamiaje copiado del workflow + los fills del modelo. Ensamblado, no generado: los mismos fills producen el mismo resultado.'
+      : '⚠ Sin fills: los valores se extrajeron del documento aprobado (comportamiento previo a v2.9.7).',
+    r.fills ? `\nFills: digest ${r.fills.digest_chars}/${r.fills.digest_limite} chars · línea más larga ${r.fills.linea_max}/${r.fills.linea_limite}.` : '',
+    r.avisos.length ? `\n**Avisos:**\n${r.avisos.map(a => `- ${a}`).join('\n')}` : '',
+    '',
+    ...r.paginas.map(p => `## ${String(p.indice).padStart(2, '0')} · ${p.nombre}\n\n\`\`\`\n${p.prompt}\n\`\`\``),
+  ].filter(Boolean).join('\n')
+
+  const { data: ses } = await db().from('forge_sessions').insert({
+    project_id, node_id, output_key: targetOutputKey, status: 'auto_approved', project_node_id,
+    iteration_count: 1, started_at: new Date().toISOString(), completed_at: new Date().toISOString(),
+    triggered_by: member_id || null,
+  }).select('id').single()
+
+  await db().from('forge_messages').insert({ session_id: ses.id, role: 'human', content: 'Assemble this output', order_index: 0, tool_calls: [] })
+  await db().from('forge_messages').insert({
+    session_id: ses.id, role: 'agent', order_index: 1, tool_calls: [],
+    content: `Assembled **${r.paginas.length}** prompts for \`${wfName}\`, largest ${Math.max(...r.paginas.map(p => p.prompt.length))} chars.` +
+             (r.avisos.length ? `\n\n**Warnings:**\n${r.avisos.map(a => `- ${a}`).join('\n')}` : ''),
+  })
+
+  const { data: asset } = await db().from('forge_assets').insert({
+    node_id, project_id, session_id: ses.id,
+    name: `${nodeDna.title} — ${def.label || targetOutputKey}`,
+    format: 'markdown', status: 'approved', content: cuerpo,
+    approved_by: member_id || null, approved_at: new Date().toISOString(),
+  }).select('id').single()
+
+  await db().from('forge_sessions').update({ output_asset_id: asset?.id || null }).eq('id', ses.id)
+  return { output_key: targetOutputKey, session_id: ses.id, asset_id: asset?.id || null, assembled: r.paginas.length }
+}
+
 async function executeImageOutput({ project_id, node_id, targetOutputKey, member_id, project_node_id = null }) {
   const { buildSystemPrompt, runReActLoop } = require('../services/canvas-chat.service')
   const { logExecution } = require('../services/execution-log.service')
@@ -211,9 +281,27 @@ async function executeImageOutput({ project_id, node_id, targetOutputKey, member
     const def = (Array.isArray(dna?.outputs) ? dna.outputs : []).find(o => (o.key || o.name) === targetOutputKey)
 
     if (await esDeck(def)) {
+      // Los fills (v2.9.7) los escribe el LLM en el output hermano. Si están, mandan; si no, el
+      // compositor extrae del documento como venía haciendo. Eso permite que este código conviva
+      // con la DNA vieja y con la nueva sin bifurcar el motor.
+      let fills = null
+      for (const h of (def.uses?.siblings_if_present || [])) {
+        if (!/_fills$/.test(h)) continue
+        const { data: hs } = await db().from('forge_sessions').select('output_asset_id')
+          .eq('project_id', project_id).eq('node_id', node_id).eq('output_key', h)
+          .in('status', ['approved', 'auto_approved']).order('completed_at', { ascending: false })
+          .limit(1).maybeSingle()
+        if (!hs?.output_asset_id) continue
+        const { data: a } = await db().from('forge_assets').select('content').eq('id', hs.output_asset_id).single()
+        if (a?.content) { fills = a.content; break }
+      }
+
+      // Qué páginas le tocan a este output lo resuelve `generateDeck`, que es quien conoce el
+      // workflow. Acá solo se le entrega la definición de la DNA.
       const r = await generateDeck({
         db, project_id, node_id, session_id: session.id, node_key: dna.node_key,
         output_key: targetOutputKey, image_gen_model: def.image_gen_model, member_id,
+        fills, outDef: def, solo: Array.isArray(def.pages) && def.pages.length ? def.pages : null,
       })
 
       // El chat del nodo lleva el parte de lo que hizo el motor. No es una conversación
@@ -3706,7 +3794,7 @@ router.post('/nodes/:project_node_id/auto-run', async (req, res, next) => {
     // DNA del nodo — para calcular qué outputs faltan
     const { data: nodeDna } = await db()
       .from('forge_nodes')
-      .select('id, outputs')
+      .select('id, title, outputs')
       .eq('id', node_id)
       .single()
 
@@ -3758,10 +3846,15 @@ router.post('/nodes/:project_node_id/auto-run', async (req, res, next) => {
       return res.json({ success: true, ran: [], skipped: true, message: 'No pending outputs — node already satisfied' })
     }
 
-    // 1) Outputs de texto (secuencial) — sesiones per-output auto-aprobadas
+    // 1) Outputs de texto (secuencial) — sesiones per-output auto-aprobadas.
+    //    Un output `assembly: true` NO pasa por el LLM: se ensambla. Re-generar lo que ya está
+    //    escrito es justamente el fallo que la DNA llama "regeneration failure".
     const ran = []
     for (const key of textTargets) {
-      ran.push(await executeOneOutput({ project_id, node_id, targetOutputKey: key, member_id }))
+      const d = (Array.isArray(nodeDna?.outputs) ? nodeDna.outputs : []).find(o => (o.key || o.name) === key)
+      ran.push(d?.assembly === true
+        ? await executeAssemblyOutput({ project_id, node_id, targetOutputKey: key, member_id, project_node_id, nodeDna })
+        : await executeOneOutput({ project_id, node_id, targetOutputKey: key, member_id }))
     }
 
     // 2) Outputs de imagen (post-pass) — ya con los siblings de texto disponibles
