@@ -186,6 +186,39 @@ async function pendingImageOutputsForNode(project_id, node_id, isStale, node) {
 // Corre el ReAct del output (produce los prompts según su ADN, con siblings ya
 // disponibles si se corrió después de los outputs de texto), parsea N ítems y
 // genera 1 imagen por ítem. Persiste en forge_sessions.output_images Y forge_assets.
+// El cuerpo de un prompt set ensamblado. Una sola función porque se emite desde dos caminos —el
+// chat y el Run— y se veían distintos.
+//
+// En inglés como el resto de lo que lee el usuario, y los avisos RESUMIDOS: cuando el modelo se
+// pasa del presupuesto en 16 de 34 líneas, dieciséis viñetas empujan el contenido fuera de la
+// pantalla y tapan justo lo que uno viene a mirar. El detalle va al final, plegado.
+function cuerpoDeck(titulo, wfName, fills, r) {
+  const excedidas = (r.avisos || []).filter(a => /^line "/.test(a)).length
+  const otros     = (r.avisos || []).filter(a => !/^line "/.test(a))
+  return [
+    `# ${titulo}`,
+    '',
+    `**${r.paginas.length} prompts** ready to dispatch · workflow \`${wfName}\``,
+    fills
+      ? 'Workflow scaffold copied verbatim + the model\'s fills. Assembly, not generation: the same fills produce the same result.'
+      : '⚠ No fills yet — values were extracted from the approved document.',
+    r.fills
+      ? `\nFills: digest ${r.fills.digest_chars}/${r.fills.digest_limite} chars · longest line ${r.fills.linea_max}/${r.fills.linea_limite}`
+      : '',
+    excedidas
+      ? `\n⚠ ${excedidas} of ${r.paginas.length} slide lines exceed the ${r.fills?.linea_limite ?? 250}-character budget. ` +
+        'Prompts still fit the workflow limit, but the DNA sets that budget for a reason — the digest multiplies across every slide.'
+      : '',
+    otros.length ? `\n${otros.map(a => `⚠ ${a}`).join('\n')}` : '',
+    '',
+    ...r.paginas.map(p => `## ${String(p.indice).padStart(2, '0')} · ${p.nombre}\n\n\`\`\`\n${p.prompt}\n\`\`\``),
+    excedidas
+      ? `\n---\n\n<details><summary>Lines over budget (${excedidas})</summary>\n\n` +
+        (r.avisos || []).filter(a => /^line "/.test(a)).map(a => `- ${a}`).join('\n') + '\n\n</details>'
+      : '',
+  ].filter(Boolean).join('\n')
+}
+
 // ─── Output ENSAMBLADO (`assembly: true`) ─────────────────────────────────────
 // No llama al LLM: compone. Para el prompt set de un deck eso significa andamiaje del workflow
 // copiado tal cual + los fills que escribió el modelo. Mismos fills, mismo resultado byte a byte.
@@ -219,18 +252,7 @@ async function executeAssemblyOutput({ project_id, node_id, targetOutputKey, mem
 
   const r = await composeDeck({ db, projectId: project_id, deck, fills })
 
-  const cuerpo = [
-    `# ${def.label || targetOutputKey}`,
-    '',
-    `${r.paginas.length} prompts listos para despacho · workflow \`${wfName}\`.`,
-    fills
-      ? 'Andamiaje copiado del workflow + los fills del modelo. Ensamblado, no generado: los mismos fills producen el mismo resultado.'
-      : '⚠ Sin fills: los valores se extrajeron del documento aprobado (comportamiento previo a v2.9.7).',
-    r.fills ? `\nFills: digest ${r.fills.digest_chars}/${r.fills.digest_limite} chars · línea más larga ${r.fills.linea_max}/${r.fills.linea_limite}.` : '',
-    r.avisos.length ? `\n**Avisos:**\n${r.avisos.map(a => `- ${a}`).join('\n')}` : '',
-    '',
-    ...r.paginas.map(p => `## ${String(p.indice).padStart(2, '0')} · ${p.nombre}\n\n\`\`\`\n${p.prompt}\n\`\`\``),
-  ].filter(Boolean).join('\n')
+  const cuerpo = cuerpoDeck(def.label || targetOutputKey, wfName, fills, r)
 
   const { data: ses } = await db().from('forge_sessions').insert({
     project_id, node_id, output_key: targetOutputKey, status: 'auto_approved', project_node_id,
@@ -2394,17 +2416,7 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
       console.log(`  fills:        ${fills ? 'sí' : 'no — extraído del documento'}`)
       console.log('─────────────────────────────────────────────────────\n')
 
-      replyText = [
-        `# ${targetOutput.label || asmKey}`,
-        '',
-        `${r.paginas.length} prompts listos para despacho · workflow \`${wfName}\`.`,
-        fills
-          ? 'Andamiaje copiado del workflow + los fills del modelo. Ensamblado, no generado.'
-          : '⚠ Sin fills todavía: los valores se extrajeron del documento aprobado.',
-        r.avisos.length ? `\n**Avisos:**\n${r.avisos.map(a => `- ${a}`).join('\n')}` : '',
-        '',
-        ...r.paginas.map(p => `## ${String(p.indice).padStart(2, '0')} · ${p.nombre}\n\n\`\`\`\n${p.prompt}\n\`\`\``),
-      ].filter(Boolean).join('\n')
+      replyText = cuerpoDeck(targetOutput.label || asmKey, wfName, fills, r)
       meta = { provider: 'assembler', model: `deck:${wfName}`, tokens_used: null, duration_ms: 0 }
 
     } else if (targetOutput?.assembly === true) {

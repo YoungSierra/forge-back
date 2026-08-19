@@ -413,7 +413,7 @@ async function composeDeck({ db, projectId, deck = 'asg', fills = null, solo = n
     const { data } = await db().from('forge_assets').select('name,content')
       .eq('project_id', projectId).eq('node_id', n.id).in('status', ['approved', 'auto_approved'])
     assets = data || []
-    if (!assets.length) avisos.push(`el nodo ${cfg.fuente} no tiene assets aprobados en este proyecto`)
+    if (!assets.length) avisos.push(`node ${cfg.fuente} has no approved assets in this project`)
   }
 
   const mapa = deck === 'gdd' ? MAPA_GDD : MAPA_ASG
@@ -425,10 +425,10 @@ async function composeDeck({ db, projectId, deck = 'asg', fills = null, solo = n
     const digest = [...mapaFills.entries()]
       .filter(([k]) => !mapaFills.propias.has(normalizar(k)))
       .reduce((n, [, v]) => n + v.length, 0)
-    if (digest > LIMITE_DIGEST) avisos.push(`el digest mide ${digest} chars y el límite es ${LIMITE_DIGEST}`)
+    if (digest > LIMITE_DIGEST) avisos.push(`the digest is ${digest} chars, over the ${LIMITE_DIGEST} limit`)
     for (const [k, v] of mapaFills) {
       if (mapaFills.propias.has(normalizar(k)) && v.length > LIMITE_LINEA) {
-        avisos.push(`la línea de "${k}" mide ${v.length} chars y el límite es ${LIMITE_LINEA}`)
+        avisos.push(`line "${k}" is ${v.length} chars, over the ${LIMITE_LINEA} limit`)
       }
     }
   }
@@ -525,7 +525,7 @@ async function composeDeck({ db, projectId, deck = 'asg', fills = null, solo = n
   // Verificación de tamaño ANTES de despachar, que es lo que pide la DNA: el límite es de entrada
   // a ComfyUI y una sola página excedida hace fallar el job entero.
   for (const p of vivas) {
-    if (p.prompt.length > LIMITE) avisos.push(`página ${p.indice} ${p.nombre}: ${p.prompt.length} chars > ${LIMITE}`)
+    if (p.prompt.length > LIMITE) avisos.push(`page ${p.indice} ${p.nombre}: ${p.prompt.length} chars > ${LIMITE}`)
   }
 
   // La medición de los fills viaja con el resultado: es lo que hay que poder mirar antes de
