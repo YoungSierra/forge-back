@@ -271,7 +271,10 @@ async function generateDeck({
           const ir = await fetch(url, { headers: KEY ? { Authorization: `Bearer ${KEY}` } : {}, redirect: 'follow' })
           if (!ir.ok) continue
           const buf  = Buffer.from(await ir.arrayBuffer())
-          const dest = `projects/${project_id}/deck/${node_key}/${output_key}/${pag?.nombre || f.filename}.png`
+          // La ruta lleva el job: sin eso cada render pisa al anterior en R2 y el versionado es
+          // mentira — las dos versiones terminan apuntando al mismo archivo y la imagen vieja se
+          // pierde. Costó perder el primer render de la página 09 descubrirlo.
+          const dest = `projects/${project_id}/deck/${node_key}/${output_key}/${pag?.nombre || f.filename}-${jobId.slice(0, 8)}.png`
           const url2 = await uploadToStorage(buf, dest, 'image/png')
           const item = { index: (pag?.indice ?? paginas.length + 1) - 1, name: pag?.nombre || f.filename, url: url2 }
           paginas.push(item)

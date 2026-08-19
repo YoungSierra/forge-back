@@ -3936,4 +3936,129 @@ router.delete('/lanes/:lane_id', async (req, res, next) => {
   } catch (err) { next(err) }
 })
 
+// ─── Iteración de UNA página de un deck ───────────────────────────────────────
+// Vuelve a renderizar una sola página y la guarda como VERSIÓN NUEVA del mismo asset. No pisa
+// nada: la anterior queda y se puede volver a ella.
+//
+// Medido: una página tarda 33–36 s. Las 34 juntas tardan 220 s porque se renderizan en paralelo,
+// así que una sola no se beneficia de eso — la llamada espera y devuelve la imagen.
+//
+// No hace falta variar la semilla: probado con el mismo payload dos veces, ComfyUI devolvió
+// imágenes distintas. No hay caché por semilla y el modelo no es determinista con ella.
+async function versionActual(asset_id) {
+  const { data } = await db().from('forge_asset_versions')
+    .select('id, version_number').eq('asset_id', asset_id)
+    .order('version_number', { ascending: false }).limit(1).maybeSingle()
+  return data?.version_number || 0
+}
+
+router.post('/assets/:asset_id/iterate', async (req, res, next) => {
+  try {
+    const { id: project_id, asset_id } = req.params
+    const member_id = req.body?.member_id || null
+
+    const { data: asset } = await db().from('forge_assets')
+      .select('id, node_id, project_id, session_id, name, storage_url, format')
+      .eq('id', asset_id).eq('project_id', project_id).single()
+    if (!asset) return res.status(404).json({ success: false, error: 'Asset not found' })
+
+    const { data: ses } = await db().from('forge_sessions')
+      .select('output_key, project_node_id').eq('id', asset.session_id).maybeSingle()
+    const { data: dna } = await db().from('forge_nodes')
+      .select('node_key, title, outputs').eq('id', asset.node_id).single()
+    const def = (Array.isArray(dna?.outputs) ? dna.outputs : [])
+      .find(o => (o.key || o.name) === ses?.output_key)
+    if (!def?.image_gen_model) {
+      return res.status(400).json({ success: false, error: 'This asset does not come from an image output' })
+    }
+
+    const { esDeck, generateDeck } = require('../services/image-gen.service')
+    if (!await esDeck(def)) {
+      return res.status(400).json({ success: false, error: 'Only deck pages can be iterated page by page' })
+    }
+
+    // Qué página es: el nombre del asset termina con el de la página («… — 09_ColorSystem»).
+    const { composeDeck, DECKS } = require('../services/slide-composer.service')
+    const wfName = String(def.image_gen_model).replace(/^comfyui:/, '')
+    const deck = Object.entries(DECKS).find(([, c]) => c.workflow === wfName)?.[0]
+    const todas = await composeDeck({ db, projectId: project_id, deck })
+    const sufijo = String(asset.name).split('—').pop().trim()
+    const pag = todas.paginas.find(p => p.nombre === sufijo)
+    if (!pag) {
+      return res.status(400).json({ success: false, error: `No page named "${sufijo}" in ${wfName}` })
+    }
+
+    // Sin `session_id`: generateDeck escribiría output_images con SOLO esta página y borraría
+    // las otras 33 del listado. La persistencia de una iteración es la versión, no la sesión.
+    const r = await generateDeck({
+      db, project_id, node_id: asset.node_id, session_id: null,
+      node_key: dna.node_key, output_key: ses.output_key,
+      image_gen_model: def.image_gen_model, member_id, solo: [pag.indice],
+    })
+    const nueva = r.paginas[0]
+    if (!nueva) return res.status(502).json({ success: false, error: 'The workflow returned no image' })
+
+    // La v1 es lo que había ANTES. Si no existe se crea ahora, porque si no el historial arranca
+    // en la 2 y no hay a dónde volver.
+    let ultima = await versionActual(asset_id)
+    if (ultima === 0 && asset.storage_url) {
+      await db().from('forge_asset_versions').insert({
+        asset_id, storage_url: asset.storage_url, version_number: 1, is_current: false,
+        metadata: { origen: 'render inicial del deck' },
+      })
+      ultima = 1
+    }
+
+    await db().from('forge_asset_versions').update({ is_current: false }).eq('asset_id', asset_id)
+    const { data: ver, error: vErr } = await db().from('forge_asset_versions').insert({
+      asset_id, storage_url: nueva.url, version_number: ultima + 1, is_current: true,
+      created_by: member_id,
+      metadata: { job: r.jobId, pagina: pag.indice, nombre: pag.nombre, workflow: wfName, segundos: r.segundos },
+    }).select('id, version_number').single()
+    if (vErr) throw vErr
+
+    // La vigente es la que ve la galería y la que consumen los nodos de aguas abajo.
+    await db().from('forge_assets').update({ storage_url: nueva.url }).eq('id', asset_id)
+
+    res.json({
+      success: true,
+      version: { id: ver.id, version_number: ver.version_number, storage_url: nueva.url },
+      pagina: { indice: pag.indice, nombre: pag.nombre },
+      job: r.jobId, segundos: r.segundos,
+    })
+  } catch (err) { next(err) }
+})
+
+// ─── Elegir qué versión queda ─────────────────────────────────────────────────
+// Aprobar es del usuario y es distinto de «vigente»: una versión puede estar a la vista sin
+// haber sido aprobada, que es justo como queda apenas termina una iteración.
+router.post('/assets/:asset_id/versions/:version_id/approve', async (req, res, next) => {
+  try {
+    const { id: project_id, asset_id, version_id } = req.params
+    const member_id = req.body?.member_id || null
+
+    const { data: asset } = await db().from('forge_assets')
+      .select('id').eq('id', asset_id).eq('project_id', project_id).single()
+    if (!asset) return res.status(404).json({ success: false, error: 'Asset not found' })
+
+    const { data: ver } = await db().from('forge_asset_versions')
+      .select('id, storage_url, version_number, metadata').eq('id', version_id).eq('asset_id', asset_id).single()
+    if (!ver) return res.status(404).json({ success: false, error: 'Version not found' })
+
+    await db().from('forge_asset_versions').update({ is_current: false }).eq('asset_id', asset_id)
+    await db().from('forge_asset_versions').update({
+      is_current: true,
+      // La aprobación va en metadata y no en una columna nueva: no hace falta migrar, y el
+      // `status` del asset se usa en otros lados donde esto no significa lo mismo.
+      metadata: { ...(ver.metadata || {}), approved_at: new Date().toISOString(), approved_by: member_id },
+    }).eq('id', version_id)
+
+    await db().from('forge_assets').update({
+      storage_url: ver.storage_url, approved_by: member_id, approved_at: new Date().toISOString(),
+    }).eq('id', asset_id)
+
+    res.json({ success: true, version_number: ver.version_number, storage_url: ver.storage_url })
+  } catch (err) { next(err) }
+})
+
 module.exports = router
