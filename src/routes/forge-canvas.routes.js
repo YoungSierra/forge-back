@@ -3966,10 +3966,23 @@ router.post('/assets/:asset_id/iterate', async (req, res, next) => {
       .select('output_key, project_node_id').eq('id', asset.session_id).maybeSingle()
     const { data: dna } = await db().from('forge_nodes')
       .select('node_key, title, outputs').eq('id', asset.node_id).single()
-    const def = (Array.isArray(dna?.outputs) ? dna.outputs : [])
-      .find(o => (o.key || o.name) === ses?.output_key)
+    const outs = Array.isArray(dna?.outputs) ? dna.outputs : []
+
+    // La página que es este asset: su nombre termina con el de la página («… — 09_ColorSystem»).
+    const sufijo = String(asset.name).split('—').pop().trim()
+
+    // Primero por la clave de la sesión. Si no aparece, se resuelve por NOMBRE DE PÁGINA: los
+    // outputs se renombran —v2.9.7 partió `art_style_guide_images` en contenido y síntesis— y los
+    // assets ya generados conservan la clave vieja. El nombre de la página no cambia.
+    let def = outs.find(o => (o.key || o.name) === ses?.output_key)
     if (!def?.image_gen_model) {
-      return res.status(400).json({ success: false, error: 'This asset does not come from an image output' })
+      def = outs.find(o => o.image_gen && (o.page_prefixes || []).includes(sufijo))
+    }
+    if (!def?.image_gen_model) {
+      return res.status(400).json({
+        success: false,
+        error: `This asset does not come from an image output (session key "${ses?.output_key}", page "${sufijo}")`,
+      })
     }
 
     const { esDeck, generateDeck } = require('../services/image-gen.service')
@@ -3977,12 +3990,10 @@ router.post('/assets/:asset_id/iterate', async (req, res, next) => {
       return res.status(400).json({ success: false, error: 'Only deck pages can be iterated page by page' })
     }
 
-    // Qué página es: el nombre del asset termina con el de la página («… — 09_ColorSystem»).
     const { composeDeck, DECKS } = require('../services/slide-composer.service')
     const wfName = String(def.image_gen_model).replace(/^comfyui:/, '')
     const deck = Object.entries(DECKS).find(([, c]) => c.workflow === wfName)?.[0]
     const todas = await composeDeck({ db, projectId: project_id, deck })
-    const sufijo = String(asset.name).split('—').pop().trim()
     const pag = todas.paginas.find(p => p.nombre === sufijo)
     if (!pag) {
       return res.status(400).json({ success: false, error: `No page named "${sufijo}" in ${wfName}` })
