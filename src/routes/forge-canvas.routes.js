@@ -298,12 +298,24 @@ async function executeImageOutput({ project_id, node_id, targetOutputKey, member
 
       // Qué páginas le tocan a este output lo resuelve `generateDeck`, que es quien conoce el
       // workflow. Acá solo se le entrega la definición de la DNA.
-      const r = await generateDeck({
+      //
+      // ── EN SEGUNDO PLANO ────────────────────────────────────────────────────
+      // Un deck tarda ~4 minutos y el navegador no sostiene una petición así: la suelta con
+      // «Failed to fetch» mientras el servidor sigue renderizando. El usuario no ve nada, vuelve
+      // a apretar, y salen tres despachos en paralelo — pasó, y costó crédito.
+      //
+      // Se despacha sin esperar y se responde enseguida con la sesión. El avance ya es visible:
+      // `output_images` se llena página por página, así que el front consulta esa sesión en vez
+      // de colgarse de la respuesta.
+      const trabajo = generateDeck({
         db, project_id, node_id, session_id: session.id, node_key: dna.node_key,
         output_key: targetOutputKey, image_gen_model: def.image_gen_model, member_id,
         fills, outDef: def, solo: Array.isArray(def.pages) && def.pages.length ? def.pages : null,
       })
 
+      // El cierre — mensajes, assets y estado — corre cuando el despacho termina, ya sin nadie
+      // esperando del otro lado.
+      trabajo.then(async r => {
       // El chat del nodo lleva el parte de lo que hizo el motor. No es una conversación
       // simulada: es el reporte de la composición, que es justo lo que hay que poder auditar.
       const parte = [
@@ -321,12 +333,14 @@ async function executeImageOutput({ project_id, node_id, targetOutputKey, member
       await db().from('forge_messages').insert({ session_id: session.id, role: 'human', content: 'Generate the output for this step', order_index: 0, tool_calls: [] })
       await db().from('forge_messages').insert({ session_id: session.id, role: 'agent',  content: parte, order_index: 1, tool_calls: [] })
 
-      // Una fila por página, para que el moodboard y los nodos de aguas abajo las encuentren.
-      const base = `${dna.title} — ${def.label || def.name || targetOutputKey}`
+      // Una fila por página. El nombre termina en el nombre de la página y NADA más: el moodboard
+      // corta por el último guion largo para saber qué es, y el `label` de la DNA ya trae uno
+      // («Art Style Guide — Content»), asi que sumarlo dejaba «… — Content 01_KeyArt» y las
+      // páginas salían desordenadas porque nadie encontraba su número.
       let primero = null
       for (const p of r.paginas.sort((a, b) => a.index - b.index)) {
         const { data: asset } = await db().from('forge_assets').insert({
-          node_id, project_id, session_id: session.id, name: `${base} ${p.name}`,
+          node_id, project_id, session_id: session.id, name: `${dna.title} — ${p.name}`,
           format: 'png', status: 'approved', storage_url: p.url,
           approved_by: member_id || null, approved_at: new Date().toISOString(),
         }).select('id').single()
@@ -376,8 +390,24 @@ async function executeImageOutput({ project_id, node_id, targetOutputKey, member
 
         await db().from('forge_sessions').update({ output_asset_id: hAsset?.id || null }).eq('id', hSes.id)
       }
+      }).catch(async e => {
+        // Sin nadie esperando la respuesta, un fallo silencioso dejaría la sesión en `active`
+        // para siempre y el front consultando sin fin. Se marca y se registra.
+        console.error(`[deck] ${targetOutputKey} falló:`, e.message)
+        await db().from('forge_sessions').update({
+          status: 'abandoned', completed_at: new Date().toISOString(),
+        }).eq('id', session.id)
+        await db().from('forge_messages').insert({
+          session_id: session.id, role: 'agent', order_index: 0, tool_calls: [],
+          content: `The dispatch did not complete: ${e.message}`,
+        }).catch(() => {})
+      })
 
-      return { output_key: targetOutputKey, session_id: session.id, asset_id: primero, images: r.paginas.length }
+      // Se responde YA. El trabajo sigue solo y su avance se lee en la sesión.
+      return {
+        output_key: targetOutputKey, session_id: session.id, asset_id: null,
+        dispatched: true, expected: (Array.isArray(def.pages) && def.pages.length) || def.image_count || null,
+      }
     }
   }
 
@@ -1432,6 +1462,23 @@ router.post('/nodes/:node_id/sessions/:session_id/generate-item-image', async (r
     }
 
     const outputDef = (node.outputs || []).find(o => (o.key || o.name) === output_key)
+
+    // Un DECK no se genera de a un ítem: sus páginas son nodos fijos del mismo grafo y van en un
+    // solo job desde el Run. Pedirlo por acá devolvía un 500 sin explicación.
+    if (outputDef && await require('../services/image-gen.service').esDeck(outputDef)) {
+      return res.status(400).json({
+        success: false,
+        error: `"${output_key}" es un deck de ${outputDef.image_count ?? '?'} páginas: se despacha completo desde Run, no ítem por ítem`,
+      })
+    }
+    // `production: deferred` se produce en otra etapa y no debe dispararse desde el chat.
+    if (outputDef?.production === 'deferred') {
+      return res.status(400).json({
+        success: false,
+        error: `"${output_key}" está declarado como deferred: se produce en otra etapa`,
+      })
+    }
+
     if (!outputDef?.image_gen) {
       return res.status(400).json({ success: false, error: `Output "${output_key}" no tiene image_gen habilitado` })
     }
@@ -2301,7 +2348,66 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
     const docWarnings = []
     const asmKey = targetOutput ? (targetOutput.key ?? targetOutput.name) : null
 
-    if (targetOutput?.assembly === true) {
+    // `assembly: true` tiene DOS formas de ensamblar y hay que distinguirlas.
+    //
+    //   · por PLANTILLA de slots — la de siempre: el ensamblador llena `tpl_<nodo>_<output>`
+    //     con lo que producen otros nodos.
+    //   · por DECK — el prompt set de un deck: andamiaje copiado del workflow de ComfyUI + los
+    //     fills del modelo. No hay slots ni plantilla, la fuente es el propio workflow.
+    //
+    // Sin esta distinción, pedir el prompt set del 3.20 fallaba con «no existe su plantilla
+    // (tpl_3_20_asg_prompt_set)» — una plantilla que no debería existir.
+    const esPromptSetDeDeck = targetOutput?.assembly === true && await (async () => {
+      const { esDeck } = require('../services/image-gen.service')
+      const img = allOutputDefs.find(o => o.image_gen && (o.uses?.siblings_if_present || []).includes(asmKey))
+      return img ? esDeck(img) : false
+    })()
+
+    if (esPromptSetDeDeck) {
+      const { composeDeck, DECKS } = require('../services/slide-composer.service')
+      const img = allOutputDefs.find(o => o.image_gen && (o.uses?.siblings_if_present || []).includes(asmKey))
+      const wfName = String(img.image_gen_model).replace(/^comfyui:/, '')
+      const deck = Object.entries(DECKS).find(([, c]) => c.workflow === wfName)?.[0]
+
+      // Los fills, si el modelo ya los escribió. Sin ellos el compositor extrae del documento,
+      // que es el comportamiento previo a v2.9.7.
+      let fills = null
+      for (const h of (targetOutput.uses?.siblings_if_present || [])) {
+        const { data: hs } = await db().from('forge_sessions').select('output_asset_id')
+          .eq('project_id', project_id).eq('node_id', node.id).eq('output_key', h)
+          .in('status', ['approved', 'auto_approved']).order('completed_at', { ascending: false })
+          .limit(1).maybeSingle()
+        if (!hs?.output_asset_id) continue
+        const { data: a } = await db().from('forge_assets').select('content').eq('id', hs.output_asset_id).single()
+        if (a?.content) { fills = a.content; break }
+      }
+
+      // El prompt set es el conjunto COMPLETO — la DNA dice «the 34 dispatch-ready prompts». La
+      // partición en 31 + 3 ocurre al despachar, no acá.
+      const r = await composeDeck({ db, projectId: project_id, deck, fills })
+      const largos = r.paginas.map(p => p.prompt.length)
+
+      console.log('\n─── [forge-chat] ENSAMBLE (deck) ────────────────────')
+      console.log(`  nodo/output:  ${node.node_key}/${asmKey}`)
+      console.log(`  workflow:     ${wfName}`)
+      console.log(`  páginas:      ${r.paginas.length}  ·  prompt ${Math.min(...largos)}–${Math.max(...largos)} chars`)
+      console.log(`  fills:        ${fills ? 'sí' : 'no — extraído del documento'}`)
+      console.log('─────────────────────────────────────────────────────\n')
+
+      replyText = [
+        `# ${targetOutput.label || asmKey}`,
+        '',
+        `${r.paginas.length} prompts listos para despacho · workflow \`${wfName}\`.`,
+        fills
+          ? 'Andamiaje copiado del workflow + los fills del modelo. Ensamblado, no generado.'
+          : '⚠ Sin fills todavía: los valores se extrajeron del documento aprobado.',
+        r.avisos.length ? `\n**Avisos:**\n${r.avisos.map(a => `- ${a}`).join('\n')}` : '',
+        '',
+        ...r.paginas.map(p => `## ${String(p.indice).padStart(2, '0')} · ${p.nombre}\n\n\`\`\`\n${p.prompt}\n\`\`\``),
+      ].filter(Boolean).join('\n')
+      meta = { provider: 'assembler', model: `deck:${wfName}`, tokens_used: null, duration_ms: 0 }
+
+    } else if (targetOutput?.assembly === true) {
       const { getTemplate, templateIdFor } = require('../services/prompt.service')
       const { assemble, defaultGlue }      = require('../services/assembler.service')
       const { resolveAssemblyPools }       = require('../services/canvas-chat.service')

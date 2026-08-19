@@ -248,6 +248,9 @@ async function generateDeck({
   const txt = await res.text()
   if (!res.ok) throw new Error(`ComfyUI rechazó el deck: ${res.status} ${txt.slice(0, 400)}`)
   const jobId = JSON.parse(txt).prompt_id
+  // Sin esto el despacho es invisible en la consola: cuatro minutos sin una línea se ven igual
+  // que un proceso muerto, y eso llevó a disparar el mismo render tres veces.
+  console.log(`[deck] ${output_key} · ${armado.paginas.length} páginas · job ${jobId} · workflow ${wfName}`)
 
   // 2. Poll con descarga PROGRESIVA: cada página se sube apenas llega, así una caída a mitad
   //    de camino no pierde lo ya rendido.
@@ -295,6 +298,7 @@ async function generateDeck({
             } catch (e) { console.error('[deck] no se pudo anotar la página en la sesión:', e.message) }
           }
 
+          console.log(`[deck]   ${String(vistos.size).padStart(2)}/${total}  ${item.name}`)
           onPage?.(item, vistos.size, total)
         } catch (e) { console.error('[deck] página perdida:', e.message) }
       }
@@ -320,6 +324,8 @@ async function generateDeck({
   const huecos = armado.paginas
     .filter(p => p.faltantes.length)
     .map(p => ({ pagina: p.nombre, falta: p.faltantes }))
+
+  console.log(`[deck] ${output_key} · ${paginas.length}/${total} en ${Math.round((Date.now() - t0) / 1000)}s · job ${jobId}`)
 
   return {
     jobId, paginas, esperadas: total, huecos,
