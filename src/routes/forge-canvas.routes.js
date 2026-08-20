@@ -458,7 +458,9 @@ async function executeImageOutput({ project_id, node_id, targetOutputKey, member
   }) } catch (logErr) { console.error('[auto-run img] logExecution failed (non-fatal):', logErr.message) }
 
   await db().from('forge_messages').insert({ session_id: session.id, role: 'human', content: userMessage, order_index: 0, tool_calls: [] })
-  await db().from('forge_messages').insert({ session_id: session.id, role: 'agent', content: replyText, order_index: 1, tool_calls: allToolCalls.length ? allToolCalls : [] })
+  const { data: msgAgente } = await db().from('forge_messages')
+    .insert({ session_id: session.id, role: 'agent', content: replyText, order_index: 1, tool_calls: allToolCalls.length ? allToolCalls : [] })
+    .select('id').single()
 
   // DNA del output + parseo de ítems (el conteo lo dicta el contenido, no se hardcodea)
   const outDef = (Array.isArray(node.outputs) ? node.outputs : []).find(o => (o.key || o.name) === targetOutputKey)
@@ -482,6 +484,13 @@ async function executeImageOutput({ project_id, node_id, targetOutputKey, member
   await db().from('forge_sessions')
     .update({ output_images: { [targetOutputKey]: outputItems } })
     .eq('id', session.id)
+
+  // Y colgadas del turno que las produjo, que es lo que hace que iterar no repinte las viejas.
+  if (msgAgente?.id) {
+    const { error: e } = await db().from('forge_messages')
+      .update({ output_images: { [targetOutputKey]: outputItems } }).eq('id', msgAgente.id)
+    if (e) console.warn('[auto-run img] sin historial por mensaje:', e.message)
+  }
 
   // Crear una fila forge_assets png por imagen → downstream las encuentra
   const baseName = `${node.title} — ${outDef?.label || outDef?.name || targetOutputKey}`
@@ -727,12 +736,16 @@ router.get('/', async (req, res, next) => {
       .filter(s => s.status === 'active' && !s.output_asset_id)
       .map(s => s.id)
     if (activeSessIds.length > 0) {
+      // Sin `.limit(activeSessIds.length)`: ese tope asumía un mensaje de agente por sesión, y en
+      // cuanto una acumula varios turnos se come el cupo de las demás. Medido: con 3 sesiones
+      // activas, el 2.1 (2 turnos) y un 2.4 (1 turno) llenaban las 3 filas y el otro 2.4 —el que
+      // más se había iterado, 5 turnos— quedaba marcado como «sin contenido». El filtro por
+      // sesiones activas ya acota el volumen.
       const { data: agentMsgs } = await asUser
         .from('forge_messages')
         .select('session_id')
         .in('session_id', activeSessIds)
         .eq('role', 'agent')
-        .limit(activeSessIds.length)
       for (const m of (agentMsgs || [])) sessionsWithAgentMsg.add(m.session_id)
     }
 
@@ -1417,24 +1430,32 @@ router.post('/nodes/:node_id/accept', async (req, res, next) => {
     )
 
     const imageAssets = pngOutputDefs.flatMap(outDef => {
-      const items = (outputImages[outDef.name] || [])
+      // `output_images` se indexa por KEY; buscar por `name` no encontraba nada cuando difieren.
+      const items = (outputImages[outDef.key || outDef.name] || outputImages[outDef.name] || [])
       return items.flatMap(item => {
-        // Formato nuevo: variations[]
+        // Formato nuevo: variations[] — el historial del ítem.
         if (Array.isArray(item.variations)) {
-          return item.variations
-            .filter(v => v.url)
-            .map(v => ({
-              node_id,
-              project_id,
-              session_id,
-              name:        `${node.title} — ${outDef.name}`,
-              format:      'png',
-              status:      'approved',
-              content:     null,
-              storage_url: v.url,
-              approved_by: member_id || null,
-              approved_at: new Date().toISOString(),
-            }))
+          // Aprobar SOLO la última. Cada iteración agrega una variación, así que aprobar todas
+          // metía en el proyecto la imagen vieja junto a la nueva y aguas abajo llegaban las dos
+          // como si ambas fueran el resultado. Lo aceptado es lo vigente; lo anterior queda en el
+          // historial del ítem, que para eso está.
+          const v = [...item.variations].reverse().find(x => x.url)
+          if (!v) return []
+          return [{
+            node_id,
+            project_id,
+            session_id,
+            // Con el índice, para que el orden y la identidad de cada imagen sobrevivan.
+            name:        items.length > 1
+              ? `${node.title} — ${outDef.label || outDef.name} ${(item.index ?? 0) + 1}`
+              : `${node.title} — ${outDef.label || outDef.name}`,
+            format:      'png',
+            status:      'approved',
+            content:     null,
+            storage_url: v.url,
+            approved_by: member_id || null,
+            approved_at: new Date().toISOString(),
+          }]
         }
         // Formato viejo: image_url
         if (item.image_url) {
@@ -1469,7 +1490,7 @@ router.post('/nodes/:node_id/accept', async (req, res, next) => {
 router.post('/nodes/:node_id/sessions/:session_id/generate-item-image', async (req, res, next) => {
   try {
     const { id: project_id, node_id, session_id } = req.params
-    const { output_key, item_index, item_text, condition } = req.body
+    const { output_key, item_index, item_text, condition, message_id = null } = req.body
 
     if (!output_key || item_index == null || !item_text?.trim()) {
       return res.status(400).json({ success: false, error: 'output_key, item_index y item_text son requeridos' })
@@ -1549,6 +1570,26 @@ router.post('/nodes/:node_id/sessions/:session_id/generate-item-image', async (r
       .eq('id', session_id)
 
     if (updateErr) throw updateErr
+
+    // Y la imagen queda además colgada del TURNO que la pidió. El mapa de la sesión es «lo último
+    // vigente» —lo que leen el canvas, el moodboard y el PDF—; este es el historial: iterar
+    // reescribe los prompts sin mover los índices, así que sin esto la respuesta nueva se pintaba
+    // con la imagen de la respuesta anterior.
+    if (message_id) {
+      const { data: msg } = await db()
+        .from('forge_messages').select('output_images').eq('id', message_id).maybeSingle()
+      const mias  = migrateOutputImages(msg?.output_images || {})
+      const lista = Array.isArray(mias[output_key]) ? [...mias[output_key]] : []
+      const i     = lista.findIndex(e => e.index === item_index)
+      if (i >= 0) lista[i] = { ...lista[i], variations: [...(lista[i].variations || []), newVariation] }
+      else        lista.push({ index: item_index, variations: [newVariation] })
+      lista.sort((a, b) => a.index - b.index)
+      // Si la columna todavía no existe (migración 051 sin correr), no se rompe la generación:
+      // la imagen ya está guardada en la sesión.
+      const { error: msgErr } = await db()
+        .from('forge_messages').update({ output_images: { ...mias, [output_key]: lista } }).eq('id', message_id)
+      if (msgErr) console.warn('[generate-item-image] sin historial por mensaje:', msgErr.message)
+    }
 
     res.json({ success: true, image_url: result.url, output_images: updatedImages })
   } catch (err) { next(err) }
@@ -1745,11 +1786,22 @@ router.get('/nodes/:node_id/session', async (req, res, next) => {
       })
     }
 
-    const { data: msgs } = await asUser
+    // `output_images` por mensaje es el historial: cada respuesta conserva lo que ella generó.
+    // Si la migración 051 no corrió todavía, la consulta falla y se cae a la de siempre — el chat
+    // sigue funcionando, solo sin historial por turno.
+    let { data: msgs } = await asUser
       .from('forge_messages')
-      .select('id, role, content, order_index, tool_calls')
+      .select('id, role, content, order_index, tool_calls, output_images')
       .eq('session_id', session.id)
       .order('order_index')
+    if (!msgs) {
+      const { data: basicos } = await asUser
+        .from('forge_messages')
+        .select('id, role, content, order_index, tool_calls')
+        .eq('session_id', session.id)
+        .order('order_index')
+      msgs = basicos
+    }
 
     // Cargar attachments de la sesión agrupados por message_id
     const { data: attachments } = await asUser
@@ -1770,10 +1822,12 @@ router.get('/nodes/:node_id/session', async (req, res, next) => {
 
     // Mapear roles: human→user, agent→assistant
     const messages = (msgs || []).map(m => ({
-      role:        m.role === 'human' ? 'user' : 'assistant',
-      content:     m.content,
-      attachments: attachmentsByMsg[m.id] || [],
-      tool_calls:  m.tool_calls?.length ? m.tool_calls : undefined,
+      id:            m.id,
+      role:          m.role === 'human' ? 'user' : 'assistant',
+      content:       m.content,
+      attachments:   attachmentsByMsg[m.id] || [],
+      tool_calls:    m.tool_calls?.length ? m.tool_calls : undefined,
+      output_images: m.output_images ? migrateOutputImages(m.output_images) : undefined,
     }))
 
     // Cargar asset si existe
@@ -2769,14 +2823,20 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
       if (attErr) console.error('[forge-chat] forge_attachments insert error:', attErr)
     }
 
-    const { error: agentInsertErr } = await db()
+    const { data: agentMsg, error: agentInsertErr } = await db()
       .from('forge_messages')
       .insert(agentRecord)
+      .select('id')
+      .single()
 
     if (agentInsertErr) {
       console.error('[forge-chat] forge_messages agent insert error:', agentInsertErr)
       throw new Error(`Failed to save agent message: ${agentInsertErr.message}`)
     }
+
+    // La generación de imágenes de una iteración la dispara el front (`triggerAutoImageGen`),
+    // que ya trae el detalle de qué ítem cambió y pinta el spinner por ítem. Acá NO se genera:
+    // hacerlo en los dos lados es pagar dos veces la misma imagen.
 
     // Incrementar contador de iteraciones
     await db()
@@ -2788,6 +2848,7 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
       success:    true,
       reply:      replyText,
       session_id: session.id,
+      message_id: agentMsg?.id ?? undefined,
       meta,
       doc_url:    docUrl    ?? undefined,
       doc_format: docFormat ?? undefined,

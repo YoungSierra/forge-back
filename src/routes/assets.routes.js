@@ -375,10 +375,18 @@ router.get('/project-assets', async (req, res, next) => {
     }))
 
     // ── imágenes generadas on-demand (forge_sessions.output_images) ─────────────
-    // Se excluyen URLs que ya están en forge_assets (PNGs aprobados) para evitar duplicados
+    // Se excluyen URLs que ya están en forge_assets (PNGs aprobados) para evitar duplicados.
+    //
+    // También las de sus VERSIONES: al iterar una página, el asset apunta a la versión nueva y la
+    // anterior deja de coincidir con `storage_url`, así que reaparecía como tarjeta suelta al
+    // final de la galería. Son la misma imagen en dos momentos, no dos imágenes: su lugar es la
+    // tira de versiones de la tarjeta original.
     const approvedPngUrls = new Set(
       (forgeAssets || []).filter(a => a.format === 'png' && a.storage_url).map(a => a.storage_url)
     )
+    for (const versiones of Object.values(forgeVersionsMap)) {
+      for (const v of versiones) if (v.storage_url) approvedPngUrls.add(v.storage_url)
+    }
 
     let sessionsQuery = db()
       .from('forge_sessions')
