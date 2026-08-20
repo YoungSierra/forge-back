@@ -166,16 +166,26 @@ async function resolveNodeInputs(db, { projectId, currentPNodeId, targetOutput, 
       if (outputKey || outputLabel) {
         const { data: cand } = await db()
           .from('forge_assets')
-          .select('name, content, forge_sessions!session_id(output_key)')
+          .select('name, content, forge_sessions!session_id(output_key, project_node_id)')
           .eq('project_id', projectId)
           .eq('node_id', sourcePNode.node_id)
           .in('status', ['approved', 'auto_approved'])
           .neq('format', 'png')
           .order('created_at', { ascending: false })
 
+        // El asset se busca por `node_id` del catálogo, que con fan-out es el MISMO en todos los
+        // lanes: sin acotar por instancia, el lane A puede quedarse con el documento del lane B —
+        // gana el más reciente, que es el que corrió último. La sesión sí sabe de qué instancia
+        // salió, así que se prefiere lo del lane propio y solo se acepta lo demás cuando el asset
+        // no tiene instancia (sesiones viejas, anteriores al fan-out).
+        const delLane = a => {
+          const pn = a.forge_sessions?.project_node_id
+          return !pn || pn === edge.source_node_id
+        }
+        const propios = (cand || []).filter(delLane)
         const want  = outputLabel ? normAssetName(`${nodeTitle} — ${outputLabel}`) : null
-        const match = (outputKey && (cand || []).find(a => a.forge_sessions?.output_key === outputKey))
-                   || (want     && (cand || []).find(a => normAssetName(a.name) === want))
+        const match = (outputKey && propios.find(a => a.forge_sessions?.output_key === outputKey))
+                   || (want     && propios.find(a => normAssetName(a.name) === want))
         if (match?.content) {
           content   = match.content
           slotLabel = `${nodeTitle} → ${outputLabel || outputKey}`
@@ -184,16 +194,19 @@ async function resolveNodeInputs(db, { projectId, currentPNodeId, targetOutput, 
 
       // 2) Fallback: asset más reciente del nodo (+ extractSection si el edge apunta a un output)
       if (content === null) {
-        const { data: recent } = await db()
+        const { data: recientes } = await db()
           .from('forge_assets')
-          .select('content')
+          .select('content, forge_sessions!session_id(project_node_id)')
           .eq('project_id', projectId)
           .eq('node_id', sourcePNode.node_id)
           .in('status', ['approved', 'auto_approved'])
           .neq('format', 'png')
           .order('created_at', { ascending: false })
-          .limit(1)
-          .maybeSingle()
+        // Mismo criterio de lane que arriba: el respaldo no puede traer el documento del vecino.
+        const recent = (recientes || []).find(a => {
+          const pn = a.forge_sessions?.project_node_id
+          return !pn || pn === edge.source_node_id
+        })
         if (recent?.content) {
           content = recent.content
           const sectionKey = outputDef ? (outputDef.key || outputDef.name) : null
@@ -210,19 +223,25 @@ async function resolveNodeInputs(db, { projectId, currentPNodeId, targetOutput, 
         resolvedInputs.push(`### ${slotLabel}\n${snippet}`)
       }
 
-      // Imágenes PNG del nodo: inyectar una sola vez por nodo fuente (los edges por-output lo repiten)
-      if (seenPngNodeIds.has(sourcePNode.node_id)) continue
-      seenPngNodeIds.add(sourcePNode.node_id)
+      // Imágenes PNG del nodo: inyectar una sola vez por INSTANCIA fuente. Deduplicar por
+      // `node_id` mezclaba los lanes: el primero que pasara se quedaba con el cupo y los demás
+      // heredaban sus imágenes.
+      if (seenPngNodeIds.has(edge.source_node_id)) continue
+      seenPngNodeIds.add(edge.source_node_id)
 
-      // Imágenes PNG aprobadas/auto_approved del nodo upstream
-      const { data: pngAssets } = await db()
+      // Imágenes PNG aprobadas/auto_approved del nodo upstream — las de ESTE lane
+      const { data: pngTodos } = await db()
         .from('forge_assets')
-        .select('name, storage_url')
+        .select('name, storage_url, forge_sessions!session_id(project_node_id)')
         .eq('project_id', projectId)
         .eq('node_id', sourcePNode.node_id)
         .in('status', ['approved', 'auto_approved'])
         .eq('format', 'png')
         .not('storage_url', 'is', null)
+      const pngAssets = (pngTodos || []).filter(a => {
+        const pn = a.forge_sessions?.project_node_id
+        return !pn || pn === edge.source_node_id
+      })
 
       for (const png of (pngAssets || [])) {
         if (png.storage_url && !injectedPngUrls.has(png.storage_url)) {
@@ -236,13 +255,15 @@ async function resolveNodeInputs(db, { projectId, currentPNodeId, targetOutput, 
       // OJO: en el modelo per-output cada output vive en SU PROPIA sesión (ej. orientation_images y
       // image_prompts son sesiones distintas), así que hay que juntar output_images de TODAS.
       if ((pngAssets || []).length === 0) {
-        const { data: approvedSessions } = await db()
+        const { data: sesionesTodas } = await db()
           .from('forge_sessions')
-          .select('output_images, forge_nodes(title, outputs)')
+          .select('output_images, project_node_id, forge_nodes(title, outputs)')
           .eq('project_id', projectId)
           .eq('node_id', sourcePNode.node_id)
           .in('status', ['approved', 'auto_approved'])
           .order('created_at', { ascending: false })
+        const approvedSessions = (sesionesTodas || [])
+          .filter(s => !s.project_node_id || s.project_node_id === edge.source_node_id)
 
         if (approvedSessions?.length) {
           const nodeTitle2 = approvedSessions[0].forge_nodes?.title ?? sourcePNode.forge_nodes?.title ?? 'Node'
@@ -303,7 +324,38 @@ async function resolveNodeInputs(db, { projectId, currentPNodeId, targetOutput, 
  * Construye el system prompt completo para un nodo dado.
  * Devuelve { finalSystemPrompt, baseUserMsg, executorStr, activeTools, outputDefs, resolvedInputs }
  */
-async function buildSystemPrompt(db, { projectId, nodeId, sessionId, userMessage, historyMsgs = [], attachmentParts = [], targetOutputKey = null }) {
+/**
+ * Resuelve SOBRE QUÉ instancia de nodo se está trabajando.
+ *
+ * Con fan-out un mismo `node_id` del catálogo vive en varios lanes, así que la consulta por
+ * `node_id` devuelve más de una fila. `maybeSingle()` en ese caso NO devuelve la primera: devuelve
+ * `data: null` con error PGRST116. Como el error se descartaba, el nodo se quedaba sin inputs en
+ * silencio y el modelo terminaba pidiendo a mano lo que ya estaba conectado — medido el 20-ago en
+ * Smack JM V2, donde el 2.4 del lane A dijo «I don't have concept data» con el cable puesto y el
+ * documento aprobado. Afectaba a 15 de 43 proyectos.
+ *
+ * Con `projectNodeId` no hay nada que adivinar. Sin él, una sola instancia es inequívoca; varias
+ * son un error del llamador, y se dice.
+ */
+async function resolverInstancia(db, { projectId, nodeId, projectNodeId = null, select = 'id' }) {
+  if (projectNodeId) {
+    const { data } = await db().from('forge_project_nodes').select(select).eq('id', projectNodeId).maybeSingle()
+    if (data) return data
+  }
+  const { data: filas } = await db()
+    .from('forge_project_nodes').select(select)
+    .eq('project_id', projectId).eq('node_id', nodeId).eq('removed', false)
+  if (!filas?.length) return null
+  if (filas.length > 1) {
+    throw new Error(
+      `Este nodo tiene ${filas.length} instancias en el proyecto (fan-out por lane): ` +
+      'hace falta project_node_id para saber cuál se está ejecutando.',
+    )
+  }
+  return filas[0]
+}
+
+async function buildSystemPrompt(db, { projectId, nodeId, sessionId, userMessage, historyMsgs = [], attachmentParts = [], targetOutputKey = null, projectNodeId = null }) {
   const { getPrompt, getSkill } = require('./prompt.service')
 
   const { data: node } = await db()
@@ -455,13 +507,7 @@ async function buildSystemPrompt(db, { projectId, nodeId, sessionId, userMessage
     project?.context_notes   ? `\n${project.context_notes}`           : '',
   ].filter(Boolean).join('\n')
 
-  const { data: currentPNode } = await db()
-    .from('forge_project_nodes')
-    .select('id')
-    .eq('project_id', projectId)
-    .eq('node_id', nodeId)
-    .eq('removed', false)
-    .maybeSingle()
+  const currentPNode = await resolverInstancia(db, { projectId, nodeId, projectNodeId })
 
   const visualRefs = []   // referencias que el modelo tiene que VER (ver vision.service)
   const resolvedInputs = currentPNode
@@ -876,4 +922,4 @@ async function resolveAssemblyPools(db, { projectId, currentPNodeId, node, outpu
 }
 
 module.exports = {
-  resolverImagenesDeItems, buildSystemPrompt, resolveNodeInputs, resolveAssemblyPools, runReActLoop, propagateStale, injectVars, injectSkillVars }
+  resolverImagenesDeItems, buildSystemPrompt, resolveNodeInputs, resolveAssemblyPools, runReActLoop, propagateStale, injectVars, injectSkillVars, resolverInstancia }

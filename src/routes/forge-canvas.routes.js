@@ -81,7 +81,7 @@ async function pendingOutputsForNode(project_id, node_id, isStale, node) {
 
 // ─── Ejecuta UN output de un nodo como sesión per-output auto-aprobada ──────────
 // Núcleo reusable del auto-run. No toca otros outputs ya aprobados (bug A).
-async function executeOneOutput({ project_id, node_id, targetOutputKey, member_id }) {
+async function executeOneOutput({ project_id, node_id, targetOutputKey, member_id, project_node_id = null }) {
   const { buildSystemPrompt, runReActLoop } = require('../services/canvas-chat.service')
   const { logExecution } = require('../services/execution-log.service')
 
@@ -91,6 +91,7 @@ async function executeOneOutput({ project_id, node_id, targetOutputKey, member_i
     .insert({
       project_id,
       node_id,
+      project_node_id,
       output_key:      targetOutputKey,
       status:          'active',
       iteration_count: 0,
@@ -103,8 +104,10 @@ async function executeOneOutput({ project_id, node_id, targetOutputKey, member_i
 
   const userMessage = 'Generate the output for this step'
 
+  // La instancia viaja con la llamada: sin ella, un nodo que vive en varios lanes no puede saber
+  // cuál de los dos es y se queda sin ningún input.
   const { finalSystemPrompt, baseUserMsg, executorStr, activeTools, resolvedInputs, visualRefs, node, targetOutput } =
-    await buildSystemPrompt(db, { projectId: project_id, nodeId: node_id, sessionId: session.id, userMessage, targetOutputKey })
+    await buildSystemPrompt(db, { projectId: project_id, nodeId: node_id, sessionId: session.id, userMessage, targetOutputKey, projectNodeId: project_node_id })
 
   const { replyText, allToolCalls, docUrl, docFormat, meta } = await runReActLoop({
     finalSystemPrompt, baseUserMsg, executorStr, activeTools, resolvedInputs, visualRefs,
@@ -436,7 +439,7 @@ async function executeImageOutput({ project_id, node_id, targetOutputKey, member
   const userMessage = 'Generate the output for this step'
 
   const { finalSystemPrompt, baseUserMsg, executorStr, activeTools, resolvedInputs, visualRefs, node, targetOutput } =
-    await buildSystemPrompt(db, { projectId: project_id, nodeId: node_id, sessionId: session.id, userMessage, targetOutputKey })
+    await buildSystemPrompt(db, { projectId: project_id, nodeId: node_id, sessionId: session.id, userMessage, targetOutputKey, projectNodeId: project_node_id })
 
   const { replyText, allToolCalls, meta } = await runReActLoop({
     finalSystemPrompt, baseUserMsg, executorStr, activeTools, resolvedInputs, visualRefs,
@@ -1694,13 +1697,15 @@ router.get('/nodes/:node_id/session', async (req, res, next) => {
 
     // Si no hay sesión general, buscar per-output sessions con imágenes o assets
     if (!session) {
-      const { data: perOutSessions } = await asUser
+      let qPer = asUser
         .from('forge_sessions')
         .select('id, output_key, output_images, output_asset_id, status')
         .eq('project_id', project_id)
         .eq('node_id', node_id)
         .not('output_key', 'is', null)
         .order('created_at', { ascending: false })
+      if (project_node_id) qPer = qPer.eq('project_node_id', project_node_id)
+      const { data: perOutSessions } = await qPer
 
       if (!perOutSessions?.length) {
         return res.json({ success: true, session: null, messages: [] })
@@ -1819,13 +1824,17 @@ router.get('/nodes/:node_id/session', async (req, res, next) => {
       session.output_images = migrateOutputImages(session.output_images)
     }
 
-    // Merge de output_images de per-output sessions (si existen)
-    const { data: perOutForMerge } = await asUser
+    // Merge de output_images de per-output sessions (si existen).
+    // Acotado a la instancia: sin esto, el 2.4 del lane B mostraba las 7 imágenes que el 2.4 del
+    // lane A había generado para OTRO concepto — mismo node_id del catálogo, distinto lane.
+    let qMerge = asUser
       .from('forge_sessions')
       .select('output_images')
       .eq('project_id', project_id)
       .eq('node_id', node_id)
       .not('output_key', 'is', null)
+    if (project_node_id) qMerge = qMerge.eq('project_node_id', project_node_id)
+    const { data: perOutForMerge } = await qMerge
 
     if (perOutForMerge?.length) {
       const merged = { ...(session.output_images ?? {}) }
@@ -2175,14 +2184,12 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
         .maybeSingle()
       currentPNode = pnDirect
     } else {
-      const { data: pnByNode } = await db()
-        .from('forge_project_nodes')
-        .select('id, bound_item_ref')
-        .eq('project_id', project_id)
-        .eq('node_id', node_id)
-        .eq('removed', false)
-        .maybeSingle()
-      currentPNode = pnByNode
+      // Sin instancia explícita: una sola es inequívoca, varias son ambiguas y hay que decirlo.
+      // `maybeSingle()` acá devolvía null con error PGRST116 y el chat se quedaba sin inputs.
+      const { resolverInstancia } = require('../services/canvas-chat.service')
+      currentPNode = await resolverInstancia(db, {
+        projectId: project_id, nodeId: node_id, select: 'id, bound_item_ref',
+      })
     }
 
     // Inputs de edges + library assets: resolvedor compartido con buildSystemPrompt (preview),
@@ -3972,7 +3979,7 @@ router.post('/nodes/:project_node_id/auto-run', async (req, res, next) => {
       const d = (Array.isArray(nodeDna?.outputs) ? nodeDna.outputs : []).find(o => (o.key || o.name) === key)
       ran.push(d?.assembly === true
         ? await executeAssemblyOutput({ project_id, node_id, targetOutputKey: key, member_id, project_node_id, nodeDna })
-        : await executeOneOutput({ project_id, node_id, targetOutputKey: key, member_id }))
+        : await executeOneOutput({ project_id, node_id, targetOutputKey: key, member_id, project_node_id }))
     }
 
     // 2) Outputs de imagen (post-pass) — ya con los siblings de texto disponibles
