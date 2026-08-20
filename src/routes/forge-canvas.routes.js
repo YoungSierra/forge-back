@@ -1308,6 +1308,22 @@ router.delete('/nodes/:project_node_id', async (req, res, next) => {
   try {
     const { id: project_id, project_node_id } = req.params
 
+    // Un nodo aprobado no se borra. El front ya lo impide en sus tres caminos (panel, arrastre al
+    // panel izquierdo y atajo), pero eso es la puerta, no la cerradura: una pantalla desactualizada
+    // o una llamada directa se llevaban por delante trabajo aceptado sin que nada lo frenara.
+    const { data: aprobadas } = await db()
+      .from('forge_sessions')
+      .select('id, output_key')
+      .eq('project_node_id', project_node_id)
+      .in('status', ['approved', 'auto_approved'])
+      .limit(1)
+    if (aprobadas?.length) {
+      return res.status(409).json({
+        success: false,
+        error: 'This node has approved output and cannot be removed. Reopen it and undo the approval first.',
+      })
+    }
+
     // Limpiar edges primero, luego eliminar el nodo
     try { await cleanupAndRewire(project_id, project_node_id, db) } catch (e) { console.error('[remove-node] auto-wire failed:', e.message) }
 
