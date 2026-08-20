@@ -168,6 +168,13 @@ const normalizar = s => String(s)
   .replace(/^§?\s*(?:ADI_)?\s*[\d.]*\s*[—–·-]?\s*/, '')
   .replace(/[^a-z0-9]+/gi, ' ')
   .trim().toLowerCase()
+  // El modelo escribe en inglés británico y el andamiaje del workflow en americano: los fills
+  // decían «Colour palette» y el slot «Color palette», así que la búsqueda fallaba, se caía a
+  // extraer del documento y metía la tabla entera de §0.4 —con encabezados y pipes— dentro de
+  // las 34 prompts. Una diferencia de ortografía no puede decidir eso.
+  .replace(/\bcolour/g, 'color')
+  .replace(/\bgrey/g, 'gray')
+  .replace(/\bcentre/g, 'center')
 
 // Devuelve el bloque completo de la sección: su encabezado y todo hasta el siguiente
 // encabezado de nivel igual o superior.
