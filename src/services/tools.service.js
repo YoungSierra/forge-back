@@ -633,6 +633,37 @@ async function docGenDocx(title, content, projectId, nodeId, itemImages = []) {
       }
     }
 
+    // ── La imagen sin ancla va al frente ──────────────────────────────────────
+    // Cada imagen se dibuja bajo el título de SU ítem. Eso funciona cuando el documento enumera
+    // los ítems (el 1.1 lista los seeds), pero un documento de lane habla de UNO solo y no se
+    // titula con su nombre: el pitch abre con «## Hook» y el concept con «## Fact Sheet», así que
+    // la imagen se descargaba y no se pintaba nunca. Si no hay dónde anclarla, su lugar es la
+    // apertura: es la imagen del concepto del que trata todo el documento.
+    {
+      const anclas = new Set()
+      for (const s of contentSections) {
+        const t = tituloDeItem(s.title || '')
+        if (t) anclas.add(t)
+        for (const l of (s.lines || [])) {
+          const limpio = String(l).replace(/^\s*(?:[-*•]\s+|#{1,6}\s+|\d+[.)]\s+)/, '')
+          const tl = tituloDeItem(limpio)
+          if (tl) anclas.add(tl)
+        }
+      }
+      for (const [t, buf] of [...porTitulo]) {
+        if (anclas.has(t)) continue
+        porTitulo.delete(t)
+        try {
+          const im    = doc.openImage(buf)
+          const alto  = im.height * (CONTENT_W / im.width)
+          if (!(alto > 0)) continue
+          checkPageBreak(alto + 40)
+          doc.image(buf, MARGIN, y, { width: CONTENT_W })
+          y += alto + 18
+        } catch (e) { console.warn('[doc_gen] portada sin imagen:', e.message) }
+      }
+    }
+
     for (const section of contentSections) {
       checkPageBreak(100)
 
@@ -648,6 +679,10 @@ async function docGenDocx(title, content, projectId, nodeId, itemImages = []) {
         y = doc.y + 8
         doc.rect(MARGIN, y, CONTENT_W, 0.5).fill(PDF_LINE)
         y += 12
+        // Un `##` también puede ser el título de un ítem — «## SMACK: Drift» en el elevator_line.
+        // Solo se miraban los encabezados internos y las viñetas, así que ese documento tenía su
+        // ancla y aun así salía sin imagen. Se usa el título original, no el capitalizado.
+        dibujarImagenDeItem(section.title, MARGIN)
       } else if (sectionLabel) {
         doc.font('Helvetica-Bold').fontSize(11).fillColor(PDF_H3_CLR)
           .text(sectionLabel, MARGIN, y, { width: CONTENT_W })

@@ -275,12 +275,20 @@ router.get('/project-assets', async (req, res, next) => {
     if (forgeAssetIds.length > 0) {
       const { data: fv } = await db()
         .from('forge_asset_versions')
-        .select('id, asset_id, storage_url, version_number, is_current, metadata, created_at')
+        .select('id, asset_id, storage_url, version_number, is_current, metadata, created_by, created_at')
         .in('asset_id', forgeAssetIds)
         .order('version_number', { ascending: false })
+      // Quién hizo cada iteración. Una versión sin autor ni hora no se puede discutir con nadie:
+      // en una tira de cinco, saber cuál puso quién y cuándo es la mitad de la información.
+      const autorIds = [...new Set((fv || []).map(v => v.created_by).filter(Boolean))]
+      const autores = {}
+      if (autorIds.length) {
+        const { data: ms } = await db().from('members').select('id, display_name').in('id', autorIds)
+        for (const m of (ms || [])) autores[m.id] = m.display_name
+      }
       for (const v of (fv || [])) {
         if (!forgeVersionsMap[v.asset_id]) forgeVersionsMap[v.asset_id] = []
-        forgeVersionsMap[v.asset_id].push(v)
+        forgeVersionsMap[v.asset_id].push({ ...v, author: autores[v.created_by] ?? null })
       }
     }
 
@@ -320,6 +328,9 @@ router.get('/project-assets', async (req, res, next) => {
         // elegida. Vive en metadata para no migrar una columna.
         approved_at:    v.metadata?.approved_at ?? null,
         created_at:     v.created_at,
+        // Quién la hizo. Va en la proyección explícita: sin nombrarlo acá se resolvía en la
+        // consulta y se perdía al salir.
+        author:         v.author ?? null,
       })),
     }))
 

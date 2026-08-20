@@ -628,10 +628,11 @@ const tituloDeItem = s => String(s || '')
 async function resolverImagenesDeItems({ db, projectId, nodeId, sessionId, outKey, contenido }) {
   const parseItems = txt => require('./fan-out.service').parseItemsFromContent(txt || '')
   const imagenes = []
-  if (!outKey) return imagenes
 
-  // 1) Propias
-  if (sessionId) {
+  // 1) Propias. Sin `output_key` —las sesiones generales, las de antes del modelo por output— no
+  //    hay una clave que buscar en `output_images`, pero eso no quita que aguas arriba haya
+  //    imágenes: antes se cortaba acá y esos documentos salían siempre sin nada.
+  if (sessionId && outKey) {
     const { data: sess } = await db().from('forge_sessions')
       .select('output_images').eq('id', sessionId).maybeSingle()
     const propios = parseItems(contenido)
@@ -644,39 +645,74 @@ async function resolverImagenesDeItems({ db, projectId, nodeId, sessionId, outKe
   }
 
   // 2) Heredadas: se arma el índice título → imagen con lo que produjeron los nodos upstream.
-  const { data: pnode } = await db().from('forge_project_nodes')
-    .select('id').eq('project_id', projectId).eq('node_id', nodeId).eq('removed', false).maybeSingle()
+  //
+  // La instancia se saca de la SESIÓN, que ya sabe en qué lane está. Buscarla por `node_id` con
+  // `maybeSingle()` fallaba en cuanto el nodo vivía en dos lanes —devuelve PGRST116 y `null`— y
+  // esta función cortaba acá: los PDF del 2.1 salían sin ninguna imagen incrustada, en los dos
+  // lanes, mientras que en un proyecto sin fan-out funcionaba.
+  let pnode = null
+  if (sessionId) {
+    const { data: ses } = await db().from('forge_sessions')
+      .select('project_node_id').eq('id', sessionId).maybeSingle()
+    if (ses?.project_node_id) {
+      const { data: p } = await db().from('forge_project_nodes')
+        .select('id, bound_item_ref').eq('id', ses.project_node_id).maybeSingle()
+      pnode = p ?? { id: ses.project_node_id }
+    }
+  }
+  if (!pnode) pnode = await resolverInstancia(db, { projectId, nodeId, select: 'id, bound_item_ref' }).catch(() => null)
   if (!pnode) return imagenes
 
-  const { data: edges } = await db().from('forge_project_edges')
-    .select('source_node_id').eq('project_id', projectId).eq('target_node_id', pnode.id)
-  if (!edges?.length) return imagenes
-
+  // Se sube por el grafo hasta encontrar quién generó. Antes solo se miraba UN salto: para el 2.1,
+  // eso es el 1.4, que selecciona pero no genera — y las imágenes viven en el 1.1, un nivel más
+  // arriba. Se devolvía cero y el PDF salía sin nada.
+  //
+  // El emparejamiento sigue siendo por TÍTULO, que es lo que hace seguro atravesar un nodo de
+  // selección: de cinco seeds sobreviven dos, y cada documento se queda con la imagen del suyo.
+  // Tres niveles alcanzan de sobra para 1.1 → 1.4 → 2.x y frenan cualquier ciclo.
+  const MAX_NIVELES = 3
   const porTitulo = new Map()
-  for (const e of edges) {
-    const { data: src } = await db().from('forge_project_nodes')
-      .select('node_id').eq('id', e.source_node_id).maybeSingle()
-    if (!src) continue
-    const { data: sesiones } = await db().from('forge_sessions')
-      .select('output_key, output_images, output_asset_id')
-      .eq('project_id', projectId).eq('node_id', src.node_id)
-      .not('output_images', 'is', null)
+  let frontera = [pnode.id]
+  const vistos = new Set(frontera)
 
-    for (const s of (sesiones || [])) {
-      for (const [k, items] of Object.entries(s.output_images || {})) {
-        // El texto de los ítems del origen, para saber a qué título corresponde cada índice.
-        const { data: asset } = await db().from('forge_assets')
-          .select('content').eq('project_id', projectId).eq('node_id', src.node_id)
-          .order('created_at', { ascending: false }).limit(1).maybeSingle()
-        const origen = asset?.content ? parseItems(asset.content) : []
-        for (const it of (items || [])) {
-          const url = it?.variations?.length ? it.variations[it.variations.length - 1]?.url : it?.url
-          const t   = tituloDeItem(origen[it?.index]?.title ?? origen[it?.index] ?? '')
-          if (url && t) porTitulo.set(t, url)
+  for (let nivel = 0; nivel < MAX_NIVELES && frontera.length && !porTitulo.size; nivel++) {
+    const { data: edges } = await db().from('forge_project_edges')
+      .select('source_node_id').eq('project_id', projectId).in('target_node_id', frontera)
+    const siguiente = []
+
+    for (const e of (edges || [])) {
+      if (vistos.has(e.source_node_id)) continue
+      vistos.add(e.source_node_id)
+      siguiente.push(e.source_node_id)
+
+      const { data: src } = await db().from('forge_project_nodes')
+        .select('node_id').eq('id', e.source_node_id).maybeSingle()
+      if (!src?.node_id) continue
+
+      const { data: sesiones } = await db().from('forge_sessions')
+        .select('output_key, output_images, output_asset_id')
+        .eq('project_id', projectId).eq('node_id', src.node_id)
+        .not('output_images', 'is', null)
+      if (!sesiones?.length) continue
+
+      // El texto de los ítems del origen, para saber a qué título corresponde cada índice. Una vez
+      // por nodo: antes se pedía dentro del bucle de outputs, repitiendo la misma consulta.
+      const { data: asset } = await db().from('forge_assets')
+        .select('content').eq('project_id', projectId).eq('node_id', src.node_id)
+        .order('created_at', { ascending: false }).limit(1).maybeSingle()
+      const origen = asset?.content ? parseItems(asset.content) : []
+
+      for (const s of sesiones) {
+        for (const items of Object.values(s.output_images || {})) {
+          for (const it of (items || [])) {
+            const url = it?.variations?.length ? it.variations[it.variations.length - 1]?.url : it?.url
+            const t   = tituloDeItem(origen[it?.index]?.title ?? origen[it?.index] ?? '')
+            if (url && t) porTitulo.set(t, url)
+          }
         }
-        void k
       }
     }
+    frontera = siguiente
   }
   if (!porTitulo.size) return imagenes
 
@@ -686,6 +722,17 @@ async function resolverImagenesDeItems({ db, projectId, nodeId, sessionId, outKe
     const t = tituloDeItem(it?.title ?? it)
     const u = t ? porTitulo.get(t) : null
     if (u) imagenes.push({ title: it?.title ?? it, url: u })
+  }
+
+  // Un nodo de lane no enumera los ítems de arriba: habla de UNO. El pitch del 2.1 no tiene una
+  // sección por seed —tiene el logline de su seed—, así que emparejar por título del documento no
+  // encuentra nada. Lo que le corresponde es la imagen de SU ítem, que es lo que dice
+  // `bound_item_ref`: por eso el lane A lleva la de «SMACK: Drift» y el B la de «SMACK: The
+  // Current», sin riesgo de cruzarlas.
+  const atado = pnode.bound_item_ref?.title
+  if (!imagenes.length && atado) {
+    const u = porTitulo.get(tituloDeItem(atado))
+    if (u) imagenes.push({ title: atado, url: u })
   }
   return imagenes
 }

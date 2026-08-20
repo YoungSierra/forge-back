@@ -1690,10 +1690,23 @@ router.post('/nodes/:node_id/generate-pdf', async (req, res, next) => {
       docContent = docContent.replace(/\bWorking Title\b/g, titleVal)
     }
 
+    // Las imágenes del documento se resolvían SOLO cuando el PDF nacía dentro de la corrida. Este
+    // botón llamaba al generador con título y texto, así que todo PDF pedido a mano salía sin una
+    // sola imagen — en cualquier proyecto, no solo en los de fan-out.
+    let itemImages = []
+    try {
+      const { resolverImagenesDeItems } = require('../services/canvas-chat.service')
+      itemImages = await resolverImagenesDeItems({
+        db, projectId: project_id, nodeId: node_id,
+        sessionId: session.id, outKey: output_key, contenido: docContent,
+      })
+    } catch (e) { console.error('[generate-pdf] imágenes:', e.message) }
+
     const { executeTool } = require('../services/tools.service')
     const docResult = await executeTool('doc_gen_docx', {
       title:   asset.name,
       content: docContent,
+      item_images: itemImages,
     }, { project_id, node_id })
 
     if (!docResult.success || !docResult.url) {
