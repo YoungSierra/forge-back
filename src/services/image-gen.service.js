@@ -112,7 +112,16 @@ async function generateOneImage({
   let result
   if (provider === 'comfyui') {
     const { generateImageComfyUI } = require('./providers/comfyui.provider')
-    result = await generateImageComfyUI(modelOrWf, imagePrompt, 1024, 1024, storagePath)
+    // Arte del proyecto como segunda imagen, si el workflow lo pide.
+    //
+    // El one-pager del 2.5 recibe DOS imágenes con papeles distintos: la plantilla de layout, que
+    // viene con el workflow y de la que se copia la composición, y el arte del juego, del que se
+    // toma el aspecto. Ese segundo hueco viene desconectado a propósito: si no hay arte del
+    // proyecto NO se enchufa nada. Conectar un relleno sería decirle al modelo «así se ve este
+    // juego» con una imagen ajena — el error que nos costó una corrida del ASG.
+    const refProyecto = await imagenDelProyecto(project_id, node_id).catch(() => null)
+    result = await generateImageComfyUI(modelOrWf, imagePrompt, 1024, 1024, storagePath,
+      refProyecto ? { ref_proyecto: refProyecto } : {})
   } else if (provider === 'openai') {
     const { generateImageOpenAI } = require('./providers/openai.image.provider')
     result = await generateImageOpenAI(modelOrWf, imagePrompt, 1024, 1024, storagePath)
@@ -156,6 +165,36 @@ async function esDeck(outDef) {
     const entry = await getWorkflowByName(String(modelo).slice('comfyui:'.length))
     return entry?.inject_config?.mode === 'per_page'
   } catch { return false }
+}
+
+// ─── El arte del proyecto que le entra a un nodo ──────────────────────────────
+// Se busca entre lo que ESTE nodo recibe por sus cables, no en todo el proyecto: el 2.5 declara
+// `orientation_images` y `pitch_images` como entradas, y esas son las que deben ilustrarlo. Gana
+// la más reciente aprobada; si no hay ninguna, se devuelve null y el hueco queda sin conectar.
+async function imagenDelProyecto(projectId, nodeId) {
+  const { db } = require('./supabase.service')
+  const { data: pns } = await db()
+    .from('forge_project_nodes').select('id').eq('project_id', projectId).eq('node_id', nodeId).eq('removed', false)
+  if (!pns?.length) return null
+
+  const { data: edges } = await db()
+    .from('forge_project_edges').select('source_node_id')
+    .eq('project_id', projectId).in('target_node_id', pns.map(p => p.id))
+  if (!edges?.length) return null
+
+  const { data: fuentes } = await db()
+    .from('forge_project_nodes').select('node_id').in('id', [...new Set(edges.map(e => e.source_node_id))])
+  const ids = [...new Set((fuentes || []).map(f => f.node_id).filter(Boolean))]
+  if (!ids.length) return null
+
+  const { data: png } = await db()
+    .from('forge_assets').select('storage_url')
+    .eq('project_id', projectId).in('node_id', ids)
+    .eq('format', 'png').in('status', ['approved', 'auto_approved'])
+    .not('storage_url', 'is', null)
+    .order('created_at', { ascending: false })
+    .limit(1).maybeSingle()
+  return png?.storage_url ?? null
 }
 
 // ─── La imagen de referencia de una página, por el NOMBRE del nodo que la produce ─────

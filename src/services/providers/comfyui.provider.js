@@ -40,6 +40,24 @@ async function submitWorkflow(workflowName, prompt, width, height, extras = {}) 
     }
   }
 
+  // Segunda imagen opcional: se sube, se carga en su propio LoadImage y RECIÉN ahí se conecta al
+  // modelo. El enganche viene declarado en el workflow (`ref_proyecto`), no hardcodeado, y si el
+  // caller no manda imagen el nodo queda huérfano y ComfyUI lo ignora — que es justo lo que
+  // queremos: sin arte del proyecto, el modelo no recibe una imagen ajena en su lugar.
+  if (inject.ref_proyecto && extras.ref_proyecto) {
+    const { load_node, model_node, field } = inject.ref_proyecto
+    if (workflow[load_node] && workflow[model_node]) {
+      try {
+        const subida = await uploadImageToComfyUI(extras.ref_proyecto)
+        workflow[load_node].inputs.image = subida
+        workflow[model_node].inputs[field] = [String(load_node), 0]
+        console.log(`[ComfyUI] arte del proyecto → ${field} (${subida})`)
+      } catch (e) {
+        console.warn('[ComfyUI] no se pudo adjuntar el arte del proyecto:', e.message)
+      }
+    }
+  }
+
   const extra_data = {}
   if (process.env.COMFYUI_API_KEY) extra_data.api_key_comfy_org = process.env.COMFYUI_API_KEY
 
