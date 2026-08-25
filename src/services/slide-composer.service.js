@@ -32,7 +32,10 @@ const MARGEN = 31000   // se recorta antes de llegar al límite
 const DECKS = {
   asg:      { workflow: 'V57_STUDIO_ArtStyleGuide_Template',      fuente: '3.9', paginas: 34 },
   gdd:      { workflow: 'V57_STUDIO_Vertical_Slice_GDD_Template', fuente: '3.8', paginas: 21 },
-  artbible: { workflow: 'V57_STUDIO_ArtBible_Template',            fuente: null, paginas: 18 },
+  // El Art Bible no se llena desde un documento: cada página recibe su página YA APROBADA del ASG
+  // y pinta la obra final de ese tema. Por eso no tiene `fuente` — su insumo es una imagen, no
+  // texto. Pasó de 18 a 26 páginas con el rediseño del 24-ago.
+  artbible: { workflow: 'V57_STUDIO_ArtBible_Template',            fuente: null, paginas: 26 },
 }
 
 // ── Mapa etiqueta de página → sección del documento fuente ───────────────────

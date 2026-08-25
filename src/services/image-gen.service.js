@@ -158,6 +158,90 @@ async function esDeck(outDef) {
   } catch { return false }
 }
 
+// ─── La imagen de referencia de una página, por el NOMBRE del nodo que la produce ─────
+//
+// El prompt de la página nombra su fuente en prosa: «coming from Pitch Document», «coming from
+// Concept Exploration + Visual Orientation». Se resuelve contra el título del nodo en el catálogo
+// en vez de contra una tabla acá adentro: si mañana una página cambia de fuente, el motor la
+// sigue sin tocar código.
+//
+// Con varias fuentes («A + B») gana la primera que tenga imagen: el orden en que están escritas
+// es el orden de preferencia de quien armó la plantilla.
+// ─── La página del ASG que una página del Art Bible toma como canon ───────────
+//
+// El Art Bible no parte de una plantilla: cada página recibe la página YA RENDERIZADA del Art
+// Style Guide de ese mismo proyecto y pinta la obra final de ese tema. El prompt la cita por
+// número y nombre —«Art Style Guide (ASG · 05 Character Design Language)»—, y el ASG guarda sus
+// páginas como assets llamados «Art Style Guide — 05_CharacterDesign».
+//
+// El emparejamiento va por NÚMERO. Los nombres no coinciden entre los dos lados («05 Character
+// Design Language» contra `05_CharacterDesign`) y el número sí es el mismo en ambos.
+async function paginaDelASG(db, projectId, numero) {
+  const { data: n } = await db().from('forge_nodes').select('id').eq('node_key', '3.20').maybeSingle()
+  if (!n) return null
+  const { data: assets } = await db()
+    .from('forge_assets')
+    .select('name, storage_url, created_at')
+    .eq('project_id', projectId).eq('node_id', n.id)
+    .eq('format', 'png').in('status', ['approved', 'auto_approved'])
+    .not('storage_url', 'is', null)
+    .order('created_at', { ascending: false })
+  // Se busca el número y nada más. Atar el patrón al guion largo del nombre —«Art Style Guide —
+  // 01_KeyArt»— es frágil: ese carácter ya causó un problema de emparejamiento antes, y basta que
+  // alguien renombre el separador para que deje de encontrar nada.
+  const dosDigitos = String(numero).padStart(2, '0')
+  const hit = (assets || []).find(a => new RegExp(`(?:^|\\D)${dosDigitos}_`).test(a.name || ''))
+  return hit?.storage_url ?? null
+}
+
+async function imagenDeNodoPorTitulo(db, projectId, fuente) {
+  const nombres = String(fuente || '').split('+').map(s => s.trim()).filter(Boolean)
+  if (!nombres.length) return null
+
+  // Solo entre los nodos que este proyecto tiene en el canvas. El catálogo repite títulos —hay un
+  // «Pitch Document» archivado con clave 99.2.1 además del 2.1 vivo— y buscar en él a secas
+  // devuelve el equivocado, que además nunca produjo nada en este proyecto.
+  const { data: pns } = await db()
+    .from('forge_project_nodes').select('node_id').eq('project_id', projectId).eq('removed', false)
+  const enProyecto = new Set((pns || []).map(p => p.node_id).filter(Boolean))
+  const { data: catalogo } = await db().from('forge_nodes').select('id, title')
+  const norm = s => String(s).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()
+
+  for (const nombre of nombres) {
+    const nodo = (catalogo || []).find(n => enProyecto.has(n.id) && norm(n.title) === norm(nombre))
+    if (!nodo) continue
+
+    // Aprobadas primero, y la más reciente: es la que el usuario dejó como buena.
+    const { data: png } = await db()
+      .from('forge_assets')
+      .select('storage_url, created_at')
+      .eq('project_id', projectId).eq('node_id', nodo.id)
+      .eq('format', 'png').in('status', ['approved', 'auto_approved'])
+      .not('storage_url', 'is', null)
+      .order('created_at', { ascending: false })
+      .limit(1).maybeSingle()
+    if (png?.storage_url) return png.storage_url
+
+    // Sin asset png, las que viven en la sesión: un output de imagen recién corrido todavía no
+    // pasó por Accept y aun así sirve como referencia.
+    const { data: ses } = await db()
+      .from('forge_sessions')
+      .select('output_images')
+      .eq('project_id', projectId).eq('node_id', nodo.id)
+      .not('output_images', 'is', null)
+      .order('created_at', { ascending: false })
+    for (const s of (ses || [])) {
+      for (const items of Object.values(s.output_images || {})) {
+        for (const it of (items || [])) {
+          const url = it?.variations?.length ? it.variations[it.variations.length - 1]?.url : it?.url
+          if (url) return url
+        }
+      }
+    }
+  }
+  return null
+}
+
 // ─── Despacho de un DECK (workflows `per_page`) ───────────────────────────────
 // El modelo de arriba —un ítem, una llamada, una imagen— no sirve para los decks del 3.20: su
 // workflow no es "una imagen por invocación", son 34 páginas fijas dentro del MISMO grafo, cada
@@ -214,6 +298,138 @@ async function generateDeck({
   let wf = JSON.parse(JSON.stringify(entry.workflow_json))
   for (const p of armado.paginas) {
     if (wf[p.prompt_node]?.inputs) wf[p.prompt_node].inputs.prompt = p.prompt
+  }
+
+  // 1a. El nombre del juego. Las 26 páginas del Art Bible abren con un recuadro «FILL IN ONCE ·
+  // GAME NAME ▶ [ PASTE THE CURRENT GAME'S TITLE HERE ]» y todo el prompt se refiere después a
+  // «the GAME NAME above». Sin rellenarlo, esa instrucción viaja literal al modelo.
+  {
+    const { data: proyecto } = await db().from('projects').select('name').eq('id', project_id).maybeSingle()
+    const titulo = (proyecto?.name || '').trim()
+    if (titulo) {
+      for (const p of armado.paginas) {
+        const n = wf[p.prompt_node]
+        if (typeof n?.inputs?.prompt === 'string') {
+          n.inputs.prompt = n.inputs.prompt.replace(/\[\s*PASTE THE CURRENT GAME'?S TITLE HERE\s*\]/gi, titulo)
+        }
+      }
+    }
+  }
+
+  // 1b. La SEGUNDA imagen de las páginas que la piden.
+  //
+  // Desde la revisión del 24-ago, algunas páginas reciben dos imágenes: la plantilla y una
+  // referencia de estilo. El propio prompt dice de dónde sale esa referencia —«IMAGE 2 = a VISUAL
+  // REFERENCE for this page coming from Pitch Document»— y en el workflow viene con una imagen de
+  // relleno, un caballero de fantasía que no tiene nada que ver con el juego. Sin reemplazarla, el
+  // modelo tomaría ESA como el estilo del proyecto: peor que no darle ninguna referencia.
+  //
+  // El nodo de origen se resuelve por el nombre que declara el prompt, no por una tabla acá: si
+  // mañana una página cambia de fuente, cambia sola.
+  const avisosRef = []
+  const sinRef    = new Set()
+  {
+    const conBatch = armado.paginas.filter(p => {
+      const gpt = wf[p.prompt_node]
+      const src = Object.values(gpt?.inputs || {}).find(v => Array.isArray(v))
+      return wf[src?.[0]]?.class_type === 'ImageBatch'
+    })
+
+    if (conBatch.length) {
+      const { uploadImageToComfyUI } = require('./providers/comfyui.provider')
+      const subidas = new Map()   // url del proyecto → nombre ya subido a ComfyUI
+
+      for (const p of conBatch) {
+        const gpt   = wf[p.prompt_node]
+        const batch = wf[Object.values(gpt.inputs).find(v => Array.isArray(v))[0]]
+        // La segunda entrada del batch es la referencia; la primera es la plantilla.
+        const refId = Object.values(batch.inputs).map(v => v?.[0])[1]
+        if (!wf[refId] || wf[refId].class_type !== 'LoadImage') continue
+
+        // Sin referencia, la página se renderiza SOLO con su plantilla — que es exactamente como
+        // se renderizaba antes de que el workflow tuviera batches, así que es un resultado
+        // conocido y bueno, no una degradación inventada.
+        //
+        // Hay que PUENTEAR el batch, no vaciarlo: `ImageBatch` declara `image1` e `image2` como
+        // requeridos y no admite opcionales, así que dejarlo con una sola entrada es un grafo
+        // inválido. Se reconecta el nodo del modelo directo a la plantilla y el batch queda
+        // huérfano; la poda posterior lo descarta.
+        const sinAncla = motivo => {
+          const plantillaId = Object.values(batch.inputs).map(v => v?.[0])[0]
+          const puerto = Object.entries(gpt.inputs).find(([, v]) => Array.isArray(v))?.[0]
+          if (plantillaId && puerto) {
+            gpt.inputs[puerto] = [String(plantillaId), 0]
+            avisosRef.push(`${p.nombre}: ${motivo} — se renderiza solo con la plantilla`)
+          } else {
+            avisosRef.push(`${p.nombre}: ${motivo}`)
+            sinRef.add(p.nombre)
+          }
+        }
+
+        const fuente = (gpt.inputs.prompt || '').match(/IMAGE 2 = [^\n]*coming from ([^.]+)\./)?.[1] || ''
+        const url    = await imagenDeNodoPorTitulo(db, project_id, fuente)
+        if (!url) { sinAncla(`sin imagen de «${fuente.trim()}» en el proyecto`); continue }
+        try {
+          if (!subidas.has(url)) subidas.set(url, await uploadImageToComfyUI(url))
+          wf[refId].inputs.image = subidas.get(url)
+        } catch (e) {
+          sinAncla(`no se pudo subir la referencia (${e.message})`)
+        }
+      }
+      console.log(`[deck] referencias de estilo: ${conBatch.length - sinRef.size}/${conBatch.length} páginas`)
+    }
+
+    // 1c. El Art Bible: su ÚNICA entrada es la página ya renderizada del ASG que el prompt cita.
+    // No hay plantilla que conservar —el prompt le pide descartar layout, marcos y todo el texto
+    // de la referencia y pintar la obra nueva—, así que la imagen embebida en el workflow es un
+    // relleno y reemplazarla no es opcional: sin esto el bible se pinta a partir de un ejemplo
+    // ajeno al juego.
+    const desdeASG = armado.paginas.filter(p => {
+      const gpt = wf[p.prompt_node]
+      const src = Object.values(gpt?.inputs || {}).find(v => Array.isArray(v))
+      return wf[src?.[0]]?.class_type === 'LoadImage' && /Art Style Guide \(ASG/i.test(gpt?.inputs?.prompt || '')
+    })
+
+    if (desdeASG.length) {
+      const { uploadImageToComfyUI } = require('./providers/comfyui.provider')
+      const subidas = new Map()
+
+      for (const p of desdeASG) {
+        const gpt    = wf[p.prompt_node]
+        const loadId = Object.values(gpt.inputs).find(v => Array.isArray(v))[0]
+        const cita   = (gpt.inputs.prompt || '').match(/Art Style Guide \(ASG\s*[·.\-]?\s*(\d{1,2})/i)
+        if (!cita) { avisosRef.push(`${p.nombre}: el prompt no dice qué página del ASG usa`); sinRef.add(p.nombre); continue }
+
+        const url = await paginaDelASG(db, project_id, cita[1])
+        if (!url) {
+          avisosRef.push(`${p.nombre}: la página ${cita[1]} del ASG todavía no está renderizada`)
+          sinRef.add(p.nombre)
+          continue
+        }
+        try {
+          if (!subidas.has(url)) subidas.set(url, await uploadImageToComfyUI(url))
+          wf[loadId].inputs.image = subidas.get(url)
+        } catch (e) {
+          avisosRef.push(`${p.nombre}: no se pudo subir la página del ASG (${e.message})`)
+          sinRef.add(p.nombre)
+        }
+      }
+      console.log(`[deck] páginas del ASG como canon: ${desdeASG.length - sinRef.size}/${desdeASG.length}`)
+    }
+  }
+
+  // Una página que pide referencia y no la consiguió NO se manda. Dejarla pasar significa
+  // renderizarla contra la imagen de relleno del workflow —un caballero de fantasía— y presentar
+  // eso como el estilo del juego: sale caro y hay que tirarlo. Mejor falta que equivocada.
+  if (sinRef.size) {
+    armado.paginas = armado.paginas.filter(p => !sinRef.has(p.nombre))
+    armado.avisos  = [...(armado.avisos || []), ...avisosRef]
+    console.log(`[deck] ${sinRef.size} página(s) omitidas por falta de referencia: ${[...sinRef].join(', ')}`)
+    if (!armado.paginas.length) {
+      throw new Error(
+        `Ninguna página se puede renderizar: todas piden una imagen de referencia que el proyecto ` +
+        `todavía no produjo.\n${avisosRef.join('\n')}`)
+    }
   }
 
   // Con subconjunto hay que PODAR el grafo: si se manda entero, ComfyUI renderiza las 34 páginas
@@ -337,4 +553,4 @@ async function generateDeck({
   }
 }
 
-module.exports = { imageOutputsOf, parseOutputItems, cleanItemText, generateOneImage, generateDeck, esDeck }
+module.exports = { imageOutputsOf, parseOutputItems, cleanItemText, generateOneImage, generateDeck, esDeck, paginaDelASG, imagenDeNodoPorTitulo }

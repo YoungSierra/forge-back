@@ -4167,6 +4167,96 @@ async function versionActual(asset_id) {
   return data?.version_number || 0
 }
 
+// ─── POST /api/projects/:id/canvas/assets/:asset_id/design-edit ──────────────
+// «Design Edits» del moodboard: el usuario pide un cambio de diseño en palabras y la imagen se
+// vuelve a generar aplicando SOLO eso.
+//
+// Se diferencia de /iterate en que no rehace la página desde el documento: parte de la imagen que
+// ya existe y la edita. Sirve para cualquier activo de imagen, no solo para las páginas de un deck.
+//
+// El prompt del workflow trae un andamiaje alrededor de un token —«mantén la plantilla exacta:
+// mismo layout, cajas, textos, tipografías…»— y ESE andamiaje es la garantía de que la iteración
+// no destruya la página. Por eso se sustituye el token y no se reemplaza el prompt.
+router.post('/assets/:asset_id/design-edit', async (req, res, next) => {
+  try {
+    const { id: project_id, asset_id } = req.params
+    const member_id = req.body?.member_id || null
+    const pedido    = String(req.body?.prompt || '').trim()
+    if (!pedido) return res.status(400).json({ success: false, error: 'Describe the design change' })
+
+    const { data: asset } = await db().from('forge_assets')
+      .select('id, node_id, project_id, name, storage_url, format')
+      .eq('id', asset_id).eq('project_id', project_id).single()
+    if (!asset)             return res.status(404).json({ success: false, error: 'Asset not found' })
+    if (!asset.storage_url) return res.status(400).json({ success: false, error: 'This asset has no image to edit' })
+
+    const { getWorkflowByName } = require('../services/config.service')
+    const entry = await getWorkflowByName('V57_STUDIO_Moodboard_Iteration')
+    if (!entry) return res.status(500).json({ success: false, error: 'Moodboard iteration workflow is not registered' })
+
+    const cfg = entry.inject_config || {}
+    const wf  = JSON.parse(JSON.stringify(entry.workflow_json))
+
+    // La imagen a editar: la versión vigente del asset, subida al input de ComfyUI.
+    const { uploadImageToComfyUI, pollUntilDone, downloadOutput } = require('../services/providers/comfyui.provider')
+    const subida = await uploadImageToComfyUI(asset.storage_url)
+    if (cfg.image?.node) wf[cfg.image.node].inputs[cfg.image.field] = subida
+
+    // El token, no el prompt entero.
+    if (cfg.prompt?.node) {
+      const campo = cfg.prompt.field
+      const base  = String(wf[cfg.prompt.node].inputs[campo] || '')
+      const token = cfg.prompt.token || '[ USER PROMPT ]'
+      wf[cfg.prompt.node].inputs[campo] = base.includes(token)
+        ? base.split(token).join(pedido)
+        : `${pedido}\n\n${base}`   // si alguien quita el token, el pedido igual llega
+    }
+    if (cfg.seed?.node) wf[cfg.seed.node].inputs[cfg.seed.field] = Math.floor(Math.random() * 2 ** 31)
+
+    const BASE = (process.env.COMFYUI_BASE_URL || '').replace(/\/$/, '')
+    const KEY  = process.env.COMFYUI_API_KEY
+    const r = await fetch(`${BASE}/api/prompt`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...(KEY ? { Authorization: `Bearer ${KEY}` } : {}) },
+      body: JSON.stringify({ prompt: wf, ...(KEY ? { extra_data: { api_key_comfy_org: KEY } } : {}) }),
+    })
+    const txt = await r.text()
+    if (!r.ok) throw new Error(`ComfyUI rechazó la edición: ${r.status} ${txt.slice(0, 300)}`)
+    const jobId = JSON.parse(txt).prompt_id
+
+    await pollUntilDone(jobId, 180000)
+    const destino = `projects/${project_id}/design-edits/${asset_id}-${Date.now()}.png`
+    const salida  = await downloadOutput(jobId, destino)
+    if (!salida?.url) return res.status(502).json({ success: false, error: 'The workflow returned no image' })
+
+    // Misma regla que la iteración del deck: la versión nueva pasa a ser la vigente, pero NO
+    // aprobada. Aprobar es un acto del usuario.
+    let ultima = await versionActual(asset_id)
+    if (ultima === 0) {
+      await db().from('forge_asset_versions').insert({
+        asset_id, storage_url: asset.storage_url, version_number: 1, is_current: false,
+        metadata: { origen: 'imagen original' },
+      })
+      ultima = 1
+    }
+    await db().from('forge_asset_versions').update({ is_current: false }).eq('asset_id', asset_id)
+    const { data: ver, error: vErr } = await db().from('forge_asset_versions').insert({
+      asset_id, storage_url: salida.url, version_number: ultima + 1, is_current: true,
+      created_by: member_id,
+      metadata: { job: jobId, design_edit: pedido, workflow: 'V57_STUDIO_Moodboard_Iteration' },
+    }).select('id, version_number').single()
+    if (vErr) throw vErr
+
+    await db().from('forge_assets').update({ storage_url: salida.url }).eq('id', asset_id)
+
+    res.json({
+      success: true,
+      version: { id: ver.id, version_number: ver.version_number, storage_url: salida.url },
+      job: jobId,
+    })
+  } catch (err) { next(err) }
+})
+
 router.post('/assets/:asset_id/iterate', async (req, res, next) => {
   try {
     const { id: project_id, asset_id } = req.params
