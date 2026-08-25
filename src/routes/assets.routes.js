@@ -519,4 +519,73 @@ router.get('/project-assets', async (req, res, next) => {
   } catch (err) { next(err) }
 })
 
+// ─── Notas del moodboard ──────────────────────────────────────────────────────
+// Se pidieron para «dejar indicaciones sin modificar la imagen», así que son del PROYECTO: una
+// indicación que solo ve quien la escribió no sirve para eso. Una por activo y por persona.
+
+// GET /api/assets/notes?project_id=  → todas las del proyecto, para pintar el lienzo de una vez
+router.get('/notes', async (req, res, next) => {
+  try {
+    const { project_id } = req.query
+    if (!project_id) return res.status(400).json({ success: false, error: 'project_id required' })
+
+    const { data, error } = await db()
+      .from('forge_asset_notes')
+      .select('id, asset_id, member_id, body, updated_at')
+      .eq('project_id', project_id)
+    if (error) throw error
+
+    const ids = [...new Set((data || []).map(n => n.member_id).filter(Boolean))]
+    const autores = {}
+    if (ids.length) {
+      const { data: ms } = await db().from('members').select('id, display_name').in('id', ids)
+      for (const m of (ms || [])) autores[m.id] = m.display_name
+    }
+    res.json({
+      success: true,
+      notes: (data || []).map(n => ({ ...n, author: autores[n.member_id] ?? null })),
+    })
+  } catch (err) { next(err) }
+})
+
+// PUT /api/assets/:id/note  { project_id, body, member_id }
+// Cuerpo vacío = borrar. Guardar una nota en blanco dejaría el elemento marcado como anotado.
+router.put('/:id/note', async (req, res, next) => {
+  try {
+    const { id: asset_id } = req.params
+    const { project_id, member_id = null } = req.body || {}
+    const body = String(req.body?.body ?? '').trim()
+    if (!project_id) return res.status(400).json({ success: false, error: 'project_id required' })
+
+    if (!body) {
+      const q = db().from('forge_asset_notes').delete().eq('asset_id', asset_id)
+      const { error } = await (member_id ? q.eq('member_id', member_id) : q.is('member_id', null))
+      if (error) throw error
+      return res.json({ success: true, deleted: true })
+    }
+
+    // Upsert a mano: la unicidad usa COALESCE sobre member_id y `onConflict` no la expresa.
+    const busca = db().from('forge_asset_notes').select('id').eq('asset_id', asset_id)
+    const { data: ya } = await (member_id ? busca.eq('member_id', member_id) : busca.is('member_id', null)).maybeSingle()
+
+    const fila = { asset_id, project_id, member_id, body, updated_at: new Date().toISOString() }
+    const { data, error } = ya
+      ? await db().from('forge_asset_notes').update(fila).eq('id', ya.id).select('id, updated_at').single()
+      : await db().from('forge_asset_notes').insert(fila).select('id, updated_at').single()
+    if (error) throw error
+
+    res.json({ success: true, note: { id: data.id, asset_id, body, updated_at: data.updated_at } })
+  } catch (err) {
+    // El lienzo mezcla activos de cuatro orígenes y solo uno vive en `forge_assets`. Si la nota
+    // se rechaza por eso, decirlo: un 500 genérico manda a buscar el problema donde no está.
+    if (String(err?.message || '').includes('forge_asset_notes_asset_id_fkey')) {
+      return res.status(409).json({
+        success: false,
+        error: 'Notes are still tied to forge_assets — run migration 053 to allow notes on library and session images.',
+      })
+    }
+    next(err)
+  }
+})
+
 module.exports = router
