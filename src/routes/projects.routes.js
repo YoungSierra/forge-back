@@ -149,6 +149,35 @@ router.put('/:id/canvas', async (req, res, next) => {
   } catch (err) { next(err) }
 })
 
+// ─── Acomodo del moodboard ────────────────────────────────────────────────────
+// Dónde puso cada quien las hojas es del PROYECTO: el equipo lo decidió así, y una hoja movida
+// que solo ve quien la movió no organiza nada.
+//
+// Vive dentro de `canvas_layout`, bajo su propia clave, para no pedir una columna nueva. Y se
+// MEZCLA del lado del servidor: el PUT de arriba reemplaza el objeto entero, así que si el
+// moodboard escribiera por ahí se llevaría por delante el layout del canvas de nodos.
+router.get('/:id/moodboard-layout', async (req, res, next) => {
+  try {
+    const { data, error } = await db().from('projects').select('canvas_layout').eq('id', req.params.id).maybeSingle()
+    if (error) throw error
+    res.json({ success: true, layout: data?.canvas_layout?.moodboard ?? {} })
+  } catch (err) { next(err) }
+})
+
+router.put('/:id/moodboard-layout', async (req, res, next) => {
+  try {
+    const { layout } = req.body || {}
+    if (!layout || typeof layout !== 'object') {
+      return res.status(400).json({ success: false, error: 'layout is required' })
+    }
+    const { data } = await db().from('projects').select('canvas_layout').eq('id', req.params.id).maybeSingle()
+    const nuevo = { ...(data?.canvas_layout ?? {}), moodboard: layout }
+    const { error } = await db().from('projects').update({ canvas_layout: nuevo }).eq('id', req.params.id)
+    if (error) throw error
+    res.json({ success: true })
+  } catch (err) { next(err) }
+})
+
 // GET /api/projects/:id
 router.get('/:id', requireAuth, async (req, res, next) => {
   try {
