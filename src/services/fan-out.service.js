@@ -143,18 +143,32 @@ function extractSeedsFromAsset(content) {
  * Parsea el contenido de un asset como array de ítems del type_registry.
  * Intenta JSON primero; fallback a text parsing (concept_seed mínimo).
  */
-// Extrae el primer array JSON del contenido (con o sin fences ```json), aunque venga
-// rodeado de prosa. Devuelve el array parseado o null si no hay uno válido.
+// Extrae el array JSON del contenido (con o sin fences ```json), aunque venga rodeado de prosa.
+// Devuelve el array parseado o null si no hay uno válido.
+//
+// Se recorren TODOS los bloques y primero los marcados ```json. Quedarse con el primer fence
+// costó los lanes "[PROPOSED" de Smack v3 Pedrito: ese documento abre con un diagrama de flujo en
+// un fence sin lenguaje, así que el JSON del final —el que el prompt del gate exige— no se miraba
+// nunca y el parser terminaba leyendo cursivas como si fueran viñetas.
 function extractJsonArray(content) {
-  const fence = content.match(/```(?:json)?\s*([\s\S]*?)```/i)
-  const text  = fence ? fence[1] : content
-  const start = text.indexOf('[')
-  const end   = text.lastIndexOf(']')
-  if (start === -1 || end <= start) return null
-  try {
-    const arr = JSON.parse(text.slice(start, end + 1))
-    return Array.isArray(arr) ? arr : null
-  } catch (_) { return null }
+  const intentar = texto => {
+    const start = texto.indexOf('[')
+    const end   = texto.lastIndexOf(']')
+    if (start === -1 || end <= start) return null
+    try {
+      const arr = JSON.parse(texto.slice(start, end + 1))
+      return Array.isArray(arr) && arr.length ? arr : null
+    } catch (_) { return null }
+  }
+
+  const bloques = [...content.matchAll(/```(\w*)\s*([\s\S]*?)```/g)]
+    .map(m => ({ lang: (m[1] || '').toLowerCase(), cuerpo: m[2] }))
+
+  // Los ```json declarados mandan; después los fences sin lenguaje; el documento pelado al final,
+  // que es el caso del asset que ES el array y nada más.
+  for (const b of bloques.filter(b => b.lang === 'json')) { const r = intentar(b.cuerpo); if (r) return r }
+  for (const b of bloques.filter(b => b.lang === ''))     { const r = intentar(b.cuerpo); if (r) return r }
+  return bloques.length ? null : intentar(content)
 }
 
 function parseItemsFromContent(content) {
