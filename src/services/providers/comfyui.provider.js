@@ -22,7 +22,27 @@ async function submitWorkflow(workflowName, prompt, width, height, extras = {}) 
   const workflow = JSON.parse(JSON.stringify(entry.workflow_json))
   const inject   = entry.inject_config
 
-  injectPoint(workflow, inject.prompt, prompt)
+  // `mode: 'token'` — el prompt del usuario va DENTRO del prompt del workflow, en el lugar que el
+  // workflow marca, no en lugar de él. Pisarlo entero le saca al modelo la instrucción de qué
+  // hacer con la imagen: medido el 25-ago, una hoja de personaje con «cambiá el turquesa a
+  // naranja» devolvió una Environment Sheet inventada. Lo hacía bien `design-edit`, que arma el
+  // payload a mano; acá se replica para que cualquier camino se comporte igual.
+  if (inject.mode === 'token' && inject.prompt?.node && workflow[inject.prompt.node]) {
+    const campo = inject.prompt.field
+    const base  = String(workflow[inject.prompt.node].inputs[campo] || '')
+    const token = inject.prompt.token || '[ USER PROMPT ]'
+    workflow[inject.prompt.node].inputs[campo] = base.includes(token)
+      ? base.split(token).join(prompt || '')
+      : `${prompt || ''}\n\n${base}`   // si alguien saca el token, el pedido igual llega
+  } else {
+    injectPoint(workflow, inject.prompt, prompt)
+  }
+
+  // Punto `image` de primer nivel: la imagen a editar, ya subida por el llamador. No estaba
+  // contemplado acá —solo `extra`— así que un workflow declarado así corría con la imagen de
+  // ejemplo que trae adentro, sin fallar y sin avisar.
+  if (inject.image?.node && extras.image) injectPoint(workflow, inject.image, extras.image)
+
   injectPoint(workflow, inject.width,  width)
   injectPoint(workflow, inject.height, height)
   injectPoint(workflow, inject.seed,   Math.floor(Math.random() * 2147483647))
@@ -186,6 +206,64 @@ async function downloadOutput(promptId, storagePath) {
   return { url: primaryResult.url, size_bytes: primaryResult.size_bytes, glb_urls: glbUrls, source: 'comfyui' }
 }
 
+// ─── Todas las salidas de un job, por nodo ───────────────────────────────────
+//
+// `downloadOutput` devuelve UNA imagen —la primera que encuentra— porque hasta ahora cada workflow
+// producía una. La cadena de Character Sheet no: su paso 2 tiene cuatro `SaveImage` (el maestro y
+// las tres vistas) y el paso 3 pide esas vistas por rol. Quedarse con la primera perdería tres
+// imágenes ya pagadas, y peor: cuál es «la primera» depende del orden en que ComfyUI devuelva los
+// nodos, así que el rol saldría distinto en cada corrida.
+//
+// Devuelve { [nodo]: { url, kind, size_bytes } }. El nodo es la clave porque es lo único estable:
+// el `filename_prefix` puede repetirse y el orden no se puede pedir.
+async function downloadOutputsByNode(promptId, basePath) {
+  const histRes = await fetch(`${BASE_URL()}/api/jobs/${promptId}`, { headers: headers() })
+  if (!histRes.ok) throw new Error(`ComfyUI jobs fetch failed: ${histRes.status}`)
+
+  const jobData = await histRes.json()
+  const outputs = jobData?.outputs ?? jobData?.[promptId]?.outputs
+  const porNodo = {}
+
+  for (const [nodo, salida] of Object.entries(outputs || {})) {
+    // Un mismo nodo puede publicar bajo varias claves; se toma el primer archivo que sirva.
+    const archivos = ['images', '3d', 'gltf', 'mesh', 'files']
+      .flatMap(k => (Array.isArray(salida?.[k]) ? salida[k] : []))
+      .filter(f => f?.filename)
+    const vistos = new Set()
+
+    for (const f of archivos) {
+      if (vistos.has(f.filename)) continue
+      vistos.add(f.filename)
+
+      const nombre = f.filename.toLowerCase()
+      const es3D   = nombre.endsWith('.glb') || nombre.endsWith('.gltf')
+      const ext    = es3D ? '.glb' : '.png'
+      const mime   = es3D ? 'model/gltf-binary' : 'image/png'
+
+      const viewUrl = `${BASE_URL()}/api/view?filename=${encodeURIComponent(f.filename)}`
+                    + `&subfolder=${encodeURIComponent(f.subfolder || '')}&type=${f.type || 'output'}`
+      const res = await fetch(viewUrl, { headers: headers(), redirect: 'follow' })
+      if (!res.ok) { console.warn(`[ComfyUI] salida ${nodo} no se pudo bajar: ${res.status} ${f.filename}`); continue }
+
+      const buffer = Buffer.from(await res.arrayBuffer())
+      // Un PNG de menos de 1 KB es un placeholder, no un render — el mismo umbral que ya usaba
+      // downloadOutput. Un GLB chico sí puede ser válido, así que el piso es solo para imágenes.
+      if (!es3D && buffer.length < 1000) continue
+
+      const url = await uploadToStorage(buffer, `${basePath}_${nodo}${ext}`, mime)
+      porNodo[nodo] = { url, kind: es3D ? 'model' : 'image', size_bytes: buffer.length }
+      console.log(`[ComfyUI] salida ${nodo} → ${url} (${Math.round(buffer.length / 1024)}kb) job:${promptId}`)
+      break
+    }
+  }
+
+  if (!Object.keys(porNodo).length) {
+    console.error(`[ComfyUI] downloadOutputsByNode: outputs del job ${promptId}:`, JSON.stringify(outputs))
+    throw new Error(`ComfyUI: el job ${promptId} no dejó ninguna salida`)
+  }
+  return porNodo
+}
+
 async function uploadImageToComfyUI(imageUrl) {
   const imgRes = await fetch(imageUrl)
   if (!imgRes.ok) throw new Error(`Failed to fetch reference image: ${imgRes.status} ${imageUrl}`)
@@ -225,4 +303,4 @@ async function generateImageComfyUI(workflowName, prompt, width, height, storage
   return result
 }
 
-module.exports = { generateImageComfyUI, uploadImageToComfyUI, submitWorkflow, pollUntilDone, downloadOutput }
+module.exports = { generateImageComfyUI, uploadImageToComfyUI, submitWorkflow, pollUntilDone, downloadOutput, downloadOutputsByNode }

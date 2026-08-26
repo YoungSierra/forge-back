@@ -4257,6 +4257,43 @@ router.post('/assets/:asset_id/design-edit', async (req, res, next) => {
   } catch (err) { next(err) }
 })
 
+// ─── Qué paso viene, sin correr nada (§8) ────────────────────────────────────
+// Lo consulta el recuadro previo de Run: tiene que decir QUÉ se va a generar y POR QUÉ antes de
+// gastar. Sin este endpoint el recuadro tendría que adivinarlo en el front, y adivinar el costo
+// de un paso es exactamente lo que no queremos.
+router.get('/assets/:asset_id/next-step', async (req, res, next) => {
+  try {
+    const { id: project_id, asset_id } = req.params
+    const { data: asset } = await db().from('forge_assets')
+      .select('id, name, metadata, storage_url')
+      .eq('id', asset_id).eq('project_id', project_id).single()
+    if (!asset) return res.status(404).json({ success: false, error: 'Asset not found' })
+
+    const { proximoPaso } = require('../services/chain.service')
+    res.json({ success: true, paso: proximoPaso(asset) })
+  } catch (err) { next(err) }
+})
+
+// ─── Avanzar la pieza por su cadena (§8 con pasos=1, §10 con pasos=3) ────────
+router.post('/assets/:asset_id/advance', async (req, res, next) => {
+  try {
+    const { id: project_id, asset_id } = req.params
+    const member_id = req.body?.member_id || null
+    const prompt    = req.body?.prompt || null
+    // El tope es la cadena más larga que existe: pedir 99 pasos no puede volverse un gasto abierto.
+    const pasos     = Math.max(1, Math.min(3, Number(req.body?.pasos) || 1))
+
+    const { avanzar } = require('../services/chain.service')
+    const r = await avanzar({ db, project_id, asset_id, pasos, prompt, member_id })
+    res.json({ success: true, ...r })
+  } catch (err) {
+    // «Esta página todavía no tiene cadena» no es una falla del servidor: es el estado real de
+    // casi todas hasta que el equipo defina sus workflows.
+    if (err.code === 'SIN_CADENA') return res.status(400).json({ success: false, error: err.message, code: err.code })
+    next(err)
+  }
+})
+
 router.post('/assets/:asset_id/iterate', async (req, res, next) => {
   try {
     const { id: project_id, asset_id } = req.params

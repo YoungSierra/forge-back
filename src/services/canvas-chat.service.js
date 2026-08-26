@@ -267,8 +267,13 @@ async function resolveNodeInputs(db, { projectId, currentPNodeId, targetOutput, 
 
         if (approvedSessions?.length) {
           const nodeTitle2 = approvedSessions[0].forge_nodes?.title ?? sourcePNode.forge_nodes?.title ?? 'Node'
+          // Cualquier output que GENERE imágenes, sea cual sea su formato. Exigir `format: png`
+          // dejaba fuera a los documentos que incrustan las suyas —el `concept_seeds` del 1.1 y,
+          // desde v2.9.13, el `pitch_document` del 2.1—: sus imágenes se producen, se guardan en
+          // `output_images` bajo la clave del output y aguas abajo no las ve nadie. El formato dice
+          // cómo se entrega el output, no si hubo imágenes.
           const pngOutputs = (approvedSessions[0].forge_nodes?.outputs || [])
-            .filter(o => (o.format === 'png' || o.format === 'image') && o.image_gen)
+            .filter(o => o.image_gen)
           // Merge de output_images de todas las sesiones (la primera no-vacía por clave; están ordenadas desc)
           const merged = {}
           for (const s of approvedSessions) {
