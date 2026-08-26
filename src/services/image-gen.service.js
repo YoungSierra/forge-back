@@ -45,20 +45,37 @@ function imageOutputsOf(node) {
 // palabra. Sin eso entraban «Seed Comparison at a Glance» y «Seed Shortlist», que son una tabla y
 // un índice: cada uno se llevaba un hueco de imagen que nadie pidió.
 const RX_ENUMERADO = /^(#{1,4})\s+\**\s*(?:seeds?|variations?|concepts?|angles?|images?|options?|pages?)\s*(?:[·:.\-—]|\d|[A-Z]\b)/i
-function bloquesEnumerados(texto) {
-  const lineas = String(texto || '').split('\n')
-  const marcas = []
-  for (let i = 0; i < lineas.length; i++) {
-    const m = RX_ENUMERADO.exec(lineas[i])
-    if (m) marcas.push({ i, nivel: m[1].length })
-  }
-  if (!marcas.length) return null
-  const nivel  = Math.min(...marcas.map(m => m.nivel))
+// Un encabezado que ES un identificador: «### pitch_01_hook». Desde v2.9.13 el título de cada
+// entrada del plan ES el id de la imagen, y el 3.20 lo cita verbatim en su reference_map. No
+// empieza con ninguna palabra del vocabulario, así que la regla del sustantivo no lo veía: el plan
+// del 2.1 salía como UN ítem («DECISION RECORD») en vez de sus cuatro entradas.
+const RX_IDENTIFICADOR = /^(#{1,4})\s+\**\s*[a-z][a-z0-9]*(?:_[a-z0-9]+)+\**\s*$/
+
+// Agrupa los encabezados que marcan entidad y devuelve un bloque por cada uno. Se exige el MISMO
+// nivel en todos: un `### Rationale` dentro de un `## SEED 04` es parte de la semilla.
+function bloquesPorMarcas(lineas, marcas, minimo = 1) {
+  if (marcas.length < minimo) return null
+  const nivel   = Math.min(...marcas.map(m => m.nivel))
   const propias = marcas.filter(m => m.nivel === nivel)
+  if (propias.length < minimo) return null
   return propias.map((p, k) => {
     const hasta = k + 1 < propias.length ? propias[k + 1].i : lineas.length
     return lineas.slice(p.i, hasta).join('\n').trim()
   })
+}
+
+function bloquesEnumerados(texto) {
+  const lineas = String(texto || '').split('\n')
+  const porSustantivo = [], porIdentificador = []
+  for (let i = 0; i < lineas.length; i++) {
+    const m = RX_ENUMERADO.exec(lineas[i])
+    if (m) { porSustantivo.push({ i, nivel: m[1].length }); continue }
+    const d = RX_IDENTIFICADOR.exec(lineas[i])
+    if (d) porIdentificador.push({ i, nivel: d[1].length })
+  }
+  // El sustantivo manda; los identificadores son el respaldo y piden DOS o más, porque un
+  // `## concept_seeds` suelto es el ancla de un output, no una entrada.
+  return bloquesPorMarcas(lineas, porSustantivo, 1) ?? bloquesPorMarcas(lineas, porIdentificador, 2)
 }
 
 // Un objeto del array, escrito como se lo lee una persona. Mandarle `JSON.stringify` al modelo de
