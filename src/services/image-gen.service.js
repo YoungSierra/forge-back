@@ -34,7 +34,17 @@ function imageOutputsOf(node) {
 // —«Concept Seeds · Pass 3»— y para protegerse había que exigir dos bloques. Con el vocabulario
 // que la DNA usa de verdad, UN bloque ya alcanza: una corrida incremental agrega una sola semilla
 // y las anteriores no se repiten, y ahí exigir dos volvía a caer en las viñetas.
-const RX_ENUMERADO = /^(#{1,4})\s+.*?\b(?:seeds?|variations?|concepts?|angles?|images?|options?|pages?)\s*[·:.\-—]?\s*0*\d{1,3}\b/i
+// El encabezado EMPIEZA con el sustantivo. Eso separa «## SEED I» —que nombra una entidad— de
+// «# SMACK — Concept Seeds · Iteration 4», que la menciona al pasar.
+//
+// Antes se exigía además un NÚMERO, y las semillas nombradas con letra (SEED I, J, L) no
+// matcheaban: caían a viñetas y el nodo ofrecía quince imágenes de la lista de mecánicas. Aceptar
+// la letra en cualquier posición fue peor —se comía el título del documento y colapsaba todo a un
+// ítem, medido en 28 de 64 outputs—. Lo que identifica al ítem es cómo ABRE el encabezado.
+// Y después del sustantivo tiene que venir un número, una letra sola o un separador — NO otra
+// palabra. Sin eso entraban «Seed Comparison at a Glance» y «Seed Shortlist», que son una tabla y
+// un índice: cada uno se llevaba un hueco de imagen que nadie pidió.
+const RX_ENUMERADO = /^(#{1,4})\s+\**\s*(?:seeds?|variations?|concepts?|angles?|images?|options?|pages?)\s*(?:[·:.\-—]|\d|[A-Z]\b)/i
 function bloquesEnumerados(texto) {
   const lineas = String(texto || '').split('\n')
   const marcas = []
@@ -51,12 +61,60 @@ function bloquesEnumerados(texto) {
   })
 }
 
+// Un objeto del array, escrito como se lo lee una persona. Mandarle `JSON.stringify` al modelo de
+// imagen le da llaves y comillas en vez de un sujeto: el prompt tiene que ser el título y lo que
+// lo describe, no su serialización.
+const OCULTO = new Set(['id', 'key', 'index', 'seed_id', 'uuid', 'gaps_for_downstream'])
+const CABECERA = ['title', 'name', 'one_liner', 'oneLiner', 'summary', 'description', 'label']
+const rotulo = k => String(k).replace(/_/g, ' ').replace(/\w/g, c => c.toUpperCase())
+const plano = v =>
+  Array.isArray(v) ? v.filter(x => x != null).map(x => typeof x === 'string' ? x : JSON.stringify(x)).join(' · ')
+  : typeof v === 'string' ? v
+  : (typeof v === 'number' || typeof v === 'boolean') ? String(v)
+  : v && typeof v === 'object' ? Object.entries(v).map(([k, x]) => `${rotulo(k)}: ${plano(x)}`).join(' · ')
+  : ''
+function textoDeItem(el) {
+  if (typeof el === 'string') return el
+  if (!el || typeof el !== 'object') return String(el ?? '')
+  const cab = CABECERA.map(k => el[k]).filter(v => typeof v === 'string' && v.trim())
+  const resto = Object.entries(el)
+    .filter(([k, v]) => !CABECERA.includes(k) && !OCULTO.has(k) && plano(v).trim())
+    .map(([k, v]) => `${rotulo(k)}: ${plano(v)}`)
+  return (cab.length || resto.length) ? [cab.join(' — '), ...resto].filter(Boolean).join('\n\n') : ''
+}
+
 function parseOutputItems(content, format) {
-  if (format === 'json') {
-    try {
-      const parsed = JSON.parse(content)
-      if (Array.isArray(parsed)) return parsed.map(String).filter(s => s.trim().length > 0)
-    } catch { /* continúa */ }
+  // Fuera antes de mirar nada: `gaps_for_downstream` —que la enmienda M-8 obliga a emitir al
+  // cierre de todo output de concepto— son huecos pendientes para los nodos de abajo, no
+  // contenido ilustrable. Sus líneas empiezan con «- gap:», así que la regla de viñetas las tomaba
+  // y el nodo ofrecía una imagen POR CADA HUECO. El front ya lo descartaba; el backend no, y es el
+  // que corre el auto-run.
+  content = String(content || '').replace(/^#{1,4}[ \t]+gaps_for_downstream[\s\S]*$/im, '').trim()
+
+  // Un array declarado manda sobre cualquier lectura de la prosa — y se busca en TODOS los
+  // bloques cercados, no en el primero. Medido: una respuesta abría con un diagrama ASCII y traía
+  // las semillas en JSON más abajo; mirar solo el primero las perdía. Y `format` acá casi nunca es
+  // 'json': `concept_seeds` es `list<concept_seed>`, así que exigirlo dejaba el JSON sin leer
+  // justo en las corridas que SÍ lo emitieron.
+  if (format === 'json' || /^list</.test(String(format || '')) || format === 'structured') {
+    const bloques = [...content.matchAll(/```(\w*)\s*([\s\S]*?)```/g)]
+      .map(m => ({ lang: (m[1] || '').toLowerCase(), cuerpo: m[2] }))
+    const candidatos = [
+      ...bloques.filter(b => b.lang === 'json').map(b => b.cuerpo),
+      ...bloques.filter(b => b.lang === '').map(b => b.cuerpo),
+      ...(bloques.length ? [] : [content]),
+    ]
+    for (const texto of candidatos) {
+      const a = texto.indexOf('['), b = texto.lastIndexOf(']')
+      if (a === -1 || b <= a) continue
+      try {
+        const arr = JSON.parse(texto.slice(a, b + 1))
+        if (Array.isArray(arr) && arr.length) {
+          const items = arr.map(textoDeItem).filter(x => x.trim())
+          if (items.length) return items
+        }
+      } catch { /* no era éste */ }
+    }
   }
 
   // Entidades enumeradas por encabezado — antes que las viñetas, que se llevan cualquier lista.
