@@ -637,14 +637,48 @@ async function resolverImagenesDeItems({ db, projectId, nodeId, sessionId, outKe
   // 1) Propias. Sin `output_key` —las sesiones generales, las de antes del modelo por output— no
   //    hay una clave que buscar en `output_images`, pero eso no quita que aguas arriba haya
   //    imágenes: antes se cortaba acá y esos documentos salían siempre sin nada.
-  if (sessionId && outKey) {
+  if (sessionId) {
     const { data: sess } = await db().from('forge_sessions')
       .select('output_images').eq('id', sessionId).maybeSingle()
-    const propios = parseItems(contenido)
-    for (const it of (sess?.output_images?.[outKey] || [])) {
-      const url = it?.variations?.length ? it.variations[it.variations.length - 1]?.url : it?.url
-      const src = propios[it?.index]
-      if (url) imagenes.push({ title: src?.title ?? src ?? '', url })
+
+    // Con `output_key` se mira esa clave; SIN ella —el nodo corrido entero— se miran TODAS las de
+    // la sesión. Antes este paso se salteaba por completo cuando la clave era null, así que un
+    // documento que había generado sus propias imágenes salía sin ninguna: estaban guardadas ahí
+    // al lado y nadie las miraba. Medido el 26-08 en el 2.1: 4 imágenes en la sesión, 0 en el PDF.
+    const claves = outKey ? [outKey] : Object.keys(sess?.output_images || {})
+
+    // De qué sección salen los títulos. Un documento que declara un hermano —el pitch declara su
+    // plan de imágenes— numera contra las entradas de ESE hermano, no contra su propia prosa.
+    const { data: dna } = await db().from('forge_nodes').select('outputs').eq('id', nodeId).maybeSingle()
+    const defs = dna?.outputs || []
+    // El ancla de un output: su clave como encabezado, con o sin negrita.
+    const anclaDe = clave => new RegExp(`^#{1,4}\\s+\\*{0,2}\\s*${clave}\\b`, 'im')
+    const seccionDe = clave => {
+      const def = defs.find(o => (o.key || o.name) === clave)
+      const decl = (def?.uses?.siblings_if_present ?? def?.uses?.siblings ?? []).find(k => /plan$/i.test(k))
+      if (!decl) return contenido
+      const ini = anclaDe(decl).exec(contenido)
+      if (!ini) return contenido
+      const desde = contenido.slice(ini.index + ini[0].length)
+      const cortes = defs.map(o => o.key || o.name).filter(k => k !== decl)
+        .map(k => anclaDe(k).exec(desde))
+        .filter(Boolean).map(r => r.index)
+      return desde.slice(0, cortes.length ? Math.min(...cortes) : desde.length).trim() || contenido
+    }
+
+    // Los títulos salen del parser de ÍTEMS, no del de fan-out: las entradas del plan son
+    // encabezados-identificador (`### pitch_01_hook`) y el de fan-out no los reconoce, así que
+    // devolvía título vacío y las imágenes quedaban sin ancla — se apilaban al principio del PDF
+    // en vez de ir cada una en su sección.
+    const { parseOutputItems, cleanItemText } = require('./image-gen.service')
+    for (const clave of claves) {
+      const propios = parseOutputItems(seccionDe(clave), 'markdown')
+        .map(t => ({ title: (cleanItemText(t).split(String.fromCharCode(10)).filter(Boolean)[0] || '') }))
+      for (const it of (sess?.output_images?.[clave] || [])) {
+        const url = it?.variations?.length ? it.variations[it.variations.length - 1]?.url : it?.url
+        const src = propios[it?.index]
+        if (url) imagenes.push({ title: it?.name ?? src?.title ?? src ?? '', url })
+      }
     }
     if (imagenes.length) return imagenes
   }
