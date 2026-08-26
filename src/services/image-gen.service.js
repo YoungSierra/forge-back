@@ -289,8 +289,15 @@ async function imagenDeNodoPorTitulo(db, projectId, fuente) {
   const { data: pns } = await db()
     .from('forge_project_nodes').select('node_id').eq('project_id', projectId).eq('removed', false)
   const enProyecto = new Set((pns || []).map(p => p.node_id).filter(Boolean))
-  const { data: catalogo } = await db().from('forge_nodes').select('id, title')
+  const { data: catalogo } = await db().from('forge_nodes').select('id, title, node_key')
   const norm = s => String(s).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()
+
+  // Se acepta el TÍTULO o la CLAVE del nodo. La plantilla del deck dice «coming from Pitch
+  // Document», pero el `reference_map` que escribe el 3.20 cita «2.1 / pitch_01_hook» — la clave.
+  // Reconocer sólo una de las dos formas deja media plataforma sin resolver, y el fallo es mudo:
+  // sin nodo no hay imagen, y la página sale con plantilla sin decir por qué.
+  const buscarNodo = nombre => (catalogo || []).find(n => enProyecto.has(n.id) &&
+    (norm(n.title) === norm(nombre) || String(n.node_key) === String(nombre).trim()))
 
   for (const crudo of nombres) {
     // «Pitch Document / pitch_01_hook» — el nodo, y QUÉ imagen suya. Sin la segunda parte se
@@ -298,7 +305,7 @@ async function imagenDeNodoPorTitulo(db, projectId, fuente) {
     // imagen concreta, que es lo que necesitan las 5 páginas del ASG que citan al Pitch Document:
     // pedir solo el nodo les daba la misma imagen a todas.
     const [nombre, item] = crudo.split('/').map(s => s.trim())
-    const nodo = (catalogo || []).find(n => enProyecto.has(n.id) && norm(n.title) === norm(nombre))
+    const nodo = buscarNodo(nombre)
     if (!nodo) continue
 
     if (item) {

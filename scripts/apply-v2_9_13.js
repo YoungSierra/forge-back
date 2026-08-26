@@ -29,7 +29,11 @@ const APPLY = process.argv.includes('--apply')
 // reenvió, así que hay más de una versión del mismo paquete y hay que poder decir cuál.
 const DIR   = process.argv.find(a => a.startsWith('--dir='))?.slice(6)
   ?? path.join(__dirname, '..', '..', 'P-26082026', 'x_v2913_new', 'v2913', 'patches')
-const PATCHES = { '1.4': '1_4_patch.json', '2.1': '2_1_patch.json', '2.2': '2_2_patch.json' }
+// Los patches se descubren en la carpeta: cada paquete trae los nodos que trae, y una lista fija
+// obligaba a editar el script en cada entrega.
+const PATCHES = Object.fromEntries(fs.readdirSync(DIR)
+  .filter(f => f.endsWith('_patch.json'))
+  .map(f => [JSON.parse(fs.readFileSync(path.join(DIR, f), 'utf-8')).node_key, f]))
 
 // El tipo, y la clave que de verdad le corresponde en estos nodos.
 const TIPO_POR_CLAVE = { concept_seed: 'selected_seeds' }
