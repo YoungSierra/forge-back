@@ -1,41 +1,47 @@
 // ─── Cadenas de producción: avanzar una pieza de etapa, un paso a la vez ─────
 //
-// Del documento de menús radiales (§8 y §10). Una página no se rehace: AVANZA. La hoja de
-// personaje se edita, de esa edición salen las tres vistas, y de las tres vistas sale el modelo 3D.
-// Cada paso produce activos NUEVOS conectados al anterior (`derived_from_id`), nunca una versión
-// del mismo — versionar en el sitio es otra cosa y ya existe.
+// Del documento de menús radiales (§8-§10, revisión del 26-08). Una página no se rehace: AVANZA.
+// De la hoja de personaje salen las tres vistas, y de las tres vistas sale el modelo 3D. Cada paso
+// produce activos NUEVOS conectados al anterior (`derived_from_id`) y publicados a su derecha.
 //
-// Run pide UN paso; Design Edits pide los tres seguidos. Es el mismo motor con distinto `pasos`:
-// que fueran dos caminos separados es justamente lo que haría que se comportaran distinto.
+// **Run avanza UN paso.** No hay encadenado automático: correr los dos seguidos es apretar Run dos
+// veces. Editar la página en su sitio es otra cosa —Design Edits— y no pasa por acá.
 //
-// El paso 3 no devuelve una imagen sino un `.glb`. Por eso las salidas se leen por NODO y no «la
-// primera que aparezca»: el paso 2 publica cuatro imágenes y el 3 pide tres de ellas POR ROL.
+// El último paso no devuelve una imagen sino un `.glb`. Por eso las salidas se leen por NODO y no
+// «la primera que aparezca»: el concept art emite cuatro y el 3D pide tres de ellas POR ROL.
 
 const { submitWorkflow, pollUntilDone, downloadOutputsByNode, uploadImageToComfyUI } = require('./providers/comfyui.provider')
 const { getWorkflowByName } = require('./config.service')
 const { logExecution } = require('./execution-log.service')
 
 // `origen` = el activo sobre el que se apretó Run. `<paso>:<rol>` = una salida del paso anterior.
+// La cadena es la de PRODUCCIÓN, y `Moodboard Iteration` NO está en ella.
+//
+// Miguel lo aclaró el 26-08, corrigiendo la contradicción entre §6 y §10 del documento: ese
+// workflow es **Design Edits**, que edita la página EN SU SITIO y la reemplaza por una versión
+// nueva conservando el layout; la anterior queda en la Asset Library. No publica a la derecha y no
+// dispara nada detrás. Los pasos de producción son ejecuciones de Run, una por una — no un
+// encadenado automático.
+//
+// Por eso Run arranca en el concept art y toma la página tal como está: si el usuario la editó
+// antes con Design Edits, lo que Run ve ya es la versión editada.
 const CADENAS = {
   character_sheet: {
     etiqueta: 'Character Sheet',
     pasos: [
       {
-        clave: 'design_edit', workflow: 'V57_STUDIO_Moodboard_Iteration', etiqueta: 'Design edit',
-        que:    'One edited image: this page with the requested change applied.',
-        porque: 'Everything downstream is built from this sheet, so the change has to land here first.',
-        entradas: { image: 'origen' },
-        pide_prompt: true,
-      },
-      {
         clave: 'concept_art', workflow: 'V57_STUDIO_ConceptArt_Characters', etiqueta: 'Concept art',
-        que:    'Four images: the master sheet plus front, left and back views.',
+        que:    'Three pages to the right: the front, side and back views of this character.',
         porque: 'A mesh cannot be built from one picture — the three views are what make the body consistent.',
-        entradas: { image: 'design_edit:*' },
+        entradas: { image: 'origen' },
+        // El workflow emite además un maestro intermedio que alimenta a las tres vistas. No se
+        // publica: el documento pide TRES páginas, y una cuarta casi idéntica al lado de las otras
+        // se lee como una vista más y no como el intermedio que es.
+        publica: ['front', 'left', 'back'],
       },
       {
         clave: '3d', workflow: 'V57_STUDIO_3D_Production_Characters', etiqueta: '3D production',
-        que:    'One textured .glb model.',
+        que:    'One textured .glb model, to the right of the views.',
         porque: 'This is the asset the vertical slice actually ships.',
         entradas: { image: 'concept_art:front', image_left: 'concept_art:left', image_back: 'concept_art:back' },
       },
@@ -193,11 +199,18 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
       triggered_by: member_id,
     }).select('id').single()
 
-    // Un activo por salida. Nacen `approved`: son el resultado de un paso que el usuario pidió y
-    // confirmó, y dejarlos pendientes los volvería invisibles para los nodos de aguas abajo.
+    // Un activo por salida PUBLICABLE. Nacen `approved`: son el resultado de un paso que el usuario
+    // pidió y confirmó, y dejarlos pendientes los volvería invisibles para los nodos de aguas abajo.
+    //
+    // `paso.publica` acota cuáles se publican. Lo que no se publica igual queda en `salidasPorPaso`
+    // y sirve de entrada al paso siguiente: un intermedio del workflow no es una página del
+    // moodboard, pero sí es material.
+    const publicables = paso.publica
+      ? Object.entries(porRol).filter(([rol]) => paso.publica.includes(rol))
+      : Object.entries(porRol)
     const nuevos = []
-    for (const [rol, s] of Object.entries(porRol)) {
-      const sufijo = Object.keys(porRol).length > 1 ? ` — ${rol}` : ''
+    for (const [rol, s] of publicables) {
+      const sufijo = publicables.length > 1 ? ` — ${rol}` : ''
       const { data: a, error } = await db().from('forge_assets').insert({
         project_id, node_id: origen.node_id, session_id: ses.id,
         name: `${origen.name} — ${paso.etiqueta}${sufijo}`,
@@ -214,7 +227,10 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
     }
 
     // El siguiente paso arranca desde la salida principal de este.
-    anterior = nuevos.find(a => a.metadata?.cadena?.rol === 'master') || nuevos[0]
+    // El paso siguiente cuelga del primero que se publicó. El maestro ya no es un activo, así que
+    // colgar de él dejaría `derived_from` apuntando a algo que el moodboard no muestra y el cable
+    // saldría de la nada.
+    anterior = nuevos[0] ?? anterior
   }
 
   return { cadena: nombreCadena, creados }
