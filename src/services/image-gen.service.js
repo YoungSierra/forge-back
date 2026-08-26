@@ -233,6 +233,52 @@ async function paginaDelASG(db, projectId, numero) {
   return hit?.storage_url ?? null
 }
 
+// Normaliza el título de un ítem para comparar. Mismo criterio que usa el emparejamiento por
+// título de `resolverImagenesDeItems`: lo que separa a dos ítems es el nombre, no la puntuación.
+const tituloItem = s => String(s || '')
+  .replace(/^[\s\-*#>]+/, '')
+  .replace(/^\d+[.)]\s*/, '')
+  .replace(/\*+/g, '')
+  .split(/\s+[—–-]\s+|\n/)[0]
+  .split(':').slice(0, 2).join(':')
+  .toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()
+
+// Índice título-de-ítem → imagen, para un nodo. Las imágenes viven en `output_images` indexadas
+// por POSICIÓN, y el título correspondiente sale del documento del nodo leído en el mismo orden —
+// que es como ya se resuelve en `resolverImagenesDeItems`. Un deck además guarda el `name` de la
+// página, y ese manda cuando está.
+async function imagenesPorItemDeNodo(db, projectId, nodeId) {
+  const idx = new Map()
+  const { data: sesiones } = await db()
+    .from('forge_sessions')
+    .select('output_images')
+    .eq('project_id', projectId).eq('node_id', nodeId)
+    .not('output_images', 'is', null)
+    .order('created_at', { ascending: false })
+  if (!sesiones?.length) return idx
+
+  const { data: asset } = await db()
+    .from('forge_assets')
+    .select('content').eq('project_id', projectId).eq('node_id', nodeId)
+    .not('content', 'is', null)
+    .order('created_at', { ascending: false }).limit(1).maybeSingle()
+  const items = asset?.content ? require('./fan-out.service').parseItemsFromContent(asset.content) : []
+
+  for (const s of sesiones) {
+    for (const lista of Object.values(s.output_images || {})) {
+      for (const it of (lista || [])) {
+        const url = it?.variations?.length ? it.variations[it.variations.length - 1]?.url : it?.url
+        if (!url) continue
+        const fuente = it?.name ?? items[it?.index]?.title ?? items[it?.index] ?? ''
+        const t = tituloItem(fuente)
+        // La sesión más reciente gana: se recorre en orden y no se pisa lo ya puesto.
+        if (t && !idx.has(t)) idx.set(t, url)
+      }
+    }
+  }
+  return idx
+}
+
 async function imagenDeNodoPorTitulo(db, projectId, fuente) {
   const nombres = String(fuente || '').split('+').map(s => s.trim()).filter(Boolean)
   if (!nombres.length) return null
@@ -246,9 +292,24 @@ async function imagenDeNodoPorTitulo(db, projectId, fuente) {
   const { data: catalogo } = await db().from('forge_nodes').select('id, title')
   const norm = s => String(s).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()
 
-  for (const nombre of nombres) {
+  for (const crudo of nombres) {
+    // «Pitch Document / pitch_01_hook» — el nodo, y QUÉ imagen suya. Sin la segunda parte se
+    // resuelve como siempre: la más reciente aprobada del nodo. Con ella, la página ancla en una
+    // imagen concreta, que es lo que necesitan las 5 páginas del ASG que citan al Pitch Document:
+    // pedir solo el nodo les daba la misma imagen a todas.
+    const [nombre, item] = crudo.split('/').map(s => s.trim())
     const nodo = (catalogo || []).find(n => enProyecto.has(n.id) && norm(n.title) === norm(nombre))
     if (!nodo) continue
+
+    if (item) {
+      const idx = await imagenesPorItemDeNodo(db, projectId, nodo.id)
+      const url = idx.get(tituloItem(item))
+      if (url) return url
+      // Y si el ítem no está, NO se cae a «la primera del nodo»: devolver otra imagen sin avisar
+      // es peor que no anclar. Sin ancla, el llamador lo reporta y la página sale con plantilla.
+      console.warn(`[ref] "${item}" no está entre las imágenes de "${nombre}" (${idx.size} con título)`)
+      continue
+    }
 
     // Aprobadas primero, y la más reciente: es la que el usuario dejó como buena.
     const { data: png } = await db()

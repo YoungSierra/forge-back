@@ -25,7 +25,10 @@ const path = require('path')
 const { db } = require('../src/services/supabase.service')
 
 const APPLY = process.argv.includes('--apply')
-const DIR   = path.join(__dirname, '..', '..', 'P-26082026', 'x_v2913', 'v2913', 'patches')
+// La carpeta se pasa por argumento: Pedro re-derivó el delta desde la fila viva del 26-08 y lo
+// reenvió, así que hay más de una versión del mismo paquete y hay que poder decir cuál.
+const DIR   = process.argv.find(a => a.startsWith('--dir='))?.slice(6)
+  ?? path.join(__dirname, '..', '..', 'P-26082026', 'x_v2913_new', 'v2913', 'patches')
 const PATCHES = { '1.4': '1_4_patch.json', '2.1': '2_1_patch.json', '2.2': '2_2_patch.json' }
 
 // El tipo, y la clave que de verdad le corresponde en estos nodos.
