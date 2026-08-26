@@ -107,6 +107,32 @@ function parseOutputItems(content, format) {
   return trimmed ? [trimmed.slice(0, 700)] : []
 }
 
+// ─── ¿El contenido trae ENTIDADES, o es un documento suelto? ──────────────────
+//
+// Un output `list<...>` promete varias piezas —semillas, vistas, páginas—. Cuando el modelo
+// devuelve prosa sin entidades, o directamente «I need more information about your concept», el
+// parser cae a su último recurso: tomar los primeros 700 caracteres como un prompt. Eso genera una
+// imagen de un párrafo cualquiera, la cobra, y nadie se entera de que el nodo corrió sin datos.
+//
+// Medido el 26-08 sobre 45 corridas per-output: 34 salieron sin estructura, y varias eran
+// pedidos de información, no contenido.
+//
+// Solo aplica a los que PROMETEN varias: un output de una sola imagen que trae su prompt en prosa
+// está perfecto y no hay que tocarlo.
+function esperaVarias(formato) {
+  return /^list</.test(String(formato || ''))
+}
+
+function tieneEntidades(content, formato) {
+  const txt = String(content || '').trim()
+  if (!txt) return false
+  if (!esperaVarias(formato)) return true
+  const items = parseOutputItems(txt, formato)
+  // El último recurso devuelve UN ítem que es el propio documento recortado. Si eso es todo lo que
+  // hay, no hay entidades que ilustrar.
+  return !(items.length === 1 && txt.startsWith(items[0].slice(0, 60)))
+}
+
 // ─── Limpieza de markdown del texto del ítem para usarlo como prompt visual ────
 function cleanItemText(text) {
   return (text || '').trim()
@@ -698,4 +724,4 @@ async function generateDeck({
   }
 }
 
-module.exports = { imageOutputsOf, parseOutputItems, cleanItemText, generateOneImage, generateDeck, esDeck, paginaDelASG, imagenDeNodoPorTitulo }
+module.exports = { imageOutputsOf, parseOutputItems, tieneEntidades, cleanItemText, generateOneImage, generateDeck, esDeck, paginaDelASG, imagenDeNodoPorTitulo }
