@@ -1636,15 +1636,31 @@ router.post('/nodes/:node_id/generate-pdf', async (req, res, next) => {
     // devolvería el documento del lane vecino. Igual que en GET /session.
     if (project_node_id) q = q.eq('project_node_id', project_node_id)
 
-    let session = null
-    if (output_key) {
-      const { data, error } = await q.eq('output_key', output_key).maybeSingle()
-      // La columna output_key puede no existir en instalaciones viejas: se cae al comportamiento
-      // de antes en vez de romper la descarga.
-      session = error ? (await q.maybeSingle()).data : data
-    } else {
-      session = (await q.maybeSingle()).data
+    // La consulta se rearma en cada intento: encadenar `.eq()` sobre la misma la va mutando y el
+    // segundo intento heredaría el filtro del primero.
+    const buscar = async filtro => {
+      let c = db().from('forge_sessions')
+        .select('id, output_asset_id, status')
+        .eq('project_id', project_id).eq('node_id', node_id)
+        .in('status', ['approved', 'auto_approved'])
+        .order('completed_at', { ascending: false }).limit(1)
+      if (project_node_id) c = c.eq('project_node_id', project_node_id)
+      if (filtro) c = filtro(c)
+      const { data, error } = await c.maybeSingle()
+      return error ? null : data
     }
+
+    let session = null
+    if (output_key) session = await buscar(c => c.eq('output_key', output_key))
+
+    // Sin sesión propia del output, la del NODO ENTERO. Correr el nodo completo deja una sola
+    // sesión con `output_key = NULL` que guarda el documento de toda la respuesta, así que pedir
+    // el PDF desde la pestaña del documento no encontraba nada y el botón moría con «no tiene un
+    // documento aprobado» — habiéndolo.
+    if (!session?.output_asset_id) session = await buscar(c => c.is('output_key', null))
+
+    // Y si tampoco, cualquiera aprobada del nodo.
+    if (!session?.output_asset_id) session = await buscar(null)
 
     if (!session?.output_asset_id) {
       return res.status(404).json({
