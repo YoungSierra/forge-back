@@ -47,6 +47,47 @@ const CADENAS = {
       },
     ],
   },
+
+  prop_sheet: {
+    etiqueta: 'Prop Sheet',
+    pasos: [
+      {
+        clave: 'concept_art', workflow: 'V57_STUDIO_ConceptArt_Props', etiqueta: 'Concept art',
+        que:    'One page to the right: the concept art of this prop.',
+        porque: 'Tripo builds the mesh from the concept, not from the sheet that describes it.',
+        entradas: { image: 'origen' },
+      },
+      {
+        clave: '3d', workflow: 'V57_STUDIO_3D_Production_Props', etiqueta: '3D production',
+        que:    'One .glb model of the prop.',
+        porque: 'This is the asset the vertical slice actually ships.',
+        entradas: { image: 'concept_art:concept' },
+      },
+    ],
+  },
+
+  environment_sheet: {
+    etiqueta: 'Environment Sheet',
+    pasos: [
+      {
+        clave: 'concept_art', workflow: 'V57_STUDIO_ConceptArt_Environments', etiqueta: 'Concept art',
+        que:    'Twenty pages to the right: the twenty parts this environment breaks into.',
+        porque: 'A scene is built part by part — the sheet describes the whole, the parts are what gets modelled.',
+        entradas: { image: 'origen' },
+      },
+      {
+        clave: '3d', workflow: 'V57_STUDIO_3D_Production_Environment', etiqueta: '3D production',
+        que:    'One .glb per part: twenty models, each to the right of its own part.',
+        porque: 'These are the pieces the scene is assembled from.',
+        // El workflow del 3D toma UNA imagen y devuelve UN modelo, así que corre una vez por
+        // parte. Miguel preguntó si había que replicar el workflow veinte veces o correrlo en
+        // lote: ninguna de las dos — es el mismo workflow, veinte despachos, que es lo que
+        // `porCadaSalidaDe` expresa. Replicarlo daría veinte copias que mantener.
+        porCadaSalidaDe: 'concept_art',
+        entradas: { image: '<cada>' },
+      },
+    ],
+  },
 }
 
 // Qué cadena le toca a un activo. Hoy solo la de Character Sheet está definida; el documento dice
@@ -54,7 +95,12 @@ const CADENAS = {
 // devolver null es la respuesta correcta y no un caso de error.
 function cadenaDe(asset) {
   const n = String(asset?.name || '')
-  if (/character\s*sheet/i.test(n)) return 'character_sheet'
+  if (/character\s*sheet/i.test(n))    return 'character_sheet'
+  if (/prop\s*sheet/i.test(n))         return 'prop_sheet'
+  if (/environment\s*sheet/i.test(n))  return 'environment_sheet'
+  // UI Component Sheet (ASG_31) y VFX Sheet (ASG_32) existen en el ASG pero todavía no tienen
+  // workflow; Audio Sheet tiene workflow pero no tiene página. Marketing necesita rellenar el ADI
+  // en su prompt, que es ensamblado y no cableado. Los tres casos devuelven null a propósito.
   return null
 }
 
@@ -143,93 +189,121 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
     if (!entry) throw new Error(`Workflow "${paso.workflow}" is not registered`)
     const roles = entry.inject_config?.salidas || null
 
-    // Resolver las imágenes de entrada y subirlas a ComfyUI: el proveedor no acepta URLs ajenas.
-    const extras = {}
-    for (const [campo, ref] of Object.entries(paso.entradas)) {
-      let url
-      if (ref === 'origen') url = anterior.storage_url
-      else {
-        const [pasoRef, rol] = ref.split(':')
-        const s = salidasPorPaso[pasoRef]
-        if (!s) throw new Error(`Step "${paso.clave}" needs the output of "${pasoRef}", which did not run`)
-        // `*` = la salida principal de un paso de una sola imagen.
-        url = rol === '*' ? Object.values(s)[0]?.url : s[rol]?.url
-        if (!url) throw new Error(`Step "${paso.clave}" needs "${rol}" from "${pasoRef}" and it is not there`)
-      }
-      extras[campo] = await uploadImageToComfyUI(url)
-    }
-
-    // Las semillas de las vistas van aparte: comparten workflow pero no nodo, y con la misma
-    // semilla en las tres el modelo devuelve tres veces el mismo ángulo.
-    for (const clave of Object.keys(entry.inject_config?.extra || {})) {
-      if (clave.startsWith('seed_')) extras[clave] = Math.floor(Math.random() * 2147483647)
-    }
-
-    const t0 = Date.now()
-    const jobId = await submitWorkflow(paso.workflow, paso.pide_prompt ? (prompt || '') : '', 1024, 1024, extras)
-    await pollUntilDone(jobId, 300_000)   // Tripo y gpt-image-2 tardan bastante más que un render local
-    const base = `projects/${project_id}/chain/${nombreCadena}/${paso.clave}/${jobId.slice(0, 8)}`
-    const salidas = await downloadOutputsByNode(jobId, base)
-
-    // Del nodo al rol. Con mapa declarado manda el mapa Y NADA MÁS: un workflow publica más de lo
-    // que interesa guardar —el de 3D tiene un `Preview3D` que emite el MISMO .glb que el `SaveGLB`,
-    // así que aceptar lo no declarado creaba dos activos idénticos del mismo archivo. Sin mapa, el
-    // nodo hace de rol, que es mejor que inventar un orden.
-    const porRol = {}
-    for (const [nodo, s] of Object.entries(salidas)) {
-      if (roles && !roles[nodo]) continue
-      porRol[roles?.[nodo] || nodo] = s
-    }
-    if (!Object.keys(porRol).length) {
-      throw new Error(`Step "${paso.clave}" produced output, but none from the declared nodes (${Object.keys(roles || {}).join(', ')})`)
-    }
-    salidasPorPaso[paso.clave] = porRol
-
-    logExecution({
-      project_id, node_id: origen.node_id, triggered_by: member_id,
-      trigger_type: 'chain', executor_type: 'comfyui', provider: 'comfyui', model: paso.workflow,
-      is_estimated: true, duration_ms: Date.now() - t0, started_at: new Date(t0).toISOString(),
-      metadata: { cadena: nombreCadena, paso: paso.clave, salidas: Object.keys(porRol).length },
-    })
-
-    // Una sesión por paso: el asset la exige y además es lo que deja el paso trazado en el log.
-    const { data: ses } = await db().from('forge_sessions').insert({
-      project_id, node_id: origen.node_id, output_key: null, status: 'auto_approved',
-      iteration_count: 1, started_at: new Date(t0).toISOString(), completed_at: new Date().toISOString(),
-      triggered_by: member_id,
-    }).select('id').single()
-
-    // Un activo por salida PUBLICABLE. Nacen `approved`: son el resultado de un paso que el usuario
-    // pidió y confirmó, y dejarlos pendientes los volvería invisibles para los nodos de aguas abajo.
+    // Un paso normal despacha UNA vez. Uno marcado `porCadaSalidaDe` despacha una vez por cada
+    // salida de ese paso: el 3D del escenario toma una parte y devuelve un modelo, así que veinte
+    // partes son veinte despachos del MISMO workflow.
     //
-    // `paso.publica` acota cuáles se publican. Lo que no se publica igual queda en `salidasPorPaso`
-    // y sirve de entrada al paso siguiente: un intermedio del workflow no es una página del
-    // moodboard, pero sí es material.
-    const publicables = paso.publica
-      ? Object.entries(porRol).filter(([rol]) => paso.publica.includes(rol))
-      : Object.entries(porRol)
-    const nuevos = []
-    for (const [rol, s] of publicables) {
-      const sufijo = publicables.length > 1 ? ` — ${rol}` : ''
-      const { data: a, error } = await db().from('forge_assets').insert({
-        project_id, node_id: origen.node_id, session_id: ses.id,
-        name: `${origen.name} — ${paso.etiqueta}${sufijo}`,
-        format: s.kind === 'model' ? 'glb' : 'png',
-        mime_type: s.kind === 'model' ? 'model/gltf-binary' : 'image/png',
-        status: 'approved', approved_by: member_id, approved_at: new Date().toISOString(),
-        storage_url: s.url, file_size_bytes: s.size_bytes,
-        derived_from_id: anterior.id,
-        metadata: { cadena: { nombre: nombreCadena, paso: paso.clave, rol }, job: jobId, prompt: paso.pide_prompt ? prompt : null },
-      }).select('id, name, storage_url, format, metadata').single()
-      if (error) throw error
-      nuevos.push(a)
-      creados.push(a)
+    // Miguel preguntó si había que replicar el workflow veinte veces o correrlo en lote: ninguna
+    // de las dos. Replicarlo daría veinte copias del mismo JSON que mantener; el lote no existe
+    // porque el workflow recibe una imagen y devuelve un modelo.
+    const instancias = paso.porCadaSalidaDe
+      ? Object.keys(salidasPorPaso[paso.porCadaSalidaDe] || {})
+      : [null]
+    if (paso.porCadaSalidaDe && !instancias.length) {
+      throw new Error(`Step "${paso.clave}" runs once per output of "${paso.porCadaSalidaDe}", which produced none`)
     }
 
-    // El siguiente paso arranca desde la salida principal de este.
-    // El paso siguiente cuelga del primero que se publicó. El maestro ya no es un activo, así que
-    // colgar de él dejaría `derived_from` apuntando a algo que el moodboard no muestra y el cable
-    // saldría de la nada.
+    const acumulado = {}
+    const nuevos = []
+
+    for (const cada of instancias) {
+      // Resolver las imágenes de entrada y subirlas a ComfyUI: el proveedor no acepta URLs ajenas.
+      const extras = {}
+      for (const [campo, ref] of Object.entries(paso.entradas)) {
+        let url
+        if (ref === 'origen') url = anterior.storage_url
+        else if (ref === '<cada>') url = salidasPorPaso[paso.porCadaSalidaDe]?.[cada]?.url
+        else {
+          const [pasoRef, rol] = ref.split(':')
+          const sal = salidasPorPaso[pasoRef]
+          if (!sal) throw new Error(`Step "${paso.clave}" needs the output of "${pasoRef}", which did not run`)
+          // `*` = la salida principal de un paso de una sola imagen.
+          url = rol === '*' ? Object.values(sal)[0]?.url : sal[rol]?.url
+          if (!url) throw new Error(`Step "${paso.clave}" needs "${rol}" from "${pasoRef}" and it is not there`)
+        }
+        if (!url) throw new Error(`Step "${paso.clave}" has no image for "${campo}"`)
+        extras[campo] = await uploadImageToComfyUI(url)
+      }
+
+      // Las semillas de las vistas van aparte: comparten workflow pero no nodo, y con la misma
+      // semilla en las tres el modelo devuelve tres veces el mismo ángulo.
+      for (const clave of Object.keys(entry.inject_config?.extra || {})) {
+        if (clave.startsWith('seed_')) extras[clave] = Math.floor(Math.random() * 2147483647)
+      }
+
+      const t0 = Date.now()
+      if (cada) console.log(`[cadena] ${paso.clave}: despachando ${cada} (${instancias.indexOf(cada) + 1}/${instancias.length})`)
+      const jobId = await submitWorkflow(paso.workflow, paso.pide_prompt ? (prompt || '') : '', 1024, 1024, extras)
+      await pollUntilDone(jobId, 300_000)   // Tripo y gpt-image-2 tardan bastante más que un render local
+      const base = `projects/${project_id}/chain/${nombreCadena}/${paso.clave}/${cada ? cada + '-' : ''}${jobId.slice(0, 8)}`
+      const salidas = await downloadOutputsByNode(jobId, base)
+
+      // Del nodo al rol. Con mapa declarado manda el mapa Y NADA MÁS: un workflow publica más de
+      // lo que interesa guardar —el de 3D tiene un `Preview3D` que emite el MISMO .glb que el
+      // `SaveGLB`, así que aceptar lo no declarado creaba dos activos idénticos del mismo archivo.
+      const porRol = {}
+      for (const [nodo, sal] of Object.entries(salidas)) {
+        if (roles && !roles[nodo]) continue
+        porRol[roles?.[nodo] || nodo] = sal
+      }
+      if (!Object.keys(porRol).length) {
+        throw new Error(`Step "${paso.clave}" produced output, but none from the declared nodes (${Object.keys(roles || {}).join(', ')})`)
+      }
+
+      logExecution({
+        project_id, node_id: origen.node_id, triggered_by: member_id,
+        trigger_type: 'chain', executor_type: 'comfyui', provider: 'comfyui', model: paso.workflow,
+        is_estimated: true, duration_ms: Date.now() - t0, started_at: new Date(t0).toISOString(),
+        metadata: { cadena: nombreCadena, paso: paso.clave, parte: cada, salidas: Object.keys(porRol).length },
+      })
+
+      // Una sesión por despacho: el asset la exige y además deja el paso trazado en el log.
+      const { data: ses } = await db().from('forge_sessions').insert({
+        project_id, node_id: origen.node_id, output_key: null, status: 'auto_approved',
+        iteration_count: 1, started_at: new Date(t0).toISOString(), completed_at: new Date().toISOString(),
+        triggered_by: member_id,
+      }).select('id').single()
+
+      // `paso.publica` acota cuáles se publican. Lo que no se publica igual queda en
+      // `salidasPorPaso` y sirve de entrada al paso siguiente: un intermedio del workflow no es una
+      // página del moodboard, pero sí es material.
+      const publicables = paso.publica
+        ? Object.entries(porRol).filter(([rol]) => paso.publica.includes(rol))
+        : Object.entries(porRol)
+
+      // Cada pieza cuelga de LO SUYO: en un paso por-cada-parte, el modelo de la parte 07 cuelga
+      // de la parte 07, no del origen. Si no, veinte cables salen todos de la misma hoja y el
+      // grafo deja de contar de dónde vino cada cosa.
+      const padre = cada
+        ? (salidasPorPaso[paso.porCadaSalidaDe]?.[cada]?.assetId ?? anterior.id)
+        : anterior.id
+
+      for (const [rol, sal] of publicables) {
+        // Con instancias, el nombre lleva la parte; sin ellas, el rol solo si hay más de uno.
+        const sufijo = cada ? ` — ${cada}` : (publicables.length > 1 ? ` — ${rol}` : '')
+        const { data: a, error } = await db().from('forge_assets').insert({
+          project_id, node_id: origen.node_id, session_id: ses.id,
+          name: `${origen.name} — ${paso.etiqueta}${sufijo}`,
+          format: sal.kind === 'model' ? 'glb' : 'png',
+          mime_type: sal.kind === 'model' ? 'model/gltf-binary' : 'image/png',
+          status: 'approved', approved_by: member_id, approved_at: new Date().toISOString(),
+          storage_url: sal.url, file_size_bytes: sal.size_bytes,
+          derived_from_id: padre,
+          metadata: { cadena: { nombre: nombreCadena, paso: paso.clave, rol, parte: cada ?? null }, job: jobId, prompt: paso.pide_prompt ? prompt : null },
+        }).select('id, name, storage_url, format, metadata').single()
+        if (error) throw error
+        // El id del activo viaja junto a la url: el paso siguiente lo necesita para colgar de él.
+        acumulado[cada ? cada : rol] = { ...sal, assetId: a.id }
+        nuevos.push(a)
+        creados.push(a)
+      }
+    }
+
+    salidasPorPaso[paso.clave] = acumulado
+
+    // El paso siguiente cuelga del primero que se publicó. Un intermedio no publicado no es
+    // activo, así que colgar de él dejaría `derived_from` apuntando a algo que el moodboard no
+    // muestra y el cable saldría de la nada.
     anterior = nuevos[0] ?? anterior
   }
 
