@@ -171,7 +171,31 @@ router.put('/:id/moodboard-layout', async (req, res, next) => {
       return res.status(400).json({ success: false, error: 'layout is required' })
     }
     const { data } = await db().from('projects').select('canvas_layout').eq('id', req.params.id).maybeSingle()
-    const nuevo = { ...(data?.canvas_layout ?? {}), moodboard: layout }
+    const previo = data?.canvas_layout?.moodboard ?? {}
+
+    // MEZCLA, no reemplazo. El acomodo se guardaba entero en cada escritura, así que dos personas
+    // —o dos pestañas de la misma— acomodando el mismo moodboard se pisaban: la que guardaba
+    // última mandaba su foto completa y borraba lo que la otra acababa de hacer. Medido el 26-08:
+    // un proyecto pasó de 4 posiciones a 2 sin que nadie borrara nada.
+    //
+    // Las posiciones se mezclan por clave y ya: una hoja que este cliente no movió no tiene por
+    // qué perder su lugar.
+    const pos = { ...(previo.pos ?? {}), ...(layout.pos ?? {}) }
+
+    // Los marcos necesitan además saber qué es un BORRADO. `conocidos` son los ids que el cliente
+    // tenía a la vista; si uno de ésos no viene en la lista, lo desagruparon y se va. Un marco que
+    // el cliente nunca vio —lo creó otro mientras tanto— se conserva.
+    //
+    // Sin `conocidos` (cliente viejo) se respeta la lista tal cual: se pierde la mezcla, pero
+    // desagrupar sigue funcionando, que es lo que no se puede romper durante un despliegue.
+    let marcos = layout.marcos ?? previo.marcos ?? []
+    if (Array.isArray(layout.conocidos)) {
+      const conocidos = new Set(layout.conocidos)
+      const ajenos = (previo.marcos ?? []).filter(m => !conocidos.has(m.id))
+      marcos = [...ajenos, ...(layout.marcos ?? [])]
+    }
+
+    const nuevo = { ...(data?.canvas_layout ?? {}), moodboard: { pos, marcos } }
     const { error } = await db().from('projects').update({ canvas_layout: nuevo }).eq('id', req.params.id)
     if (error) throw error
     res.json({ success: true })
