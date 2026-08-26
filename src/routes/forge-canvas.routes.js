@@ -1696,6 +1696,7 @@ router.post('/nodes/:node_id/generate-pdf', async (req, res, next) => {
       .single()
 
     let docContent = asset.content
+
     const studioVal = project?.studio_name || 'V57 Studio'
     const titleVal  = project?.name || ''
     docContent = docContent
@@ -1706,6 +1707,29 @@ router.post('/nodes/:node_id/generate-pdf', async (req, res, next) => {
       docContent = docContent.replace(/\bWorking Title\b/g, titleVal)
     }
 
+    // La respuesta ENTERA del nodo, antes de recortar. El resolvedor de imágenes navega por
+    // secciones —encuentra el output y su plan hermano por el encabezado— así que si se le pasa
+    // el texto ya recortado no encuentra ninguna y el documento sale pelado.
+    const contenidoCompleto = docContent
+
+    // Un PDF de «Pitch Document» tiene que ser el pitch, no la respuesta entera del nodo.
+    // Al correr el nodo completo el asset guarda las TRES secciones —la frase, el plan de imágenes
+    // y el documento— y el PDF salía con las tres: siete páginas donde el plan se llevaba las
+    // imágenes por sus encabezados y el documento imprimía los corchetes `[ IMAGE: … ]` sin nada
+    // al lado. Con `output_key` se recorta a su sección; sin ella se manda todo, como antes.
+    if (output_key) {
+      const anclaDe = k => new RegExp(`^#{1,4}\\s+\\*{0,2}\\s*${k}\\b.*$`, 'im')
+      const ini = anclaDe(output_key).exec(docContent)
+      if (ini) {
+        const desde = docContent.slice(ini.index + ini[0].length)
+        const { data: dna } = await db().from('forge_nodes').select('outputs').eq('id', node_id).maybeSingle()
+        const cortes = (dna?.outputs || []).map(o => o.key || o.name).filter(k => k && k !== output_key)
+          .map(k => anclaDe(k).exec(desde)).filter(Boolean).map(r => r.index)
+        const seccion = desde.slice(0, cortes.length ? Math.min(...cortes) : desde.length).trim()
+        if (seccion.length > 200) docContent = seccion
+      }
+    }
+
     // Las imágenes del documento se resolvían SOLO cuando el PDF nacía dentro de la corrida. Este
     // botón llamaba al generador con título y texto, así que todo PDF pedido a mano salía sin una
     // sola imagen — en cualquier proyecto, no solo en los de fan-out.
@@ -1714,7 +1738,7 @@ router.post('/nodes/:node_id/generate-pdf', async (req, res, next) => {
       const { resolverImagenesDeItems } = require('../services/canvas-chat.service')
       itemImages = await resolverImagenesDeItems({
         db, projectId: project_id, nodeId: node_id,
-        sessionId: session.id, outKey: output_key, contenido: docContent,
+        sessionId: session.id, outKey: output_key, contenido: contenidoCompleto,
       })
     } catch (e) { console.error('[generate-pdf] imágenes:', e.message) }
 

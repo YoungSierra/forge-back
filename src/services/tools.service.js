@@ -561,6 +561,18 @@ async function docGenDocx(title, content, projectId, nodeId, itemImages = []) {
     drawCover(doc, docType, gameTitle || h1?.title || title, subtitle)
 
     let contentSections = sections.filter(s => s.level >= 2)
+
+    // Lo que va bajo el `#` y ANTES del primer `##` se perdía entero. En la mayoría de documentos
+    // ahí solo vive la línea de metadata, que ya está en la portada, y por eso el corte pasaba
+    // desapercibido — pero en un pitch ahí está la apertura: el hook, su imagen y los dos párrafos
+    // que sostienen el argumento. Medido el 26-08 sobre la BD viva: 55 assets perdían ≥200 chars,
+    // uno de ellos 12 KB. Se recupera como sección sin título, sin la línea que usó la portada.
+    const h1Body = (sections.find(s => s.level === 1)?.lines ?? [])
+      .filter(l => l.trim() && !/^[-*_]{3,}\s*$/.test(l.trim()))
+      .filter(l => stripEmphasis(l) !== subtitle && l.trim() !== subtitle)
+    if (contentSections.length && h1Body.join('\n').trim().length >= 200) {
+      contentSections = [{ level: 2, title: '', lines: h1Body }, ...contentSections]
+    }
     // Sin secciones ## — renderizar el cuerpo disponible (nivel-1 o todo el texto) para no dejar
     // el PDF en portada vacía (outputs cortos/sin headings, ej. feel_statement).
     if (!contentSections.length) {
@@ -586,6 +598,19 @@ async function docGenDocx(title, content, projectId, nodeId, itemImages = []) {
     // pie de una hoja y la imagen abre la siguiente, con media página en blanco en el medio.
     // Se consume al usarla: el mismo título puede aparecer dos veces en un documento (el 1.4
     // lo nombra al justificar y otra vez al listar) y la imagen va solo en la primera.
+    // Un marcador de imagen escrito en el texto: «[ IMAGE: <id> — descripción ]». El id va
+    // primero, antes del guion largo o de los dos puntos.
+    const RX_HUECO_IMAGEN = /^\[\s*IMAGE\s*:\s*([^\]\n—:-]+)/i
+
+    // El id del último hueco dibujado, para reconocer su pie de foto en el bloque siguiente.
+    let ultimoHueco = null
+
+    // El pie repite el id —«*pitch_01_hook — La arena…*»—. El pie sirve; el id es andamiaje
+    // interno y en un pitch para un comité de inversión no puede quedar impreso. Se quita solo
+    // cuando el pie empieza EXACTAMENTE con el id de ese hueco.
+    const quitarIdDePie = (txt, id) =>
+      String(txt).replace(new RegExp(`^\\s*(\\**)\\s*${id}\\s*[—:-]\\s*`, 'i'), '$1').trim()
+
     const buscarImagen = texto => {
       const t = tituloDeItem(texto)
       return t && porTitulo.has(t) ? { t, buf: porTitulo.get(t) } : null
@@ -738,14 +763,50 @@ async function docGenDocx(title, content, projectId, nodeId, itemImages = []) {
           }
           y += 8
 
+        } else if (block.type === 'paragraph' && RX_HUECO_IMAGEN.test(block.text)) {
+          // «[ IMAGE: pitch_01_hook — descripción ]». El modelo lo escribe aunque la DNA lo
+          // prohíbe desde v2.9.13, y en un pitch para inversores queda impreso el andamiaje.
+          //
+          // Pero el corchete NOMBRA la imagen, así que sirve de ancla exacta: se dibuja ahí y el
+          // corchete no se imprime. Si esa imagen no existe, tampoco se imprime el marcador — un
+          // hueco callado es mejor que una instrucción interna en la página.
+          const id  = block.text.match(RX_HUECO_IMAGEN)[1].trim()
+          const hit = buscarImagen(id)
+          if (hit) {
+            const alto = altoImagenDeItem(id, MARGIN)
+            if (alto) checkPageBreak(alto + 26)
+            dibujarImagenDeItem(id, MARGIN)
+          } else {
+            console.warn('[doc_gen] marcador sin imagen, se omite:', id)
+          }
+
+          // El corchete casi nunca viene solo: el bloque sigue con su pie de foto y con la prosa
+          // que va debajo, hasta el próximo encabezado. Tirar el bloque entero se llevaba puestos
+          // los dos párrafos de apertura del pitch — se corta en el `]` y el resto se imprime.
+          //
+          // El pie repite el id —«*pitch_01_hook — La arena…*»— y ese identificador es andamiaje
+          // interno: se quita solo cuando el pie empieza EXACTAMENTE con el id del hueco.
+          ultimoHueco  = id
+          const cierre = block.text.indexOf(']')
+          const resto  = cierre >= 0 ? quitarIdDePie(block.text.slice(cierre + 1), id) : ''
+          if (resto) {
+            ultimoHueco = null
+            renderInline(doc, resto, MARGIN, y, { width: CONTENT_W, lineGap: 3 }, 10, PDF_TEXT)
+            y = doc.y + 5
+          }
+
         } else if (block.type === 'paragraph') {
+          // El pie llega casi siempre como bloque aparte, justo detrás del hueco.
+          const textoP = ultimoHueco ? quitarIdDePie(block.text, ultimoHueco) : block.text
+          ultimoHueco = null
+
           // Un párrafo también puede abrir un ítem: el 1.4 los nombra así —
           // "**SMACK: Drift** — advances because…"— en vez de con encabezado o viñeta.
-          const altoImg = altoImagenDeItem(block.text, MARGIN)
+          const altoImg = altoImagenDeItem(textoP, MARGIN)
           if (altoImg) checkPageBreak(altoImg + 60)
-          renderInline(doc, block.text, MARGIN, y, { width: CONTENT_W, lineGap: 3 }, 10, PDF_TEXT)
+          renderInline(doc, textoP, MARGIN, y, { width: CONTENT_W, lineGap: 3 }, 10, PDF_TEXT)
           y = doc.y + 5
-          dibujarImagenDeItem(block.text, MARGIN)
+          dibujarImagenDeItem(textoP, MARGIN)
 
         } else if (block.type === 'table') {
           const { header, rows } = block

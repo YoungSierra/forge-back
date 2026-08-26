@@ -670,10 +670,31 @@ async function resolverImagenesDeItems({ db, projectId, nodeId, sessionId, outKe
     // encabezados-identificador (`### pitch_01_hook`) y el de fan-out no los reconoce, así que
     // devolvía título vacío y las imágenes quedaban sin ancla — se apilaban al principio del PDF
     // en vez de ir cada una en su sección.
+    // La propia sección del output, sin pasar por el hermano. Es donde viven los marcadores.
+    const seccionPropia = clave => {
+      const ini = anclaDe(clave).exec(contenido)
+      if (!ini) return ''
+      const desde = contenido.slice(ini.index + ini[0].length)
+      const cortes = defs.map(o => o.key || o.name).filter(k => k !== clave)
+        .map(k => anclaDe(k).exec(desde)).filter(Boolean).map(r => r.index)
+      return desde.slice(0, cortes.length ? Math.min(...cortes) : desde.length)
+    }
+
+    // Los ids que el propio documento escribe en sus huecos: «[ IMAGE: pitch_01_hook — … ]».
+    // Es la única fuente EXACTA que hay — el id lo puso el modelo, no lo adivinamos raspando
+    // encabezados. Sacar los títulos del plan hermano fallaba en 3 de 4 (títulos vacíos) y las
+    // imágenes terminaban ancladas al plan, no al pitch. Si el documento no trae marcadores se
+    // sigue con el plan, que es lo que necesitan los documentos que no los usan.
+    const RX_MARCADOR = /\[\s*IMAGE\s*:\s*([^\]\n—:-]+)/gi
+    const idsDeMarcadores = txt => [...String(txt).matchAll(RX_MARCADOR)].map(m => m[1].trim())
+
     const { parseOutputItems, cleanItemText } = require('./image-gen.service')
     for (const clave of claves) {
-      const propios = parseOutputItems(seccionDe(clave), 'markdown')
-        .map(t => ({ title: (cleanItemText(t).split(String.fromCharCode(10)).filter(Boolean)[0] || '') }))
+      const marcas  = idsDeMarcadores(seccionPropia(clave))
+      const propios = marcas.length
+        ? marcas.map(t => ({ title: t }))
+        : parseOutputItems(seccionDe(clave), 'markdown')
+            .map(t => ({ title: (cleanItemText(t).split(String.fromCharCode(10)).filter(Boolean)[0] || '') }))
       for (const it of (sess?.output_images?.[clave] || [])) {
         const url = it?.variations?.length ? it.variations[it.variations.length - 1]?.url : it?.url
         const src = propios[it?.index]
