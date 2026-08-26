@@ -57,10 +57,16 @@ const corregirUses = (uses, nodeKey, outKey, avisos) => {
   if (error) { console.error('ERR lectura:', error.message); process.exit(1) }
 
   if (APPLY) {
+    // Con la fecha sola en el nombre, aplicar dos paquetes el mismo día pisaba el respaldo del
+    // primero — y encima con MENOS nodos, porque cada corrida respalda solo los que toca. Pasó el
+    // 26-08: el backup de 1.4/2.1/2.2 quedó reemplazado por uno que traía únicamente el 3.20.
+    // El nombre lleva ahora la hora y de qué paquete salió.
+    const sello   = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+    const paquete = path.basename(path.resolve(DIR, '..')) || 'delta'
     const dest = path.join(__dirname, '..', '..', '_Prod', 'backups',
-      `forge_nodes_pre_v2913_${new Date().toISOString().slice(0, 10)}.json`)
+      `forge_nodes_pre_${paquete}_${sello}.json`)
     fs.writeFileSync(dest, JSON.stringify(nodes, null, 2), 'utf-8')
-    console.log('backup →', dest, '\n')
+    console.log('backup →', dest, `(${nodes.map(n => n.node_key).join(', ')})`, '\n')
   }
 
   const avisos = []
