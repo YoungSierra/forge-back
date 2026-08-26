@@ -1718,9 +1718,17 @@ router.post('/nodes/:node_id/generate-pdf', async (req, res, next) => {
       })
     } catch (e) { console.error('[generate-pdf] imágenes:', e.message) }
 
+    // Título de PORTADA. La portada parte el título en «tipo de documento — nombre del juego»,
+    // pero el asset se llama «título del nodo — label del output». Pasarle el nombre del asset
+    // ponía el label donde va el juego: la portada decía «Pitch Document / Output», porque al
+    // aceptar el nodo entero el label es el genérico «Output».
+    const { data: proyecto } = await db().from('projects').select('name').eq('id', project_id).maybeSingle()
+    const tipoDoc = String(asset.name || '').split(' — ')[0] || asset.name
+    const tituloPortada = proyecto?.name ? `${tipoDoc} — ${proyecto.name}` : tipoDoc
+
     const { executeTool } = require('../services/tools.service')
     const docResult = await executeTool('doc_gen_docx', {
-      title:   asset.name,
+      title:   tituloPortada,
       content: docContent,
       item_images: itemImages,
     }, { project_id, node_id })
