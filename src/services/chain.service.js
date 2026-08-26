@@ -127,6 +127,10 @@ function proximoPaso(asset) {
     indice: i + 1, de: def.pasos.length,
     clave: p.clave, etiqueta: p.etiqueta, que: p.que, porque: p.porque,
     pide_prompt: !!p.pide_prompt, workflow: p.workflow,
+    // Qué paso alimenta a éste cuando corre una vez por cada salida. El recuadro necesita saberlo
+    // para contar cuántos despachos son: apretar Run sobre una parte del escenario dispara las
+    // veinte, y eso no puede quedar detrás de un botón que no lo dice.
+    por_cada_salida_de: p.porCadaSalidaDe ?? null,
   }
 }
 

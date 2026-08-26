@@ -4270,7 +4270,26 @@ router.get('/assets/:asset_id/next-step', async (req, res, next) => {
     if (!asset) return res.status(404).json({ success: false, error: 'Asset not found' })
 
     const { proximoPaso } = require('../services/chain.service')
-    res.json({ success: true, paso: proximoPaso(asset) })
+    const paso = proximoPaso(asset)
+
+    // Cuántos despachos son. Un paso normal es uno; uno que corre por cada salida del anterior son
+    // tantos como partes haya producido — veinte, en el escenario. El recuadro tiene que poder
+    // decirlo ANTES, porque cada despacho es pago y no se repite.
+    let despachos = paso ? 1 : 0
+    if (paso?.por_cada_salida_de) {
+      const { data: hermanas } = await db().from('forge_assets')
+        .select('metadata')
+        .eq('project_id', project_id)
+        .eq('metadata->cadena->>paso', paso.por_cada_salida_de)
+        .not('storage_url', 'is', null)
+      const job = asset.metadata?.job
+      const roles = new Set((hermanas || [])
+        .filter(h => !job || h.metadata?.job === job)
+        .map(h => h.metadata?.cadena?.rol).filter(Boolean))
+      despachos = roles.size || 1
+    }
+
+    res.json({ success: true, paso: paso ? { ...paso, despachos } : null })
   } catch (err) { next(err) }
 })
 
