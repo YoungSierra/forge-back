@@ -20,6 +20,37 @@ function imageOutputsOf(node) {
 // Diferencia clave con el frontend: NO se colapsa png/image a 1 ítem. El contenido
 // se parsea en N ítems (la lista de prompts que escribe el agente) → N imágenes.
 // Respeta el ADN: si el prompt pide "2–3 imágenes", el agente produce 2–3 prompts.
+// Bloques encabezados que enumeran entidades: «## SEED 01», «### Angle 2», «### Image 3».
+// Cuando existen, ESOS son los ítems y no se discute.
+//
+// Iban últimos, así que las viñetas ganaban siempre — y un documento de semillas está lleno de
+// viñetas que no son semillas. Medido: a ComfyUI se le mandó «Primary: Arcade / Action» y
+// «Celeste (Extremely OK Games, 2018) — precision platformer…» como prompts de imagen. Eran la
+// clasificación de género y los comparables; las semillas, que son encabezados, nunca se miraron.
+//
+// Se exige el MISMO nivel de encabezado en todos: un `### Rationale` dentro de un `## SEED 04` es
+// parte de la semilla, no otra semilla.
+// El SUSTANTIVO importa. «Cualquier palabra + número» tomaba también el título del documento
+// —«Concept Seeds · Pass 3»— y para protegerse había que exigir dos bloques. Con el vocabulario
+// que la DNA usa de verdad, UN bloque ya alcanza: una corrida incremental agrega una sola semilla
+// y las anteriores no se repiten, y ahí exigir dos volvía a caer en las viñetas.
+const RX_ENUMERADO = /^(#{1,4})\s+.*?\b(?:seeds?|variations?|concepts?|angles?|images?|options?|pages?)\s*[·:.\-—]?\s*0*\d{1,3}\b/i
+function bloquesEnumerados(texto) {
+  const lineas = String(texto || '').split('\n')
+  const marcas = []
+  for (let i = 0; i < lineas.length; i++) {
+    const m = RX_ENUMERADO.exec(lineas[i])
+    if (m) marcas.push({ i, nivel: m[1].length })
+  }
+  if (!marcas.length) return null
+  const nivel  = Math.min(...marcas.map(m => m.nivel))
+  const propias = marcas.filter(m => m.nivel === nivel)
+  return propias.map((p, k) => {
+    const hasta = k + 1 < propias.length ? propias[k + 1].i : lineas.length
+    return lineas.slice(p.i, hasta).join('\n').trim()
+  })
+}
+
 function parseOutputItems(content, format) {
   if (format === 'json') {
     try {
@@ -27,6 +58,10 @@ function parseOutputItems(content, format) {
       if (Array.isArray(parsed)) return parsed.map(String).filter(s => s.trim().length > 0)
     } catch { /* continúa */ }
   }
+
+  // Entidades enumeradas por encabezado — antes que las viñetas, que se llevan cualquier lista.
+  const enumerados = bloquesEnumerados(content)
+  if (enumerados) return enumerados
 
   // Bullet list: "- item", "* item", "• item"
   const bulletRx   = /^[ \t]*[-*•][ \t]+(.+)$/gm
@@ -77,6 +112,9 @@ function cleanItemText(text) {
   return (text || '').trim()
     .replace(/\*{1,2}([^*]+)\*{1,2}/g, '$1')  // quitar negrita/cursiva
     .replace(/^[-*]\s+/, '')                    // quitar bullet inicial
+    // El bloque llega con su encabezado, que es lo que le da nombre al ítem — pero los `#` son
+    // marcado y no tienen por qué viajar al modelo de imagen.
+    .replace(/^#{1,6}\s*/gm, '')
     .replace(/^(Variation\s+\d+:\s*)/i, '')     // quitar prefijo "Variation N:"
 }
 
