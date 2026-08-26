@@ -133,7 +133,7 @@ function proximoPaso(asset) {
 // ─── Corre N pasos desde donde esté el activo ────────────────────────────────
 // Devuelve los activos creados, en orden. Si un paso falla se devuelve lo que sí se produjo: lo ya
 // generado está pagado y publicado, y borrarlo para «dejar limpio» sería tirar plata.
-async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, member_id = null }) {
+async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, member_id = null, limitePorCada = 0 }) {
   const { data: origen, error: e0 } = await db().from('forge_assets')
     .select('id, project_id, node_id, session_id, name, storage_url, metadata')
     .eq('id', asset_id).single()
@@ -196,11 +196,22 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
     // Miguel preguntó si había que replicar el workflow veinte veces o correrlo en lote: ninguna
     // de las dos. Replicarlo daría veinte copias del mismo JSON que mantener; el lote no existe
     // porque el workflow recibe una imagen y devuelve un modelo.
-    const instancias = paso.porCadaSalidaDe
-      ? Object.keys(salidasPorPaso[paso.porCadaSalidaDe] || {})
+    let instancias = paso.porCadaSalidaDe
+      ? Object.keys(salidasPorPaso[paso.porCadaSalidaDe] || {}).sort()
       : [null]
     if (paso.porCadaSalidaDe && !instancias.length) {
       throw new Error(`Step "${paso.clave}" runs once per output of "${paso.porCadaSalidaDe}", which produced none`)
+    }
+
+    // `limitePorCada` corre solo las primeras N partes. Sirve para mirar una antes de
+    // comprometer veinte: cada parte es un despacho pago y no reproducible, así que descubrir en
+    // la número 3 que el encuadre no sirve cuesta las tres.
+    //
+    // Recorta SOLO este paso. Lo que ya produjo el anterior está pagado y sigue publicado; el
+    // resto de las partes se pueden avanzar después, porque cada una arranca desde sí misma.
+    if (paso.porCadaSalidaDe && limitePorCada > 0 && instancias.length > limitePorCada) {
+      console.log(`[cadena] ${paso.clave}: ${instancias.length} partes, se corren ${limitePorCada} — el resto queda para otro Run`)
+      instancias = instancias.slice(0, limitePorCada)
     }
 
     const acumulado = {}

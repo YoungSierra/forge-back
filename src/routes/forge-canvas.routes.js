@@ -4282,9 +4282,13 @@ router.post('/assets/:asset_id/advance', async (req, res, next) => {
     const prompt    = req.body?.prompt || null
     // El tope es la cadena más larga que existe: pedir 99 pasos no puede volverse un gasto abierto.
     const pasos     = Math.max(1, Math.min(3, Number(req.body?.pasos) || 1))
+    // Cuántas partes correr en un paso que despacha una por cada salida del anterior. 0 = todas.
+    // El Environment abre en veinte, y cada una es un despacho pago e irrepetible: poder mirar la
+    // primera antes de comprometer las veinte es la diferencia entre una prueba y una apuesta.
+    const limite    = Math.max(0, Number(req.body?.limite_por_cada) || 0)
 
     const { avanzar } = require('../services/chain.service')
-    const r = await avanzar({ db, project_id, asset_id, pasos, prompt, member_id })
+    const r = await avanzar({ db, project_id, asset_id, pasos, prompt, member_id, limitePorCada: limite })
     res.json({ success: true, ...r })
   } catch (err) {
     // «Esta página todavía no tiene cadena» no es una falla del servidor: es el estado real de
