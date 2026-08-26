@@ -143,7 +143,18 @@ router.put('/:id/canvas', async (req, res, next) => {
     const { canvas_layout } = req.body
     if (!canvas_layout) return res.status(400).json({ success: false, error: 'canvas_layout is required' })
 
-    const { error } = await db().from('projects').update({ canvas_layout }).eq('id', id)
+    // `canvas_layout` es de DOS dueños: el canvas de nodos escribe `nodes/edges/viewport/templateId`
+    // y el moodboard su propio acomodo bajo `moodboard`. Este PUT reemplazaba la columna entera,
+    // así que cada guardado del canvas —mover un nodo, cambiar el zoom— borraba el acomodo del
+    // moodboard sin que nadie lo tocara: grupos y posiciones desaparecían al recargar el proyecto.
+    // Medido el 26-08: un grupo creado a las 15:14 no existía a las 15:21, y ningún otro proyecto
+    // tenía acomodo guardado.
+    //
+    // Se conserva lo que este PUT no trae. Cada dueño pisa solo sus claves.
+    const { data: previo } = await db().from('projects').select('canvas_layout').eq('id', id).maybeSingle()
+    const fusion = { ...(previo?.canvas_layout ?? {}), ...canvas_layout }
+
+    const { error } = await db().from('projects').update({ canvas_layout: fusion }).eq('id', id)
     if (error) return res.status(500).json({ success: false, error: error.message })
     res.json({ success: true })
   } catch (err) { next(err) }
