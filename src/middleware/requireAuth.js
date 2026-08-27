@@ -18,7 +18,12 @@ const _cache = new Map() // token -> { exp, identity }
 // perfectamente válido. El token de Supabase dura una hora; revalidar cada 5 minutos sigue
 // acotando cuánto tarda en reflejarse un cambio de rol, con una fracción del tráfico.
 const CACHE_TTL_MS = 5 * 60_000
-const AUTH_TIMEOUT_MS = 4_000
+// Medido el 27-08 contra el proyecto: Auth contesta, pero mal — 1 de 4 llamadas volvió en 2,8 s y
+// 3 pasaron de 8 s. Con 4 s de presupuesto casi ninguna llegaba, y en un back recién reiniciado no
+// hay identidad previa de la que echar mano, así que TODO se rechazaba. El propio servidor de Auth
+// corta a los 10 s, así que esperar 9 no alarga nada: solo deja de tirar la respuesta que venía.
+const AUTH_TIMEOUT_MS = 9_000
+const REINTENTOS = 2
 
 // Última identidad conocida por token, sin vencimiento. Es la red de seguridad para cuando Auth
 // no contesta: se prefiere seguir sirviendo a quien YA se validó antes que negarle el paso por un
@@ -42,16 +47,23 @@ async function resolveIdentity(token) {
   if (hit && hit.exp > Date.now()) return hit.identity
   if (vencido(token)) return null
 
+  // Se reintenta porque el fallo es intermitente por saturación, no por el token: la misma
+  // llamada que se pasa de tiempo vuelve bien al segundo intento.
   let user = null, authErr = null
-  try {
-    const r = await Promise.race([
-      getClient().auth.getUser(token),
-      new Promise((_, rechazar) => setTimeout(() => rechazar(new Error('auth-timeout')), AUTH_TIMEOUT_MS)),
-    ])
-    user = r?.data?.user ?? null
-    authErr = r?.error ?? null
-  } catch (e) {
-    authErr = e
+  for (let intento = 1; intento <= REINTENTOS && !user; intento++) {
+    try {
+      const r = await Promise.race([
+        getClient().auth.getUser(token),
+        new Promise((_, rechazar) => setTimeout(() => rechazar(new Error('auth-timeout')), AUTH_TIMEOUT_MS)),
+      ])
+      user = r?.data?.user ?? null
+      authErr = r?.error ?? null
+      // Un token que Auth rechaza de verdad no mejora reintentando.
+      if (authErr) break
+    } catch (e) {
+      authErr = e
+      if (intento < REINTENTOS) console.warn(`[requireAuth] Auth no respondió en ${AUTH_TIMEOUT_MS} ms, reintentando`)
+    }
   }
 
   if (authErr || !user) {
