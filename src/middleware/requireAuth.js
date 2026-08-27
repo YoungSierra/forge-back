@@ -12,14 +12,60 @@ const { getClient, db } = require('../services/supabase.service')
 // en cada request (el canvas hace muchas). Se invalida solo por TTL; los cambios de rol/org tardan
 // hasta CACHE_TTL_MS en reflejarse, lo cual es aceptable.
 const _cache = new Map() // token -> { exp, identity }
-const CACHE_TTL_MS = 30_000
+// 30 s obligaba a revalidar contra Supabase Auth constantemente. En el plan FREE ese servidor
+// tiene 10 conexiones y mata toda petición a los 10 s, así que cada revalidación competía por un
+// recurso escaso — y cuando no contestaba, el back respondía «Invalid token» sobre un token
+// perfectamente válido. El token de Supabase dura una hora; revalidar cada 5 minutos sigue
+// acotando cuánto tarda en reflejarse un cambio de rol, con una fracción del tráfico.
+const CACHE_TTL_MS = 5 * 60_000
+const AUTH_TIMEOUT_MS = 4_000
+
+// Última identidad conocida por token, sin vencimiento. Es la red de seguridad para cuando Auth
+// no contesta: se prefiere seguir sirviendo a quien YA se validó antes que negarle el paso por un
+// problema de infraestructura. Acotado para no crecer sin límite.
+const _ultima = new Map() // token -> identity
+const MAX_ULTIMA = 500
+
+// El vencimiento del propio JWT, leído sin red. Un token vencido se rechaza acá mismo y ni
+// siquiera se le pregunta a Auth.
+function vencido(token) {
+  try {
+    const p = token.split('.')[1]
+    if (!p) return false
+    const json = JSON.parse(Buffer.from(p.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8'))
+    return typeof json.exp === 'number' && json.exp * 1000 <= Date.now()
+  } catch { return false }
+}
 
 async function resolveIdentity(token) {
   const hit = _cache.get(token)
   if (hit && hit.exp > Date.now()) return hit.identity
+  if (vencido(token)) return null
 
-  const { data: { user } = {}, error: authErr } = await getClient().auth.getUser(token)
-  if (authErr || !user) return null
+  let user = null, authErr = null
+  try {
+    const r = await Promise.race([
+      getClient().auth.getUser(token),
+      new Promise((_, rechazar) => setTimeout(() => rechazar(new Error('auth-timeout')), AUTH_TIMEOUT_MS)),
+    ])
+    user = r?.data?.user ?? null
+    authErr = r?.error ?? null
+  } catch (e) {
+    authErr = e
+  }
+
+  if (authErr || !user) {
+    // Auth no pudo responder. Si a este token ya se lo validó antes, se sigue confiando en él: su
+    // vencimiento se comprobó arriba sin red, y negarle el paso a alguien logueado porque el
+    // servidor de auth está saturado es peor que servirle con la identidad que ya conocíamos.
+    const previa = _ultima.get(token)
+    if (previa) {
+      console.warn('[requireAuth] Auth no respondió; se usa la identidad ya conocida de este token')
+      _cache.set(token, { exp: Date.now() + CACHE_TTL_MS, identity: previa })
+      return previa
+    }
+    return null
+  }
 
   const { data: member } = await db()
     .from('members').select('id, role, display_name').eq('auth_user_id', user.id).maybeSingle()
@@ -35,6 +81,8 @@ async function resolveIdentity(token) {
     orgs: orgRows || [],
   }
   _cache.set(token, { exp: Date.now() + CACHE_TTL_MS, identity })
+  if (_ultima.size >= MAX_ULTIMA) _ultima.delete(_ultima.keys().next().value)
+  _ultima.set(token, identity)
   return identity
 }
 
