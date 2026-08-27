@@ -37,7 +37,13 @@ async function callOpenAI(systemPrompt, userMessage, options = {}) {
     params.temperature = options.temperature !== undefined ? options.temperature : 0.8
   }
 
-  const completion = await getClient().chat.completions.create(params)
+  // La señal viaja hasta acá para que Stop corte la generación de verdad y deje de gastar; sin
+  // ella el cliente se soltaba pero el proveedor seguía facturando.
+  if (options.signal?.aborted) { const e = new Error('cancelado por el usuario'); e.code = 'ABORTED'; throw e }
+  const completion = await getClient().chat.completions.create(
+    params,
+    options.signal ? { signal: options.signal } : undefined,
+  )
 
   const raw = completion.choices[0]?.message?.content || ''
   const finishReason = completion.choices[0]?.finish_reason

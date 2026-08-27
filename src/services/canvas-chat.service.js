@@ -873,7 +873,11 @@ async function runReActLoop({ finalSystemPrompt, baseUserMsg, executorStr, activ
   if (visionNota) currentUserMsg += visionNota
 
   for (let iter = 0; iter < MAX_TOOL_ITERS; iter++) {
+    // Entre iteraciones también: el bucle puede llamar al LLM hasta cinco veces, y sin este corte
+    // apretar Stop en la primera igual pagaba las otras cuatro.
+    if (signal?.aborted) { const e = new Error('cancelado por el usuario'); e.code = 'ABORTED'; throw e }
     const result = await callLLM(finalSystemPrompt, currentUserMsg, {
+      signal,
       images: visionImages,
       // 16K de techo: documentos largos (GDD 14 secciones, TDD) se truncaban con 8192.
       // Es un límite, no un objetivo — solo se paga por lo generado; 16384 es seguro

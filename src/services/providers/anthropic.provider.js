@@ -9,10 +9,13 @@ function getClient() {
 // Reintenta la llamada streaming ante overloaded (529/503) — incluido el caso en que Anthropic
 // corta el stream A MITAD de una generación larga (el SDK no reintenta eso solo). Sin este retry,
 // un blip transitorio mata un TDD de varios minutos y quema el crédito de input ya consumido.
-async function streamFinalWithRetry(params, { retries = 4 } = {}) {
+async function streamFinalWithRetry(params, { retries = 4, signal = null } = {}) {
   for (let attempt = 0; ; attempt++) {
+    // Cancelar de verdad: sin propagar la señal, apretar Stop soltaba al cliente pero el
+    // proveedor seguía generando y el crédito se gastaba igual.
+    if (signal?.aborted) { const e = new Error('cancelado por el usuario'); e.code = 'ABORTED'; throw e }
     try {
-      return await getClient().messages.stream(params).finalMessage()
+      return await getClient().messages.stream(params, signal ? { signal } : undefined).finalMessage()
     } catch (err) {
       const status = err.status || err.statusCode
       const msg    = err?.error?.message || err?.message || ''
@@ -54,7 +57,7 @@ async function callAnthropic(systemPrompt, userMessage, options = {}) {
     if (supportsTemperature) createParams.temperature = temperature
     // Streaming: en generaciones largas el request NO-stream golpea el timeout del cliente HTTP
     // del SDK ("Request timed out"). stream()+finalMessage() espera el fin y ensambla el mensaje.
-    response = await streamFinalWithRetry(createParams)
+    response = await streamFinalWithRetry(createParams, { signal: options.signal })
   } catch (err) {
     const status = err.status || err.statusCode
     if (status === 429) {
@@ -107,7 +110,7 @@ async function callAnthropic(systemPrompt, userMessage, options = {}) {
         ],
       }
       if (supportsTemperature) contParams.temperature = temperature
-      const contResp = await streamFinalWithRetry(contParams)
+      const contResp = await streamFinalWithRetry(contParams, { signal: options.signal })
       fullText     = prefill + extractText(contResp)
       stopReason   = contResp.stop_reason
       inTokens    += contResp.usage?.input_tokens  ?? 0

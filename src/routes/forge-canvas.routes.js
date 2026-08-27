@@ -2022,6 +2022,18 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
       return res.status(400).json({ success: false, error: 'user_message es requerido' })
     }
 
+    // Stop: cuando el usuario cancela, el navegador aborta el fetch y la conexión se cierra. Eso
+    // se traduce en una señal que viaja hasta el proveedor, así que la generación se corta de
+    // verdad y se deja de gastar — no solo se suelta al cliente mientras el LLM sigue facturando.
+    const abortar = new AbortController()
+    let cancelado = false
+    req.on('close', () => {
+      if (res.writableEnded) return   // terminó bien; el cierre es normal
+      cancelado = true
+      abortar.abort()
+      console.warn(`[forge-chat] cancelado por el usuario · nodo ${node_id}`)
+    })
+
     // Frente 4: gate de crédito ANTES de correr el LLM (bloquea sin gastar)
     if (!(await creditGate(project_id, res, req.auth?.memberId))) return
 
@@ -2637,7 +2649,11 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
     if (visionNota) currentUserMsg += visionNota
 
     for (let iter = 0; !assemblyReport && iter < MAX_TOOL_ITERS; iter++) {
+      // Entre iteraciones también: este bucle puede llamar al LLM hasta cinco veces, y sin el
+      // corte apretar Stop en la primera igual pagaba las otras cuatro.
+      if (abortar.signal.aborted) { const e = new Error('cancelado por el usuario'); e.code = 'ABORTED'; throw e }
       const result = await callLLM(finalSystemPrompt, currentUserMsg, {
+        signal:          abortar.signal,
         images:          visionImages,
         model:           executorStr,
         rawText:         true,
@@ -2970,7 +2986,15 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
         storage_url:     pendingAttachment.storage_url,
       } : undefined,
     })
-  } catch (err) { next(err) }
+  } catch (err) {
+    // Cancelar no es un fallo. El cliente ya se fue, así que no hay a quién responderle, y pasarlo
+    // al manejador de errores llenaría los logs de rojo por algo que el usuario pidió.
+    if (err?.code === 'ABORTED' || err?.name === 'AbortError' || res.writableEnded) {
+      console.warn('[forge-chat] generación cancelada')
+      return
+    }
+    next(err)
+  }
 })
 
 // ─── GET /api/projects/:id/canvas/nodes-catalog ──────────────
