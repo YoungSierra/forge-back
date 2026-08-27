@@ -38,7 +38,22 @@ router.get('/', async (req, res, next) => {
     // Los filtros de abajo (org activa, owner/compartidos) se suman por encima.
     let query = dbAsUser(req.auth.token)
       .from('projects')
-      .select('*, assets(id, review_status), generation_jobs(id, current_step, status), forge_sessions(id, status, node_id), forge_project_nodes(id, removed, node_type), updated_at')
+      // Columnas explícitas, NO `*`. Con `*` viajaban los `canvas_layout` completos de todos los
+      // proyectos —9,9 de los 10,9 MB de esta consulta— desde Supabase hasta acá, para que tres
+      // líneas más abajo se borraran del resultado. La lista no dibuja ningún canvas. Medido el
+      // 27-08 sobre 100 proyectos: 2.566 ms y 10.967 KB con `*`; 1.173 ms y 1.053 KB así.
+      // `repo_token_encrypted` tampoco vuelve: el `...p` de abajo lo mandaba al navegador.
+      .select(`
+        id, owner_member_id, name, description, genre, target_engine, status,
+        monthly_budget_usd, concept, created_at, updated_at, repo_config,
+        action_instances, studio_name, target_platform, team_scale, budget_range,
+        timeline, context_notes, parent_project_id, run_config, org_id,
+        credit_cap_usd, credit_cap_period,
+        assets(id, review_status),
+        generation_jobs(id, current_step, status),
+        forge_sessions(id, status, node_id),
+        forge_project_nodes(id, removed, node_type)
+      `)
       .order('created_at', { ascending: false })
 
     // Aislamiento por organización (Frente 2): solo proyectos de la org activa
