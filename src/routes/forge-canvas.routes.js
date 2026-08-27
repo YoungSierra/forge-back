@@ -4393,10 +4393,18 @@ router.post('/assets/:asset_id/iterate', async (req, res, next) => {
       def = outs.find(o => o.image_gen && (o.page_prefixes || []).includes(sufijo))
     }
     if (!def?.image_gen_model) {
-      return res.status(400).json({
-        success: false,
-        error: `This asset does not come from an image output (session key "${ses?.output_key}", page "${sufijo}")`,
-      })
+      // El mensaje viejo culpaba al asset —«no viene de un output de imagen»— cuando el asset
+      // estaba perfecto y lo que fallaba era la configuración: la clave de su sesión había
+      // envejecido por un rename y ningún output declaraba su página. Con eso, las 34 páginas del
+      // ASG dejaron de poder iterarse y el error no decía por dónde empezar a mirar.
+      const claveViva  = outs.some(o => (o.key || o.name) === ses?.output_key)
+      const conPaginas = outs.filter(o => o.image_gen && (o.page_prefixes || []).length).length
+      const causa = !claveViva && !conPaginas
+        ? `the output "${ses?.output_key}" no longer exists and no image output declares its pages — run scripts/preflight-workflows.js`
+        : !claveViva
+          ? `the output "${ses?.output_key}" no longer exists and no image output claims page "${sufijo}"`
+          : `the output "${ses?.output_key}" is not an image output`
+      return res.status(400).json({ success: false, error: `Cannot iterate this page: ${causa}` })
     }
 
     const { esDeck, generateDeck } = require('../services/image-gen.service')
