@@ -157,8 +157,20 @@ function parseOutputItems(content, format) {
       try { arr = JSON.parse(texto.slice(a, b + 1)) } catch { continue }
       if (!Array.isArray(arr) || !arr.length) continue
       if (!arr.every(x => x && typeof x === 'object' && !Array.isArray(x))) continue
-      const prompts = arr.map(o => String(o.prompt ?? o.image_prompt ?? '').trim())
+      // `prompt` primero —es el texto listo para renderizar— y `depicts` como segunda opción: la
+      // DNA del 2.2 declara sus imágenes con `depicts` y sin `prompt`, y exigir `prompt` dejaba
+      // esa declaración sin leer. Medido sobre las 33 respuestas de la base: 32 no cambian, la
+      // del 2.2 pasa de 3 ítems a 2, ninguna sube.
+      const prompts = arr.map(o => {
+        for (const campo of ['prompt', 'image_prompt', 'depicts']) {
+          const v = o[campo]
+          if (typeof v === 'string' && v.trim()) return v.trim()
+        }
+        return ''
+      })
       if (prompts.filter(Boolean).length * 2 < arr.length) continue
+      // Sin recorte: un prompt declarado va COMPLETO. El tope de 700 del respaldo existe para no
+      // mandar un documento entero, no para cortar a la mitad un prompt que el modelo escribió.
       const items = arr.map((o, i) => prompts[i] || textoDeItem(o)).filter(x => x.trim())
       if (items.length) return items
     }

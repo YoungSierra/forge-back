@@ -68,12 +68,27 @@ function willExportDoc(targetOutput) {
 // es una instrucción falsa (se veía en 3.13/vs_spec, que es `connection`).
 function getDocPolicyBlock(tools, targetOutput) {
   if (!Array.isArray(tools) || !tools.includes('doc_gen_docx')) return ''
-  if (!willExportDoc(targetOutput)) return ''
-  return [
+
+  // La PROHIBICIÓN vale siempre que la herramienta esté escondida, exporte o no este output: el
+  // modelo ve el nodo entero, y un hermano que pide un docx lo empuja a escribir el script aunque
+  // el output que está corriendo sea una imagen. Colgar la prohibición de `willExportDoc` la
+  // apagaba justo ahí — el 2.2 corriendo `development_images` devolvió 17.649 caracteres de
+  // python-docx dentro de una respuesta de imágenes (27-08). Es el mismo fallo del 05-ago
+  // entrando por otra puerta.
+  const prohibicion = [
     '## Document delivery',
-    'This node exports a PDF automatically from your reply. You have NO code execution and NO file system.',
-    '- NEVER write a script (python-docx, docx, reportlab, pandoc, LaTeX...) to build the document.',
+    'You have NO code execution and NO file system.',
+    '- NEVER write a script (python-docx, docx, reportlab, pandoc, LaTeX...) to build a document.',
     '- NEVER claim a file was saved or generated, and never reference a path such as /tmp/....',
+  ]
+
+  // La PROMESA sí es condicional: decirle «esto se exporta a PDF» a un output que no se rendera
+  // es una instrucción falsa (se veía en 3.13/vs_spec, que es `connection`).
+  if (!willExportDoc(targetOutput)) return prohibicion.join('\n')
+
+  return [
+    ...prohibicion,
+    'This node exports a PDF automatically from your reply.',
     '- Write the document ITSELF, as markdown, directly in your reply.',
     '- Put every section under a "## " heading: anything before the first "## " heading is dropped from the PDF.',
   ].join('\n')
