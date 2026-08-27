@@ -209,6 +209,28 @@ function parseOutputItems(content, format, outputKey = null) {
     }
   }
 
+  // Un bloque cercado SIN lenguaje, en un output de imagen, ES el prompt: el modelo lo delimita a
+  // propósito para separarlo de su razonamiento. La regla general los descarta —un ```json o un
+  // ```yaml son datos, nunca un sujeto de imagen— y por eso el 2.4 mandaba a ComfyUI 337
+  // caracteres de análisis («Diagram 1 confirms the three-phase pulse cycle…») mientras su prompt
+  // real, de 1.400 caracteres con paleta en hex, iluminación y negative prompt, quedaba adentro
+  // del cercado sin que nadie lo leyera.
+  //
+  // Se exige: sin lenguaje declarado, que no parsee como JSON, y con cuerpo suficiente para ser un
+  // prompt y no una etiqueta suelta. Medido sobre las 34 respuestas de outputs de imagen de la
+  // base: 33 no cambian; el 2.4 pasa de 6 ítems de 215 chars a 5 de 1.882.
+  if (format === 'png' || format === 'image') {
+    const cercados = []
+    for (const m of content.matchAll(/```(\w*)\s*([\s\S]*?)```/g)) {
+      if ((m[1] || '').trim()) continue
+      const cuerpo = m[2].trim()
+      if (cuerpo.length < 120) continue
+      try { JSON.parse(cuerpo); continue } catch { /* no es dato: es prosa, sirve */ }
+      cercados.push(cuerpo)
+    }
+    if (cercados.length) return cercados
+  }
+
   // Entidades enumeradas por encabezado — antes que las viñetas, que se llevan cualquier lista.
   const enumerados = bloquesEnumerados(content)
   if (enumerados) return enumerados
