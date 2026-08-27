@@ -210,7 +210,8 @@ async function resolveNodeInputs(db, { projectId, currentPNodeId, targetOutput, 
         if (recent?.content) {
           content = recent.content
           const sectionKey = outputDef ? (outputDef.key || outputDef.name) : null
-          const extracted  = sectionKey ? extractSection(content, sectionKey) : null
+          const hermanas   = outputs.map(o => o.key || o.name).filter(Boolean)
+          const extracted  = sectionKey ? extractSection(content, sectionKey, hermanas) : null
           if (extracted) {
             content   = extracted
             slotLabel = `${nodeTitle} → ${outputLabel || sectionKey}`

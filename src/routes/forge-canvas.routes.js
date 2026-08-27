@@ -2770,7 +2770,7 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
             console.log(`[forge-chat] auto doc_gen_docx — cortado antes de sección secundaria (${docContent.length} chars)`)
           } else {
             // Fallback: extracción exacta de la sección primaria
-            const extracted = extractSection(replyText, outName)
+            const extracted = extractSection(replyText, outName, secondaryDefs.map(outKeyOf).filter(Boolean))
             if (extracted && extracted.length > 100) {
               docContent = extracted
               console.log(`[forge-chat] auto doc_gen_docx — usando sección "${outName}" (${extracted.length} chars)`)
@@ -3391,7 +3391,8 @@ router.get('/nodes/:project_node_id/context-inputs', async (req, res, next) => {
               ?? outputs[parseInt(handleVal, 10)]
             if (outDef) {
               outputKey = outDef.key || outDef.name || null
-              const extracted = outputKey ? extractSection(content, outputKey) : null
+              const hermanas  = outputs.map(o => o.key || o.name).filter(Boolean)
+              const extracted = outputKey ? extractSection(content, outputKey, hermanas) : null
               if (extracted) {
                 content = extracted
                 label   = `${nodeTitle} — ${outDef.label || outputKey}`
