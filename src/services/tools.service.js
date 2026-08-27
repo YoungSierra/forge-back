@@ -1012,13 +1012,49 @@ function pptxParseSlideBody(lines) {
   return out
 }
 
+// ── Cuánto alto ocupa un texto, para no encimarlo con el siguiente ───────────
+//
+// Los renderers avanzaban una cantidad FIJA por ítem (0.42 in un párrafo, 0.41 una viñeta) sin
+// mirar cuánto texto traía. Un párrafo de tres líneas ocupa ~0.55 y solo avanzaba 0.42, así que el
+// siguiente le caía encima. Medido en un deck real: 9 solapes en 5 de 12 diapositivas.
+//
+// Calibri promedia ~0.48 em por carácter; la línea, con interlineado, ~1.32 em.
+// El ancho medio depende de la FUENTE: Calibri ~0.48 em, Arial ~0.55, y Consolas es monoespaciada
+// a 0.55. Asumir Calibri para todas subestimaba los títulos en Arial un 15%, y ahí el texto se
+// salía igual aunque la medición diera bien — el solape de la página 5.
+const EM_POR_FUENTE = { calibri: 0.48, arial: 0.55, consolas: 0.55, 'courier new': 0.60 }
+const emDe = fuente => EM_POR_FUENTE[String(fuente || 'calibri').toLowerCase()] ?? 0.52
+
+const altoLinea = pt => pt * 1.32 / 72
+function altoTexto(texto, anchoIn, pt, fuente) {
+  const anchoChar = pt * emDe(fuente) / 72
+  const porLinea  = Math.max(8, Math.floor(anchoIn / anchoChar))
+  const lineas    = String(texto || '').split('\n')
+    .reduce((n, l) => n + Math.max(1, Math.ceil(l.length / porLinea)), 0)
+  // 8% de margen: PowerPoint corta por PALABRA, así que una palabra larga puede empujar una línea
+  // entera antes de lo que dice el conteo de caracteres.
+  return lineas * altoLinea(pt) * 1.08
+}
+
+// El factor por el que hay que achicar la fuente para que TODO entre en el alto disponible.
+// Cuanta más información, más chica la letra — en vez de dejar que se pise o se salga.
+// Piso en 0.62: por debajo de ~6.5 pt no se lee en proyección, y ahí es mejor recortar.
+function escalaParaEntrar(alturas, disponible) {
+  const total = alturas.reduce((a, b) => a + b, 0)
+  if (total <= disponible || !total) return 1
+  return Math.max(0.62, Math.sqrt(disponible / total))
+}
+
 // ── Layout hero ──────────────────────────────────────────────────────────────
 function renderHeroSlide(slide, sectionTitle, body, img, C) {
   const cl = s => (s || '').replace(/\*\*/g, '').replace(/\*/g, '').trim()
   const W  = img ? 6.8 : 12.3
 
   if (img) {
-    slide.addImage({ data: img, x: 0, y: 0, w: 13.33, h: 7.5 })
+    // `sizing: cover` recorta el sobrante y conserva la proporción. Sin esto, una imagen cuadrada
+    // —que es lo que devuelve ComfyUI: 1024×1024— se estiraba a 16:9, un 78% más ancha que alta, y
+    // encima quedaba a 77 DPI repartida en 13,33 pulgadas. Es la portada deformada y borrosa.
+    slide.addImage({ data: img, x: 0, y: 0, w: 13.33, h: 7.5, sizing: { type: 'cover', w: 13.33, h: 7.5 } })
     slide.addShape('rect', { x: 0, y: 0, w: 13.33, h: 7.5, fill: { color: '000000', transparency: 30 } })
     slide.addShape('rect', { x: 0, y: 0, w: 7.8,   h: 7.5, fill: { color: C.BG_DARK, transparency: 40 } })
   }
@@ -1296,30 +1332,44 @@ function renderContentSlide(slide, sectionTitle, body, img, C) {
 
   let cy = divY + 0.22
   const items = [
-    ...body.taglines.map(t  => ({ kind: 'tagline', text: t })),
-    ...body.bullets.map(b   => ({ kind: 'bullet',  text: b })),
-    ...body.paragraphs.map(p => ({ kind: 'para',    text: p })),
+    ...body.taglines.map(t  => ({ kind: 'tagline', text: cl(t),  base: 14   })),
+    ...body.bullets.map(b   => ({ kind: 'bullet',  text: cl(b),  base: 10.5 })),
+    ...body.paragraphs.map(p => ({ kind: 'para',    text: cl(p), base: 10.5 })),
   ]
 
+  // Cuánta más información, más chica la letra. Antes cada ítem avanzaba un alto FIJO sin mirar
+  // su largo, así que un párrafo de tres líneas se comía al siguiente — y el último se metía en el
+  // pie de página. Se mide lo que ocupa cada uno y se busca la escala que hace entrar el conjunto.
+  const FONDO = 6.95   // el pie vive en 7.1: nada debe pasar de acá
+  const disponible = FONDO - cy
+  const anchoCaja = i => (i.kind === 'bullet' ? TWX - 0.2 : TWX)
+  const escala = escalaParaEntrar(
+    items.map(i => altoTexto(i.text, anchoCaja(i), i.base) + 0.06),
+    disponible,
+  )
+
   for (const item of items) {
-    if (cy > 6.8) break
+    const pt   = Math.round(item.base * escala * 10) / 10
+    const alto = altoTexto(item.text, anchoCaja(item), pt) + 0.06
+    // Si aun con la letra al mínimo no entra, se corta: mejor perder el último ítem que pisar el
+    // pie de página o desbordar la diapositiva.
+    if (cy + alto > FONDO) break
+
     if (item.kind === 'tagline') {
-      slide.addText(cl(item.text), {
-        x: TX, y: cy, w: TWX, h: 0.44, fontSize: 14, color: C.LIGHT, italic: true, breakLine: true,
+      slide.addText(item.text, {
+        x: TX, y: cy, w: TWX, h: alto, fontSize: pt, color: C.LIGHT, italic: true, breakLine: true, valign: 'top',
       })
-      cy += 0.48
     } else if (item.kind === 'bullet') {
       slide.addText([
         { text: '▪  ', options: { color: C.AMBER, bold: true } },
-        { text: cl(item.text), options: { color: C.LIGHT } },
-      ], { x: TX + 0.15, y: cy, w: TWX - 0.2, h: 0.38, fontSize: 10.5, breakLine: true })
-      cy += 0.41
+        { text: item.text, options: { color: C.LIGHT } },
+      ], { x: TX + 0.15, y: cy, w: TWX - 0.2, h: alto, fontSize: pt, breakLine: true, valign: 'top' })
     } else {
-      slide.addText(cl(item.text), {
-        x: TX, y: cy, w: TWX, h: 0.38, fontSize: 10.5, color: C.GRAY, breakLine: true,
+      slide.addText(item.text, {
+        x: TX, y: cy, w: TWX, h: alto, fontSize: pt, color: C.GRAY, breakLine: true, valign: 'top',
       })
-      cy += 0.42
     }
+    cy += alto
   }
 }
 
@@ -1393,13 +1443,32 @@ async function docGenPptxCinematic(deck, imageUrls, projectId) {
   function txt(sl, text, x, y, w, h, opts = {}) {
     const { size = 18, color = C.LIGHT, bold = false, italic = false,
             align = 'left', font = BODY } = opts
+
+    // A más información, letra más chica. El tamaño venía fijo por tipo de elemento, así que un
+    // bloque largo desbordaba su caja y se encimaba con el siguiente o se metía en el pie de
+    // página. Medido en un deck real: 9 solapes en 5 de 12 diapositivas.
+    //
+    // Solo se achica, nunca se agranda: un texto corto conserva el tamaño que el diseño eligió.
+    // Piso en 0.62 — por debajo de ~6.5 pt no se lee en proyección, y ahí es mejor que desborde
+    // visiblemente a entregar algo ilegible.
+    // Se baja de a poco hasta que entre, en vez de calcular el factor de una: al achicar la letra
+    // entran más caracteres por línea Y la línea es más baja, así que la altura no cae de forma
+    // proporcional y cualquier fórmula cerrada se queda corta. Bajar y volver a medir da el
+    // tamaño exacto y cuesta unas pocas iteraciones.
+    let size2 = size
+    const MINIMO = size * 0.62
+    while (h > 0 && size2 > MINIMO && altoTexto(String(text), w, size2, font) > h) {
+      size2 = Math.round((size2 - 0.5) * 10) / 10
+    }
+
     const lines = String(text).split('\n')
     const arr   = lines.map((line, i) => ({
       text:    line,
       options: i < lines.length - 1 ? { breakLine: true } : {},
     }))
-    sl.addText(arr, { x, y, w, h, fontSize: size, color, bold, italic,
-                      fontFace: font, align, valign: 'top', wrap: true, isTextBox: true })
+    sl.addText(arr, { x, y, w, h, fontSize: size2, color, bold, italic,
+                      fontFace: font, align, valign: 'top', wrap: true, isTextBox: true,
+                      shrinkText: true })
   }
 
   function rct(sl, prs, x, y, w, h, opts = {}) {
@@ -1415,7 +1484,10 @@ async function docGenPptxCinematic(deck, imageUrls, projectId) {
   }
 
   function imgEl(sl, localPath, x, y, w, h) {
-    sl.addImage({ path: localPath, x, y, w, h })
+    // `cover` recorta el sobrante y conserva la proporción. Sin esto, una imagen cuadrada —que es
+    // lo que devuelve ComfyUI: 1024×1024— se estiraba al marco 16:9 de la portada: 78% más ancha
+    // que alta, y a 77 DPI repartida en 13,33 pulgadas. Es la portada deformada y sin definición.
+    sl.addImage({ path: localPath, x, y, w, h, sizing: { type: 'cover', w, h } })
   }
 
   function overlay(sl, prs, x, y, w, h, alpha = 55) {
