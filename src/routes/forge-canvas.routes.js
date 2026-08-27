@@ -1497,6 +1497,24 @@ router.post('/nodes/:node_id/accept', async (req, res, next) => {
       if (imgErr) console.error('[accept] Error guardando image assets:', imgErr.message)
     }
 
+    // El nodo acaba de reconstruirse con los inputs de ahora, así que ya no está desactualizado.
+    // Solo el Run limpiaba esta marca; aceptando desde el chat quedaba puesta para siempre — el
+    // 2.4 mostró su ⚠ toda la tarde después de haberse rehecho y aceptado.
+    //
+    // Y lo que produjo es nuevo, así que sus descendientes SÍ quedan desactualizados: la misma
+    // propagación que ya hace el Run.
+    const { data: sesion } = await db().from('forge_sessions')
+      .select('project_node_id').eq('id', session_id).maybeSingle()
+    const pnId = sesion?.project_node_id
+      ?? (await db().from('forge_project_nodes').select('id')
+            .eq('project_id', project_id).eq('node_id', node_id).eq('removed', false)
+            .maybeSingle()).data?.id
+    if (pnId) {
+      await db().from('forge_project_nodes').update({ is_stale: false }).eq('id', pnId)
+      const { propagateStale } = require('../services/canvas-chat.service')
+      await propagateStale(db, project_id, pnId)
+    }
+
     res.json({ success: true, asset_id: asset.id, image_assets_saved: imageAssets.length })
   } catch (err) { next(err) }
 })
