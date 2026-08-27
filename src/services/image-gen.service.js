@@ -100,7 +100,7 @@ function textoDeItem(el) {
   return (cab.length || resto.length) ? [cab.join(' — '), ...resto].filter(Boolean).join('\n\n') : ''
 }
 
-function parseOutputItems(content, format) {
+function parseOutputItems(content, format, outputKey = null) {
   // Fuera antes de mirar nada: `gaps_for_downstream` —que la enmienda M-8 obliga a emitir al
   // cierre de todo output de concepto— son huecos pendientes para los nodos de abajo, no
   // contenido ilustrable. Sus líneas empiezan con «- gap:», así que la regla de viñetas las tomaba
@@ -147,10 +147,43 @@ function parseOutputItems(content, format) {
   if (format === 'png' || format === 'image') {
     const bloques = [...content.matchAll(/```(\w*)\s*([\s\S]*?)```/g)]
       .map(m => ({ lang: (m[1] || '').toLowerCase(), cuerpo: m[2] }))
-    for (const texto of [
+    const cercados = [
       ...bloques.filter(b => b.lang === 'json').map(b => b.cuerpo),
       ...bloques.filter(b => b.lang === '').map(b => b.cuerpo),
-    ]) {
+    ]
+
+    // El bloque declarado tiene que ser EL DE ESTE OUTPUT, no cualquier arreglo de la respuesta.
+    // El 2.2 decidió `development_images: []` —cero imágenes, y lo argumenta— y a continuación
+    // emitió `approved_images`, que es el INVENTARIO de lo ya aprobado que le pasa a los nodos de
+    // abajo. Tomar ese inventario como encargo hizo ofrecer un hueco donde el nodo dijo cero, y
+    // se generó un duplicado de la semilla. Si el output se nombra a sí mismo, esa lista manda —
+    // incluso vacía, que es una respuesta legítima.
+    // La declaración de CERO no siempre va en un cercado: el 2.2 la escribe en prosa, como
+    // «`development_images: []` — no images added». Es inequívoca —el output se nombra a sí mismo
+    // con la lista vacía— y su DNA dice que cero es una respuesta válida y común. Sin leerla se
+    // ofrecía un hueco de todos modos.
+    if (outputKey && new RegExp(`\`?"?${outputKey}"?\\s*:\\s*\\[\\s*\\]`).test(content)) return []
+
+    if (outputKey) {
+      const rx = new RegExp(`"${outputKey}"\\s*:\\s*\\[`)
+      for (const texto of cercados) {
+        const m = rx.exec(texto)
+        if (!m) continue
+        const desde = texto.slice(m.index + m[0].length - 1)
+        let prof = 0, fin = -1
+        for (let i = 0; i < desde.length; i++) {
+          if (desde[i] === '[') prof++
+          else if (desde[i] === ']') { prof--; if (!prof) { fin = i; break } }
+        }
+        if (fin < 0) continue
+        let arr
+        try { arr = JSON.parse(desde.slice(0, fin + 1)) } catch { continue }
+        if (!Array.isArray(arr)) continue
+        return arr.map(o => (typeof o === 'string' ? o : textoDeItem(o))).filter(x => String(x).trim())
+      }
+    }
+
+    for (const texto of cercados) {
       const a = texto.indexOf('['), b = texto.lastIndexOf(']')
       if (a === -1 || b <= a) continue
       let arr
@@ -240,11 +273,15 @@ function esperaVarias(formato) {
   return /^list</.test(String(formato || ''))
 }
 
-function tieneEntidades(content, formato) {
+function tieneEntidades(content, formato, outputKey = null) {
   const txt = String(content || '').trim()
   if (!txt) return false
   if (!esperaVarias(formato)) return true
-  const items = parseOutputItems(txt, formato)
+  const items = parseOutputItems(txt, formato, outputKey)
+  // Un output que se declara VACÍO —«development_images: []», que su propia DNA acepta como
+  // respuesta legítima— no tiene nada que ilustrar. Sin esto se ofrecía un hueco donde el nodo
+  // había dicho cero, y se pagó un duplicado de la semilla.
+  if (!items.length) return false
   // El último recurso devuelve UN ítem que es el propio documento recortado. Si eso es todo lo que
   // hay, no hay entidades que ilustrar.
   return !(items.length === 1 && txt.startsWith(items[0].slice(0, 60)))

@@ -464,7 +464,7 @@ async function executeImageOutput({ project_id, node_id, targetOutputKey, member
 
   // DNA del output + parseo de ítems (el conteo lo dicta el contenido, no se hardcodea)
   const outDef = (Array.isArray(node.outputs) ? node.outputs : []).find(o => (o.key || o.name) === targetOutputKey)
-  const items  = parseOutputItems(replyText || '', outDef?.format || 'png')
+  const items  = parseOutputItems(replyText || '', outDef?.format || 'png', targetOutputKey)
 
   // Generar 1 imagen por ítem en paralelo (acota latencia en runs por tiers)
   const results = await Promise.all(items.map((itemText, idx) =>
