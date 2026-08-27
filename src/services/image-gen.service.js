@@ -134,6 +134,36 @@ function parseOutputItems(content, format) {
     }
   }
 
+  // Un output de IMAGEN también puede declarar sus imágenes en un bloque JSON, y hasta ahora nadie
+  // lo leía porque su `format` es 'png'. El 2.2 cerró su respuesta declarando UNA imagen con su
+  // prompt completo, y como el parseo cayó a la prosa se ofrecieron OCHO — entre ellas las viñetas
+  // que dicen «No image needed». Dos renders se pagaron con la frase «Setting / Art & Audio… No
+  // gap.» como prompt.
+  //
+  // Se exige que sea un arreglo de objetos donde la mayoría trae `prompt`: eso distingue una
+  // declaración de imágenes de un arreglo de paleta, de gaps o de cualquier otro JSON suelto.
+  // Medido sobre las 33 respuestas de outputs de imagen de la base: 32 no cambian, 1 pasa de 8 a 1
+  // ítem, ninguna sube.
+  if (format === 'png' || format === 'image') {
+    const bloques = [...content.matchAll(/```(\w*)\s*([\s\S]*?)```/g)]
+      .map(m => ({ lang: (m[1] || '').toLowerCase(), cuerpo: m[2] }))
+    for (const texto of [
+      ...bloques.filter(b => b.lang === 'json').map(b => b.cuerpo),
+      ...bloques.filter(b => b.lang === '').map(b => b.cuerpo),
+    ]) {
+      const a = texto.indexOf('['), b = texto.lastIndexOf(']')
+      if (a === -1 || b <= a) continue
+      let arr
+      try { arr = JSON.parse(texto.slice(a, b + 1)) } catch { continue }
+      if (!Array.isArray(arr) || !arr.length) continue
+      if (!arr.every(x => x && typeof x === 'object' && !Array.isArray(x))) continue
+      const prompts = arr.map(o => String(o.prompt ?? o.image_prompt ?? '').trim())
+      if (prompts.filter(Boolean).length * 2 < arr.length) continue
+      const items = arr.map((o, i) => prompts[i] || textoDeItem(o)).filter(x => x.trim())
+      if (items.length) return items
+    }
+  }
+
   // Entidades enumeradas por encabezado — antes que las viñetas, que se llevan cualquier lista.
   const enumerados = bloquesEnumerados(content)
   if (enumerados) return enumerados
