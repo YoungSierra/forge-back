@@ -702,6 +702,61 @@ async function resolverImagenesDeItems({ db, projectId, nodeId, sessionId, outKe
         if (url) imagenes.push({ title: it?.name ?? src?.title ?? src ?? '', url })
       }
     }
+
+    // 1b) Las del HERMANO que genera imágenes. Un documento puede no producir ninguna y aun así
+    //     tener que llevarlas: el `concept_document` del 2.2 no genera, y su hermano
+    //     `development_images` sí. Antes había que pasárselas a mano.
+    //
+    //     Y dónde va cada una NO hay que preguntárselo a nadie: el hermano ya lo escribe. Cuando
+    //     declara una imagen emite `"placement": "Signature Mechanics section, adjacent to
+    //     Pillar 1"`. Se resuelve contra los encabezados del documento y la imagen cae ahí.
+    //     Sin `placement` se usa su etiqueta, que es el comportamiento de antes.
+    if (outKey && !imagenes.length) {
+      const hermanos = (defs.find(o => (o.key || o.name) === outKey)?.uses?.siblings_if_present
+                     ?? defs.find(o => (o.key || o.name) === outKey)?.uses?.siblings ?? [])
+        .filter(k => defs.find(o => (o.key || o.name) === k)?.image_gen)
+
+      for (const hermano of hermanos) {
+        const { data: sh } = await db().from('forge_sessions')
+          .select('output_images, output_asset_id')
+          .eq('project_id', projectId).eq('node_id', nodeId).eq('output_key', hermano)
+          .in('status', ['approved', 'auto_approved']).maybeSingle()
+        const urls = Object.values(sh?.output_images || {}).flat()
+          .map(it => ({ i: it.index, url: it?.variations?.length ? it.variations[it.variations.length - 1]?.url : it?.url }))
+          .filter(x => x.url)
+        if (!urls.length) continue
+
+        // La declaración del hermano, con su `placement`.
+        let decl = []
+        if (sh?.output_asset_id) {
+          const { data: ah } = await db().from('forge_assets').select('content').eq('id', sh.output_asset_id).maybeSingle()
+          const m = /```(?:json)?\s*([\s\S]*?)```/.exec(ah?.content || '')
+          try {
+            const j = JSON.parse(m?.[1] ?? '')
+            decl = Array.isArray(j?.[hermano]) ? j[hermano] : (Array.isArray(j) ? j : [])
+          } catch { /* sin declaración: se cae a la etiqueta */ }
+        }
+
+        // Los encabezados de ESTE documento. Gana el más largo que aparezca dentro del texto del
+        // placement: así «Signature Mechanics» le gana a «Mechanics» sin adivinar la redacción.
+        const encabezados = String(contenido).split('\n')
+          .filter(l => /^#{1,4}\s+\S/.test(l))
+          .map(l => l.replace(/^#{1,4}\s+/, '').replace(/\*/g, '').trim())
+        const seccionDePlacement = p => {
+          const t = String(p || '').toLowerCase()
+          let mejor = null
+          for (const h of encabezados) if (t.includes(h.toLowerCase()) && (!mejor || h.length > mejor.length)) mejor = h
+          return mejor
+        }
+
+        const etiqueta = defs.find(o => (o.key || o.name) === hermano)?.label || hermano
+        for (const u of urls) {
+          const d = decl[u.i]
+          imagenes.push({ title: seccionDePlacement(d?.placement) || d?.label || `${etiqueta} ${u.i + 1}`, url: u.url })
+        }
+      }
+    }
+
     if (imagenes.length) return imagenes
   }
 
