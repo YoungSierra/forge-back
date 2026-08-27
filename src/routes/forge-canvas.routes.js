@@ -1515,7 +1515,7 @@ router.post('/nodes/:node_id/sessions/:session_id/generate-item-image', async (r
     // Leer DNA del nodo para obtener el workflow configurado en el output
     const { data: node, error: nodeErr } = await db()
       .from('forge_nodes')
-      .select('node_key, outputs')
+      .select('node_key, title, outputs')
       .eq('id', node_id)
       .single()
 
@@ -1586,6 +1586,36 @@ router.post('/nodes/:node_id/sessions/:session_id/generate-item-image', async (r
       .eq('id', session_id)
 
     if (updateErr) throw updateErr
+
+    // Y además como asset png, igual que hace el Run.
+    //
+    // `output_images` es el mapa que leen el canvas, el moodboard y el PDF. Pero TODO lo demás del
+    // sistema busca imágenes en `forge_assets` con `format: 'png'`: los inputs que se le arman a
+    // un nodo de abajo y la referencia visual que se le adjunta a ComfyUI. El Run creaba esa fila
+    // y el botón ✦ del chat no, así que una imagen generada desde el chat quedaba invisible para
+    // todo lo que viene después. Auditado el 27-08 en v0.3: el 1.1 y el 2.1 tenían 4 imágenes cada
+    // uno y CERO assets png — el hilo visual se cortaba ahí.
+    //
+    // Una fila por ítem, actualizada al regenerar: iterar produce una variación nueva del mismo
+    // ítem, no una imagen nueva, y duplicar filas llenaría de copias los inputs de abajo.
+    try {
+      const etiqueta  = outputDef.label || outputDef.name || output_key
+      const assetName = `${node.title} — ${etiqueta} ${item_index + 1}`
+      const { data: previo } = await db().from('forge_assets')
+        .select('id').eq('project_id', project_id).eq('node_id', node_id)
+        .eq('session_id', session_id).eq('format', 'png').eq('name', assetName).maybeSingle()
+
+      const fila = {
+        node_id, project_id, session_id, name: assetName,
+        format: 'png', status: 'approved', content: item_text, storage_url: result.url,
+        approved_by: memberId || null, approved_at: new Date().toISOString(),
+      }
+      if (previo) await db().from('forge_assets').update(fila).eq('id', previo.id)
+      else        await db().from('forge_assets').insert(fila)
+    } catch (e) {
+      // Nunca tumbar la generación por esto: la imagen ya está guardada en la sesión.
+      console.warn('[generate-item-image] no se pudo registrar el asset png:', e.message)
+    }
 
     // Y la imagen queda además colgada del TURNO que la pidió. El mapa de la sesión es «lo último
     // vigente» —lo que leen el canvas, el moodboard y el PDF—; este es el historial: iterar
