@@ -50,30 +50,28 @@ function textOutputsOf(node) {
 //  · Decision 3A: si el nodo está stale → se re-corren TODOS sus outputs.
 //  · Decision 2A: una sesión general aprobada "tapa" el nodo completo (retro-compat blob).
 //  · un output con sesión per-output aprobada está satisfecho → no se vuelve a correr.
-async function pendingOutputsForNode(project_id, node_id, isStale, node) {
+//  NO es opcional por gusto: con fan-out el mismo nodo vive en varios lanes y
+// las sesiones se consultaban solo por node_id, así que un output ya aprobado en el lane A dejaba
+// al lane B por satisfecho — nunca corría, nunca generaba. Medido en 2.1: lane B sin despacho.
+async function pendingOutputsForNode(project_id, node_id, isStale, node, project_node_id = null) {
   const textOuts = textOutputsOf(node)
   if (!textOuts.length) return []
   if (isStale) return textOuts.map(o => o.key)
 
   // Sesión general aprobada → nodo satisfecho (no se toca)
-  const { data: gen } = await db()
-    .from('forge_sessions')
-    .select('id')
-    .eq('project_id', project_id)
-    .eq('node_id', node_id)
-    .is('output_key', null)
-    .in('status', ['approved', 'auto_approved'])
-    .limit(1)
+  let qGen = db().from('forge_sessions').select('id')
+    .eq('project_id', project_id).eq('node_id', node_id).is('output_key', null)
+    .in('status', ['approved', 'auto_approved']).limit(1)
+  if (project_node_id) qGen = qGen.eq('project_node_id', project_node_id)
+  const { data: gen } = await qGen
   if ((gen || []).length) return []
 
   // Outputs con sesión per-output aprobada → satisfechos
-  const { data: outSess } = await db()
-    .from('forge_sessions')
-    .select('output_key')
-    .eq('project_id', project_id)
-    .eq('node_id', node_id)
-    .not('output_key', 'is', null)
+  let qOut = db().from('forge_sessions').select('output_key')
+    .eq('project_id', project_id).eq('node_id', node_id).not('output_key', 'is', null)
     .in('status', ['approved', 'auto_approved'])
+  if (project_node_id) qOut = qOut.eq('project_node_id', project_node_id)
+  const { data: outSess } = await qOut
   const approved = new Set((outSess || []).map(s => s.output_key))
 
   return textOuts.filter(o => !approved.has(o.key)).map(o => o.key)
@@ -155,31 +153,26 @@ async function executeOneOutput({ project_id, node_id, targetOutputKey, member_i
 // ─── Outputs de IMAGEN pendientes de un nodo (auto-gen, #8) ────────────────────
 // Mismo criterio "satisfecho" que los de texto: sesión per-output aprobada = listo.
 // stale → se re-generan todos. Condición estricta: image_gen && format∈{png,image}.
-async function pendingImageOutputsForNode(project_id, node_id, isStale, node) {
+async function pendingImageOutputsForNode(project_id, node_id, isStale, node, project_node_id = null) {
   const { imageOutputsOf } = require('../services/image-gen.service')
   const imgOuts = imageOutputsOf(node)
   if (!imgOuts.length) return []
   if (isStale) return imgOuts.map(o => o.key)
 
   // Sesión general aprobada → nodo satisfecho (retro-compat blob, decision 2A)
-  const { data: gen } = await db()
-    .from('forge_sessions')
-    .select('id')
-    .eq('project_id', project_id)
-    .eq('node_id', node_id)
-    .is('output_key', null)
-    .in('status', ['approved', 'auto_approved'])
-    .limit(1)
+  let qGen = db().from('forge_sessions').select('id')
+    .eq('project_id', project_id).eq('node_id', node_id).is('output_key', null)
+    .in('status', ['approved', 'auto_approved']).limit(1)
+  if (project_node_id) qGen = qGen.eq('project_node_id', project_node_id)
+  const { data: gen } = await qGen
   if ((gen || []).length) return []
 
   // Outputs con sesión per-output aprobada → satisfechos
-  const { data: outSess } = await db()
-    .from('forge_sessions')
-    .select('output_key')
-    .eq('project_id', project_id)
-    .eq('node_id', node_id)
-    .not('output_key', 'is', null)
+  let qOut = db().from('forge_sessions').select('output_key')
+    .eq('project_id', project_id).eq('node_id', node_id).not('output_key', 'is', null)
     .in('status', ['approved', 'auto_approved'])
+  if (project_node_id) qOut = qOut.eq('project_node_id', project_node_id)
+  const { data: outSess } = await qOut
   const approved = new Set((outSess || []).map(s => s.output_key))
 
   return imgOuts.filter(o => !approved.has(o.key)).map(o => o.key)
@@ -346,16 +339,21 @@ async function promptsDelPlanHermano({ project_id, node_id, project_node_id, tar
   // escribe una u otra según le parece, y las dos son válidas: un encabezado por imagen y el
   // prompt en su viñeta. Leer solo json dejaba el atajo mudo la mitad de las veces.
   const entradas = []
-  const rxTitulo = /^#{2,4}[ \t]+\**[ \t]*([a-z][a-z0-9_]*)\**[ \t]*$/gim
-  const titulos = [...seccion.matchAll(rxTitulo)]
+  // El título de la entrada es su id, pero el modelo lo maqueta como encabezado (`### id`) o
+  // como una línea en negrita suelta (`**id**`) según le parece. La DNA fija los CAMPOS, no la
+  // maquetación, así que el lector acepta las dos: exigir encabezado dejaba el atajo mudo.
+  const rxTitulo = /^(?:#{2,4}[ \t]+\**[ \t]*([a-z][a-z0-9_]*)\**|\*\*[ \t]*([a-z][a-z0-9_]*)[ \t]*\*\*)[ \t]*:?[ \t]*$/gim
+  const titulos = [...seccion.matchAll(rxTitulo)].map(m => Object.assign(m, { clave: m[1] || m[2] }))
   for (let i = 0; i < titulos.length; i++) {
     const desde  = titulos[i].index + titulos[i][0].length
     const hasta  = i + 1 < titulos.length ? titulos[i + 1].index : seccion.length
     const cuerpo = seccion.slice(desde, hasta)
     // La viñeta del prompt, hasta la siguiente viñeta con etiqueta en negrita o el fin del bloque
-    const m = /[-*][ \t]*\**[ \t]*(?:generation[ _]prompt|image[ _]prompt|prompt)[ \t]*:?[ \t]*\**[ \t]*:?[ \t]*([\s\S]*?)(?=\n[ \t]*[-*][ \t]*\*\*|\n#{2,4}[ \t]|$)/i.exec(cuerpo)
+    // La viñeta es opcional: v2.9.18 enumera los campos (section/subject/prompt/why) sin fijar
+    // cómo se maquetan, y una lista con guiones y una de líneas en negrita son la misma entrada.
+    const m = /(?:^|\n)[ \t]*(?:[-*][ \t]*)?\**[ \t]*(?:generation[ _]prompt|image[ _]prompt|prompt)[ \t]*:?[ \t]*\**[ \t]*:?[ \t]*([\s\S]*?)(?=\n[ \t]*(?:[-*][ \t]*)?\*\*|\n#{2,4}[ \t]|$)/i.exec(cuerpo)
     if (!m) continue
-    entradas.push({ id: titulos[i][1], prompt: m[1].replace(/^["'`]|["'`]$/g, '').trim() })
+    entradas.push({ id: titulos[i].clave, prompt: m[1].replace(/^["'`]|["'`]$/g, '').trim() })
   }
   return validos(entradas)
 }
@@ -3178,7 +3176,7 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
         const porClave = new Map(
           (Array.isArray(dnaImg?.outputs) ? dnaImg.outputs : []).map(o => [o.key || o.name, o])
         )
-        const pendientes = await pendingImageOutputsForNode(project_id, node_id, pnEstado?.is_stale, dnaImg || {})
+        const pendientes = await pendingImageOutputsForNode(project_id, node_id, pnEstado?.is_stale, dnaImg || {}, currentPNode.id)
 
         const aDespachar = pendientes.filter(k => {
           const d = porClave.get(k)
@@ -4028,7 +4026,7 @@ router.post('/run-validate', async (req, res, next) => {
       if (sealedSet.has(n.blueprint_id)) continue
       const dna = defById[n.node_id]
       if (!dna) continue
-      const pending = await pendingOutputsForNode(project_id, n.node_id, n.is_stale, dna)
+      const pending = await pendingOutputsForNode(project_id, n.node_id, n.is_stale, dna, n.id)
       if (pending.length > 0) forgeNodes.push(n)
     }
 
@@ -4411,9 +4409,9 @@ router.post('/nodes/:project_node_id/auto-run', async (req, res, next) => {
       textTargets  = imageKeys.has(explicitKey) ? [] : [explicitKey]
       imageTargets = imageKeys.has(explicitKey) ? [explicitKey] : []
     } else {
-      textTargets  = (await pendingOutputsForNode(project_id, node_id, pNode.is_stale, nodeDna || {}))
+      textTargets  = (await pendingOutputsForNode(project_id, node_id, pNode.is_stale, nodeDna || {}, project_node_id))
         .filter(k => !diferidos.has(k) && !porDeck.has(k))
-      imageTargets = (await pendingImageOutputsForNode(project_id, node_id, pNode.is_stale, nodeDna || {}))
+      imageTargets = (await pendingImageOutputsForNode(project_id, node_id, pNode.is_stale, nodeDna || {}, project_node_id))
         .filter(k => !diferidos.has(k))
     }
 
