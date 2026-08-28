@@ -3014,7 +3014,24 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
         // navegador. El front sigue el avance en `output_images` de la sesión de cada output.
         for (const key of aDespachar) {
           executeImageOutput({ project_id, node_id, targetOutputKey: key, member_id, project_node_id: currentPNode.id })
-            .catch(e => console.error(`[forge-chat] imagen ${key}:`, e?.message || e))
+            .catch(async e => {
+              // Un fallo acá no lo espera nadie: la primera vez dejó una sesión `active` con CERO
+              // mensajes y el front consultando un avance que nunca iba a llegar. Se marca y se
+              // deja el motivo escrito donde el usuario lo va a ver.
+              console.error(`[forge-chat] imagen ${key}:`, e?.stack || e?.message || e)
+              try {
+                const { data: rota } = await db().from('forge_sessions')
+                  .select('id').eq('project_node_id', currentPNode.id).eq('output_key', key)
+                  .eq('status', 'active').order('created_at', { ascending: false }).limit(1).maybeSingle()
+                if (!rota) return
+                await db().from('forge_sessions')
+                  .update({ status: 'abandoned', completed_at: new Date().toISOString() }).eq('id', rota.id)
+                await db().from('forge_messages').insert({
+                  session_id: rota.id, role: 'agent', order_index: 0, tool_calls: [],
+                  content: `Image generation did not start: ${e?.message || e}`,
+                })
+              } catch (e2) { console.error('[forge-chat] no se pudo marcar la sesión rota:', e2?.message || e2) }
+            })
           imagenesDespachadas.push(key)
         }
       } catch (e) {
