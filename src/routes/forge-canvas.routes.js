@@ -804,9 +804,16 @@ async function executeImageOutput({ project_id, node_id, targetOutputKey, member
 
   // Persistir en forge_sessions.output_images (formato nuevo con variations[])
   const outputItems = ok.map(r => ({ index: r.idx, variations: [{ url: r.url, condition: null }] }))
+  // Una corrida que produce CERO imágenes tiene que cerrar igual. Quedándose en `active` el front
+  // sigue esperando para siempre —«Waiting for images…» sobre algo que ya terminó— y el documento
+  // nunca se libera. Terminó: sin imágenes, pero terminó.
   await db().from('forge_sessions')
-    .update({ output_images: { [targetOutputKey]: outputItems } })
+    .update({
+      output_images: { [targetOutputKey]: outputItems },
+      ...(ok.length ? {} : { status: 'auto_approved', completed_at: new Date().toISOString() }),
+    })
     .eq('id', session.id)
+  if (!ok.length) console.log(`[auto-run img] ${targetOutputKey}: 0 imágenes — la sesión se cierra igual`)
 
   // Y colgadas del turno que las produjo, que es lo que hace que iterar no repinte las viejas.
   if (msgAgente?.id) {
