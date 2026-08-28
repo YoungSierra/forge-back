@@ -281,6 +281,85 @@ async function executeAssemblyOutput({ project_id, node_id, targetOutputKey, mem
   return { output_key: targetOutputKey, session_id: ses.id, asset_id: asset?.id || null, assembled: r.paginas.length }
 }
 
+// ─── Los prompts que ya escribió el hermano que declara las imágenes ───────────
+// Devuelve [{ id, prompt, fuente }] o [] si este output no declara un plan, o si el plan todavía
+// no está escrito. El id es el título de la entrada: el MISMO que el documento pone en su ancla
+// `[ IMAGE: <id> ]`, que es lo que permite anclar sin adivinar.
+async function promptsDelPlanHermano({ project_id, node_id, project_node_id, targetOutputKey }) {
+  const { data: dna } = await db().from('forge_nodes').select('outputs').eq('id', node_id).maybeSingle()
+  const outs = Array.isArray(dna?.outputs) ? dna.outputs : []
+  const def  = outs.find(o => (o.key || o.name) === targetOutputKey)
+  const plan = (def?.uses?.siblings_if_present ?? def?.uses?.siblings ?? []).find(k => /plan$/i.test(k))
+  if (!plan) return []
+
+  // El plan puede vivir en su propia sesión (run por output) o dentro de la respuesta del nodo
+  // entero. Se buscan las dos, la propia primero.
+  let contenido = null
+  const { data: sesPlan } = await db().from('forge_sessions').select('id, output_asset_id')
+    .eq('project_id', project_id).eq('node_id', node_id).eq('output_key', plan)
+    .order('created_at', { ascending: false }).limit(1).maybeSingle()
+  if (sesPlan?.output_asset_id) {
+    const { data: a } = await db().from('forge_assets').select('content').eq('id', sesPlan.output_asset_id).maybeSingle()
+    contenido = a?.content || null
+  }
+  if (!contenido && sesPlan?.id) {
+    const { data: ms } = await db().from('forge_messages').select('content, role')
+      .eq('session_id', sesPlan.id).order('created_at', { ascending: false }).limit(4)
+    contenido = (ms || []).find(m => m.role === 'agent')?.content || null
+  }
+  if (!contenido) {
+    let q = db().from('forge_sessions').select('id').eq('project_id', project_id).eq('node_id', node_id).is('output_key', null)
+    if (project_node_id) q = q.eq('project_node_id', project_node_id)
+    const { data: gen } = await q.order('created_at', { ascending: false }).limit(1).maybeSingle()
+    if (!gen?.id) return []
+    const { data: ms } = await db().from('forge_messages').select('content, role')
+      .eq('session_id', gen.id).order('created_at', { ascending: false }).limit(6)
+    contenido = (ms || []).find(m => m.role === 'agent')?.content || null
+  }
+  if (!contenido) return []
+
+  // La sección del plan dentro de la respuesta, acotada por las claves hermanas
+  const { extractSection } = require('../utils/extract-section')
+  const seccion = extractSection(contenido, plan, outs.map(o => o.key || o.name)) || contenido
+
+  const util = e => ({
+    id:     String(e?.id ?? '').trim(),
+    prompt: String(e?.prompt ?? '').trim(),
+    fuente: plan,
+  })
+  const validos = xs => xs.map(util).filter(e => e.id && e.prompt.length >= 40)
+
+  // Forma A · json cercado
+  const bloque = /```json\s*([\s\S]*?)```/.exec(seccion)
+  if (bloque) {
+    let entradas
+    try { entradas = JSON.parse(bloque[1]) } catch { entradas = null }
+    if (!Array.isArray(entradas)) entradas = entradas?.[plan] || entradas?.[targetOutputKey]
+    if (Array.isArray(entradas)) {
+      const r = validos(entradas.map(e => ({ id: e?.title || e?.id, prompt: e?.generation_prompt || e?.prompt })))
+      if (r.length) return r
+    }
+  }
+
+  // Forma B · markdown. El DNA pide «una entrada por imagen, su título es el identificador, y
+  // debajo el target section, el subject, el prompt y el porqué» — sin exigir json. El modelo
+  // escribe una u otra según le parece, y las dos son válidas: un encabezado por imagen y el
+  // prompt en su viñeta. Leer solo json dejaba el atajo mudo la mitad de las veces.
+  const entradas = []
+  const rxTitulo = /^#{2,4}[ \t]+\**[ \t]*([a-z][a-z0-9_]*)\**[ \t]*$/gim
+  const titulos = [...seccion.matchAll(rxTitulo)]
+  for (let i = 0; i < titulos.length; i++) {
+    const desde  = titulos[i].index + titulos[i][0].length
+    const hasta  = i + 1 < titulos.length ? titulos[i + 1].index : seccion.length
+    const cuerpo = seccion.slice(desde, hasta)
+    // La viñeta del prompt, hasta la siguiente viñeta con etiqueta en negrita o el fin del bloque
+    const m = /[-*][ \t]*\**[ \t]*(?:generation[ _]prompt|image[ _]prompt|prompt)[ \t]*:?[ \t]*\**[ \t]*:?[ \t]*([\s\S]*?)(?=\n[ \t]*[-*][ \t]*\*\*|\n#{2,4}[ \t]|$)/i.exec(cuerpo)
+    if (!m) continue
+    entradas.push({ id: titulos[i][1], prompt: m[1].replace(/^["'`]|["'`]$/g, '').trim() })
+  }
+  return validos(entradas)
+}
+
 async function executeImageOutput({ project_id, node_id, targetOutputKey, member_id, project_node_id = null }) {
   const { buildSystemPrompt, runReActLoop } = require('../services/canvas-chat.service')
   const { logExecution } = require('../services/execution-log.service')
@@ -437,6 +516,104 @@ async function executeImageOutput({ project_id, node_id, targetOutputKey, member
   }
 
   const userMessage = 'Generate the output for this step'
+
+  // ── Atajo: los prompts YA los escribió el hermano que los declara ─────────────────────────────
+  // Un output cuyas imágenes decide un plan hermano (`pitch_image_plan`) no necesita otra pasada
+  // del LLM: el plan trae una entrada por imagen con su `generation_prompt`, y su título es el
+  // mismo id que el documento usó en sus anclas. Volver a correr el ReAct reescribía el documento
+  // ENTERO —`doc_gen_docx` activo, hasta 5 iteraciones— para producir un texto que ya existe:
+  // medido, 6+ minutos y otros $0.08 por nada.
+  const planos = await promptsDelPlanHermano({ project_id, node_id, project_node_id, targetOutputKey })
+  if (planos?.length) {
+    const { data: dnaP } = await db().from('forge_nodes').select('node_key,title,outputs').eq('id', node_id).single()
+    const defP = (Array.isArray(dnaP?.outputs) ? dnaP.outputs : []).find(o => (o.key || o.name) === targetOutputKey)
+
+    const parte = [
+      `Dispatched **${planos.length}** image(s) declared by \`${planos[0].fuente}\` — no second generation pass.`,
+      '',
+      'The plan already carries one entry per image with its prompt, and each entry title is the id the',
+      'document anchored. Re-running the model would rewrite the document to say what is already written.',
+      '',
+      ...planos.map((p, i) => `## ${String(i + 1).padStart(2, '0')} · ${p.id}\n\n\`\`\`\n${p.prompt}\n\`\`\``),
+    ].join('\n')
+
+    await db().from('forge_messages').insert({ session_id: session.id, role: 'human', content: userMessage, order_index: 0, tool_calls: [] })
+    const { data: msgP } = await db().from('forge_messages')
+      .insert({ session_id: session.id, role: 'agent', content: parte, order_index: 1, tool_calls: [] }).select('id').single()
+
+    const res = await Promise.all(planos.map((p, idx) =>
+      generateOneImage({
+        project_id, node_id, session_id: session.id, node_key: dnaP.node_key,
+        output_key: targetOutputKey, image_gen_model: defP?.image_gen_model,
+        item_index: idx, item_text: p.prompt, condition: null, member_id,
+      })
+        .then(r => ({ idx, url: r.url, id: p.id }))
+        .catch(err => { console.error(`[img-plan] ${p.id}:`, err.message); return null })
+    ))
+
+    const listos = res.filter(Boolean)
+    const outputItems = listos.map(r => ({ index: r.idx, name: r.id, variations: [{ url: r.url, condition: null }] }))
+    await db().from('forge_sessions').update({
+      output_images: { [targetOutputKey]: outputItems },
+      status: 'auto_approved', completed_at: new Date().toISOString(), iteration_count: 1,
+    }).eq('id', session.id)
+    // `.catch()` sobre el builder de supabase no existe hasta que se await-ea: encadenarlo tiraba
+    // TypeError DESPUÉS de haber generado y guardado las imágenes.
+    if (msgP?.id) {
+      const { error: eMsg } = await db().from('forge_messages')
+        .update({ output_images: { [targetOutputKey]: outputItems } }).eq('id', msgP.id)
+      if (eMsg) console.warn('[img-plan] sin historial por mensaje:', eMsg.message)
+    }
+
+    // ── Rehacer el documento con las imágenes dentro ───────────────────────────────────────────
+    // El PDF se arma DENTRO de la corrida del texto, segundos antes de que exista la primera
+    // imagen: sale con los `[ IMAGE: … ]` impresos y su enlace queda escrito en el mensaje.
+    // Esconderlo no alcanza —el enlace ya está—, así que se rehace y se sustituye. Es pdfkit, sin
+    // modelo de por medio: determinista y sin costo.
+    if (listos.length) {
+      try {
+        const { executeTool } = require('../services/tools.service')
+        let q = db().from('forge_sessions').select('id').eq('project_id', project_id).eq('node_id', node_id).is('output_key', null)
+        if (project_node_id) q = q.eq('project_node_id', project_node_id)
+        const { data: gen } = await q.order('created_at', { ascending: false }).limit(1).maybeSingle()
+        if (gen?.id) {
+          const { data: msgs } = await db().from('forge_messages')
+            .select('id, content, tool_calls').eq('session_id', gen.id).order('created_at', { ascending: false }).limit(6)
+          const conDoc = (msgs || []).find(m => (m.tool_calls || []).some(t => t.tool === 'doc_gen_docx' && t.result?.url))
+          if (conDoc) {
+            // Solo la sección del output, igual que el endpoint del PDF
+            const anclaDe = k => new RegExp('^#{1,4}\\s+\\*{0,2}\\s*' + k + '\\b.*$', 'im')
+            const ini = anclaDe(targetOutputKey).exec(conDoc.content || '')
+            let cuerpo = conDoc.content || ''
+            if (ini) {
+              const desde  = cuerpo.slice(ini.index + ini[0].length)
+              const cortes = (Array.isArray(dnaP?.outputs) ? dnaP.outputs : []).map(o => o.key || o.name)
+                .filter(k => k && k !== targetOutputKey)
+                .map(k => anclaDe(k).exec(desde)).filter(Boolean).map(r => r.index)
+              const sec = desde.slice(0, cortes.length ? Math.min(...cortes) : desde.length).trim()
+              if (sec.length > 200) cuerpo = sec
+            }
+            const rehecho = await executeTool('doc_gen_docx', {
+              title: (conDoc.tool_calls.find(t => t.tool === 'doc_gen_docx')?.result?.filename || 'Document').replace(/\.pdf$/i, ''),
+              content: cuerpo,
+              item_images: listos.map(r => ({ title: r.id, url: r.url })),
+            }, { project_id, node_id })
+
+            if (rehecho?.url) {
+              const tc = conDoc.tool_calls.map(t => (t.tool === 'doc_gen_docx' && t.result?.url)
+                ? { ...t, result: { ...t.result, url: rehecho.url } } : t)
+              await db().from('forge_messages').update({ tool_calls: tc }).eq('id', conDoc.id)
+              console.log(`[img-plan] documento rehecho con ${listos.length} imagen(es) → ${rehecho.url}`)
+            }
+          }
+        }
+      } catch (e) {
+        console.error('[img-plan] no se pudo rehacer el documento:', e?.message || e)
+      }
+    }
+
+    return { output_key: targetOutputKey, session_id: session.id, asset_id: null, dispatched: true, expected: planos.length }
+  }
 
   const { finalSystemPrompt, baseUserMsg, executorStr, activeTools, resolvedInputs, visualRefs, node, targetOutput } =
     await buildSystemPrompt(db, { projectId: project_id, nodeId: node_id, sessionId: session.id, userMessage, targetOutputKey, projectNodeId: project_node_id })

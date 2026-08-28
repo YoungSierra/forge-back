@@ -639,8 +639,21 @@ async function resolverImagenesDeItems({ db, projectId, nodeId, sessionId, outKe
   //    hay una clave que buscar en `output_images`, pero eso no quita que aguas arriba haya
   //    imágenes: antes se cortaba acá y esos documentos salían siempre sin nada.
   if (sessionId) {
-    const { data: sess } = await db().from('forge_sessions')
-      .select('output_images').eq('id', sessionId).maybeSingle()
+    const { data: propia } = await db().from('forge_sessions')
+      .select('output_images, project_node_id').eq('id', sessionId).maybeSingle()
+
+    // Las imágenes de un output pueden NO estar en esta sesión: el despacho del run del nodo
+    // entero las guarda en la sesión del propio output. Se juntan las dos, la del output encima,
+    // o el documento sale pelado teniendo las imágenes al lado. Medido: 4 generadas, 0 en el PDF.
+    let mezcla = { ...(propia?.output_images || {}) }
+    if (propia?.project_node_id) {
+      const { data: porOutput } = await db().from('forge_sessions')
+        .select('output_key, output_images, created_at')
+        .eq('project_node_id', propia.project_node_id).not('output_key', 'is', null)
+        .order('created_at')
+      for (const s of porOutput || []) mezcla = { ...mezcla, ...(s.output_images || {}) }
+    }
+    const sess = { output_images: mezcla }
 
     // Con `output_key` se mira esa clave; SIN ella —el nodo corrido entero— se miran TODAS las de
     // la sesión. Antes este paso se salteaba por completo cuando la clave era null, así que un
