@@ -433,6 +433,26 @@ async function buildSystemPrompt(db, { projectId, nodeId, sessionId, userMessage
 
   if (basePrompt) {
     layer1 = basePrompt
+
+    // ── El contrato de CADA output, también corriendo el nodo entero ───────────────────────────
+    // En modo focus el prompt del output se apila sobre el default (arriba). Sin foco no se
+    // mandaba ninguno: el modelo recibía el resumen del nodo y nunca el contrato de sus salidas
+    // —dónde va el bloque de emisión, qué campos lleva el plan, cómo se escriben las anclas—.
+    //
+    // Medido el 28-08 en 2.2: el modelo respondió «this node's contract does not declare image_gen
+    // outputs» y emitió []. Tenía razón desde lo que veía. La misma ceguera explica los sobres que
+    // faltaron toda la tarde y las tres maquetaciones distintas del plan.
+    if (!targetOutput) {
+      const contratos = outputDefs
+        .filter(o => o.prompt)
+        .map(o => `### ${o.key}${o.format ? ` (${o.format})` : ''}\n${injectVars(o.prompt, templateVars)}`)
+      if (contratos.length) {
+        layer1 += '\n\n## Output contracts\n'
+          + 'Each section below is the contract of one output of this node. Produce every one of them, '
+          + 'each opened by a level-2 heading with its exact name, and honor its contract in full.\n\n'
+          + contratos.join('\n\n')
+      }
+    }
   } else {
     const outputsBlock = activeOutputDefs.length
       ? activeOutputDefs.map(o => {
@@ -730,12 +750,32 @@ async function resolverImagenesDeItems({ db, projectId, nodeId, sessionId, outKe
         .filter(k => defs.find(o => (o.key || o.name) === k)?.image_gen)
 
       for (const hermano of hermanos) {
-        const { data: sh } = await db().from('forge_sessions')
+        let { data: sh } = await db().from('forge_sessions')
           .select('output_images, output_asset_id')
           .eq('project_id', projectId).eq('node_id', nodeId).eq('output_key', hermano)
           .in('status', ['approved', 'auto_approved']).maybeSingle()
+
+        // Corriendo el nodo ENTERO no hay sesión por output: las imágenes del hermano quedan en
+        // la general, bajo su clave. Mirar solo la sesión por output dejaba el documento sin una
+        // sola imagen teniéndolas al lado — medido en 2.2: 3 generadas, 0 en el PDF.
+        if (!Object.keys(sh?.output_images || {}).length) {
+          const { data: sg } = await db().from('forge_sessions')
+            .select('output_images, output_asset_id, id')
+            .eq('project_id', projectId).eq('node_id', nodeId).is('output_key', null)
+            .order('created_at', { ascending: false }).limit(1).maybeSingle()
+          if (sg?.output_images?.[hermano]) sh = { output_images: { [hermano]: sg.output_images[hermano] }, output_asset_id: sg.output_asset_id }
+        }
+
+        // `name` es el id con el que se generó la imagen —el mismo que el documento pone en su
+        // ancla—. El despachador lo guarda ahí; ignorarlo obligaba a reconstruir el título por
+        // etiqueta («Development Images 1») y entonces ningún marcador coincidía: el motor
+        // incrustaba bien y el PDF pedido a mano salía sin nada.
         const urls = Object.values(sh?.output_images || {}).flat()
-          .map(it => ({ i: it.index, url: it?.variations?.length ? it.variations[it.variations.length - 1]?.url : it?.url }))
+          .map(it => ({
+            i: it.index,
+            id: it?.name || null,
+            url: it?.variations?.length ? it.variations[it.variations.length - 1]?.url : it?.url,
+          }))
           .filter(x => x.url)
         if (!urls.length) continue
 
@@ -743,7 +783,12 @@ async function resolverImagenesDeItems({ db, projectId, nodeId, sessionId, outKe
         let decl = []
         if (sh?.output_asset_id) {
           const { data: ah } = await db().from('forge_assets').select('content').eq('id', sh.output_asset_id).maybeSingle()
-          const m = /```(?:json)?\s*([\s\S]*?)```/.exec(ah?.content || '')
+          const txt = ah?.content || ''
+          // El sobre del hermano NO es necesariamente el primer bloque json: en el nodo entero la
+          // respuesta trae antes el documento en json (concept_data). Se busca el bloque que
+          // nombra al hermano; si no hay, se cae al primero, como antes.
+          const conClave = new RegExp('```(?:json)?\\s*(\\{[\\s\\S]*?"' + hermano + '"[\\s\\S]*?\\})\\s*```', 'i').exec(txt)
+          const m = conClave || /```(?:json)?\s*([\s\S]*?)```/.exec(txt)
           try {
             const j = JSON.parse(m?.[1] ?? '')
             decl = Array.isArray(j?.[hermano]) ? j[hermano] : (Array.isArray(j) ? j : [])
@@ -765,11 +810,17 @@ async function resolverImagenesDeItems({ db, projectId, nodeId, sessionId, outKe
         const etiqueta = defs.find(o => (o.key || o.name) === hermano)?.label || hermano
         for (const u of urls) {
           const d = decl[u.i]
-          imagenes.push({ title: seccionDePlacement(d?.placement) || d?.label || `${etiqueta} ${u.i + 1}`, url: u.url })
+          // El id con el que se generó manda: es el que el documento ancló.
+          imagenes.push({ title: u.id || seccionDePlacement(d?.placement) || d?.label || `${etiqueta} ${u.i + 1}`, url: u.url })
         }
       }
     }
 
+    // NO se cae a `concept_data.approved_images[]`. Esas son las imágenes de REFERENCIA que llegan
+    // de arriba —el hilo visual—, el insumo del que este nodo deriva las suyas: misma paleta, mismo
+    // registro. Incrustarlas cuando el nodo no generó las propias produce un documento que parece
+    // correcto y no lo es, y de paso tapa el fallo que hay que ver: que no se emitió el sobre.
+    // Un documento vacío se revisa; uno lleno de las imágenes equivocadas, no.
     if (imagenes.length) return imagenes
   }
 

@@ -38,34 +38,42 @@ const cliente = () => new S3Client({
   let fallos = 0
 
   for (const f of man.files) {
-    const { data: cfg, error } = await db().from('forge_skill_configs').select('r2_path').eq('key', f.skill).single()
-    if (error || !cfg?.r2_path) { console.error(`  ✗ ${f.skill}: no está en forge_skill_configs`); fallos++; continue }
+    // El manifiesto puede nombrar el skill con extensión (`v57_pitch_template.md`) y la tabla los
+    // guarda sin ella. Es cosmético, pero paraba el lock entero por 25 «no está en la tabla».
+    const clave = String(f.skill).replace(/\.md$/i, '')
+    const { data: cfg, error } = await db().from('forge_skill_configs').select('r2_path').eq('key', clave).single()
+    if (error || !cfg?.r2_path) { console.error(`  ✗ ${clave}: no está en forge_skill_configs`); fallos++; continue }
 
-    const vivo   = await ps.getSkill(f.skill)
+    const vivo   = await ps.getSkill(clave)
     const hVivo  = sha(vivo)
-    const parche = fs.readFileSync(path.join(DIR, f.skill + '.md'), 'utf8')
+    const parche = fs.readFileSync(path.join(DIR, clave + '.md'), 'utf8')
     const hParche = sha(parche)
 
     const base = hVivo === f.base_sha256
     const alt  = f.alt_base_sha256_if_T1rev_already_applied && hVivo === f.alt_base_sha256_if_T1rev_already_applied
 
     if (!base && !alt) {
-      console.error(`  ✗ ${f.skill}: la fuente viva NO coincide con la base del parche`)
+      console.error(`  ✗ ${clave}: la fuente viva NO coincide con la base del parche`)
       console.error(`      vivo     ${hVivo}`)
       console.error(`      esperado ${f.base_sha256}`)
       fallos++; continue
     }
     if (hParche !== f.patched_sha256) {
-      console.error(`  ✗ ${f.skill}: el archivo entregado no coincide con su propio manifiesto`)
+      console.error(`  ✗ ${clave}: el archivo entregado no coincide con su propio manifiesto`)
       fallos++; continue
     }
 
-    console.log(`  ✔ ${f.skill.padEnd(36)} ${vivo.length} → ${parche.length} chars  · ${base ? 'base' : 'alt-base'} · ${cfg.r2_path}`)
+    console.log(`  ✔ ${clave.padEnd(36)} ${vivo.length} → ${parche.length} chars  · ${base ? 'base' : 'alt-base'} · ${cfg.r2_path}`)
     f.changes?.forEach(c => console.log(`       · ${c}`))
-    listos.push({ ...f, r2_path: cfg.r2_path, vivo, parche })
+    listos.push({ ...f, skill: clave, r2_path: cfg.r2_path, vivo, parche })
   }
 
-  if (fallos) { console.error(`\nDETENIDO: ${fallos} problema(s). No se escribió nada.`); process.exit(1) }
+  // Por defecto se detiene todo: el assert de los deltas es «cualquier hash inesperado → parar».
+  // `--solo-verificados` sube los que SÍ pasaron y deja los otros fuera, nombrados. Nunca escribe
+  // sobre una base sin verificar; solo permite avanzar con la parte comprobada.
+  const SOLO_OK = process.argv.includes('--solo-verificados')
+  if (fallos && !SOLO_OK) { console.error(`\nDETENIDO: ${fallos} problema(s). No se escribió nada.`); process.exit(1) }
+  if (fallos) console.warn(`\n⚠ ${fallos} archivo(s) quedan FUERA por no coincidir con su base — se reportan a quien mandó el delta.`)
 
   if (BACKUP) {
     fs.mkdirSync(BACKUP, { recursive: true })

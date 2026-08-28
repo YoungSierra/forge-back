@@ -42,6 +42,35 @@ function vencido(token) {
   } catch { return false }
 }
 
+// El `sub` del token, leído sin red. Solo se usa DESPUÉS de comprobar la firma.
+function sujetoDe(token) {
+  try {
+    const p = token.split('.')[1]
+    if (!p) return null
+    const json = JSON.parse(Buffer.from(p.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8'))
+    return typeof json.sub === 'string' ? json.sub : null
+  } catch { return null }
+}
+
+// Segunda vía de comprobación, sin pasar por Auth: PostgREST verifica la firma del JWT en cada
+// consulta —con la anon key y el token del usuario— y devuelve 401 si no cuadra. Una consulta
+// trivial basta como prueba de firma. La BD responde bien cuando Auth no; son servicios distintos.
+async function validarPorPostgREST(token) {
+  const sub = sujetoDe(token)
+  if (!sub) return null
+  try {
+    const { dbAsUser } = require('../services/supabase.service')
+    const { error } = await Promise.race([
+      dbAsUser(token).from('members').select('id').limit(1),
+      new Promise((_, rechazar) => setTimeout(() => rechazar(new Error('rest-timeout')), 6_000)),
+    ])
+    // Un JWT mal firmado o vencido lo rechaza PostgREST con PGRST301 / JWSError. Cualquier otro
+    // error —tabla, permisos, RLS— significa que la FIRMA pasó, que es lo único que se comprueba.
+    if (error && /JWT|JWS|PGRST301|invalid|expired/i.test(`${error.code} ${error.message}`)) return null
+    return sub
+  } catch { return null }
+}
+
 async function resolveIdentity(token) {
   const hit = _cache.get(token)
   if (hit && hit.exp > Date.now()) return hit.identity
@@ -66,6 +95,8 @@ async function resolveIdentity(token) {
     }
   }
 
+  let authUserId = user?.id ?? null
+
   if (authErr || !user) {
     // Auth no pudo responder. Si a este token ya se lo validó antes, se sigue confiando en él: su
     // vencimiento se comprobó arriba sin red, y negarle el paso a alguien logueado porque el
@@ -76,11 +107,18 @@ async function resolveIdentity(token) {
       _cache.set(token, { exp: Date.now() + CACHE_TTL_MS, identity: previa })
       return previa
     }
-    return null
+
+    // Sin identidad previa —un back recién reiniciado, que con nodemon es todo el tiempo— esa red
+    // está vacía y se rechazaba a un usuario perfectamente logueado. Queda una segunda forma de
+    // comprobar el token que NO pasa por Auth: PostgREST valida la firma del JWT en cada consulta.
+    // Si acepta el token, la firma es buena; el `sub` se lee del propio token, sin red.
+    authUserId = await validarPorPostgREST(token)
+    if (!authUserId) return null
+    console.warn('[requireAuth] Auth no respondió; token validado contra PostgREST')
   }
 
   const { data: member } = await db()
-    .from('members').select('id, role, display_name').eq('auth_user_id', user.id).maybeSingle()
+    .from('members').select('id, role, display_name').eq('auth_user_id', authUserId).maybeSingle()
   if (!member) return { noMember: true }
 
   const { data: orgRows } = await db().from('org_members').select('org_id, org_role').eq('member_id', member.id)

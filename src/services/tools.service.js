@@ -471,6 +471,41 @@ function drawPageHeader(doc, title) {
 // es donde el lector la espera. Sin ellas el PDF sale como siempre.
 async function docGenDocx(title, content, projectId, nodeId, itemImages = []) {
   const { jsonToMarkdown } = require('./json-display')
+
+  // ── Los bloques máquina NO se imprimen ───────────────────────────────────────────────────────
+  // Un documento que además emite contratos —`concept_data`, el sobre de imágenes, el contrato de
+  // carril— los lleva en la misma respuesta. Cuando el modelo no escribe el encabezado del output
+  // no hay por dónde recortar y el PDF se los come: medido en 2.2, un tratamiento de 6 páginas
+  // salió con 10, cuatro de ellas listas de `audio_references` y códigos hexadecimales. Y las
+  // imágenes, bien puestas en sus anclas, parecían amontonadas al principio de un documento que
+  // no terminaba nunca.
+  //
+  // Se quitan solo los bloques CERCADOS que parsean como json y pesan: un fragmento corto que
+  // alguien puso a propósito para ilustrar algo se queda.
+  const sinBloquesMaquina = txt => {
+    let fuera = 0
+    const r = String(txt || '').replace(/```json\s*([\s\S]*?)```/gi, (todo, cuerpo) => {
+      if (cuerpo.trim().length < 300) return todo
+      try { JSON.parse(cuerpo) } catch { return todo }
+      fuera++
+      return ''
+    }).replace(/\n{3,}/g, '\n\n')
+    if (!fuera) return txt
+    // Si el documento ERA el bloque, no se toca: hay outputs cuya esencia es el json —el
+    // `concept_data` del 2.2, el veredicto de un gate— y para esos `jsonToMarkdown` es justamente
+    // lo que hay que hacer. Medido sobre los 479 assets vivos: sin esta guarda, el asset de
+    // Concept Data pasaba de 11.510 a 1.005 caracteres, o sea se perdía entero.
+    //
+    // Lo que queda tiene que sostenerse solo: un documento de verdad, con sus secciones.
+    const queda = r.trim()
+    const encabezados = (queda.match(/^#{1,4}\s+\S/gm) || []).length
+    if (queda.length < 1500 || encabezados < 2) return txt
+    console.log(`[doc_gen] ${fuera} bloque(s) máquina fuera del PDF`)
+    return r
+  }
+
+  content = sinBloquesMaquina(content)
+
   // Si el output es JSON estructurado (ej. concept_data del 2.2), renderizarlo LEGIBLE (headings +
   // bullets) en vez de volcar el JSON crudo al PDF. Si no es JSON, se usa el contenido tal cual.
   let cleanContent = jsonToMarkdown(content) ?? content ?? title
@@ -681,6 +716,21 @@ async function docGenDocx(title, content, projectId, nodeId, itemImages = []) {
     // apertura: es la imagen del concepto del que trata todo el documento.
     {
       const anclas = new Set()
+
+      // Un marcador `[ IMAGE: image_wide ]` ES un ancla, y de las buenas: el documento dice dónde
+      // va esa imagen exacta. No contarlo mandaba las tres al frente —«están al inicio y no donde
+      // deben»— y cuando el cuerpo llegaba a su marcador ya no quedaba imagen que dibujar.
+      // El título se saca del id, no de la línea entera: «[ IMAGE: image_wide ]» normalizado da
+      // «image image wide» y no coincide con nada.
+      for (const s of contentSections) {
+        for (const l of (s.lines || [])) {
+          const m = /^\[\s*IMAGE\s*:\s*([^\]\n—:-]+)/i.exec(String(l).trim())
+          if (!m) continue
+          const t = tituloDeItem(m[1].trim())
+          if (t) anclas.add(t)
+        }
+      }
+
       for (const s of contentSections) {
         const t = tituloDeItem(s.title || '')
         if (t) anclas.add(t)

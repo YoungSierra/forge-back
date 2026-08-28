@@ -274,16 +274,45 @@ async function executeAssemblyOutput({ project_id, node_id, targetOutputKey, mem
   return { output_key: targetOutputKey, session_id: ses.id, asset_id: asset?.id || null, assembled: r.paginas.length }
 }
 
+// ─── El sobre de emisión que la respuesta ya trae ──────────────────────────────
+// Desde v2.9.18 el `default_prompt` obliga a cerrar con el bloque de emisión corra el nodo como
+// corra. Es la segunda fuente de prompts, y sirve cuando el output no declara un plan hermano o
+// cuando el plan no está escrito: sin ella el despacho cae al ReAct, que reescribe el documento
+// entero para producir lo que ya está en la respuesta.
+function promptsDelSobre(contenido, targetOutputKey) {
+  if (!contenido) return []
+  const rx = new RegExp('```json\\s*(\\{[\\s\\S]*?"' + targetOutputKey + '"[\\s\\S]*?\\})\\s*```', 'i')
+  const b = rx.exec(contenido)
+  if (!b) return []
+  let j
+  try { j = JSON.parse(b[1]) } catch { return [] }
+  const arr = j?.[targetOutputKey]
+  if (!Array.isArray(arr)) return []
+  return arr
+    .map(e => ({ id: String(e?.id ?? '').trim(), prompt: String(e?.prompt ?? '').trim(), fuente: 'emission block' }))
+    .filter(e => e.id && e.prompt.length >= 40)
+}
+
 // ─── Los prompts que ya escribió el hermano que declara las imágenes ───────────
-// Devuelve [{ id, prompt, fuente }] o [] si este output no declara un plan, o si el plan todavía
-// no está escrito. El id es el título de la entrada: el MISMO que el documento pone en su ancla
-// `[ IMAGE: <id> ]`, que es lo que permite anclar sin adivinar.
+// Devuelve [{ id, prompt, fuente }] o [] si no hay de dónde sacarlos. El id es el título de la
+// entrada: el MISMO que el documento pone en su ancla `[ IMAGE: <id> ]`, que es lo que permite
+// anclar sin adivinar.
 async function promptsDelPlanHermano({ project_id, node_id, project_node_id, targetOutputKey }) {
   const { data: dna } = await db().from('forge_nodes').select('outputs').eq('id', node_id).maybeSingle()
   const outs = Array.isArray(dna?.outputs) ? dna.outputs : []
   const def  = outs.find(o => (o.key || o.name) === targetOutputKey)
   const plan = (def?.uses?.siblings_if_present ?? def?.uses?.siblings ?? []).find(k => /plan$/i.test(k))
-  if (!plan) return []
+
+  // Sin plan declarado, el sobre de la respuesta general es la única fuente
+  if (!plan) {
+    let q0 = db().from('forge_sessions').select('id').eq('project_id', project_id).eq('node_id', node_id).is('output_key', null)
+    if (project_node_id) q0 = q0.eq('project_node_id', project_node_id)
+    const { data: g0 } = await q0.order('created_at', { ascending: false }).limit(1).maybeSingle()
+    if (!g0?.id) return []
+    const { data: m0 } = await db().from('forge_messages').select('content, role')
+      .eq('session_id', g0.id).order('created_at', { ascending: false }).limit(6)
+    return promptsDelSobre((m0 || []).find(m => m.role === 'agent')?.content, targetOutputKey)
+  }
 
   // El plan puede vivir en su propia sesión (run por output) o dentro de la respuesta del nodo
   // entero. Se buscan las dos, la propia primero.
@@ -355,7 +384,95 @@ async function promptsDelPlanHermano({ project_id, node_id, project_node_id, tar
     if (!m) continue
     entradas.push({ id: titulos[i].clave, prompt: m[1].replace(/^["'`]|["'`]$/g, '').trim() })
   }
-  return validos(entradas)
+  const delPlan = validos(entradas)
+  if (delPlan.length) return delPlan
+
+  // El plan existe pero no se pudo leer: queda el sobre, que desde v2.9.18 la respuesta cierra
+  // siempre. Antes de esto, un plan con una maquetación nueva mandaba el despacho al ReAct.
+  return promptsDelSobre(contenido, targetOutputKey)
+}
+
+// ─── ¿El nodo decidió, explícitamente, que NO van imágenes? ────────────────────
+// «Cero es válido» está en el contrato de estos outputs, y cuando el modelo lo elige lo escribe:
+// un sobre vacío, o un registro de decisión. Eso NO es un fallo que haya que compensar — es una
+// respuesta. Tratarlo como si faltaran prompts hacía dos daños: se anunciaba un despacho que no
+// existía —la pantalla se quedaba en «Waiting for images…» para siempre— y se caía al ReAct
+// completo, pagando una corrida entera por un output que acababa de decir que no.
+function decidioCero(contenido, targetOutputKey, clavePlan) {
+  if (!contenido) return false
+  const bloques = [...String(contenido).matchAll(/```json\s*([\s\S]*?)```/g)]
+  for (const b of bloques) {
+    let j
+    try { j = JSON.parse(b[1]) } catch { continue }
+    if (!j || typeof j !== 'object' || Array.isArray(j)) continue
+
+    // Sobre vacío: { "<output>": [] }
+    if (Array.isArray(j[targetOutputKey]) && j[targetOutputKey].length === 0) return true
+    // Registro de decisión del plan o del propio output
+    const nombra = j.format === targetOutputKey || (clavePlan && j.format === clavePlan)
+    const texto  = `${j.decision ?? ''} ${j.images ?? ''}`.toLowerCase()
+    if (nombra && (/zero|none|no[_ ]images/.test(texto) || (Array.isArray(j.images) && j.images.length === 0))) return true
+  }
+  return false
+}
+
+// ─── Tercera fuente: pedirle SOLO el sobre ─────────────────────────────────────
+// Cuando el output no declara un plan y la respuesta no trae el sobre, no hay prompts en ninguna
+// parte. La red que había era el ReAct completo: reescribir el documento ENTERO para sacar cuatro
+// prompts —seis minutos y otros $0.08 por un texto que ya existe—.
+//
+// En la respuesta grande el sobre compite con 60.000 caracteres de plantillas y skills, y pierde:
+// medido, cuatro corridas de cuatro. Solo, con el documento ya escrito como contexto y su propio
+// contrato como instrucción, no tiene con qué competir. Segundos y centavos.
+//
+// No se inventa nada: los prompts los escribe el modelo, derivados de lo que él mismo acaba de
+// escribir. El motor no compone arte.
+async function pedirSoloElSobre({ node_id, targetOutputKey, contenido, executorStr }) {
+  if (!contenido) return []
+  const { callLLM } = require('../services/llm.service')
+  const { data: dna } = await db().from('forge_nodes').select('outputs, title').eq('id', node_id).maybeSingle()
+  const def = (Array.isArray(dna?.outputs) ? dna.outputs : []).find(o => (o.key || o.name) === targetOutputKey)
+  if (!def) return []
+
+  // Las anclas que el documento YA escribió son la señal que falta. Sin ellas el modelo responde
+  // `[]` —válido por contrato, «las development images son opcionales»— y el documento se queda
+  // con marcadores que no resuelven a nada. Medido: sin la señal, 0 prompts; con ella, uno por
+  // ancla, con su `placement` cayendo en secciones reales del documento.
+  const anclas = [...String(contenido).matchAll(/\[\s*IMAGE\s*:\s*([^\]\n]+)\]/gi)].map(m => m[1].trim())
+  const señalAnclas = anclas.length
+    ? `The document ALREADY anchors ${anclas.length} image(s) with these exact ids: ${anclas.join(', ')}. `
+      + 'Emit one entry per anchor, reusing those ids verbatim — the document reserved a place for each, '
+      + 'and a marker with no image resolves to nothing.'
+    : 'The document anchors no images. If it needs none, [] is the right answer.'
+
+  const sistema = [
+    `You wrote the document below for the node "${dna.title}". It is finished and must NOT be rewritten.`,
+    `The only thing missing is the image-emission block for the output \`${targetOutputKey}\`.`,
+    '',
+    'This is that output\'s own contract — follow it exactly:',
+    '---',
+    String(def.prompt || '').slice(0, 4000),
+    '---',
+    '',
+    `Reply with NOTHING but the fenced json block: { "${targetOutputKey}": [ … ] }.`,
+    'No prose before it, no prose after it. [] is a valid answer when the document needs no images.',
+    'Every prompt is render-ready and derives from the visual thread already written in the document —',
+    'same palette (hex verbatim), same rendering register.',
+    señalAnclas,
+  ].join('\n')
+
+  try {
+    const res = await callLLM(sistema, String(contenido).slice(0, 60000), {
+      model: executorStr || 'anthropic:claude-sonnet-4-6', rawText: true, temperature: 0.4, maxOutputTokens: 4000,
+    })
+    const texto = typeof res === 'string' ? res : (res?.data ?? res?.text ?? '')
+    const r = promptsDelSobre(texto, targetOutputKey)
+    console.log(`[img-sobre] ${targetOutputKey}: el re-pedido devolvió ${r.length} prompt(s)`)
+    return r
+  } catch (e) {
+    console.error(`[img-sobre] ${targetOutputKey}:`, e?.message || e)
+    return []
+  }
 }
 
 async function executeImageOutput({ project_id, node_id, targetOutputKey, member_id, project_node_id = null }) {
@@ -521,7 +638,28 @@ async function executeImageOutput({ project_id, node_id, targetOutputKey, member
   // mismo id que el documento usó en sus anclas. Volver a correr el ReAct reescribía el documento
   // ENTERO —`doc_gen_docx` activo, hasta 5 iteraciones— para producir un texto que ya existe:
   // medido, 6+ minutos y otros $0.08 por nada.
-  const planos = await promptsDelPlanHermano({ project_id, node_id, project_node_id, targetOutputKey })
+  let planos = await promptsDelPlanHermano({ project_id, node_id, project_node_id, targetOutputKey })
+
+  // Ni plan ni sobre: antes esto mandaba el despacho al ReAct completo. Se le pide SOLO el bloque,
+  // con el documento que acaba de escribir como contexto.
+  if (!planos?.length) {
+    let qC = db().from('forge_sessions').select('id').eq('project_id', project_id).eq('node_id', node_id).is('output_key', null)
+    if (project_node_id) qC = qC.eq('project_node_id', project_node_id)
+    const { data: gC } = await qC.order('created_at', { ascending: false }).limit(1).maybeSingle()
+    if (gC?.id) {
+      const { data: mC } = await db().from('forge_messages').select('content, role')
+        .eq('session_id', gC.id).order('created_at', { ascending: false }).limit(6)
+      const doc = (mC || []).find(m => m.role === 'agent')?.content
+      if (doc) {
+        const { data: nEx } = await db().from('forge_nodes').select('executor').eq('id', node_id).maybeSingle()
+        planos = await pedirSoloElSobre({
+          node_id, targetOutputKey, contenido: doc,
+          executorStr: typeof nEx?.executor === 'string' ? nEx.executor : nEx?.executor?.model,
+        })
+      }
+    }
+  }
+
   if (planos?.length) {
     const { data: dnaP } = await db().from('forge_nodes').select('node_key,title,outputs').eq('id', node_id).single()
     const defP = (Array.isArray(dnaP?.outputs) ? dnaP.outputs : []).find(o => (o.key || o.name) === targetOutputKey)
@@ -601,6 +739,16 @@ async function executeImageOutput({ project_id, node_id, targetOutputKey, member
               const tc = conDoc.tool_calls.map(t => (t.tool === 'doc_gen_docx' && t.result?.url)
                 ? { ...t, result: { ...t.result, url: rehecho.url } } : t)
               await db().from('forge_messages').update({ tool_calls: tc }).eq('id', conDoc.id)
+
+              // El enlace del documento vive en DOS sitios: el tool_call del mensaje —que lee el
+              // chip del chat— y `forge_assets.storage_url` —que lee el botón del nodo—. Actualizar
+              // uno solo deja los dos botones apuntando a PDFs distintos: uno con imágenes y otro
+              // sin ellas. Pasó, y desde fuera parece que el arreglo no funcionó.
+              const { data: docAsset } = await db().from('forge_assets')
+                .select('id').eq('session_id', gen.id).neq('format', 'png')
+                .order('created_at', { ascending: false }).limit(1).maybeSingle()
+              if (docAsset?.id) await db().from('forge_assets').update({ storage_url: rehecho.url }).eq('id', docAsset.id)
+
               console.log(`[img-plan] documento rehecho con ${listos.length} imagen(es) → ${rehecho.url}`)
             }
           }
@@ -1845,6 +1993,28 @@ router.post('/nodes/:node_id/generate-pdf', async (req, res, next) => {
   try {
     const { id: project_id, node_id } = req.params
     const { output_key = null, project_node_id = null } = req.body ?? {}
+
+    // Un PDF pedido mientras las imágenes del nodo se están renderizando sale con los
+    // `[ IMAGE: … ]` impresos como texto: el resolvedor lee `output_images` al armarlo y todavía
+    // está vacío. La regla vive acá, en el servidor, y no en cada botón: puesta en el cliente hubo
+    // que reponerla nodo por nodo, y bastaba con que el front no se enterara para entregarlo a medias.
+    {
+      let qA = db().from('forge_sessions').select('output_key')
+        .eq('project_id', project_id).eq('node_id', node_id)
+        .not('output_key', 'is', null).eq('status', 'active')
+      if (project_node_id) qA = qA.eq('project_node_id', project_node_id)
+      const { data: activas } = await qA
+      const { data: dnaPdf } = await db().from('forge_nodes').select('outputs').eq('id', node_id).maybeSingle()
+      const { imageOutputsOf } = require('../services/image-gen.service')
+      const claveImg = new Set(imageOutputsOf(dnaPdf || {}).map(o => o.key))
+      const enVuelo = (activas || []).map(s => s.output_key).filter(k => claveImg.has(k))
+      if (enVuelo.length) {
+        return res.status(409).json({
+          success: false, error_code: 'images_rendering',
+          error: `Images are still rendering (${enVuelo.join(', ')}). The PDF would print the [ IMAGE: … ] markers as text — it is rebuilt automatically when they land.`,
+        })
+      }
+    }
 
     let q = db()
       .from('forge_sessions')
@@ -3178,11 +3348,20 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
         )
         const pendientes = await pendingImageOutputsForNode(project_id, node_id, pnEstado?.is_stale, dnaImg || {}, currentPNode.id)
 
+        // TODOS los outputs de imagen, también los png. El front dejó de despachar en el run del
+        // nodo entero: su parser cae a las viñetas del documento cuando no hay sobre, y eso mandó
+        // prosa a ComfyUI. Acá los prompts salen del plan, del sobre, o se piden — nunca se
+        // adivinan. En modo focus sigue mandando el front, que sabe qué ítem cambió.
         const aDespachar = pendientes.filter(k => {
           const d = porClave.get(k)
           if (!d || d.production === 'deferred') return false
-          // Los png/image ya los despacha el front — despacharlos también acá es pagar dos veces
-          return d.format !== 'png' && d.format !== 'image'
+          // Un «cero imágenes» declarado es una respuesta, no un hueco: ni se despacha ni se avisa
+          const plan = (d.uses?.siblings_if_present ?? d.uses?.siblings ?? []).find(x => /plan$/i.test(x))
+          if (decidioCero(replyText, k, plan)) {
+            console.log(`[forge-chat] ${k}: el nodo declaró cero imágenes — no se despacha`)
+            return false
+          }
+          return true
         })
 
         // Sin esperar, como el deck: cuatro renders de ComfyUI no caben en una petición del
@@ -3227,8 +3406,12 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
       session_id: session.id,
       message_id: agentMsg?.id ?? undefined,
       meta,
-      doc_url:    docUrl    ?? undefined,
-      doc_format: docFormat ?? undefined,
+      // Con imágenes en vuelo NO se entrega el documento. Se armó segundos antes de que existiera
+      // la primera, así que lleva los `[ IMAGE: … ]` impresos como texto; el motor lo rehace en
+      // cuanto llegan. La regla vive acá y no en el cliente: puesta en el front había que
+      // reponerla nodo por nodo, y bastaba con que no se enterara para volver a entregarlo a medias.
+      doc_url:    imagenesDespachadas.length ? undefined : (docUrl    ?? undefined),
+      doc_format: imagenesDespachadas.length ? undefined : (docFormat ?? undefined),
       // Outputs de imagen que se despacharon en segundo plano: el front los consulta por sesión
       images_dispatched: imagenesDespachadas.length ? imagenesDespachadas : undefined,
       // Trazabilidad del ensamble: qué slot se llenó desde qué fuente y cuál pasó por el
