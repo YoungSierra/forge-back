@@ -1222,12 +1222,34 @@ router.post('/gate', async (req, res, next) => {
       return res.status(400).json({ success: false, error: 'decision debe ser ACCEPT, REFINE o KILL' })
     }
 
-    // Registrar decisión en el historial del blueprint
-    await db()
+    // Registrar decisión en el historial del blueprint.
+    //
+    // Un UPDATE sobre una fila que no existe afecta CERO filas y no falla. Y esa fila puede no
+    // existir: las fases cargadas por fan-out crean sus `project_nodes` pero no su fila aquí. El
+    // resultado era una decisión que se perdía en silencio — se apretaba Accept, el gate no se
+    // sellaba, y el modal volvía a aparecer. Medido en la fase 2 de smack_test_pedrito_v0.4.
+    const { data: filas } = await db()
       .from('forge_project_blueprints')
-      .update({ gate_decision: decision })
+      .select('id')
       .eq('project_id', project_id)
       .eq('blueprint_id', blueprint_id)
+
+    if ((filas || []).length) {
+      await db().from('forge_project_blueprints')
+        .update({ gate_decision: decision })
+        .eq('project_id', project_id)
+        .eq('blueprint_id', blueprint_id)
+    } else {
+      const { error } = await db().from('forge_project_blueprints').insert({
+        project_id, blueprint_id, gate_decision: decision,
+        trigger: 'manual', loaded_by: member_id || null,
+      })
+      if (error) {
+        console.error('[gate] no se pudo registrar la decisión:', error.message)
+        return res.status(500).json({ success: false, error: `No se pudo registrar la decisión: ${error.message}` })
+      }
+      console.log(`[gate] fase ${String(blueprint_id).slice(0, 8)} no tenía fila (cargada por fan-out) — creada con ${decision}`)
+    }
 
     if (decision !== 'ACCEPT') {
       return res.json({ success: true, decision, next_blueprint: null })
@@ -1435,9 +1457,15 @@ router.post('/gate', async (req, res, next) => {
           db,
         })
 
-        await db()
+        // `trigger` tiene un CHECK de tres valores —project_creation, gate_accept, manual— y este
+        // insert mandaba 'gate_fanout', que no está. Fallaba SIEMPRE, y nadie miraba el error: la
+        // fase cargada por fan-out se quedaba sin fila, y sin fila el gate no podía registrar su
+        // decisión ni sellar nada. Es el origen de «aprieto Accept y el modal vuelve».
+        // La carga la disparó un gate aceptado, así que ese es su trigger.
+        const { error: eBp } = await db()
           .from('forge_project_blueprints')
-          .insert({ project_id, blueprint_id: nextBp.id, trigger: 'gate_fanout', loaded_by: member_id || null })
+          .insert({ project_id, blueprint_id: nextBp.id, trigger: 'gate_accept', loaded_by: member_id || null })
+        if (eBp) console.error('[gate] no se pudo registrar la fase cargada por fan-out:', eBp.message)
 
         return res.json({
           success:        true,
