@@ -2978,6 +2978,50 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
     // La generación de imágenes de una iteración la dispara el front (`triggerAutoImageGen`),
     // que ya trae el detalle de qué ítem cambió y pinta el spinner por ítem. Acá NO se genera:
     // hacerlo en los dos lados es pagar dos veces la misma imagen.
+    //
+    // ── Salvo los outputs que el front NO despacha ────────────────────────────────────────────
+    // `triggerAutoImageGen` corta en `format === 'png' || 'image'`; los demás quedan a un botón
+    // manual. Un DOCUMENTO con `image_gen: true` —el pitch_document, format docx— caía justo ahí:
+    // el nodo corría entero, el texto salía, y las imágenes no las pedía nadie. Desde afuera el
+    // nodo parecía terminado y estaba a medias.
+    //
+    // Solo en el run del nodo entero (sin foco): con foco manda el front, que sabe qué ítem cambió.
+    //
+    // NO se parsea esta respuesta. El blob no trae el sobre de emisión y `parseOutputItems` acaba
+    // leyendo prosa del documento o el plan hermano —medido: 3 ítems que no son prompts—. Es
+    // `executeImageOutput` quien corre el ReAct del propio output, que sí emite su sobre.
+    let imagenesDespachadas = []
+    if (!target_output_key && currentPNode?.id) {
+      try {
+        const { data: pnEstado } = await db()
+          .from('forge_project_nodes').select('is_stale').eq('id', currentPNode.id).maybeSingle()
+        const { data: dnaImg } = await db()
+          .from('forge_nodes').select('id, outputs').eq('id', node_id).single()
+
+        const porClave = new Map(
+          (Array.isArray(dnaImg?.outputs) ? dnaImg.outputs : []).map(o => [o.key || o.name, o])
+        )
+        const pendientes = await pendingImageOutputsForNode(project_id, node_id, pnEstado?.is_stale, dnaImg || {})
+
+        const aDespachar = pendientes.filter(k => {
+          const d = porClave.get(k)
+          if (!d || d.production === 'deferred') return false
+          // Los png/image ya los despacha el front — despacharlos también acá es pagar dos veces
+          return d.format !== 'png' && d.format !== 'image'
+        })
+
+        // Sin esperar, como el deck: cuatro renders de ComfyUI no caben en una petición del
+        // navegador. El front sigue el avance en `output_images` de la sesión de cada output.
+        for (const key of aDespachar) {
+          executeImageOutput({ project_id, node_id, targetOutputKey: key, member_id, project_node_id: currentPNode.id })
+            .catch(e => console.error(`[forge-chat] imagen ${key}:`, e?.message || e))
+          imagenesDespachadas.push(key)
+        }
+      } catch (e) {
+        // Que el post-pass falle no puede tumbar la respuesta: el texto ya está guardado
+        console.error('[forge-chat] post-pass de imágenes:', e?.message || e)
+      }
+    }
 
     // Incrementar contador de iteraciones
     await db()
@@ -2993,6 +3037,8 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
       meta,
       doc_url:    docUrl    ?? undefined,
       doc_format: docFormat ?? undefined,
+      // Outputs de imagen que se despacharon en segundo plano: el front los consulta por sesión
+      images_dispatched: imagenesDespachadas.length ? imagenesDespachadas : undefined,
       // Trazabilidad del ensamble: qué slot se llenó desde qué fuente y cuál pasó por el
       // LLM de pegamento. Sin esto, un documento compuesto por código es una caja negra.
       assembly:   assemblyReport ?? undefined,

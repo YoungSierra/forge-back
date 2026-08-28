@@ -13,7 +13,11 @@ const { logExecution } = require('./execution-log.service')
 // (botón ✦ manual) quedan user-decided y NO se auto-generan.
 function imageOutputsOf(node) {
   const outs = (Array.isArray(node?.outputs) ? node.outputs : []).map(o => ({ ...o, key: o.key || o.name }))
-  return outs.filter(o => o.key && o.image_gen === true && (o.format === 'png' || o.format === 'image'))
+  // Lo que decide es `image_gen`, NO el formato. Exigir png/image dejaba fuera a los documentos
+  // que generan sus propias imágenes —2.1/pitch_document es docx con image_gen: true— y con eso
+  // quedaban invisibles para TODO el motor: el Run del nodo, el del lane y el post-pass del chat.
+  // El nodo corría, el texto salía, y las imágenes no las pedía nadie.
+  return outs.filter(o => o.key && o.image_gen === true)
 }
 
 // ─── Port de parseOutputItems (frontend NodeChatWindow.tsx) ────────────────────
