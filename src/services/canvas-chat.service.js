@@ -853,7 +853,11 @@ async function resolverImagenesDeItems({ db, projectId, nodeId, sessionId, outKe
   return imagenes
 }
 
-async function runReActLoop({ finalSystemPrompt, baseUserMsg, executorStr, activeTools, resolvedInputs = [], visualRefs = [], projectId, nodeId, nodeName = '', sessionId = null, targetOutput = null }) {
+// `signal` es opcional y va DECLARADO: el corte por Stop lo usa dentro del bucle, y sin estar en
+// la firma cualquier llamada moría con «ReferenceError: signal is not defined» en la primera
+// iteración. Los dos que llaman —el Run por output y el de imagen— no lo pasan, así que el Run
+// quedó roto entero desde que se añadió el corte.
+async function runReActLoop({ finalSystemPrompt, baseUserMsg, executorStr, activeTools, resolvedInputs = [], visualRefs = [], projectId, nodeId, nodeName = '', sessionId = null, targetOutput = null, signal = null }) {
   const { db } = require('./supabase.service')
   const { callLLM }                          = require('./llm.service')
   const { parseToolCalls, executeTool }      = require('./tools.service')
