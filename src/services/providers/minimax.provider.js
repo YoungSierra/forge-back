@@ -138,10 +138,14 @@ function sinRazonamiento (texto) {
     // Devolver el bloque sería peor que devolver vacío: parecería una respuesta.
     if (despues) return despues
   }
-  // Bloques cerrados en medio del texto.
+  // Bloques cerrados en medio del texto. Solo vale si QUITÓ algo: si no hay pares, `replace`
+  // devuelve el mismo texto y devolverlo aquí se saltaba el caso de abajo — que es justo el que
+  // este limpiador existe para cubrir. Se ve con `max_tokens` corto: el modelo se queda pensando,
+  // el bloque nunca cierra y el razonamiento entero salía como si fuera la respuesta.
   const limpio = t.replace(/<think>[\s\S]*?<\/think>/gi, '').trim()
-  if (limpio) return limpio
-  // Un `<think>` que nunca cerró: se descarta desde ahí.
+  if (limpio && limpio !== t.trim()) return limpio
+  // Un `<think>` que nunca cerró: se descarta desde ahí. Lo que quede antes puede ser vacío, y
+  // vacío es la respuesta correcta — el modelo no llegó a contestar.
   const abre = t.indexOf('<think>')
   if (abre !== -1) return t.slice(0, abre).trim()
   return t.trim()
@@ -182,10 +186,43 @@ async function callMinimax(systemPrompt, userMessage, options = {}) {
     params.temperature = options.temperature !== undefined ? options.temperature : 0.8
   }
 
+  // SIEMPRE en streaming. Sin él, una entrada grande deja la conexión muda hasta el final y
+  // MiniMax no vuelve nunca: medido el 31-08 con el 3.12 —123k tokens de entrada— la llamada
+  // estuvo **32 minutos colgada con 2,4 s de CPU**, esperando red. La misma entrada en streaming
+  // devolvió el primer token a los 3,5 s y terminó en 49 s.
+  //
+  // Es además lo que ya hace el provider de Anthropic, y por eso el 3.12 sí corría con Sonnet.
+  //
+  // `signal` viaja: sin él el Stop soltaba al cliente y MiniMax seguía generando y facturando.
+  params.stream = true
+  params.stream_options = { include_usage: true }
+
   let response
   try {
-    response = await getClient().chat.completions.create(params)
+    const flujo = await getClient().chat.completions.create(
+      params,
+      options.signal ? { signal: options.signal } : undefined,
+    )
+    let texto = ''
+    let uso = null
+    let ultimoTrozo = Date.now()
+    for await (const parte of flujo) {
+      texto += parte.choices?.[0]?.delta?.content || ''
+      if (parte.usage) uso = parte.usage
+      ultimoTrozo = Date.now()
+    }
+    // El SDK ya normaliza la forma; se arma la respuesta que espera el resto de esta función para
+    // no tocar el parseo, que es dónde viven las cuatro estrategias de extracción de JSON.
+    void ultimoTrozo
+    response = { choices: [{ message: { content: texto } }], usage: uso || {} }
   } catch (err) {
+    // Abortar es del usuario, no una falla del proveedor: se propaga tal cual para que arriba se
+    // distinga de un error real y no se registre como fallo ni se reintente.
+    if (err?.name === 'AbortError' || options.signal?.aborted) {
+      const e = new Error('cancelado por el usuario')
+      e.code = 'ABORTED'
+      throw e
+    }
     const status = err.status || err.statusCode
     if (status === 429) {
       const retryAfter = err.headers?.['retry-after']

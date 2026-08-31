@@ -6,6 +6,16 @@ const { autoWire, cleanupAndRewire } = require('../services/auto-wire.service')
 const { extractSection } = require('../utils/extract-section')
 const { canRun } = require('../services/credits.service')
 
+// Cancelaciones PEDIDAS. Antes el único modo de cancelar era que el navegador cerrara la
+// conexión, y eso no distingue «el usuario apretó Stop» de «la conexión se cayó»: el 3.12 tarda
+// entre diez y trece minutos, cualquier cliente corta antes, y la ruta abortaba una generación ya
+// pagada y tiraba lo hecho. Medido el 31-08: la sesión quedó `active` con cero mensajes.
+//
+// Ahora parar es un acto explicito — `POST .../stop` — y una conexión caída no para nada. El
+// conjunto vive en memoria del proceso a propósito: es de una corrida en curso, y una corrida en
+// curso vive en un proceso. Reiniciar el back mata la corrida de todos modos.
+const cancelacionesPedidas = new Set()
+
 // Frente 4: gate de crédito. Bloquea correr un nodo si la org no tiene saldo, o si el proyecto/miembro
 // alcanzó su sub-tope (el más restrictivo manda). Devuelve true si se puede seguir; si no, responde 402.
 async function creditGate(project_id, res, memberId = null) {
@@ -2460,16 +2470,24 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
       return res.status(400).json({ success: false, error: 'user_message es requerido' })
     }
 
-    // Stop: cuando el usuario cancela, el navegador aborta el fetch y la conexión se cierra. Eso
-    // se traduce en una señal que viaja hasta el proveedor, así que la generación se corta de
-    // verdad y se deja de gastar — no solo se suelta al cliente mientras el LLM sigue facturando.
+    // Parar es un acto EXPLÍCITO: `POST .../stop` con el id de la sesión. Un cierre de conexión
+    // ya no cancela nada — el navegador corta a los pocos minutos y el 3.12 tarda trece, así que
+    // deducir el Stop del cierre tiraba trabajo pagado en cada corrida larga.
+    //
+    // Que nadie escuche no cambia lo que hay que hacer: la corrida sigue hasta el final y GUARDA
+    // —mensajes, asset y documento— igual que el despacho de imágenes, que hace justo esto desde
+    // siempre. El usuario recarga y su trabajo está.
     const abortar = new AbortController()
-    let cancelado = false
-    req.on('close', () => {
-      if (res.writableEnded) return   // terminó bien; el cierre es normal
-      cancelado = true
-      abortar.abort()
-      console.warn(`[forge-chat] cancelado por el usuario · nodo ${node_id}`)
+    let cancelado  = false
+    let sinNadie   = false
+    // Se escucha la RESPUESTA, no la petición. `req.on('close')` se emite en cuanto se termina de
+    // leer el cuerpo —medido: 0 ms, con la conexión viva— así que usarlo para decidir «el cliente
+    // se fue» daba un falso positivo en cada llamada. `res` cierra cuando la respuesta terminó o
+    // cuando la conexión se cayó, y `writableEnded` distingue una cosa de la otra.
+    res.on('close', () => {
+      if (res.writableEnded) return
+      sinNadie = true
+      console.warn(`[forge-chat] el cliente se fue · nodo ${node_id} — la corrida sigue y se guarda`)
     })
 
     // Frente 4: gate de crédito ANTES de correr el LLM (bloquea sin gastar)
@@ -3089,6 +3107,12 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
     for (let iter = 0; !assemblyReport && iter < MAX_TOOL_ITERS; iter++) {
       // Entre iteraciones también: este bucle puede llamar al LLM hasta cinco veces, y sin el
       // corte apretar Stop en la primera igual pagaba las otras cuatro.
+      // Se consulta el registro, que es donde deja su marca el Stop explícito; la señal del
+      // socket ya no participa.
+      if (session?.id && cancelacionesPedidas.has(session.id)) {
+        cancelado = true
+        abortar.abort()
+      }
       if (abortar.signal.aborted) { const e = new Error('cancelado por el usuario'); e.code = 'ABORTED'; throw e }
       const result = await callLLM(finalSystemPrompt, currentUserMsg, {
         signal:          abortar.signal,
@@ -3479,6 +3503,14 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
       .from('forge_sessions')
       .update({ iteration_count: session.iteration_count + 1 })
       .eq('id', session.id)
+
+    if (sinNadie) {
+      // El cliente se fue hace rato. Todo lo de arriba ya se guardó —mensajes, asset, documento—
+      // así que la corrida terminó bien; solo no hay a quién contarle. Se deja dicho en el log
+      // para que «no pasó nada» no se confunda con «falló» al mirar el servidor.
+      console.log(`[forge-chat] terminado sin cliente · sesión ${session.id} · ${replyText.length} chars guardados`)
+    }
+    cancelacionesPedidas.delete(session.id)
 
     res.json({
       success:    true,
@@ -5131,6 +5163,27 @@ router.post('/assets/:asset_id/versions/:version_id/approve', async (req, res, n
     }).eq('id', asset_id)
 
     res.json({ success: true, version_number: ver.version_number, storage_url: ver.storage_url })
+  } catch (err) { next(err) }
+})
+
+// ─── POST /api/projects/:id/canvas/nodes/:node_id/stop ───────────────────────
+// Parar una corrida en curso. Es explicito a proposito: antes se deducia de que el navegador
+// cerrara la conexion, y eso no distingue un Stop de una caida — el 3.12 tarda trece minutos, el
+// cliente corta antes, y se abortaba una generacion ya pagada.
+//
+// Marca la sesion; el bucle del chat lo consulta entre iteraciones y ante la proxima llamada al
+// proveedor. Si la corrida ya termino, la marca se limpia sola al responder.
+router.post('/nodes/:node_id/stop', async (req, res, next) => {
+  try {
+    const { session_id } = req.body || {}
+    if (!session_id) return res.status(400).json({ success: false, error: 'session_id es requerido' })
+
+    const { data: s } = await db().from('forge_sessions').select('id,status').eq('id', session_id).maybeSingle()
+    if (!s) return res.status(404).json({ success: false, error: 'Session not found' })
+
+    cancelacionesPedidas.add(session_id)
+    console.warn(`[forge-chat] STOP pedido · sesion ${session_id}`)
+    res.json({ success: true, session_id, status: s.status })
   } catch (err) { next(err) }
 })
 
