@@ -39,14 +39,33 @@ const IMAGE_COST_USD = {
 // modelo: repetirlo en cada llamada llenaría el log y nadie lo leería.
 const sinPrecio = new Set()
 
+// Anthropic cobra por FAMILIA, no por versión: todos los opus valen lo mismo entre sí, todos los
+// sonnet entre sí, todos los haiku entre sí — así está la tabla de arriba desde siempre. Un modelo
+// nuevo de una familia conocida hereda el precio de su familia, que es muchísimo más cercano que
+// el genérico 1,00/2,00: para un opus, ese genérico se equivoca por un factor de 15.
+const FAMILIA_ANTHROPIC = [
+  [/opus/i,   { input: 15.00, output: 75.00 }],
+  [/sonnet/i, { input: 3.00,  output: 15.00 }],
+  [/haiku/i,  { input: 0.80,  output: 4.00  }],
+]
+
+function porFamilia (provider, model) {
+  if (provider !== 'anthropic') return null
+  return FAMILIA_ANTHROPIC.find(([rx]) => rx.test(model))?.[1] || null
+}
+
 function calculateLLMCost(provider, model, tokens) {
   const key    = `${provider}:${model}`
+  const familia = LLM_PRICING[key] ? null : porFamilia(provider, model)
   if (!LLM_PRICING[key] && !sinPrecio.has(key)) {
     sinPrecio.add(key)
-    console.warn(`[costos] "${key}" no tiene precio declarado — se imputa el genérico 1,00/2,00 por millón. `
-      + `El gasto que se registre de este modelo es una estimación gruesa hasta que se agregue a LLM_PRICING.`)
+    console.warn(familia
+      ? `[costos] "${key}" no tiene precio propio — se usa el de su familia (${familia.input}/${familia.output} por millón). `
+        + `Confirmarlo con la tarifa publicada si el modelo cambió de precio.`
+      : `[costos] "${key}" no tiene precio declarado — se imputa el genérico 1,00/2,00 por millón. `
+        + `El gasto que se registre de este modelo es una estimación gruesa hasta que se agregue a LLM_PRICING.`)
   }
-  const prices = LLM_PRICING[key] || LLM_PRICING[`${provider}:default`] || { input: 1.00, output: 2.00 }
+  const prices = LLM_PRICING[key] || familia || LLM_PRICING[`${provider}:default`] || { input: 1.00, output: 2.00 }
   const input_cost  = ((tokens.input  || 0) * prices.input)  / 1_000_000
   const output_cost = ((tokens.output || 0) * prices.output) / 1_000_000
   return parseFloat((input_cost + output_cost).toFixed(8))
