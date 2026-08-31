@@ -221,7 +221,14 @@ router.put('/:id/moodboard-layout', async (req, res, next) => {
       marcos = [...ajenos, ...(layout.marcos ?? [])]
     }
 
-    const nuevo = { ...(data?.canvas_layout ?? {}), moodboard: { pos, marcos } }
+    // Qué hojas están escondidas del lienzo (informe v3 de Miguel, punto 3). Es un mapa y no una
+    // lista para poder mezclarlo por clave igual que `pos`: `true` esconde, `false` devuelve al
+    // lienzo. Con una lista, dos personas trabajando a la vez se pisarían el conjunto entero.
+    // Esconder es SOLO del lienzo — el activo sigue entero en la librería y en su página madre.
+    const ocultos = { ...(previo.ocultos ?? {}), ...(layout.ocultos ?? {}) }
+    for (const k of Object.keys(ocultos)) if (!ocultos[k]) delete ocultos[k]
+
+    const nuevo = { ...(data?.canvas_layout ?? {}), moodboard: { pos, marcos, ocultos } }
     const { error } = await db().from('projects').update({ canvas_layout: nuevo }).eq('id', req.params.id)
     if (error) throw error
     res.json({ success: true })
