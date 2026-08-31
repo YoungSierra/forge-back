@@ -5076,6 +5076,23 @@ router.post('/assets/:asset_id/versions/:version_id/approve', async (req, res, n
     if (!ver) return res.status(404).json({ success: false, error: 'Version not found' })
 
     await db().from('forge_asset_versions').update({ is_current: false }).eq('asset_id', asset_id)
+
+    // Una sola versión aprobada por página (informe v3 de Miguel, punto 9). Aprobar desmarca la
+    // anterior —la última que se aprueba es la oficial— y el botón NO se bloquea: cambiar de
+    // opinión es parte de iterar. Sin esto la aprobación solo se sumaba, y una página del Art
+    // Style Guide llegó a tener las versiones 7, 8 y 9 aprobadas a la vez sin que nada dijera
+    // cuál era la buena.
+    const { data: previas } = await db().from('forge_asset_versions')
+      .select('id, metadata').eq('asset_id', asset_id).neq('id', version_id)
+    for (const p of (previas || [])) {
+      if (!p.metadata?.approved_at && !p.metadata?.approved_by) continue
+      const limpio = { ...p.metadata }
+      delete limpio.approved_at
+      delete limpio.approved_by
+      const { error } = await db().from('forge_asset_versions').update({ metadata: limpio }).eq('id', p.id)
+      if (error) console.warn(`[approve] no pude desaprobar la versión ${p.id}: ${error.message}`)
+    }
+
     await db().from('forge_asset_versions').update({
       is_current: true,
       // La aprobación va en metadata y no en una columna nueva: no hace falta migrar, y el
