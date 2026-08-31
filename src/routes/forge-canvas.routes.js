@@ -1708,7 +1708,7 @@ router.delete('/nodes/:project_node_id', async (req, res, next) => {
 router.post('/nodes/:node_id/accept', async (req, res, next) => {
   try {
     const { id: project_id, node_id } = req.params
-    const { session_id, content, member_id, doc_url, doc_format } = req.body
+    const { session_id, content, member_id, doc_url, doc_format, project_node_id } = req.body
 
     if (!session_id || !content?.trim()) {
       return res.status(400).json({ success: false, error: 'session_id y content son requeridos' })
@@ -1728,9 +1728,42 @@ router.post('/nodes/:node_id/accept', async (req, res, next) => {
     // Obtener output_key de la sesión para nombrar el asset correctamente
     const { data: sessRow } = await db()
       .from('forge_sessions')
-      .select('output_key')
+      .select('output_key, node_id, project_id, project_node_id, status')
       .eq('id', session_id)
       .maybeSingle()
+
+    // La sesión y el nodo llegan por caminos distintos —`session_id` es estado del chat, `node_id`
+    // va en la URL— y nada garantizaba que fueran del mismo nodo. Cuando se desincronizan, el
+    // accept cuelga el documento de un nodo en la sesión de OTRO: el nodo de destino se queda sin
+    // aprobar (parece que el Accept «no hace nada») y el nodo invadido enseña en todos sus outputs
+    // el documento ajeno. Medido el 31-08: le pasó al 2.7 sobre el 2.6 y al 3.0 sobre el 3.2.
+    // Escribir cruzado no es recuperable, así que se rechaza en vez de adivinar cuál manda.
+    if (!sessRow) {
+      return res.status(404).json({ success: false, error: 'Session not found' })
+    }
+    if (sessRow.node_id !== node_id || sessRow.project_id !== project_id) {
+      const { data: dueno } = await db()
+        .from('forge_nodes').select('node_key, title').eq('id', sessRow.node_id).maybeSingle()
+      console.error(`[accept] sesión cruzada: ${session_id} es de ${dueno?.node_key || sessRow.node_id} `
+        + `y se intentó aceptar como ${node.node_key}`)
+      return res.status(409).json({
+        success: false, error: 'session_node_mismatch',
+        message: `Esa sesión es de ${dueno ? `${dueno.node_key} — ${dueno.title}` : 'otro nodo'}, `
+          + `no de ${node.node_key} — ${node.title}. Volvé a abrir el nodo y aceptá de nuevo.`,
+      })
+    }
+    // Y con fan-out el `node_id` no alcanza: el mismo 2.1 vive en el lane A y en el B, así que una
+    // sesión del lane vecino pasaría el filtro de arriba. Solo se exige cuando ambas partes lo
+    // traen — las sesiones viejas no tienen instancia y el front puede no mandarla.
+    if (project_node_id && sessRow.project_node_id && sessRow.project_node_id !== project_node_id) {
+      console.error(`[accept] instancia cruzada: sesión ${session_id} es de la instancia `
+        + `${sessRow.project_node_id} y se aceptó desde ${project_node_id}`)
+      return res.status(409).json({
+        success: false, error: 'session_instance_mismatch',
+        message: `Esa sesión es de otra instancia de ${node.node_key} (otro lane). `
+          + `Volvé a abrir el nodo y aceptá de nuevo.`,
+      })
+    }
 
     // Si la sesión tiene output_key, usar el label del output DNA como nombre del asset
     const outputKey = sessRow?.output_key ?? null
