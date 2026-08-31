@@ -443,7 +443,8 @@ async function pedirSoloElSobre({ node_id, targetOutputKey, contenido, executorS
     ? `The document ALREADY anchors ${anclas.length} image(s) with these exact ids: ${anclas.join(', ')}. `
       + 'Emit one entry per anchor, reusing those ids verbatim — the document reserved a place for each, '
       + 'and a marker with no image resolves to nothing.'
-    : 'The document anchors no images. If it needs none, [] is the right answer.'
+    : 'The document anchors no images. Emit what its contract requires — and if the contract '
+      + 'requires images the document did not anchor, emit them with the ids the contract prescribes.'
 
   const sistema = [
     `You wrote the document below for the node "${dna.title}". It is finished and must NOT be rewritten.`,
@@ -455,7 +456,13 @@ async function pedirSoloElSobre({ node_id, targetOutputKey, contenido, executorS
     '---',
     '',
     `Reply with NOTHING but the fenced json block: { "${targetOutputKey}": [ … ] }.`,
-    'No prose before it, no prose after it. [] is a valid answer when the document needs no images.',
+    'No prose before it, no prose after it.',
+    // Cuántas imágenes corresponden lo dice el contrato de arriba, no esta instrucción. Decía
+    // «[] is a valid answer» de forma fija, y desde v2.9.21 el contrato de 2.2 declara justo lo
+    // contrario —mínimo una—: le estábamos metiendo una contradicción al modelo, que es la clase
+    // de fallo que perseguimos ayer.
+    'How many images are warranted is decided by the contract above — including whether an empty',
+    'emission is acceptable at all. Follow it.',
     'Every prompt is render-ready and derives from the visual thread already written in the document —',
     'same palette (hex verbatim), same rendering register.',
     señalAnclas,
@@ -3393,7 +3400,12 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
           // Un «cero imágenes» declarado es una respuesta, no un hueco: ni se despacha ni se avisa
           const plan = (d.uses?.siblings_if_present ?? d.uses?.siblings ?? []).find(x => /plan$/i.test(x))
           if (decidioCero(replyText, k, plan)) {
-            console.log(`[forge-chat] ${k}: el nodo declaró cero imágenes — no se despacha`)
+            // Desde v2.9.21 hay outputs cuyo contrato prohíbe el cero (2.2 exige al menos una).
+            // Si aun así lo declara, sigue siendo su respuesta —no se le inventan imágenes— pero
+            // se deja dicho: es una falla de conformidad, no una decisión.
+            const prohibeCero = /\[\]\s*is\s*NOT\s*valid|at least ONE is always produced/i.test(d.prompt || '')
+            console.log(`[forge-chat] ${k}: el nodo declaró cero imágenes — no se despacha`
+              + (prohibeCero ? '  ⚠ pero su contrato exige al menos una: falla de conformidad' : ''))
             return false
           }
           return true
