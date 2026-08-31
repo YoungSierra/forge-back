@@ -34,8 +34,18 @@ const IMAGE_COST_USD = {
 }
 
 // ─── Calcula costo LLM en USD ─────────────────────────────────────────────────
+// Un modelo sin precio propio cae al genérico 1,00/2,00 y el costo queda MAL sin que nada lo diga
+// — el número entra igual al log, a la analítica y a los topes por proyecto. Se avisa una vez por
+// modelo: repetirlo en cada llamada llenaría el log y nadie lo leería.
+const sinPrecio = new Set()
+
 function calculateLLMCost(provider, model, tokens) {
   const key    = `${provider}:${model}`
+  if (!LLM_PRICING[key] && !sinPrecio.has(key)) {
+    sinPrecio.add(key)
+    console.warn(`[costos] "${key}" no tiene precio declarado — se imputa el genérico 1,00/2,00 por millón. `
+      + `El gasto que se registre de este modelo es una estimación gruesa hasta que se agregue a LLM_PRICING.`)
+  }
   const prices = LLM_PRICING[key] || LLM_PRICING[`${provider}:default`] || { input: 1.00, output: 2.00 }
   const input_cost  = ((tokens.input  || 0) * prices.input)  / 1_000_000
   const output_cost = ((tokens.output || 0) * prices.output) / 1_000_000

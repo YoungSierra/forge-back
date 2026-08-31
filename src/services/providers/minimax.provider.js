@@ -1,12 +1,20 @@
 const OpenAI = require('openai')
 const { jsonrepair } = require('jsonrepair')
 
+// El endpoint cambió con la cuenta nueva: `api.minimaxi.chat` → `api.minimax.io`. Va por entorno
+// y no fijo en el código, que es lo que obligaba a un despliegue para cambiar de cuenta; el valor
+// por defecto es el nuevo, así que sin tocar nada el back apunta bien.
+const MINIMAX_BASE = () => process.env.MINIMAX_BASE_URL || 'https://api.minimax.io/v1'
+
 let _client = null
+let _base   = null
 function getClient() {
-  if (!_client) _client = new OpenAI({
-    apiKey: process.env.MINIMAX_API_KEY,
-    baseURL: 'https://api.minimaxi.chat/v1',
-  })
+  // El cliente se cachea, así que un cambio de base con el proceso vivo se quedaba con el viejo.
+  if (!_client || _base !== MINIMAX_BASE()) {
+    _base = MINIMAX_BASE()
+    _client = new OpenAI({ apiKey: process.env.MINIMAX_API_KEY, baseURL: _base })
+    console.log(`[MiniMax] endpoint: ${_base}`)
+  }
   return _client
 }
 
@@ -116,6 +124,29 @@ function extractJson(text) {
   return null
 }
 
+// El razonamiento del modelo NO es la respuesta. En modo JSON ya se descartaba —`extractJson` se
+// queda con lo que hay después del `</think>`— pero en modo TEXTO se devolvía el crudo, así que el
+// bloque entero viajaba al documento. Medido el 31-08: cero salidas vivas lo tienen, porque
+// todavía ningún nodo corre con MiniMax; el día que uno lo haga, el `<think>` se imprime.
+function sinRazonamiento (texto) {
+  const t = String(texto || '')
+  const cierra = t.lastIndexOf('</think>')
+  // Lo que viene DESPUÉS del último cierre. Cubre a los modelos que emiten varios bloques.
+  if (cierra !== -1) {
+    const despues = t.slice(cierra + '</think>'.length).trim()
+    // Un `</think>` sin nada detrás significa que el modelo se quedó pensando y no respondió.
+    // Devolver el bloque sería peor que devolver vacío: parecería una respuesta.
+    if (despues) return despues
+  }
+  // Bloques cerrados en medio del texto.
+  const limpio = t.replace(/<think>[\s\S]*?<\/think>/gi, '').trim()
+  if (limpio) return limpio
+  // Un `<think>` que nunca cerró: se descarta desde ahí.
+  const abre = t.indexOf('<think>')
+  if (abre !== -1) return t.slice(0, abre).trim()
+  return t.trim()
+}
+
 async function callMinimax(systemPrompt, userMessage, options = {}) {
   const model     = options.model || 'MiniMax-M2.7'
   const startTime = Date.now()
@@ -183,7 +214,7 @@ async function callMinimax(systemPrompt, userMessage, options = {}) {
 
   if (options.rawText) {
     return {
-      data: raw.trim(),
+      data: sinRazonamiento(raw),
       meta: { provider: 'minimax', model, tokens_used: { input: response.usage?.prompt_tokens || 0, output: response.usage?.completion_tokens || 0, cached: 0 }, duration_ms: Date.now() - startTime }
     }
   }
