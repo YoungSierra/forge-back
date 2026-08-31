@@ -608,6 +608,7 @@ async function imagenDeNodoPorTitulo(db, projectId, fuente) {
 async function generateDeck({
   db, project_id, node_id, session_id, node_key, output_key,
   image_gen_model, deck, member_id, onPage, fills = null, solo = null, outDef = null,
+  extraPrompt = null,
 }) {
   const { composeDeck, DECKS } = require('./slide-composer.service')
   const { getWorkflowByName } = require('./config.service')
@@ -647,8 +648,19 @@ async function generateDeck({
   // 1. Poblar: se clona el grafo y se le escribe a cada página su prompt.
   const armado = await composeDeck({ db, projectId: project_id, deck, fills, solo })
   let wf = JSON.parse(JSON.stringify(entry.workflow_json))
+  // `extraPrompt` es lo que el usuario ya le pidió a ESTA página y quiere conservar al rehacerla.
+  // Va DESPUÉS del prompt compuesto y anunciado: el prompt de la plantilla es el que garantiza que
+  // la página siga siendo la página —mismo layout, mismas cajas, misma tipografía— y anteponerle
+  // la instrucción del usuario la convertiría en el encargo principal.
+  const cola = String(extraPrompt || '').trim()
   for (const p of armado.paginas) {
-    if (wf[p.prompt_node]?.inputs) wf[p.prompt_node].inputs.prompt = p.prompt
+    if (!wf[p.prompt_node]?.inputs) continue
+    wf[p.prompt_node].inputs.prompt = cola
+      ? `${p.prompt}
+
+ALREADY-APPLIED DESIGN EDIT — keep it in this render:
+${cola}`
+      : p.prompt
   }
 
   // 1a. El nombre del juego. Las 26 páginas del Art Bible abren con un recuadro «FILL IN ONCE ·

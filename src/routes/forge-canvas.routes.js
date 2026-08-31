@@ -4994,12 +4994,30 @@ router.post('/assets/:asset_id/iterate', async (req, res, next) => {
       return res.status(400).json({ success: false, error: `No page named "${sufijo}" in ${wfName}` })
     }
 
+    // Lo último que el usuario le pidió a ESTA página. Iterar recompone la página desde el
+    // documento, así que sin esto cada iteración borraba los Design Edits y la página volvía a la
+    // versión original — el punto 8 del informe v3. El pedido queda guardado en la versión que lo
+    // aplicó; se toma el más reciente, que es el estado que el usuario está mirando.
+    const { data: vers } = await db().from('forge_asset_versions')
+      .select('version_number, is_current, metadata').eq('asset_id', asset_id)
+      .order('version_number', { ascending: false })
+    // Se parte de la VIGENTE, no de la más alta. Volver a una versión anterior y luego iterar es
+    // un gesto normal, y medido en la base pasa: `28_CharacterSheet` tiene nueve versiones y la
+    // vigente es la ocho. Tomar la más alta iteraría desde algo que el usuario no está mirando.
+    const vigente = (vers || []).find(v => v.is_current)
+    const tope    = vigente ? vigente.version_number : Infinity
+    const ultimoPedido = (vers || [])
+      .filter(v => v.version_number <= tope)
+      .map(v => String(v.metadata?.design_edit || '').trim()).find(Boolean) || null
+    if (ultimoPedido) console.log(`[iterate] ${sufijo}: conservando el design edit «${ultimoPedido.slice(0, 60)}»`)
+
     // Sin `session_id`: generateDeck escribiría output_images con SOLO esta página y borraría
     // las otras 33 del listado. La persistencia de una iteración es la versión, no la sesión.
     const r = await generateDeck({
       db, project_id, node_id: asset.node_id, session_id: null,
       node_key: dna.node_key, output_key: ses.output_key,
       image_gen_model: def.image_gen_model, member_id, solo: [pag.indice],
+      extraPrompt: ultimoPedido,
     })
     const nueva = r.paginas[0]
     if (!nueva) return res.status(502).json({ success: false, error: 'The workflow returned no image' })
@@ -5019,7 +5037,13 @@ router.post('/assets/:asset_id/iterate', async (req, res, next) => {
     const { data: ver, error: vErr } = await db().from('forge_asset_versions').insert({
       asset_id, storage_url: nueva.url, version_number: ultima + 1, is_current: true,
       created_by: member_id,
-      metadata: { job: r.jobId, pagina: pag.indice, nombre: pag.nombre, workflow: wfName, segundos: r.segundos },
+      // El pedido viaja con la versión nueva. Sin arrastrarlo, la SEGUNDA iteración volvía a
+      // buscarlo hacia atrás, lo encontraba dos versiones más abajo y funcionaba de casualidad;
+      // en cuanto alguien hiciera un design edit distinto en el medio, el orden decidía cuál gana.
+      metadata: {
+        job: r.jobId, pagina: pag.indice, nombre: pag.nombre, workflow: wfName, segundos: r.segundos,
+        ...(ultimoPedido ? { design_edit: ultimoPedido, design_edit_heredado: true } : {}),
+      },
     }).select('id, version_number').single()
     if (vErr) throw vErr
 
