@@ -137,7 +137,11 @@ function proximoPaso(asset) {
 // ─── Corre N pasos desde donde esté el activo ────────────────────────────────
 // Devuelve los activos creados, en orden. Si un paso falla se devuelve lo que sí se produjo: lo ya
 // generado está pagado y publicado, y borrarlo para «dejar limpio» sería tirar plata.
-async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, member_id = null, limitePorCada = 0 }) {
+// `opciones` son las de generación que eligió el usuario en el diálogo de Run (informe v3, punto
+// 12). Valen para TODA la corrida —así lo confirmó Miguel—; regenerar una pieza suelta las pide
+// aparte. Se guardan además en el metadata de cada activo producido: es lo que deja mostrarlas
+// bajo la imagen y reusarlas al rehacerla.
+async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, member_id = null, limitePorCada = 0, opciones = null }) {
   const { data: origen, error: e0 } = await db().from('forge_assets')
     .select('id, project_id, node_id, session_id, name, storage_url, metadata')
     .eq('id', asset_id).single()
@@ -248,7 +252,7 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
 
       const t0 = Date.now()
       if (cada) console.log(`[cadena] ${paso.clave}: despachando ${cada} (${instancias.indexOf(cada) + 1}/${instancias.length})`)
-      const jobId = await submitWorkflow(paso.workflow, paso.pide_prompt ? (prompt || '') : '', 1024, 1024, extras)
+      const jobId = await submitWorkflow(paso.workflow, paso.pide_prompt ? (prompt || '') : '', 1024, 1024, extras, opciones)
       await pollUntilDone(jobId, 300_000)   // Tripo y gpt-image-2 tardan bastante más que un render local
       const base = `projects/${project_id}/chain/${nombreCadena}/${paso.clave}/${cada ? cada + '-' : ''}${jobId.slice(0, 8)}`
       const salidas = await downloadOutputsByNode(jobId, base)
@@ -304,7 +308,14 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
           status: 'approved', approved_by: member_id, approved_at: new Date().toISOString(),
           storage_url: sal.url, file_size_bytes: sal.size_bytes,
           derived_from_id: padre,
-          metadata: { cadena: { nombre: nombreCadena, paso: paso.clave, rol, parte: cada ?? null }, job: jobId, prompt: paso.pide_prompt ? prompt : null },
+          // Las opciones quedan pegadas a la pieza: es lo que se muestra debajo de la imagen y lo
+          // que se reusa al rehacerla. Sin esto habría que adivinar con qué se generó, y el
+          // workflow ya cambió de valores para entonces.
+          metadata: {
+            cadena: { nombre: nombreCadena, paso: paso.clave, rol, parte: cada ?? null },
+            job: jobId, prompt: paso.pide_prompt ? prompt : null,
+            ...(opciones && Object.keys(opciones).length ? { opciones } : {}),
+          },
         }).select('id, name, storage_url, format, metadata').single()
         if (error) throw error
         // El id del activo viaja junto a la url: el paso siguiente lo necesita para colgar de él.

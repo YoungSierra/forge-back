@@ -4819,6 +4819,18 @@ router.post('/assets/:asset_id/design-edit', async (req, res, next) => {
     const cfg = entry.inject_config || {}
     const wf  = JSON.parse(JSON.stringify(entry.workflow_json))
 
+    // Rehacer UNA pieza con otras opciones (informe v3, punto 12, paso 3). Miguel lo confirmó
+    // así: en Run valen para toda la corrida, acá solo para esta imagen. Se validan contra lo que
+    // declara ComfyUI, no contra una lista escrita acá.
+    const opciones = req.body?.opciones && typeof req.body.opciones === 'object' ? req.body.opciones : null
+    if (opciones && Object.keys(opciones).length) {
+      const { opcionesDe, aplicarOpciones } = require('../services/workflow-options.service')
+      const catalogo = await opcionesDe(entry.workflow_json)
+      const { escrituras, avisos } = aplicarOpciones(wf, opciones, catalogo)
+      if (avisos.length) return res.status(400).json({ success: false, error: avisos.join(' · ') })
+      console.log(`[design-edit] opciones del usuario: ${escrituras} escritura(s)`)
+    }
+
     // La imagen a editar: la versión vigente del asset, subida al input de ComfyUI.
     const { uploadImageToComfyUI, pollUntilDone, downloadOutput } = require('../services/providers/comfyui.provider')
     const subida = await uploadImageToComfyUI(asset.storage_url)
@@ -4865,11 +4877,21 @@ router.post('/assets/:asset_id/design-edit', async (req, res, next) => {
     const { data: ver, error: vErr } = await db().from('forge_asset_versions').insert({
       asset_id, storage_url: salida.url, version_number: ultima + 1, is_current: true,
       created_by: member_id,
-      metadata: { job: jobId, design_edit: pedido, workflow: 'V57_STUDIO_Moodboard_Iteration' },
+      metadata: {
+        job: jobId, design_edit: pedido, workflow: 'V57_STUDIO_Moodboard_Iteration',
+        ...(opciones && Object.keys(opciones).length ? { opciones } : {}),
+      },
     }).select('id, version_number').single()
     if (vErr) throw vErr
 
-    await db().from('forge_assets').update({ storage_url: salida.url }).eq('id', asset_id)
+    // El asset guarda con qué quedó: la tira que se ve bajo la imagen lee de acá, y sin esto
+    // seguiría mostrando las opciones de la generación anterior.
+    const parche = { storage_url: salida.url }
+    if (opciones && Object.keys(opciones).length) {
+      const { data: previo } = await db().from('forge_assets').select('metadata').eq('id', asset_id).maybeSingle()
+      parche.metadata = { ...(previo?.metadata || {}), opciones: { ...(previo?.metadata?.opciones || {}), ...opciones } }
+    }
+    await db().from('forge_assets').update(parche).eq('id', asset_id)
 
     res.json({
       success: true,
@@ -4927,9 +4949,13 @@ router.post('/assets/:asset_id/advance', async (req, res, next) => {
     // El Environment abre en veinte, y cada una es un despacho pago e irrepetible: poder mirar la
     // primera antes de comprometer las veinte es la diferencia entre una prueba y una apuesta.
     const limite    = Math.max(0, Number(req.body?.limite_por_cada) || 0)
+    // Las opciones de generación del diálogo de Run (informe v3, punto 12). Valen para toda la
+    // corrida. No se validan acá: el catálogo vive por workflow y cada paso de la cadena usa el
+    // suyo, así que la validación pasa donde se arma el grafo.
+    const opciones  = req.body?.opciones && typeof req.body.opciones === 'object' ? req.body.opciones : null
 
     const { avanzar } = require('../services/chain.service')
-    const r = await avanzar({ db, project_id, asset_id, pasos, prompt, member_id, limitePorCada: limite })
+    const r = await avanzar({ db, project_id, asset_id, pasos, prompt, member_id, limitePorCada: limite, opciones })
     res.json({ success: true, ...r })
   } catch (err) {
     // «Esta página todavía no tiene cadena» no es una falla del servidor: es el estado real de
@@ -5106,6 +5132,37 @@ router.post('/assets/:asset_id/versions/:version_id/approve', async (req, res, n
 
     res.json({ success: true, version_number: ver.version_number, storage_url: ver.storage_url })
   } catch (err) { next(err) }
+})
+
+// ─── GET /api/projects/:id/canvas/workflows/:nombre/opciones ─────────────────
+// Qué puede elegir el usuario antes de correr ESTE workflow, con los valores válidos que declara
+// ComfyUI. No hay lista escrita a mano: una lista fija envejece en silencio y el error saldría
+// recién al pagar la corrida.
+router.get('/workflows/:nombre/opciones', async (req, res, next) => {
+  try {
+    const { getWorkflowByName } = require('../services/config.service')
+    const entry = await getWorkflowByName(req.params.nombre)
+    if (!entry) return res.status(404).json({ success: false, error: `Unknown workflow "${req.params.nombre}"` })
+
+    const { opcionesDe } = require('../services/workflow-options.service')
+    const opciones = await opcionesDe(entry.workflow_json)
+
+    // Cuántas imágenes produce el workflow, para poder decir el tamaño de la corrida. Es lo único
+    // honesto que se puede decir del costo: el sistema imputa un precio plano por imagen —medido,
+    // 405 corridas y un solo valor— así que un número por calidad sería inventado.
+    const cfg = entry.inject_config || {}
+    const imagenes = Array.isArray(cfg.pages) ? cfg.pages.length
+                   : cfg.salidas ? Object.keys(cfg.salidas).length
+                   : 1
+    res.json({ success: true, opciones, imagenes, costo_por_imagen_usd: 0.04 })
+  } catch (err) {
+    // Sin ComfyUI no hay catálogo. Se dice, en vez de ofrecer un formulario vacío que parecería
+    // que el workflow no tiene nada que elegir.
+    if (/object_info|fetch/i.test(err.message)) {
+      return res.status(503).json({ success: false, error: `ComfyUI did not answer: ${err.message}` })
+    }
+    next(err)
+  }
 })
 
 module.exports = router

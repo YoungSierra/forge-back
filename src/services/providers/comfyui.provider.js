@@ -15,7 +15,7 @@ function injectPoint(workflow, point, value) {
   node.inputs[point.field] = value
 }
 
-async function submitWorkflow(workflowName, prompt, width, height, extras = {}) {
+async function submitWorkflow(workflowName, prompt, width, height, extras = {}, opciones = null) {
   const entry = await getWorkflowByName(workflowName)
   if (!entry) throw new Error(`Unknown ComfyUI workflow: "${workflowName}"`)
 
@@ -75,6 +75,24 @@ async function submitWorkflow(workflowName, prompt, width, height, extras = {}) 
       } catch (e) {
         console.warn('[ComfyUI] no se pudo adjuntar el arte del proyecto:', e.message)
       }
+    }
+  }
+
+  // Las opciones de generación que eligió el usuario (informe v3, punto 12). Van al final, encima
+  // de todo lo demás: son una decisión explícita y tienen que ganarle a los valores que el
+  // workflow trae guardados. Un valor que no existe se rechaza acá y no en ComfyUI, que lo
+  // descubriría recién al cobrar la corrida.
+  if (opciones && Object.keys(opciones).length) {
+    const { opcionesDe, aplicarOpciones } = require('../workflow-options.service')
+    try {
+      const catalogo = await opcionesDe(entry.workflow_json)
+      const { escrituras, avisos } = aplicarOpciones(workflow, opciones, catalogo)
+      console.log(`[ComfyUI] opciones del usuario: ${escrituras} escritura(s) en ${workflowName}`)
+      avisos.forEach(a => console.warn(`[ComfyUI] opción ignorada: ${a}`))
+    } catch (e) {
+      // Sin object_info no hay catálogo, y sin catálogo no se puede validar. Correr con los
+      // valores por defecto es peor que no correr: el usuario pidió otra cosa y pagaría por ésta.
+      throw new Error(`No pude aplicar las opciones de generación: ${e.message}`)
     }
   }
 

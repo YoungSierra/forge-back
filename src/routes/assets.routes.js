@@ -258,7 +258,7 @@ router.get('/project-assets', async (req, res, next) => {
       .from('forge_assets')
       .select(`
         id, name, format, status, storage_url, ${mediaOnly ? '' : 'content,'} approved_at, created_at,
-        node_id, project_id, derived_from_id,
+        node_id, project_id, derived_from_id, metadata,
         forge_nodes ( node_key, title, phase )
       `)
       .order('approved_at', { ascending: false, nullsFirst: false })
@@ -321,6 +321,10 @@ router.get('/project-assets', async (req, res, next) => {
       // de publicación (§9): la cadena existe en la base —`design_edit` → las tres vistas → el
       // 3D— y en pantalla se ven cuatro hojas sueltas sin relación entre sí.
       derived_from: a.derived_from_id ?? null,
+      // Con qué opciones se generó (informe v3, punto 12): es lo que se muestra bajo la imagen y
+      // lo que se reusa al rehacerla. Solo eso del metadata — el resto es interno de la cadena y
+      // no tiene por qué viajar a cada tarjeta del moodboard.
+      opciones:    a.metadata?.opciones ?? null,
       created_at:  a.approved_at ?? a.created_at,
       versions:    (forgeVersionsMap[a.id] || []).map(v => ({
         id:             v.id,
