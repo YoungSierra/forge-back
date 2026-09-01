@@ -12,7 +12,11 @@ const { db } = require('../src/services/supabase.service')
 
 const TEXTO = o => !o.image_gen && o.production !== 'deferred'
 // Instrucción de encabezado de nivel 2 dirigida a las secciones del documento.
-const PIDE_H2 = /(^|[^#])##\s|'##\s?'|"##\s?"|`##\s?`|heading per section|## heading/i
+// EXACTAMENTE dos almohadillas. Buscar la frase «heading per section» suelta era peor que inútil:
+// v2.9.24 la conserva diciendo '###', que es justo lo que queríamos, y el preflight la denunciaba.
+// La marca literal basta — el prompt viejo del 2.2 decía «One "## " heading per section» y cae
+// igual por el `"## "`.
+const PIDE_H2 = /(^|[^#])##(?!#)[ \t]|['"`]##(?!#)[ \t]?['"`]/
 
 ;(async () => {
   const { data: nodos } = await db().from('forge_nodes')
@@ -27,12 +31,27 @@ const PIDE_H2 = /(^|[^#])##\s|'##\s?'|"##\s?"|`##\s?`|heading per section|## hea
     if (!tieneContrato || textos.length < 2) continue
     conContrato++
 
-    const culpables = outs.filter(o => PIDE_H2.test(o.prompt || ''))
+    // Un '## ' que nombra la CLAVE DEL PROPIO OUTPUT no es una colisión: es el contrato dicho en
+    // voz alta, y es lo que hace v2.9.24 en el 2.2. Se quitan esas menciones antes de mirar, o el
+    // preflight denuncia justo el arreglo que acabamos de aplicar. Igual con 1.4 y 3.9.
+    const sinPropia = o => {
+      const k = (o.key || o.name || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/_/g, '[_\\s]')
+      let p = String(o.prompt || '')
+      if (k) p = p.replace(new RegExp(`#{1,4}\\s*${k}`, 'gi'), '')
+      // Y enunciar la regla no es infringirla: «'##' is reserved for output keys» o «Never promote
+      // a section to '##'» hablan DE la marca para prohibirla, no mandan usarla. Sin descontarlas
+      // el preflight denuncia el texto que dice que no hay que hacer lo que denuncia — y eso es
+      // peor que no tener preflight: la próxima persona lee «1 colisión» sobre el arreglo.
+      // Se descarta la ORACIÓN entera cuando lleva la marca junto a una palabra de prohibición.
+      const PROHIBE = /\b(never|reserved|not|no longer|only|nunca|reservad|solo)\b/i
+      return p.split(/(?<=\.)\s+/).filter(f => !(/#{2,4}/.test(f) && PROHIBE.test(f))).join(' ')
+    }
+    const culpables = outs.filter(o => PIDE_H2.test(sinPropia(o)))
     if (culpables.length) {
       chocan.push({
         nk: n.node_key, t: n.title,
         outs: culpables.map(o => o.key || o.name),
-        muestra: (culpables[0].prompt.match(/[^.]*##[^.]*\./) || [''])[0].trim().slice(0, 150),
+        muestra: (sinPropia(culpables[0]).match(/[^.]*##[^.]*\./) || [''])[0].trim().slice(0, 150),
       })
     }
   }

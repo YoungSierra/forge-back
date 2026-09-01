@@ -264,6 +264,24 @@ function parseOutputItems(content, format, outputKey = null) {
     if (cercados.length) return cercados
   }
 
+  // Un output de imagen que YA emitió su sobre estructurado no admite adivinanzas. Si llegamos
+  // hasta acá con un arreglo de objetos cercado en la respuesta, es que el sobre existe pero
+  // ninguna entrada trae prompt: eso es un incumplimiento del contrato, y el motor tiene que
+  // decirlo, no inventar encargos. Abajo esperan lectores de prosa —viñetas, numeradas,
+  // encabezados— que se llevan CUALQUIER lista: el 2.2 emitió tres entradas con `subject` y
+  // `composition_notes` pero sin `prompt`, el sobre se descartó, y el enumerador por encabezado
+  // devolvió las dos secciones de la respuesta como si fueran sujetos. Se pagaron tres renders
+  // con el acta de decisión de prompt — de ahí la imagen que no se parecía a nada del plan.
+  if (format === 'png' || format === 'image') {
+    const traeSobre = [...content.matchAll(/```(\w*)\s*([\s\S]*?)```/g)].some(m => {
+      try {
+        const v = JSON.parse(m[2])
+        return Array.isArray(v) && v.length && v.every(o => o && typeof o === 'object' && !Array.isArray(o))
+      } catch { return false }
+    })
+    if (traeSobre) return []
+  }
+
   // Entidades enumeradas por encabezado — antes que las viñetas, que se llevan cualquier lista.
   const enumerados = bloquesEnumerados(content)
   if (enumerados) return enumerados
