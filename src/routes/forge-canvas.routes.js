@@ -3783,7 +3783,20 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
 
         // Sin esperar, como el deck: cuatro renders de ComfyUI no caben en una petición del
         // navegador. El front sigue el avance en `output_images` de la sesión de cada output.
-        for (const key of aDespachar) {
+        // Se vuelve a preguntar JUSTO ANTES de despachar. `pendientes` se calculó antes de llamar
+        // al modelo, y entre una cosa y otra pasan minutos: en la corrida del 2.2 del 01-09 el
+        // front generó sus tres imágenes ocho segundos antes de que el motor despachara las suyas
+        // —seis renders distintos para un output de tres— y el motor no se enteró porque estaba
+        // mirando una foto vieja. Las guardas de más abajo tampoco podían: cuando la primera tanda
+        // empezó, no había nada que ver.
+        const yaNoHacenFalta = await pendingImageOutputsForNode(
+          project_id, node_id, pnEstado?.is_stale, dnaImg || {}, currentPNode.id)
+        const finales = aDespachar.filter(k => yaNoHacenFalta.includes(k))
+        for (const k of aDespachar.filter(x => !finales.includes(x))) {
+          console.warn(`[forge-chat] ${k}: ya tiene sus imágenes desde que arrancó la corrida — no se despacha`)
+        }
+
+        for (const key of finales) {
           executeImageOutput({ project_id, node_id, targetOutputKey: key, member_id, project_node_id: currentPNode.id, respuestaPrevia: replyText })
             .catch(async e => {
               // Un fallo acá no lo espera nadie: la primera vez dejó una sesión `active` con CERO
