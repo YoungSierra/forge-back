@@ -24,6 +24,16 @@ const claveDe = o => o.key || o.name
 const CAMPOS = ['title', 'phase', 'purpose', 'inputs', 'outputs', 'constraints', 'tools',
                 'skills', 'default_prompt', 'executor', 'standalone_prompt', 'role', 'metadata']
 
+// Campos que NO se pisan aunque el delta los traiga. El ejecutor es el caso claro: el modelo de un
+// nodo se cambia desde el admin y es una decisión del estudio, no de la DNA. Los deltas se derivan
+// de un export viejo, así que arrastran el modelo de entonces: v2.9.23 habría devuelto trece nodos
+// de MiniMax-M3 a Sonnet 4.6 sin que el changelog lo mencionara.
+//
+//   node scripts/apply-nodes-delta.js <json> --apply --conservar=executor,skills
+const CONSERVAR = new Set(
+  (process.argv.find(a => a.startsWith('--conservar='))?.split('=')[1] || '')
+    .split(',').map(s => s.trim()).filter(Boolean))
+
 ;(async () => {
   const filas = JSON.parse(fs.readFileSync(RUTA, 'utf8'))
   console.log(`${filas.length} fila(s): ${filas.map(f => f.node_key).join(', ')}\n`)
@@ -61,13 +71,14 @@ const CAMPOS = ['title', 'phase', 'purpose', 'inputs', 'outputs', 'constraints',
     fs.writeFileSync(BACKUP, JSON.stringify(Object.values(vivos), null, 1))
     console.log(`respaldo de las filas vivas → ${BACKUP}`)
   }
+  if (CONSERVAR.size) console.log(`\ncampos que NO se tocan: ${[...CONSERVAR].join(', ')}`)
   if (!APLICAR) return console.log('\n(simulación — usar --apply para escribir)')
 
   for (const f of filas) {
     const upd = {}
     // El export trae TODO como string, incluidas las columnas json/array. Postgres rechaza
     // un text[] recibido como cadena JSON, así que se deserializa lo que sea deserializable.
-    for (const c of CAMPOS) if (c in f) upd[c] = parse(f[c])
+    for (const c of CAMPOS) if (c in f && !CONSERVAR.has(c)) upd[c] = parse(f[c])
     const { error } = await db().from('forge_nodes').update(upd).eq('node_key', f.node_key)
     if (error) { console.error('  UPDATE ' + f.node_key + ': ' + JSON.stringify(error)); process.exit(1) }
   }
@@ -77,5 +88,14 @@ const CAMPOS = ['title', 'phase', 'purpose', 'inputs', 'outputs', 'constraints',
     const { data: v } = await db().from('forge_nodes').select('outputs, metadata').eq('node_key', f.node_key).single()
     const outs = parse(v.outputs) || []
     console.log(`  ${f.node_key}: ${outs.length} outputs · dna_version ${parse(v.metadata)?.dna_version}`)
+  }
+  // Y lo conservado: decir que no se tocó sin mirarlo es lo mismo que no haberlo conservado.
+  for (const c of CONSERVAR) {
+    const { data: vs } = await db().from('forge_nodes').select('node_key, ' + c).in('node_key', filas.map(f => f.node_key))
+    const intactos = (vs || []).filter(v => {
+      const enDelta = filas.find(f => f.node_key === v.node_key)?.[c]
+      return enDelta !== undefined && JSON.stringify(parse(enDelta)) !== JSON.stringify(v[c])
+    })
+    console.log(`  ${c}: ${intactos.length} fila(s) conservaron su valor vivo, distinto del que traía el delta`)
   }
 })()

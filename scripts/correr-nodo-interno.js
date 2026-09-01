@@ -70,7 +70,7 @@ if (!CLAVE) { console.error('uso: <node_key> [project_id]'); process.exit(1) }
 
   try {
     const cuerpo = JSON.stringify({
-      user_message: 'Generate the output for this step',
+      user_message: process.argv.find(a => a.startsWith('--msg=')) ? process.argv.find(a => a.startsWith('--msg=')).slice(6) : 'Generate the output for this step',
       project_node_id: instancia,
     })
     const r = await pedir({

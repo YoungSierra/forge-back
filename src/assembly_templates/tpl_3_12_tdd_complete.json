@@ -1,0 +1,52 @@
+{
+  "template_id": "tpl_3_12_tdd_complete_v1",
+  "for_node": "3.12",
+  "for_output": "tdd_complete",
+  "renderer": "docx (rendered from the assembled markdown)",
+  "derived_from": "TDD_Template.md — el estándar de 27.506 chars, gates G-01..G-18",
+  "notes": [
+    "Piloto de ensamble del TDD. NO cambia la DNA: se corre aparte para comparar el documento",
+    "ensamblado contra el que genera el LLM hoy (143.809 chars, 465.595 de fuentes copiadas a mano",
+    "por el modelo).",
+    "",
+    "Tres clases de sección, y la diferencia importa:",
+    "  copy/repeat — vienen ENTERAS de un nodo aguas arriba. Son la mayoría, y hoy le pedimos al",
+    "                modelo que las transcriba: 116.400 tokens de prompt para copiar.",
+    "  glue        — lo único que se redacta, y con un LLM chico que no puede inventar hechos.",
+    "  §0.2        — el gate NO va acá: se verifica por código contando ids, no se le pregunta al",
+    "                modelo si aprobó su propio trabajo. Queda fuera de esta plantilla a propósito.",
+    "",
+    "§11 Technical tampoco está: no existe en ningún nodo aguas arriba, lo redacta el 3.12. Es la",
+    "otra mitad del rediseño y no se puede ensamblar desde fuentes que no existen."
+  ],
+  "slots": [
+    { "id": "§A",    "heading": "Project Identity",              "from": "input:project_identity",       "mode": "copy",   "required": true },
+    { "id": "§1",    "heading": "High Concept",                  "from": "input:concept_data",           "mode": "copy",   "required": true },
+    { "id": "§2",    "heading": "Game Overview",                 "from": "input:concept_data",           "mode": "copy",   "required": true },
+    { "id": "§3",    "heading": "Core Gameplay",                 "from": "input:core_loop",              "mode": "copy",   "required": true },
+    { "id": "§4",    "heading": "Mechanics & Systems",           "from": "input:mechanic_specs",         "mode": "repeat", "required": true },
+    { "id": "§B",    "heading": "Mechanic Engineering Blocks",   "from": "input:mechanics_engineering",  "mode": "repeat", "required": true },
+    { "id": "§5",    "heading": "Game Modes",                    "from": "input:progression_sys",        "mode": "copy",   "required": false },
+    { "id": "§6",    "heading": "World & Level Design",          "from": ["input:level_map", "input:world_lore"], "mode": "copy", "required": false },
+    { "id": "§6.2",  "heading": "Encounter Design",              "from": "input:encounter_design",       "mode": "copy",   "required": false },
+    { "id": "§7",    "heading": "Narrative & Characters",        "from": ["input:narrative_arc", "input:char_profiles"], "mode": "copy", "required": false },
+    { "id": "§8",    "heading": "Art Direction & Visual Style",  "from": "input:style_guide",            "mode": "copy",   "required": true },
+    { "id": "§9",    "heading": "UI / UX",                       "from": "input:feedback_system",        "mode": "copy",   "required": true },
+    { "id": "§9.1",  "heading": "Screen registry",               "from": "input:ui_screens",             "mode": "copy",   "required": true },
+    { "id": "§10",   "heading": "Audio Direction",               "from": "input:audio_direction",        "mode": "copy",   "required": false },
+    { "id": "§12",   "heading": "Business Model",                "from": ["input:revenue_model", "input:monetization_doc"], "mode": "copy", "required": false },
+    { "id": "§13.1", "heading": "Content scope & inventory",     "from": "input:item_catalog",           "mode": "copy",   "required": true },
+    { "id": "§13.2", "heading": "Scene manifest",                "from": "input:scene_manifest",         "mode": "copy",   "required": true },
+    { "id": "§14.3", "heading": "Consistency ledger",            "from": "sibling:consistency_ledger",   "mode": "copy",   "required": true },
+    { "id": "§14.2", "heading": "Pending registry",              "from": "sibling:placeholder_registry", "mode": "copy",   "required": true },
+    { "id": "§D",    "heading": "Dependency graph",              "from": "sibling:dependency_graph",     "mode": "copy",   "required": true },
+    {
+      "id": "§0.1", "heading": "Document Control", "mode": "glue", "required": false,
+      "from": ["input:project_identity", "input:concept_data"],
+      "glue_rules": {
+        "instruction": "One short paragraph naming the game, the studio and the engine pin, and stating that this TDD is assembled from upstream node outputs. No version numbers you were not given.",
+        "max_tokens": 220
+      }
+    }
+  ]
+}
