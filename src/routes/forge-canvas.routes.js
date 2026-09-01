@@ -3568,6 +3568,8 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
         // Extraer solo la sección del output principal (format: document/pdf)
         // para no incluir outputs secundarios (light_pitches, etc.) en el PDF
         let docContent = replyText
+        // ¿Sabemos dónde termina el documento, o estamos adivinando? Cambia qué piso se exige abajo.
+        let fronteraConocida = false
         // v1.3.0/v2.6.0 usan 'key'; legacy usaba 'name'. Resolver ambos para no romper.
         const outKeyOf = o => typeof o === 'object' ? (o.key ?? o.name ?? '') : o
         const docOutputDef = allOutputDefs.find(o => {
@@ -3614,23 +3616,35 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
             // conserva TODAS sus sub-secciones ## (§0, §1, …). NO recortar al 2º ## — eso mutilaba
             // el doc dejando solo la 1ª sección.
             docContent = replyText.slice(0, cutIndex).trim()
+            fronteraConocida = true
             console.log(`[forge-chat] auto doc_gen_docx — cortado antes de sección secundaria (${docContent.length} chars)`)
           } else {
             // Fallback: extracción exacta de la sección primaria
             const extracted = extractSection(replyText, outName, secondaryDefs.map(outKeyOf).filter(Boolean))
             if (extracted && extracted.length > 100) {
               docContent = extracted
+              fronteraConocida = true
               console.log(`[forge-chat] auto doc_gen_docx — usando sección "${outName}" (${extracted.length} chars)`)
             }
           }
         }
 
-        // Salvaguarda: si la extracción del output primario dejó un fragmento chico frente a la
-        // respuesta completa (ej. agarró un preámbulo del template del skill y cortó el cuerpo),
-        // descartarla y usar la respuesta completa. Mejor un doc con algo de más que casi vacío.
-        if (docContent.trim().length < Math.max(2000, replyText.trim().length * 0.5)) {
+        // Salvaguarda: una extracción que dejó un fragmento minúsculo no sirve — pasó con un
+        // preámbulo del skill que cortaba el cuerpo. Pero la regla vieja medía el fragmento contra
+        // la RESPUESTA ENTERA y exigía la mitad, y eso dejó de tener sentido cuando el SECTION
+        // CONTRACT hizo que la respuesta lleve TODOS los outputs: el documento del 2.2 son 8.881
+        // chars de una respuesta de 26.136 —porque `concept_data` ocupa 9.000 él solo—, así que la
+        // extracción correcta se descartaba y el PDF salía con la respuesta entera. De ahí que el
+        // documento del 01-09 arrastrara el `development_image_plan`, que su propia DNA prohíbe
+        // copiar dentro del documento.
+        //
+        // Si sabemos DÓNDE termina el documento —porque encontramos la sección del hermano que lo
+        // sigue— la extracción es de fiar y solo se exige un piso absoluto. La regla relativa queda
+        // para cuando estamos adivinando.
+        const piso = fronteraConocida ? 600 : Math.max(2000, replyText.trim().length * 0.5)
+        if (docContent.trim().length < piso) {
           docContent = replyText
-          console.log(`[forge-chat] auto doc_gen_docx — extracción descartada (fragmento < 50% del output), usando respuesta completa (${replyText.trim().length} chars)`)
+          console.log(`[forge-chat] auto doc_gen_docx — extracción descartada (${docContent.trim().length} < ${Math.round(piso)}), usando respuesta completa`)
         }
 
         // Post-process: el LLM a veces reproduce placeholders literalmente en el output
