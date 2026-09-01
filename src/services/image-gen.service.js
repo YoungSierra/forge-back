@@ -125,15 +125,44 @@ function parseOutputItems(content, format, outputKey = null) {
       ...bloques.filter(b => b.lang === '').map(b => b.cuerpo),
       ...(bloques.length ? [] : [content]),
     ]
+    // El array se busca POR SU NOMBRE, no por ser el primero. Toda respuesta de concepto cierra
+    // con `gaps_for_downstream`, que también es un array de objetos, y el 1.1 lo emite ANTES de
+    // las semillas: pidiendo «el primer array» se ofrecía una imagen por cada hueco pendiente.
+    // Medido el 01-09: diez ítems, los diez gaps, cero semillas.
+    const esHueco = o => o && typeof o === 'object' && ('gap' in o || 'node_that_needs_it' in o)
+    const arrayPorNombre = texto => {
+      if (!outputKey) return null
+      const rx = new RegExp('"' + outputKey.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '"\\s*:\\s*\\[')
+      const m = rx.exec(texto)
+      if (!m) return null
+      const desde = texto.indexOf('[', m.index)
+      // Cierre por conteo de corchetes: `lastIndexOf` se pasa al siguiente array del documento.
+      let nivel = 0
+      for (let i = desde; i < texto.length; i++) {
+        if (texto[i] === '[') nivel++
+        else if (texto[i] === ']' && --nivel === 0) {
+          try { const v = JSON.parse(texto.slice(desde, i + 1)); return Array.isArray(v) ? v : null } catch { return null }
+        }
+      }
+      return null
+    }
+
+    for (const texto of candidatos) {
+      const nombrado = arrayPorNombre(texto)
+      if (nombrado?.length) {
+        const items = nombrado.map(textoDeItem).filter(x => x.trim())
+        if (items.length) return items
+      }
+    }
     for (const texto of candidatos) {
       const a = texto.indexOf('['), b = texto.lastIndexOf(']')
       if (a === -1 || b <= a) continue
       try {
         const arr = JSON.parse(texto.slice(a, b + 1))
-        if (Array.isArray(arr) && arr.length) {
-          const items = arr.map(textoDeItem).filter(x => x.trim())
-          if (items.length) return items
-        }
+        if (!Array.isArray(arr) || !arr.length) continue
+        if (arr.every(esHueco)) continue   // son huecos pendientes, no contenido ilustrable
+        const items = arr.map(textoDeItem).filter(x => x.trim())
+        if (items.length) return items
       } catch { /* no era éste */ }
     }
   }
