@@ -530,6 +530,106 @@ async function pedirSoloElSobre({ node_id, targetOutputKey, contenido, executorS
   }
 }
 
+// ─── Re-pedido de cierre: los outputs de texto que la corrida no emitió ───────────────────────
+//
+// El SECTION CONTRACT es una PETICIÓN, no una garantía. Medido el 01-09 sobre las corridas de
+// nodo entero posteriores al contrato: cumplen 5, fallan 13. Y no es que el texto no exista y ya
+// —`concept_data` alimenta a nueve nodos, y en la corrida limpia del 2.2 su cadena aparecía UNA
+// vez en 14.780 caracteres, dentro de un comentario del sobre de imágenes.
+//
+// Detectarlo y avisar no alcanza: hoy el aviso sale en la pestaña y el output se queda sin
+// existir. Se le vuelve a pedir, SOLO el que falta.
+//
+// La condición la puso Pedro y es la que hace que esto no rompa la no-divergencia que el contrato
+// buscaba al pedirlos juntos: el re-pedido corre DESPUÉS del documento y CON el documento como
+// hermano. Pedirle los campos mirando la prosa ya escrita diverge menos que pedirle las dos cosas
+// a la vez y que las funda en una.
+async function pedirSeccionFaltante({ node_id, targetOutputKey, contenido, executorStr }) {
+  if (!contenido) return null
+  const { callLLM } = require('../services/llm.service')
+  const { data: dna } = await db().from('forge_nodes').select('outputs, title').eq('id', node_id).maybeSingle()
+  const def = (Array.isArray(dna?.outputs) ? dna.outputs : []).find(o => (o.key || o.name) === targetOutputKey)
+  if (!def) return null
+
+  const sistema = [
+    `You wrote the document below for the node "${dna.title}". It is finished and must NOT be rewritten.`,
+    `The only thing missing is the output \`${targetOutputKey}\`, which the reply never emitted under its own heading.`,
+    '',
+    "This is that output's own contract — follow it exactly:",
+    '---',
+    String(def.prompt || '').slice(0, 4000),
+    '---',
+    '',
+    // Que derive del documento es el punto entero: es lo que sustituye a la garantía de haberlos
+    // escrito en la misma pasada.
+    'Derive it from the document below. Every value it carries must already be stated there —',
+    'this output renders the document as data, it never introduces anything the document does not say.',
+    '',
+    `Reply with NOTHING but the section, opening with the heading \`## ${targetOutputKey}\` verbatim.`,
+    'No prose before it, no commentary after it, no other heading at level 2.',
+  ].join('\n')
+
+  try {
+    const res = await callLLM(sistema, String(contenido).slice(0, 60000), {
+      model: executorStr || 'anthropic:claude-sonnet-4-6', rawText: true, temperature: 0.4, maxOutputTokens: 8000,
+    })
+    let texto = String(typeof res === 'string' ? res : (res?.data ?? res?.text ?? '')).trim()
+    if (!texto) return null
+    // El encabezado se normaliza acá y no se le exige al modelo: si contestó el contenido sin él,
+    // la sección igual queda bien puesta; si lo puso, no se duplica.
+    const rx = new RegExp(`^#{1,4}\\s*\\**\\s*${targetOutputKey}\\b.*$`, 'im')
+    const m = rx.exec(texto)
+    if (m) texto = `## ${targetOutputKey}\n` + texto.slice(m.index + m[0].length).trim()
+    else   texto = `## ${targetOutputKey}\n` + texto
+    // Una respuesta de dos líneas no es la sección: es el modelo diciendo que no puede.
+    if (texto.length < 200) {
+      console.warn(`[seccion] ${targetOutputKey}: el re-pedido devolvió ${texto.length} chars — se descarta`)
+      return null
+    }
+    console.log(`[seccion] ${targetOutputKey}: recuperada, ${texto.length} chars`)
+    return texto
+  } catch (e) {
+    console.error(`[seccion] ${targetOutputKey}:`, e?.message || e)
+    return null
+  }
+}
+
+// Cierra la corrida de nodo entero: qué outputs de texto quedaron sin su sección, se re-piden, y
+// se cosen en el sitio correcto de la respuesta.
+async function recuperarSeccionesFaltantes({ node_id, replyText, outputDefs, executorStr }) {
+  const { extractSection } = require('../utils/extract-section')
+  const esTexto = o => typeof o === 'object' && !o.image_gen && o.production !== 'deferred'
+    && o.assembly !== true && !['png', 'image'].includes(String(o.format || '').toLowerCase())
+  const claves = outputDefs.map(o => (typeof o === 'object' ? (o.key || o.name) : o)).filter(Boolean)
+  const textos = outputDefs.filter(esTexto)
+  if (textos.length < 2) return replyText
+
+  let salida = replyText
+  for (const def of textos) {
+    const k = def.key || def.name
+    if (!k) continue
+    if (extractSection(salida, k, claves.filter(x => x !== k))) continue
+    console.warn(`[seccion] ${k}: la corrida no lo emitió — se re-pide con el documento como hermano`)
+    const sec = await pedirSeccionFaltante({ node_id, targetOutputKey: k, contenido: salida, executorStr })
+    if (!sec) continue
+
+    // Se cose ANTES del primer output de imagen. El contrato dice que la respuesta CIERRA con el
+    // bloque de emisión y que no va nada después; pegar la sección al final lo rompería y el
+    // parser de imágenes dejaría de encontrar el sobre como último bloque.
+    const imgKeys = outputDefs.filter(o => typeof o === 'object' && (o.image_gen || ['png', 'image'].includes(String(o.format || '').toLowerCase())))
+      .map(o => o.key || o.name).filter(Boolean)
+    let corte = -1
+    for (const ik of imgKeys) {
+      const m = new RegExp(`^#{1,4}\\s*\\**\\s*${ik.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b.*$`, 'im').exec(salida)
+      if (m && (corte < 0 || m.index < corte)) corte = m.index
+    }
+    salida = corte >= 0
+      ? `${salida.slice(0, corte).trimEnd()}\n\n${sec}\n\n${salida.slice(corte)}`
+      : `${salida.trimEnd()}\n\n${sec}`
+  }
+  return salida
+}
+
 // `respuestaPrevia` es el texto que el nodo ACABA de producir. Corriendo el nodo entero, el
 // post-paso llama aquí para despachar cada output de imagen — y sin esto se le volvía a pedir al
 // modelo lo que había escrito un minuto antes: una llamada completa de más por output.
@@ -3328,6 +3428,16 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
 
     // Normalizar secciones estructuradas — independiente de cómo las formateó el LLM
     replyText = normalizeOutputSections(replyText, allOutputDefs)
+
+    // Y antes de armar el documento: los outputs de texto que la corrida no emitió se re-piden.
+    // Va acá y no después porque el PDF se corta por la primera sección secundaria, y una sección
+    // que aparece más tarde cambiaría dónde corta. Solo en corridas de nodo entero: una sesión
+    // enfocada en un output no debe ponerse a producir a sus hermanos.
+    if (!targetOutputKey && replyText.trim().length > 400) {
+      replyText = await recuperarSeccionesFaltantes({
+        node_id, replyText, outputDefs: allOutputDefs, executorStr,
+      })
+    }
 
     // Si el nodo tiene doc_gen_docx y el LLM no la llamó por su cuenta, generar automáticamente.
     const hasDocTool   = activeTools.includes('doc_gen_docx')
