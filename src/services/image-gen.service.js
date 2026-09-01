@@ -199,14 +199,22 @@ function parseOutputItems(content, format, outputKey = null) {
       // «#E8930A», «#04060F» y «#7B2FBE» como prompts. Un sobre de imágenes se reconoce por lo que
       // trae dentro: objetos con `prompt`/`image_prompt`/`depicts`. Se recorren todos los arreglos
       // balanceados de la sección y se toma el PRIMERO que lo parezca.
-      // `subject` cuenta como sobre. La DNA no obliga a un solo nombre de campo y el modelo alterna:
-      // una corrida del 2.2 emitió `prompt`, la siguiente `subject` + `composition` + `mood` +
-      // `negative`. Exigiendo solo `prompt`, la segunda no se reconocía y el lector volvía a caer
-      // en la prosa — el front ofrecía las tres mecánicas del documento como si fueran imágenes.
-      const CAMPOS = ['prompt', 'image_prompt', 'depicts', 'subject']
-      const esSobre = v => Array.isArray(v) && v.length && v.some(o =>
-        o && typeof o === 'object' && !Array.isArray(o)
-        && CAMPOS.some(k => typeof o[k] === 'string' && o[k].trim().length >= 40))
+      // No se exige NINGÚN nombre de campo. Perseguirlos fue perder un día entero: cuatro corridas
+      // del 2.2, la misma DNA, cuatro esquemas — `subject`+`composition_notes`, luego `prompt`,
+      // luego `subject`+`composition`+`mood`+`negative`, y ahora `purpose`+`type`+
+      // `style_inheritance`+`placement_in_concept_document`. Cada nombre nuevo era otro arreglo, y
+      // el que faltaba dejaba el output en cero.
+      //
+      // Lo que SÍ define un sobre, y no cambia: está dentro de la sección de este output, sus
+      // entradas son objetos, y cada una se identifica y se describe. Un `id` y un texto con
+      // cuerpo suficiente para ser una imagen. La lista de paleta del 2.4 —tres cadenas de hex
+      // sueltas— no pasa: ni son objetos ni tienen id.
+      const describe = o => Object.entries(o).some(([k, v]) =>
+        k !== 'id' && typeof v === 'string' && v.trim().length >= 40)
+      const esSobre = v => Array.isArray(v) && v.length
+        && v.every(o => o && typeof o === 'object' && !Array.isArray(o))
+        && v.filter(o => typeof o.id === 'string' && o.id.trim()).length >= Math.ceil(v.length / 2)
+        && v.some(describe)
 
       for (let ini = desde.indexOf('['); ini !== -1; ini = desde.indexOf('[', ini + 1)) {
         let nivel = 0
