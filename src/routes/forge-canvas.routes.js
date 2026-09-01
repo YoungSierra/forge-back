@@ -833,6 +833,32 @@ async function executeImageOutput({ project_id, node_id, targetOutputKey, member
     }
   }
 
+  // ── Una imagen por id, aunque el sobre venga dos veces ────────────────────────────────────────
+  //
+  // Última red antes de ComfyUI, y la única que no depende de que la DNA esté bien escrita. Dos
+  // contratos nuestros se contradecían —el SECTION CONTRACT pide cada output bajo su '##' y la
+  // cláusula de cierre exigía cerrar la respuesta con el bloque de emisión—, así que donde el
+  // output de imagen no era el último, obedecer a los dos significaba emitir el sobre DOS VECES y
+  // renderizar cada imagen dos veces. v2.9.26 quita la contradicción; esto quita el riesgo.
+  //
+  // Se deduplica por `id`, que es la identidad de la imagen: el mismo id es la misma imagen, la
+  // pida quien la pida. Y a falta de id, por el prompt. Cada descarte se registra: un sobre
+  // duplicado es un fallo de conformidad que hay que poder ver, no algo que se tapa en silencio.
+  if (planos?.length) {
+    const vistos = new Map()
+    const repetidos = []
+    for (const p of planos) {
+      const clave = (p.id || '').trim().toLowerCase() || `prompt:${(p.prompt || '').trim().slice(0, 200)}`
+      if (vistos.has(clave)) { repetidos.push(p.id || '(sin id)'); continue }
+      vistos.set(clave, p)
+    }
+    if (repetidos.length) {
+      console.warn(`[img-dedupe] ${targetOutputKey}: ${repetidos.length} entrada(s) repetida(s) descartada(s)`
+        + ` — ${repetidos.join(', ')}. Se renderiza ${vistos.size} de ${planos.length}.`)
+      planos = [...vistos.values()]
+    }
+  }
+
   if (planos?.length) {
     const { data: dnaP } = await db().from('forge_nodes').select('node_key,title,outputs').eq('id', node_id).single()
     const defP = (Array.isArray(dnaP?.outputs) ? dnaP.outputs : []).find(o => (o.key || o.name) === targetOutputKey)
