@@ -199,9 +199,14 @@ function parseOutputItems(content, format, outputKey = null) {
       // «#E8930A», «#04060F» y «#7B2FBE» como prompts. Un sobre de imágenes se reconoce por lo que
       // trae dentro: objetos con `prompt`/`image_prompt`/`depicts`. Se recorren todos los arreglos
       // balanceados de la sección y se toma el PRIMERO que lo parezca.
+      // `subject` cuenta como sobre. La DNA no obliga a un solo nombre de campo y el modelo alterna:
+      // una corrida del 2.2 emitió `prompt`, la siguiente `subject` + `composition` + `mood` +
+      // `negative`. Exigiendo solo `prompt`, la segunda no se reconocía y el lector volvía a caer
+      // en la prosa — el front ofrecía las tres mecánicas del documento como si fueran imágenes.
+      const CAMPOS = ['prompt', 'image_prompt', 'depicts', 'subject']
       const esSobre = v => Array.isArray(v) && v.length && v.some(o =>
         o && typeof o === 'object' && !Array.isArray(o)
-        && ['prompt', 'image_prompt', 'depicts'].some(k => typeof o[k] === 'string' && o[k].trim().length >= 40))
+        && CAMPOS.some(k => typeof o[k] === 'string' && o[k].trim().length >= 40))
 
       for (let ini = desde.indexOf('['); ini !== -1; ini = desde.indexOf('[', ini + 1)) {
         let nivel = 0
@@ -221,9 +226,12 @@ function parseOutputItems(content, format, outputKey = null) {
     {
       const arr = sobreDeLaSeccion()
       if (arr) {
+        // Un `prompt` declarado va tal cual. Sin él, la entrada se arma con sus campos —sujeto,
+        // composición, ánimo, paleta— que es exactamente lo que describe la imagen; serializar el
+        // objeto entero le mandaría llaves y comillas al modelo de imagen.
         const items = arr.map(o => {
           if (typeof o === 'string') return o
-          for (const campo of ['prompt', 'image_prompt', 'depicts']) {
+          for (const campo of ['prompt', 'image_prompt']) {
             const v = o?.[campo]
             if (typeof v === 'string' && v.trim()) return v.trim()
           }
