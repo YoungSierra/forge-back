@@ -780,17 +780,37 @@ async function executeImageOutput({ project_id, node_id, targetOutputKey, member
             .select('id, content, tool_calls').eq('session_id', gen.id).order('created_at', { ascending: false }).limit(6)
           const conDoc = (msgs || []).find(m => (m.tool_calls || []).some(t => t.tool === 'doc_gen_docx' && t.result?.url))
           if (conDoc) {
-            // Solo la sección del output, igual que el endpoint del PDF
+            // El cuerpo del PDF es la sección del OUTPUT DOCUMENTO, no la del output de imagen que
+            // se está despachando. Anclando en `targetOutputKey` se extraía `## development_images`
+            // —el bloque de emisión— y el PDF salía con los metadatos de máquina como cuerpo y sin
+            // el documento: medido el 01-09 en el 2.2, siete páginas donde tres no tenían más que
+            // encabezado y pie, dos imprimían «format: concept_document_image_emission… source_url:
+            // …» y los 8.898 caracteres del Concept Treatment no aparecían por ningún lado. El
+            // primer PDF estaba bien; este paso lo sustituía por uno roto.
+            //
+            // Mismo criterio que la generación original: el output cuyo formato es de documento.
+            const outsP  = Array.isArray(dnaP?.outputs) ? dnaP.outputs : []
+            const FMT_DOC = ['document', 'pdf', 'doc', 'docx', 'pptx']
+            const defDoc = outsP.find(o => FMT_DOC.includes(String(o.format || '').toLowerCase())) || outsP[0]
+            const claveDoc = defDoc ? (defDoc.key || defDoc.name) : targetOutputKey
+
             const anclaDe = k => new RegExp('^#{1,4}\\s+\\*{0,2}\\s*' + k + '\\b.*$', 'im')
-            const ini = anclaDe(targetOutputKey).exec(conDoc.content || '')
+            const ini = anclaDe(claveDoc).exec(conDoc.content || '')
             let cuerpo = conDoc.content || ''
             if (ini) {
               const desde  = cuerpo.slice(ini.index + ini[0].length)
-              const cortes = (Array.isArray(dnaP?.outputs) ? dnaP.outputs : []).map(o => o.key || o.name)
-                .filter(k => k && k !== targetOutputKey)
+              const cortes = outsP.map(o => o.key || o.name)
+                .filter(k => k && k !== claveDoc)
                 .map(k => anclaDe(k).exec(desde)).filter(Boolean).map(r => r.index)
               const sec = desde.slice(0, cortes.length ? Math.min(...cortes) : desde.length).trim()
               if (sec.length > 200) cuerpo = sec
+            }
+            // Una sección que sale mucho más corta que la respuesta es una extracción fallida, no
+            // un documento breve. Antes que publicar un PDF mutilado, va la respuesta entera.
+            if (cuerpo.trim().length < Math.max(2000, (conDoc.content || '').trim().length * 0.4)) {
+              console.warn(`[img-plan] sección "${claveDoc}" quedó en ${cuerpo.trim().length} chars`
+                + ` de ${(conDoc.content || '').length}: se rehace con la respuesta completa`)
+              cuerpo = conDoc.content || ''
             }
             const rehecho = await executeTool('doc_gen_docx', {
               title: (conDoc.tool_calls.find(t => t.tool === 'doc_gen_docx')?.result?.filename || 'Document').replace(/\.pdf$/i, ''),
