@@ -2211,6 +2211,65 @@ router.post('/nodes/:node_id/sessions/:session_id/generate-item-image', async (r
       })
     }
 
+    // ── El output YA tiene sus imágenes: no se vuelve a pagar ────────────────────────────────
+    //
+    // La guarda va acá, en la caja, y no en cada quien pide. Perseguir al que pide no funcionó:
+    // el 01-09 el 2.2 produjo SEIS imágenes distintas para un output de tres —una tanda maquetada
+    // como página, sin id, en la sesión general, y otra de ilustraciones con id en la sesión del
+    // output— y leyendo el código no se puede decir quién pidió la segunda. Da igual quién sea:
+    // por acá pasa todo render de ítem, y acá se corta.
+    //
+    // «Ya las tiene» se mide sobre TODAS las sesiones de la instancia, no solo la que pide: las
+    // dos tandas viven en sesiones distintas y mirando una sola parecen tres, no seis.
+    //
+    // Un ítem que YA tiene su imagen sí se puede rehacer —es el radial Iterate, que versiona— así
+    // que lo que se rechaza es el hueco NUEVO sobre un output ya completo, no la iteración.
+    {
+      // Cuántas le tocan. `image_count` solo lo declaran algunos outputs —el 2.2 no lo tiene, su
+      // contrato dice «mínimo una» y el número lo decide el plan—, así que cuando falta se
+      // cuentan los ítems que la PROPIA RESPUESTA declara. Ese número siempre existe: es el mismo
+      // que el motor usó para despachar.
+      let esperadas = outputDef?.image_count ?? null
+      const { data: sesión } = await db().from('forge_sessions')
+        .select('project_id, project_node_id').eq('id', session_id).maybeSingle()
+      if (!esperadas) {
+        const { data: msgs } = await db().from('forge_messages').select('role, content')
+          .eq('session_id', session_id).order('order_index')
+        const respuesta = [...(msgs || [])].reverse().find(m => m.role === 'agent')?.content
+        if (respuesta) {
+          try {
+            const { parseOutputItems } = require('../services/image-gen.service')
+            const n = (parseOutputItems(respuesta, outputDef?.format || 'png', output_key) || []).length
+            if (n) esperadas = n
+          } catch { /* sin número declarado: no se bloquea nada */ }
+        }
+      }
+      if (esperadas) {
+        let q = db().from('forge_sessions').select('id, output_images')
+          .eq('node_id', node_id).not('output_images', 'is', null)
+        if (sesión?.project_id) q = q.eq('project_id', sesión.project_id)
+        if (sesión?.project_node_id) q = q.eq('project_node_id', sesión.project_node_id)
+        const { data: conImg } = await q
+
+        const índices = new Set()
+        for (const s of (conImg || [])) {
+          for (const it of ((s.output_images || {})[output_key] || [])) {
+            if ((it.variations || []).length) índices.add(it.index)
+          }
+        }
+        if (índices.size >= esperadas && !índices.has(Number(item_index))) {
+          console.warn(`[img-origen] RECHAZADO: ${output_key} ya tiene ${índices.size}/${esperadas}`
+            + ` imágenes en la instancia y se pidió el índice ${item_index}, que es nuevo`)
+          return res.status(409).json({
+            success: false, error: 'output_already_rendered',
+            message: `"${output_key}" already has its ${índices.size} image(s) in this node. `
+              + 'They may live on another session of the same instance — open the node to see them. '
+              + 'To redo one, iterate on the image itself; a new slot would be a second render of the same output.',
+          })
+        }
+      }
+    }
+
     if (!outputDef?.image_gen) {
       return res.status(400).json({ success: false, error: `Output "${output_key}" no tiene image_gen habilitado` })
     }
