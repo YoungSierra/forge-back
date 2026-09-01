@@ -202,7 +202,28 @@ async function pendingImageOutputsForNode(project_id, node_id, isStale, node, pr
   }
   if (yaTienen.size) console.log(`[pendientes] ${node.node_key || node_id}: ya tienen imágenes → ${[...yaTienen].join(', ')}`)
 
-  return imgOuts.filter(o => !approved.has(o.key) && !yaTienen.has(o.key)).map(o => o.key)
+  // Un despacho EN VUELO también satisface. Las dos comprobaciones de arriba leen un estado que
+  // todavía no existe: el despacho por plan responde de inmediato —«Se responde YA, el trabajo
+  // sigue solo»— y escribe `output_images` cuando terminan los renders, medio minuto después.
+  // Quien pregunte en esa ventana recibe «sí, pendiente» y despacha encima. Medido el 01-09 en el
+  // 2.2: ocho URLs distintas para un output de cuatro imágenes — cuatro de `[img-plan]` con sus
+  // ids y cuatro de `[auto-run img]` sin nombre, treinta segundos más tarde. Ocho renders pagados.
+  //
+  // La ventana existe para que una corrida muerta no bloquee para siempre: pasada, el output
+  // vuelve a estar disponible y se puede reintentar.
+  const VENTANA_MIN = 15
+  const desde = new Date(Date.now() - VENTANA_MIN * 60_000).toISOString()
+  let qVuelo = db().from('forge_sessions').select('output_key, created_at')
+    .eq('project_id', project_id).eq('node_id', node_id).not('output_key', 'is', null)
+    .eq('status', 'active').gte('created_at', desde)
+  if (project_node_id) qVuelo = qVuelo.eq('project_node_id', project_node_id)
+  const { data: enVuelo } = await qVuelo
+  const despachando = new Set((enVuelo || []).map(s => s.output_key))
+  if (despachando.size) console.log(`[pendientes] ${node.node_key || node_id}: despacho en vuelo → ${[...despachando].join(', ')}`)
+
+  return imgOuts
+    .filter(o => !approved.has(o.key) && !yaTienen.has(o.key) && !despachando.has(o.key))
+    .map(o => o.key)
 }
 
 // ─── Ejecuta UN output de imagen como sesión per-output auto-aprobada (#8) ──────
@@ -1995,6 +2016,15 @@ router.post('/nodes/:node_id/sessions/:session_id/generate-item-image', async (r
   try {
     const { id: project_id, node_id, session_id } = req.params
     const { output_key, item_index, item_text, condition, message_id = null } = req.body
+
+    // Cada render cuesta, y el 01-09 el 2.2 pagó ocho para un output de cuatro: cuatro por el
+    // despacho del sobre —en su propia sesión, con sus ids— y cuatro más treinta segundos después
+    // en la sesión general, sin nombre. Leyendo el código no se puede decir quién pidió la segunda
+    // tanda, así que cada pedido deja dicho de dónde viene. Sin esto la próxima corrida vuelve a
+    // dejar el mismo rastro mudo.
+    console.log(`[img-origen] generate-item-image · nodo ${node_id.slice(0, 8)} · sesión ${String(session_id).slice(0, 8)}`
+      + ` · ${output_key}[${item_index}] · msg=${message_id ? String(message_id).slice(0, 8) : 'ninguno'}`
+      + ` · origen=${req.get('referer') || 'sin referer'}`)
 
     if (!output_key || item_index == null || !item_text?.trim()) {
       return res.status(400).json({ success: false, error: 'output_key, item_index y item_text son requeridos' })
