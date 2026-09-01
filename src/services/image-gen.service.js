@@ -178,6 +178,64 @@ function parseOutputItems(content, format, outputKey = null) {
   // Medido sobre las 33 respuestas de outputs de imagen de la base: 32 no cambian, 1 pasa de 8 a 1
   // ítem, ninguna sube.
   if (format === 'png' || format === 'image') {
+    // El sobre se busca SIN depender de los cercados. Emparejar ``` funciona hasta que el modelo
+    // abre un bloque y no lo cierra: ahí el número de marcas queda impar, todo el emparejamiento
+    // se corre y el sobre se vuelve invisible. Medido el 01-09 en el 2.2 — el modelo truncó su
+    // `concept_data` a mitad de una URL, la respuesta quedó con cinco marcas, y ni el back ni el
+    // front vieron las tres imágenes que el sobre declaraba con su id: el back despachó cuatro
+    // renders de las secciones del documento y el front ofreció seis huecos sacados de la prosa.
+    //
+    // Los cercados son decoración; el dato es el arreglo. Se ancla en la sección DEL OUTPUT y se
+    // lee el primer arreglo balanceado que venga después, cerrando por conteo de corchetes.
+    const sobreDeLaSeccion = () => {
+      if (!outputKey) return null
+      const esc = outputKey.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      const anc = new RegExp(`^#{1,4}[ \\t]+\\**\\s*${esc}\\b.*$`, 'im').exec(content)
+      if (!anc) return null
+      const desde = content.slice(anc.index + anc[0].length)
+
+      // No vale «el primer arreglo después del encabezado»: la sección del 2.4 abre con su tabla
+      // de paleta y una lista de tres hex, y esa se llevaba el cupo — a ComfyUI le habrían llegado
+      // «#E8930A», «#04060F» y «#7B2FBE» como prompts. Un sobre de imágenes se reconoce por lo que
+      // trae dentro: objetos con `prompt`/`image_prompt`/`depicts`. Se recorren todos los arreglos
+      // balanceados de la sección y se toma el PRIMERO que lo parezca.
+      const esSobre = v => Array.isArray(v) && v.length && v.some(o =>
+        o && typeof o === 'object' && !Array.isArray(o)
+        && ['prompt', 'image_prompt', 'depicts'].some(k => typeof o[k] === 'string' && o[k].trim().length >= 40))
+
+      for (let ini = desde.indexOf('['); ini !== -1; ini = desde.indexOf('[', ini + 1)) {
+        let nivel = 0
+        for (let i = ini; i < desde.length; i++) {
+          if (desde[i] === '[') nivel++
+          else if (desde[i] === ']' && --nivel === 0) {
+            try {
+              const v = JSON.parse(desde.slice(ini, i + 1))
+              if (esSobre(v)) return v
+            } catch { /* no era un arreglo legible; se prueba el siguiente */ }
+            break
+          }
+        }
+      }
+      return null
+    }
+    {
+      const arr = sobreDeLaSeccion()
+      if (arr) {
+        const items = arr.map(o => {
+          if (typeof o === 'string') return o
+          for (const campo of ['prompt', 'image_prompt', 'depicts']) {
+            const v = o?.[campo]
+            if (typeof v === 'string' && v.trim()) return v.trim()
+          }
+          return textoDeItem(o)
+        }).filter(x => String(x).trim())
+        if (items.length) {
+          console.log(`[img] ${outputKey}: sobre leído desde su propia sección — ${items.length} ítem(s)`)
+          return items
+        }
+      }
+    }
+
     const bloques = [...content.matchAll(/```(\w*)\s*([\s\S]*?)```/g)]
       .map(m => ({ lang: (m[1] || '').toLowerCase(), cuerpo: m[2] }))
     const cercados = [
@@ -264,14 +322,22 @@ function parseOutputItems(content, format, outputKey = null) {
     if (cercados.length) return cercados
   }
 
-  // Un output de imagen que YA emitió su sobre estructurado no admite adivinanzas. Si llegamos
-  // hasta acá con un arreglo de objetos cercado en la respuesta, es que el sobre existe pero
-  // ninguna entrada trae prompt: eso es un incumplimiento del contrato, y el motor tiene que
-  // decirlo, no inventar encargos. Abajo esperan lectores de prosa —viñetas, numeradas,
-  // encabezados— que se llevan CUALQUIER lista: el 2.2 emitió tres entradas con `subject` y
-  // `composition_notes` pero sin `prompt`, el sobre se descartó, y el enumerador por encabezado
-  // devolvió las dos secciones de la respuesta como si fueran sujetos. Se pagaron tres renders
-  // con el acta de decisión de prompt — de ahí la imagen que no se parecía a nada del plan.
+  // Un output de IMAGEN nunca saca sus prompts de la prosa. Si llegamos hasta acá, el sobre no se
+  // pudo leer, y lo que sigue abajo son lectores de prosa —viñetas, numeradas, encabezados— que se
+  // llevan CUALQUIER lista que encuentren. Eso no es un respaldo: es gasto en arte equivocado.
+  //
+  // Medido el 01-09 en el 2.2. El modelo abrió un bloque JSON y no lo cerró, así que la respuesta
+  // quedó con un número IMPAR de marcas de cercado y el emparejamiento se descolocó: ni el back ni
+  // el front encontraron el sobre. El back devolvió las cuatro secciones del documento como
+  // sujetos de imagen y despachó cuatro renders del texto del propio documento; el front devolvió
+  // seis, las mecánicas y las entradas del plan en prosa. Ninguno de los dos vio las tres imágenes
+  // que el sobre declaraba con su id.
+  //
+  // Lo que arregla el caso del 2.2 es el lector de arriba, que ya no depende de emparejar cercados.
+  // Esta compuerta se queda como estaba: solo corta cuando el sobre EXISTE y no se pudo usar.
+  // Probé hacerla incondicional y fue peor — medido sobre los 144 pares vivos, 46 se iban a cero,
+  // entre ellos `3.9 reference_images` (24 → 0) y `3.3 item_catalog_sheet` (14 → 0), que declaran
+  // sus imágenes en prosa por diseño. Matar la prosa para todos arreglaba un nodo y rompía tres.
   if (format === 'png' || format === 'image') {
     const traeSobre = [...content.matchAll(/```(\w*)\s*([\s\S]*?)```/g)].some(m => {
       try {
@@ -279,7 +345,10 @@ function parseOutputItems(content, format, outputKey = null) {
         return Array.isArray(v) && v.length && v.every(o => o && typeof o === 'object' && !Array.isArray(o))
       } catch { return false }
     })
-    if (traeSobre) return []
+    if (traeSobre) {
+      console.warn(`[img] ${outputKey || '(sin clave)'}: hay un sobre pero no se pudo usar — 0 ítems, no se adivina.`)
+      return []
+    }
   }
 
   // Entidades enumeradas por encabezado — antes que las viñetas, que se llevan cualquier lista.
