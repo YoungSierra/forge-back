@@ -3433,7 +3433,7 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
     // Va acá y no después porque el PDF se corta por la primera sección secundaria, y una sección
     // que aparece más tarde cambiaría dónde corta. Solo en corridas de nodo entero: una sesión
     // enfocada en un output no debe ponerse a producir a sus hermanos.
-    if (!targetOutputKey && replyText.trim().length > 400) {
+    if (!target_output_key && replyText.trim().length > 400) {
       replyText = await recuperarSeccionesFaltantes({
         node_id, replyText, outputDefs: allOutputDefs, executorStr,
       })
