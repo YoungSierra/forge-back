@@ -676,13 +676,23 @@ async function executeImageOutput({ project_id, node_id, targetOutputKey, member
         // Sin nadie esperando la respuesta, un fallo silencioso dejaría la sesión en `active`
         // para siempre y el front consultando sin fin. Se marca y se registra.
         console.error(`[deck] ${targetOutputKey} falló:`, e.message)
-        await db().from('forge_sessions').update({
-          status: 'abandoned', completed_at: new Date().toISOString(),
-        }).eq('id', session.id)
-        await db().from('forge_messages').insert({
-          session_id: session.id, role: 'agent', order_index: 0, tool_calls: [],
-          content: `The dispatch did not complete: ${e.message}`,
-        }).catch(() => {})
+        // Todo el manejador va protegido, y no por prolijidad: esto corre dentro del `.catch` de
+        // una promesa que nadie espera, así que lo que se escape acá es un rechazo sin dueño y
+        // Node tumba el proceso. Un despacho que falla debe dejar la sesión marcada, no matar el
+        // backend — el 01-09 el 3.20 se quejó de que le faltaba `pages` y se llevó el server.
+        try {
+          await db().from('forge_sessions').update({
+            status: 'abandoned', completed_at: new Date().toISOString(),
+          }).eq('id', session.id)
+          // `.catch()` sobre el builder de supabase no existe hasta que se await-ea: encadenarlo
+          // tiraba TypeError DENTRO del manejador de errores, que es el peor sitio posible.
+          await db().from('forge_messages').insert({
+            session_id: session.id, role: 'agent', order_index: 0, tool_calls: [],
+            content: `The dispatch did not complete: ${e.message}`,
+          })
+        } catch (e2) {
+          console.error(`[deck] ${targetOutputKey}: tampoco se pudo registrar el fallo:`, e2.message)
+        }
       })
 
       // Se responde YA. El trabajo sigue solo y su avance se lee en la sesión.
