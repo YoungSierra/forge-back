@@ -1325,8 +1325,30 @@ router.get('/', async (req, res, next) => {
       }
     }
 
+    // Qué outputs de imagen son DECKS. El front no puede saberlo —la marca vive en
+    // `comfyui_workflows.inject_config.mode`, no en la DNA— y sin saberlo ofrece generar página
+    // por página algo que solo se despacha entero: el 01-09 el 3.20 disparó siete pedidos para
+    // `gdd_art_style_images`, un deck de 21, y el motor los rechazó los siete. No costó dinero,
+    // pero el usuario vio siete errores donde no había nada que hacer.
+    //
+    // Tabla de configuración global, no del proyecto: va por service-role y no por `asUser`.
+    const { data: wfTodos } = await db().from('comfyui_workflows').select('name, inject_config')
+    const decks = new Set((wfTodos || [])
+      .filter(w => {
+        const ic = typeof w.inject_config === 'string' ? (() => { try { return JSON.parse(w.inject_config) } catch { return null } })() : w.inject_config
+        return ic?.mode === 'per_page'
+      })
+      .map(w => w.name))
+
     const nodes = (projectNodes || []).map(pn => {
       const nodeType     = pn.node_type || 'forge_node'
+      // Se anota sobre la copia que va en la respuesta; la DNA no se toca.
+      if (Array.isArray(pn.forge_nodes?.outputs)) {
+        pn.forge_nodes.outputs = pn.forge_nodes.outputs.map(o => {
+          const m = String(o?.image_gen_model || '')
+          return m.startsWith('comfyui:') && decks.has(m.slice('comfyui:'.length)) ? { ...o, deck: true } : o
+        })
+      }
       const session      = nodeType === 'forge_node'
         ? (sessionsByPNodeId[pn.id] || sessionsByNodeId[pn.node_id] || null)
         : null
