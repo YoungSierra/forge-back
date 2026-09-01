@@ -185,7 +185,24 @@ async function pendingImageOutputsForNode(project_id, node_id, isStale, node, pr
   const { data: outSess } = await qOut
   const approved = new Set((outSess || []).map(s => s.output_key))
 
-  return imgOuts.filter(o => !approved.has(o.key)).map(o => o.key)
+  // Un output que YA TIENE SUS IMÁGENES no está pendiente, esté donde esté la sesión que las
+  // guarda y sea cual sea su estado. Mirando solo el estado, una sesión general todavía `active`
+  // —porque nadie apretó Accept— dejaba el output como pendiente y se despachaba otra vez encima
+  // de imágenes que ya existían. Medido el 01-09 en el 1.1: tres imágenes colgando de la sesión
+  // general y cuatro más de la per-output, siete renders pagados por un output de cuatro.
+  let qImg = db().from('forge_sessions').select('output_images')
+    .eq('project_id', project_id).eq('node_id', node_id).not('output_images', 'is', null)
+  if (project_node_id) qImg = qImg.eq('project_node_id', project_node_id)
+  const { data: conImg } = await qImg
+  const yaTienen = new Set()
+  for (const s of (conImg || [])) {
+    for (const [clave, items] of Object.entries(s.output_images || {})) {
+      if ((items || []).some(i => (i.variations || []).length > 0)) yaTienen.add(clave)
+    }
+  }
+  if (yaTienen.size) console.log(`[pendientes] ${node.node_key || node_id}: ya tienen imágenes → ${[...yaTienen].join(', ')}`)
+
+  return imgOuts.filter(o => !approved.has(o.key) && !yaTienen.has(o.key)).map(o => o.key)
 }
 
 // ─── Ejecuta UN output de imagen como sesión per-output auto-aprobada (#8) ──────
@@ -492,7 +509,15 @@ async function pedirSoloElSobre({ node_id, targetOutputKey, contenido, executorS
   }
 }
 
-async function executeImageOutput({ project_id, node_id, targetOutputKey, member_id, project_node_id = null }) {
+// `respuestaPrevia` es el texto que el nodo ACABA de producir. Corriendo el nodo entero, el
+// post-paso llama aquí para despachar cada output de imagen — y sin esto se le volvía a pedir al
+// modelo lo que había escrito un minuto antes: una llamada completa de más por output.
+//
+// No era solo el gasto. La segunda respuesta trae OTRA lista: medido el 01-09 en el 1.1, la
+// primera enumeró 3 semillas y la segunda 4, así que el proyecto quedó con dos tandas de imágenes
+// distintas del mismo output —tres colgando de la sesión general y cuatro de la del output— y
+// siete renders de ComfyUI pagados donde correspondían cuatro.
+async function executeImageOutput({ project_id, node_id, targetOutputKey, member_id, project_node_id = null, respuestaPrevia = null }) {
   const { buildSystemPrompt, runReActLoop } = require('../services/canvas-chat.service')
   const { logExecution } = require('../services/execution-log.service')
   const { parseOutputItems, generateOneImage, esDeck, generateDeck } = require('../services/image-gen.service')
@@ -778,24 +803,40 @@ async function executeImageOutput({ project_id, node_id, targetOutputKey, member
     return { output_key: targetOutputKey, session_id: session.id, asset_id: null, dispatched: true, expected: planos.length }
   }
 
-  const { finalSystemPrompt, baseUserMsg, executorStr, activeTools, resolvedInputs, visualRefs, node, targetOutput } =
-    await buildSystemPrompt(db, { projectId: project_id, nodeId: node_id, sessionId: session.id, userMessage, targetOutputKey, projectNodeId: project_node_id })
+  // Con la respuesta ya en la mano, lo único que falta del modelo es NADA: los ítems están
+  // escritos. Se salta la llamada entera — prompt, skills, inputs resueltos y todo.
+  const reusa = typeof respuestaPrevia === 'string' && respuestaPrevia.trim().length > 0
 
-  const { replyText, allToolCalls, meta } = await runReActLoop({
-    finalSystemPrompt, baseUserMsg, executorStr, activeTools, resolvedInputs, visualRefs,
-    projectId: project_id, nodeId: node_id, nodeName: node.title,
-    sessionId: session.id, targetOutput,
-  })
+  let replyText, allToolCalls = [], meta = null, node
+  if (reusa) {
+    const { data: dnaNodo } = await db().from('forge_nodes')
+      .select('id, node_key, title, outputs').eq('id', node_id).single()
+    node = dnaNodo
+    replyText = respuestaPrevia
+    console.log(`[img] ${targetOutputKey}: se reusa la respuesta del nodo (${replyText.length} chars) — sin segunda llamada al modelo`)
+  } else {
+    const armado = await buildSystemPrompt(db, { projectId: project_id, nodeId: node_id, sessionId: session.id, userMessage, targetOutputKey, projectNodeId: project_node_id })
+    node = armado.node
+    const r = await runReActLoop({
+      finalSystemPrompt: armado.finalSystemPrompt, baseUserMsg: armado.baseUserMsg,
+      executorStr: armado.executorStr, activeTools: armado.activeTools,
+      resolvedInputs: armado.resolvedInputs, visualRefs: armado.visualRefs,
+      projectId: project_id, nodeId: node_id, nodeName: armado.node.title,
+      sessionId: session.id, targetOutput: armado.targetOutput,
+    })
+    replyText = r.replyText; allToolCalls = r.allToolCalls; meta = r.meta
 
-  // Log del run LLM (no bloqueante)
-  try { logExecution({
-    project_id, node_id, session_id: session.id, triggered_by: member_id || null,
-    trigger_type: 'auto_run', executor_type: 'llm',
-    provider: meta?.provider || null, model: meta?.model || null,
-    tokens: meta?.tokens_used || null, duration_ms: meta?.duration_ms || null,
-    started_at: new Date(Date.now() - (meta?.duration_ms || 0)).toISOString(),
-    status: 'success', metadata: { node_key: node.node_key, output_key: targetOutputKey },
-  }) } catch (logErr) { console.error('[auto-run img] logExecution failed (non-fatal):', logErr.message) }
+    // Log del run LLM (no bloqueante). Solo cuando HUBO run: registrar una llamada que no ocurrió
+    // inflaba el gasto del proyecto y el conteo de corridas del nodo.
+    try { logExecution({
+      project_id, node_id, session_id: session.id, triggered_by: member_id || null,
+      trigger_type: 'auto_run', executor_type: 'llm',
+      provider: meta?.provider || null, model: meta?.model || null,
+      tokens: meta?.tokens_used || null, duration_ms: meta?.duration_ms || null,
+      started_at: new Date(Date.now() - (meta?.duration_ms || 0)).toISOString(),
+      status: 'success', metadata: { node_key: node.node_key, output_key: targetOutputKey },
+    }) } catch (logErr) { console.error('[auto-run img] logExecution failed (non-fatal):', logErr.message) }
+  }
 
   await db().from('forge_messages').insert({ session_id: session.id, role: 'human', content: userMessage, order_index: 0, tool_calls: [] })
   const { data: msgAgente } = await db().from('forge_messages')
@@ -3471,7 +3512,7 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
         // Sin esperar, como el deck: cuatro renders de ComfyUI no caben en una petición del
         // navegador. El front sigue el avance en `output_images` de la sesión de cada output.
         for (const key of aDespachar) {
-          executeImageOutput({ project_id, node_id, targetOutputKey: key, member_id, project_node_id: currentPNode.id })
+          executeImageOutput({ project_id, node_id, targetOutputKey: key, member_id, project_node_id: currentPNode.id, respuestaPrevia: replyText })
             .catch(async e => {
               // Un fallo acá no lo espera nadie: la primera vez dejó una sesión `active` con CERO
               // mensajes y el front consultando un avance que nunca iba a llegar. Se marca y se
