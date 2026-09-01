@@ -929,6 +929,27 @@ function migrateOutputImages(raw) {
   return result
 }
 
+// Une dos mapas de output_images SIN pisar arreglos enteros. `Object.assign` reemplaza la lista
+// completa de una clave, así que la sesión que llegara última borraba lo que había hecho la otra:
+// el 2.2 tenía tres imágenes en su sesión enfocada y una en la general, y el chat enseñaba solo
+// una — dos huecos vacíos con las imágenes ya renderizadas al lado. Quien apretaba ✦ pagaba un
+// render que ya existía. Se une por (clave, índice) y gana la entrada con más variaciones; a
+// igualdad, la que ya estaba.
+function unirOutputImages(base, extra) {
+  const out = { ...(base || {}) }
+  for (const [clave, lista] of Object.entries(extra || {})) {
+    if (!Array.isArray(lista)) { out[clave] = lista; continue }
+    const porIndice = new Map((out[clave] || []).map(it => [it.index, it]))
+    for (const it of lista) {
+      const previo = porIndice.get(it.index)
+      const gana = !previo || (it.variations?.length ?? 0) > (previo.variations?.length ?? 0)
+      if (gana) porIndice.set(it.index, previo ? { ...previo, ...it } : it)
+    }
+    out[clave] = [...porIndice.values()].sort((a, b) => (a.index ?? 0) - (b.index ?? 0))
+  }
+  return out
+}
+
 // ─── Normalización post-generación de secciones estructuradas ────────────────
 
 // Normaliza listas estructuradas a bullets "- item" para renderizado consistente
@@ -2349,10 +2370,10 @@ router.get('/nodes/:node_id/session', async (req, res, next) => {
       }
 
       // Merge de output_images de todas las per-output sessions
-      const allOutputImages = {}
+      let allOutputImages = {}
       for (const ps of perOutSessions) {
         if (ps.output_images) {
-          Object.assign(allOutputImages, migrateOutputImages(ps.output_images))
+          allOutputImages = unirOutputImages(allOutputImages, migrateOutputImages(ps.output_images))
         }
       }
 
@@ -2487,9 +2508,9 @@ router.get('/nodes/:node_id/session', async (req, res, next) => {
     const { data: perOutForMerge } = await qMerge
 
     if (perOutForMerge?.length) {
-      const merged = { ...(session.output_images ?? {}) }
+      let merged = { ...(session.output_images ?? {}) }
       for (const ps of perOutForMerge) {
-        if (ps.output_images) Object.assign(merged, migrateOutputImages(ps.output_images))
+        if (ps.output_images) merged = unirOutputImages(merged, migrateOutputImages(ps.output_images))
       }
       session = { ...session, output_images: Object.keys(merged).length ? merged : session.output_images }
     }
