@@ -234,10 +234,28 @@ function parseOutputItems(content, format, outputKey = null) {
     {
       const arr = sobreDeLaSeccion()
       if (arr) {
+        // Una entrada que trae URL y no trae prompt NO es un encargo: es una REFERENCIA a arte que
+        // ya existe. El 2.4 —Visual Convergence— no genera nada: converge el arte aprobado del 2.2
+        // y su sobre es un manifiesto `{ role, url, source }`. Sin distinguirlo, el motor lo trató
+        // como tres encargos y le mandó a ComfyUI la URL COMO TEXTO: medido el 02-09, el prompt de
+        // una de las imágenes era literalmente «role: splash_art_wide  url: https://…png».
+        //
+        // Es la misma regla que v2.9.27 le puso al sobre por el lado de la DNA —«no URL, no path
+        // dentro del bloque; el sobre transporta ids y texto de prompt»—, aplicada acá para los
+        // nodos que ese delta todavía no cubre.
+        const esReferencia = o => o && typeof o === 'object'
+          && ['url', 'path', 'src', 'image_url'].some(k => typeof o[k] === 'string' && /^(https?:|\/)/.test(o[k].trim()))
+          && !['prompt', 'image_prompt'].some(k => typeof o[k] === 'string' && o[k].trim())
+        const refs = arr.filter(esReferencia).length
+        if (refs) {
+          console.warn(`[img] ${outputKey}: ${refs} de ${arr.length} entrada(s) son REFERENCIAS a arte ya existente`
+            + ' (traen url y no prompt) — no se renderizan.')
+        }
+
         // Un `prompt` declarado va tal cual. Sin él, la entrada se arma con sus campos —sujeto,
         // composición, ánimo, paleta— que es exactamente lo que describe la imagen; serializar el
         // objeto entero le mandaría llaves y comillas al modelo de imagen.
-        const items = arr.map(o => {
+        const items = arr.filter(o => !esReferencia(o)).map(o => {
           if (typeof o === 'string') return o
           for (const campo of ['prompt', 'image_prompt']) {
             const v = o?.[campo]
@@ -248,6 +266,12 @@ function parseOutputItems(content, format, outputKey = null) {
         if (items.length) {
           console.log(`[img] ${outputKey}: sobre leído desde su propia sección — ${items.length} ítem(s)`)
           return items
+        }
+        // Sobre entero de referencias: el output no encarga nada. Cero, y se corta acá — dejarlo
+        // seguir lo mandaría a los lectores de prosa, que ilustrarían el documento.
+        if (refs === arr.length) {
+          console.log(`[img] ${outputKey}: el sobre son ${refs} referencia(s) a arte existente — 0 encargos.`)
+          return []
         }
       }
     }
