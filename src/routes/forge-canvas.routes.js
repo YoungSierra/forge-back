@@ -900,6 +900,30 @@ async function executeImageOutput({ project_id, node_id, targetOutputKey, member
       if (eMsg) console.warn('[img-plan] sin historial por mensaje:', eMsg.message)
     }
 
+    // ── Una fila de asset por imagen ──────────────────────────────────────────────────────────
+    // Este camino escribía `output_images` y nada más, y devolvía `asset_id: null`. Las imágenes
+    // existían pero NO como assets, y eso las deja invisibles en los dos sitios que importan: el
+    // modal de output del nodo y los nodos de abajo, que buscan filas png en `forge_assets`.
+    //
+    // Medido el 02-09 en el 2.2: el sobre despachó dev_01..dev_04 —las buenas, con sus prompts—
+    // y el modal mostraba OTRAS cuatro, las del despacho duplicado, que sí habían creado assets
+    // por el otro camino. Chat y modal enseñando lotes distintos, y el bueno era el que no se veía.
+    //
+    // El nombre lleva el id de la imagen, que es el mismo que el documento pone en su ancla.
+    let primerAsset = null
+    for (const r of listos) {
+      const { data: a, error: eA } = await db().from('forge_assets').insert({
+        node_id, project_id, session_id: session.id,
+        name: `${dnaP?.title || 'Output'} — ${r.id}`,
+        format: 'png', status: 'approved', storage_url: r.url,
+        approved_by: member_id || null, approved_at: new Date().toISOString(),
+      }).select('id').single()
+      if (eA) { console.warn(`[img-plan] ${r.id}: sin fila de asset — ${eA.message}`); continue }
+      if (!primerAsset) primerAsset = a?.id || null
+    }
+    if (primerAsset) await db().from('forge_sessions').update({ output_asset_id: primerAsset }).eq('id', session.id)
+    console.log(`[img-plan] ${targetOutputKey}: ${listos.length} imagen(es) · ${listos.length ? 'assets creados' : 'sin assets'}`)
+
     // ── Rehacer el documento con las imágenes dentro ───────────────────────────────────────────
     // El PDF se arma DENTRO de la corrida del texto, segundos antes de que exista la primera
     // imagen: sale con los `[ IMAGE: … ]` impresos y su enlace queda escrito en el mensaje.
