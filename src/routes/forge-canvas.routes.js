@@ -1022,6 +1022,29 @@ async function executeImageOutput({ project_id, node_id, targetOutputKey, member
 
   // DNA del output + parseo de ítems (el conteo lo dicta el contenido, no se hardcodea)
   const outDef = (Array.isArray(node.outputs) ? node.outputs : []).find(o => (o.key || o.name) === targetOutputKey)
+
+  // Si la respuesta trae secciones de OTROS outputs pero NO la de éste, el output no se emitió —
+  // y entonces no hay nada que parsear. Sin esta comprobación se cae a los lectores de prosa y se
+  // ilustra el documento: medido el 01-09 en el 2.2, el modelo no emitió `## development_images`,
+  // el motor volvió a preguntar, recibió el documento entero y pagó tres renders sacados de su
+  // prosa — sin nombre, sin corresponder a ninguna de las anclas.
+  //
+  // Solo aplica cuando el SECTION CONTRACT está en juego: si la respuesta no trae NINGUNA sección
+  // con clave, es un nodo que no lo usa y se sigue como siempre.
+  {
+    const { extractSection } = require('../utils/extract-section')
+    const claves = (Array.isArray(node.outputs) ? node.outputs : []).map(o => o.key || o.name).filter(Boolean)
+    const conSeccion = claves.filter(k => extractSection(replyText || '', k, claves.filter(x => x !== k)))
+    if (conSeccion.length && !conSeccion.includes(targetOutputKey)) {
+      console.warn(`[auto-run img] ${targetOutputKey}: la respuesta emite ${conSeccion.join(', ')} pero NO este output.`
+        + ' No se ilustra el documento: 0 imágenes.')
+      await db().from('forge_sessions').update({
+        status: 'auto_approved', completed_at: new Date().toISOString(), iteration_count: 1,
+      }).eq('id', session.id)
+      return { output_key: targetOutputKey, session_id: session.id, asset_id: null, images: 0 }
+    }
+  }
+
   const items  = parseOutputItems(replyText || '', outDef?.format || 'png', targetOutputKey)
 
   // Generar 1 imagen por ítem en paralelo (acota latencia en runs por tiers)
