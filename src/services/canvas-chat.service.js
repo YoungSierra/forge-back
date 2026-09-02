@@ -605,7 +605,41 @@ async function buildSystemPrompt(db, { projectId, nodeId, sessionId, userMessage
   // Fecha actual para el LLM (mismo criterio que el handler de chat): evita que use su corte de
   // entrenamiento en afirmaciones time-sensitive (ej. "as of June 2025" en un scan competitivo).
   const dateBlock = `The current date is ${new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })}. Use it as "today" for any time-sensitive or recency statement (market data, "as of", "current year", competitive scans); do NOT rely on your training cutoff.`
-  const systemPrompt = [dateBlock, layer1, ...layer2Parts, toolsBlock, getDocPolicyBlock(activeTools)].filter(Boolean).join('\n\n')
+  // ── De qué juego estamos hablando, ANTES de las plantillas ──────────────────────────────────
+  //
+  // Los skills se cargan en `layer1` y los datos del proyecto van después. En el 2.5 eso son 38.826
+  // caracteres de plantillas genéricas de deck antes de que el modelo se entere de qué juego es:
+  // `concept_data` empezaba en el carácter 49.813 de 75.587. Íntegro, sin truncar, con 35
+  // menciones de «medusa» — y el modelo igual se quedó con el título «Atelier of Bells» y escribió
+  // un simulador de fundición de campanas, con su paleta de bronce y Unreal 5.
+  //
+  // No es cosa de un modelo: cualquiera que lea cincuenta mil caracteres de instrucciones antes
+  // del tema va a rellenar. Se antepone la identidad en unas líneas. Sale de los inputs ya
+  // resueltos —no se vuelve a consultar nada— y si no hay de dónde, no se pone nada.
+  const anclaIdentidad = (() => {
+    const CAMPOS = ['title', 'one_liner', 'elevator_line', 'genre', 'setting', 'core_fantasy', 'palette']
+    for (const bloque of resolvedInputs) {
+      const m = /\{[\s\S]*\}/.exec(String(bloque || ''))
+      if (!m) continue
+      let o = null
+      try { o = JSON.parse(m[0]) } catch { continue }
+      if (!o || typeof o !== 'object' || !o.title) continue
+      const lineas = []
+      for (const k of CAMPOS) {
+        const v = o[k] ?? o.fact_sheet?.[k]
+        if (typeof v === 'string' && v.trim()) lineas.push(`${k.replace(/_/g, ' ')}: ${v.trim().slice(0, 300)}`)
+        else if (Array.isArray(v) && v.length) lineas.push(`${k.replace(/_/g, ' ')}: ${v.filter(x => typeof x === 'string').join(' · ').slice(0, 300)}`)
+      }
+      if (lineas.length < 2) continue
+      return '## The game this node is working on\n'
+        + 'Everything below — templates, grammars, examples — is generic. THIS is the game. If any\n'
+        + 'instruction and these facts disagree, these facts win. Never infer the game from its title.\n\n'
+        + lineas.join('\n')
+    }
+    return ''
+  })()
+
+  const systemPrompt = [dateBlock, anclaIdentidad, layer1, ...layer2Parts, toolsBlock, getDocPolicyBlock(activeTools)].filter(Boolean).join('\n\n')
 
   const finalSystemPrompt = attachmentParts.length
     ? systemPrompt + '\n\n## Attached references\n' + attachmentParts.join('\n\n')
