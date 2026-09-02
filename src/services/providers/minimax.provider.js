@@ -175,7 +175,14 @@ async function callMinimax(systemPrompt, userMessage, options = {}) {
     max_tokens: options.maxOutputTokens || 8192,
     messages: [
       { role: 'system', content: effectiveSystem },
-      { role: 'user',   content: effectiveUser },
+      // Bloques de vision cuando hay imagenes; el string de siempre cuando no. MiniMax habla el
+      // mismo esquema que OpenAI, comprobado el 02-09 contra su API: se le mando una imagen del
+      // proyecto y describio sus paneles uno por uno. Hasta hoy no estaba en la lista de
+      // proveedores con vision, asi que cada imagen se descartaba y al modelo le llegaba solo la
+      // URL como texto — once referencias tiradas en una sola corrida del 2.5.
+      { role: 'user',   content: options.images?.length
+        ? require('../vision.format').contenidoOpenAI(options.images, effectiveUser)
+        : effectiveUser },
     ],
   }
 

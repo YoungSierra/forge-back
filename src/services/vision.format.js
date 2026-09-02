@@ -10,7 +10,11 @@
 // día que uno cambie su API haya un solo lugar donde mirar.
 
 /** Proveedores capaces de recibir imágenes. Los que no están reciben solo texto. */
-const CON_VISION = new Set(['anthropic', 'openai', 'openrouter', 'gemini', 'groq', 'together'])
+// MiniMax entro el 02-09. Su API es compatible con OpenAI y acepta el mismo bloque `image_url`:
+// comprobado contra su endpoint con una imagen real del proyecto — la describio panel por panel.
+// Mientras estuvo fuera, cada nodo que corria con MiniMax recibia solo la URL como texto, y eso
+// es todo el arte aprobado que 2.1, 2.2, 3.9 y 3.20 usan como referencia visual.
+const CON_VISION = new Set(['anthropic', 'openai', 'openrouter', 'gemini', 'groq', 'together', 'minimax'])
 
 const soportaVision = proveedor => CON_VISION.has(proveedor)
 
