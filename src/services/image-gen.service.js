@@ -434,9 +434,25 @@ function parseOutputItems(content, format, outputKey = null) {
     .filter(p => /^[A-Za-z][A-Za-z ]*[ \t]+\d{1,4}/.test(p) && p.length > 40)
   if (seedBlocks.length > 1) return seedBlocks
 
-  // Fallback: el contenido completo es un solo prompt → 1 imagen
+  // Fallback: el contenido completo es un solo prompt → 1 imagen.
+  //
+  // Pero solo si el contenido PUEDE ser un prompt. Este último recurso es el que manda a ComfyUI
+  // el reporte de una herramienta cuando el modelo no produjo el output: medido el 02-09 en el
+  // 2.5, la respuesta entera eran 196 caracteres —«The investor deck is ready: [Download the
+  // PowerPoint presentation](…pptx)»— y eso fue el prompt de la lámina.
+  //
+  // Un prompt de imagen no es un enlace de descarga ni cabe en dos líneas. Medido sobre los 392
+  // pares vivos con ítems: 342 siguen pasando, 50 se cortan — reportes de descarga, resúmenes de
+  // despacho y respuestas del tipo «necesito que me describas tu concepto». Ninguno era arte.
   const trimmed = content.trim()
-  return trimmed ? [trimmed.slice(0, 700)] : []
+  if (!trimmed) return []
+  const ENLACE = /\[[^\]]*\]\(https?:\/\/[^)]+\.(?:pptx|pdf|docx|md|png|jpe?g)\)/i
+  if (trimmed.length < 300 || ENLACE.test(trimmed)) {
+    console.warn(`[img] ${outputKey || '(sin clave)'}: la respuesta no es un prompt`
+      + ` (${trimmed.length} chars${ENLACE.test(trimmed) ? ', con enlace de descarga' : ''}) — 0 ítems.`)
+    return []
+  }
+  return [trimmed.slice(0, 700)]
 }
 
 // ─── ¿El contenido trae ENTIDADES, o es un documento suelto? ──────────────────
