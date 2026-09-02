@@ -518,7 +518,12 @@ async function pedirSoloElSobre({ node_id, targetOutputKey, contenido, executorS
 
   try {
     const res = await callLLM(sistema, String(contenido).slice(0, 60000), {
-      model: executorStr || 'anthropic:claude-sonnet-4-6', rawText: true, temperature: 0.4, maxOutputTokens: 4000,
+      // Presupuesto de salida generoso a proposito. Un modelo de razonamiento gasta parte del
+      // cupo pensando y, si se queda corto, la respuesta NO empieza: devuelve cadena vacia sin
+      // error. Medido el 02-09 pidiendo `visual_pitch_plan` a MiniMax-M3: con 8.000 volvio vacio
+      // tras 100 segundos; con 16.000 entrego la seccion entera. Vacio no significaba que el
+      // modelo no supiera, significaba que no le dejamos sitio.
+      model: executorStr || 'anthropic:claude-sonnet-4-6', rawText: true, temperature: 0.4, maxOutputTokens: 16000,
     })
     const texto = typeof res === 'string' ? res : (res?.data ?? res?.text ?? '')
     const r = promptsDelSobre(texto, targetOutputKey)
@@ -571,7 +576,12 @@ async function pedirSeccionFaltante({ node_id, targetOutputKey, contenido, execu
 
   try {
     const res = await callLLM(sistema, String(contenido).slice(0, 60000), {
-      model: executorStr || 'anthropic:claude-sonnet-4-6', rawText: true, temperature: 0.4, maxOutputTokens: 8000,
+      // Presupuesto de salida generoso a proposito. Un modelo de razonamiento gasta parte del
+      // cupo pensando y, si se queda corto, la respuesta NO empieza: devuelve cadena vacia sin
+      // error. Medido el 02-09 pidiendo `visual_pitch_plan` a MiniMax-M3: con 8.000 volvio vacio
+      // tras 100 segundos; con 16.000 entrego la seccion entera. Vacio no significaba que el
+      // modelo no supiera, significaba que no le dejamos sitio.
+      model: executorStr || 'anthropic:claude-sonnet-4-6', rawText: true, temperature: 0.4, maxOutputTokens: 16000,
     })
     let texto = String(typeof res === 'string' ? res : (res?.data ?? res?.text ?? '')).trim()
     if (!texto) return null
