@@ -961,6 +961,9 @@ async function runReActLoop({ finalSystemPrompt, baseUserMsg, executorStr, activ
   const { parseToolCalls, executeTool }      = require('./tools.service')
 
   const MAX_TOOL_ITERS = 5
+  // Lo ya ejecutado en ESTA corrida, por firma. Vive fuera del bucle: el modelo puede repetir
+  // la misma llamada en iteraciones distintas, no solo dentro de una.
+  const yaEjecutadas = new Map()
   let currentUserMsg   = baseUserMsg
   let replyText        = ''
   let allToolCalls     = []
@@ -994,7 +997,31 @@ async function runReActLoop({ finalSystemPrompt, baseUserMsg, executorStr, activ
 
     const toolResultParts = []
     for (const tc of calls) {
+      // ── Una herramienta no se ejecuta dos veces por lo mismo en la misma corrida ──────────────
+      //
+      // El bucle ejecutaba cada llamada que el modelo emitiera, sin memoria. Medido el 02-09 en el
+      // 2.5: trece `doc_gen_pptx` seguidos, uno cada dos o tres segundos, trece PPTX de doce
+      // diapositivas — y el modelo aún no había escrito su respuesta. El resultado que se le
+      // devuelve ya le dice «no repitas el contenido»; la instrucción no bastó.
+      //
+      // Los generadores de documento se limitan a UNO por corrida: un nodo produce un documento
+      // por output, y una segunda llamada es el modelo repitiéndose, no un segundo documento. Las
+      // demás herramientas se deduplican por argumentos, que es lo que distingue «otra búsqueda»
+      // de «la misma búsqueda otra vez».
+      const esDoc = /^doc_gen_/.test(tc.tool)
+      const firma = esDoc ? `doc:${tc.tool}` : `${tc.tool}:${JSON.stringify(tc.args ?? {})}`
+      if (yaEjecutadas.has(firma)) {
+        const previo = yaEjecutadas.get(firma)
+        console.warn(`[react] ${tc.tool}: repetida en la misma corrida — se reusa el resultado anterior`
+          + `${previo?.url ? ` (${previo.url.slice(-28)})` : ''}`)
+        allToolCalls.push({ ...tc, result: previo, reused: true })
+        toolResultParts.push(`<tool_result tool="${tc.tool}">\nAlready generated in this run. `
+          + `Reuse this: ${previo?.url || JSON.stringify(previo)}\nDo not call this tool again.\n</tool_result>`)
+        continue
+      }
+
       const toolResult = await executeTool(tc.tool, tc.args, { project_id: projectId, node_id: nodeId })
+      yaEjecutadas.set(firma, toolResult)
       allToolCalls.push({ ...tc, result: toolResult })
 
       let resultText = JSON.stringify(toolResult, null, 2)

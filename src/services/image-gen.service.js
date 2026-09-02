@@ -209,8 +209,18 @@ function parseOutputItems(content, format, outputKey = null) {
       // entradas son objetos, y cada una se identifica y se describe. Un `id` y un texto con
       // cuerpo suficiente para ser una imagen. La lista de paleta del 2.4 —tres cadenas de hex
       // sueltas— no pasa: ni son objetos ni tienen id.
-      const describe = o => Object.entries(o).some(([k, v]) =>
+      // «Se describe» cuenta también un nivel hacia adentro. El 2.5 puso toda la descripción en
+      // `fills` —un objeto con título, subtítulo, zonas y paleta— y en el primer nivel solo quedaban
+      // etiquetas cortas: `placement: "sheet"`, `format: "vertical_portrait"`. Mirando solo la
+      // superficie, un sobre perfectamente descriptivo parecía metadatos y se descartaba.
+      const textoLargo = o => Object.entries(o).some(([k, v]) =>
         k !== 'id' && typeof v === 'string' && v.trim().length >= 40)
+      const describe = o => textoLargo(o) || Object.entries(o).some(([k, v]) =>
+        k !== 'id' && v && typeof v === 'object' && !Array.isArray(v) && textoLargo(v))
+      // Trae URL y no trae prompt: es una referencia a arte que ya existe, no un encargo.
+      const esReferenciaSobre = o => o && typeof o === 'object'
+        && ['url', 'path', 'src', 'image_url'].some(k => typeof o[k] === 'string' && /^(https?:|\/)/.test(o[k].trim()))
+        && !['prompt', 'image_prompt'].some(k => typeof o[k] === 'string' && o[k].trim())
       const esSobre = v => Array.isArray(v) && v.length
         && v.every(o => o && typeof o === 'object' && !Array.isArray(o))
         && v.filter(o => typeof o.id === 'string' && o.id.trim()).length >= Math.ceil(v.length / 2)
@@ -223,8 +233,36 @@ function parseOutputItems(content, format, outputKey = null) {
           else if (desde[i] === ']' && --nivel === 0) {
             try {
               const v = JSON.parse(desde.slice(ini, i + 1))
-              if (esSobre(v)) return v
+              // Un candidato hecho SOLO de referencias no es el sobre: es el inventario de arte
+              // aprobado que la seccion cita. El 2.5 lleva una lista `{id, role, url, anchor}` de
+              // cuatro imagenes antes de su sobre real, y quedarse con ella devolvia cero con el
+              // sobre legible unas lineas mas abajo. Se sigue buscando.
+              if (esSobre(v) && !v.every(esReferenciaSobre)) return v
             } catch { /* no era un arreglo legible; se prueba el siguiente */ }
+            break
+          }
+        }
+      }
+
+      // Un output de UNA imagen puede emitir el objeto suelto en vez de un arreglo de uno. Es la
+      // misma variación de forma que ya absorbemos por dentro: el 2.5 emitió
+      // `{ "image_emission": { id, placement, fills: {…} } }` y el lector, que solo miraba
+      // arreglos, no encontró nada — cero imágenes con un sobre perfectamente legible delante.
+      //
+      // Se acepta el objeto y se desenvuelve una capa si viene envuelto en una clave única. Se
+      // exige lo mismo que a una entrada de arreglo: que se identifique y que se describa.
+      for (let ini = desde.indexOf('{'); ini !== -1; ini = desde.indexOf('{', ini + 1)) {
+        let nivel = 0
+        for (let i = ini; i < desde.length; i++) {
+          if (desde[i] === '{') nivel++
+          else if (desde[i] === '}' && --nivel === 0) {
+            try {
+              let v = JSON.parse(desde.slice(ini, i + 1))
+              // `{ image_emission: {…} }` → la entrada está una capa adentro.
+              const claves = v && typeof v === 'object' && !Array.isArray(v) ? Object.keys(v) : []
+              if (claves.length === 1 && v[claves[0]] && typeof v[claves[0]] === 'object' && !Array.isArray(v[claves[0]])) v = v[claves[0]]
+              if (esSobre([v]) && !esReferenciaSobre(v)) return [v]
+            } catch { /* no era éste; se prueba el siguiente */ }
             break
           }
         }
