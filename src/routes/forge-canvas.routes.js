@@ -2300,15 +2300,28 @@ router.post('/nodes/:node_id/sessions/:session_id/generate-item-image', async (r
         if (sesión?.project_node_id) q = q.eq('project_node_id', sesión.project_node_id)
         const { data: conImg } = await q
 
+        // Se separa lo que hay en TODA la instancia de lo que hay en la sesión que pide. Iterar
+        // —el radial, que versiona— trabaja sobre una imagen que ESTA sesión ya tiene: agrega una
+        // variación al mismo índice. Un despacho duplicado, en cambio, llega desde otra sesión y
+        // pide índices que allá no existen aunque existan en la vecina.
+        //
+        // Mirando solo «¿el índice ya existe?» los dos casos se ven igual, y por ahí se coló el
+        // duplicado del 02-09: el motor despachó dev_01..dev_04 a las 15:31:37 y veintitrés
+        // segundos después entraron otras cuatro, con los MISMOS índices 0..3 desde la sesión
+        // general. Ocho renders para un output de cuatro.
         const índices = new Set()
+        const míos = new Set()
         for (const s of (conImg || [])) {
           for (const it of ((s.output_images || {})[output_key] || [])) {
-            if ((it.variations || []).length) índices.add(it.index)
+            if (!(it.variations || []).length) continue
+            índices.add(it.index)
+            if (s.id === session_id) míos.add(it.index)
           }
         }
-        if (índices.size >= esperadas && !índices.has(Number(item_index))) {
+        if (índices.size >= esperadas && !míos.has(Number(item_index))) {
           console.warn(`[img-origen] RECHAZADO: ${output_key} ya tiene ${índices.size}/${esperadas}`
-            + ` imágenes en la instancia y se pidió el índice ${item_index}, que es nuevo`)
+            + ` imágenes en la instancia; el índice ${item_index} no está en ESTA sesión, así que`
+            + ' no es una iteración sino un segundo despacho')
           return res.status(409).json({
             success: false, error: 'output_already_rendered',
             message: `"${output_key}" already has its ${índices.size} image(s) in this node. `
