@@ -808,7 +808,8 @@ async function executeImageOutput({ project_id, node_id, targetOutputKey, member
       // Se responde YA. El trabajo sigue solo y su avance se lee en la sesión.
       return {
         output_key: targetOutputKey, session_id: session.id, asset_id: null,
-        dispatched: true, expected: (Array.isArray(def.pages) && def.pages.length) || def.image_count || null,
+        dispatched: true,
+        expected: (Array.isArray(def.pages) && def.pages.length) || require('../services/image-count').techoDeclarado(def),
       }
     }
   }
@@ -897,6 +898,15 @@ async function executeImageOutput({ project_id, node_id, targetOutputKey, member
     ))
 
     const listos = res.filter(Boolean)
+
+    // Lo declarado contra lo generado. Es la métrica que pidió Pedro y la única que ve de una
+    // sola vez el fallo que costó los $0.39 del 3.3: un output que declara UNA lámina y produce
+    // ocho. No frena el despacho —las imágenes ya existen cuando esto corre— pero deja escrito
+    // el número, que es lo que faltaba para poder decir «esto no cuadra» sin abrir la BD.
+    {
+      const v = require('../services/image-count').verificarCuenta(defP, listos.length)
+      if (v && !v.ok) console.warn(`[conformidad] ${v.motivo}`)
+    }
     const outputItems = listos.map(r => ({ index: r.idx, name: r.id, variations: [{ url: r.url, condition: null }] }))
     await db().from('forge_sessions').update({
       output_images: { [targetOutputKey]: outputItems },
@@ -1093,6 +1103,11 @@ async function executeImageOutput({ project_id, node_id, targetOutputKey, member
   ))
 
   const ok = results.filter(Boolean)
+
+  {
+    const v = require('../services/image-count').verificarCuenta(outDef, ok.length)
+    if (v && !v.ok) console.warn(`[conformidad] ${v.motivo}`)
+  }
 
   // Persistir en forge_sessions.output_images (formato nuevo con variations[])
   const outputItems = ok.map(r => ({ index: r.idx, variations: [{ url: r.url, condition: null }] }))
@@ -2283,7 +2298,7 @@ router.post('/nodes/:node_id/sessions/:session_id/generate-item-image', async (r
     if (outputDef && await require('../services/image-gen.service').esDeck(outputDef)) {
       return res.status(400).json({
         success: false,
-        error: `"${output_key}" es un deck de ${outputDef.image_count ?? '?'} páginas: se despacha completo desde Run, no ítem por ítem`,
+        error: `"${output_key}" es un deck de ${require('../services/image-count').textoDeCuenta(outputDef) ?? '?'} páginas: se despacha completo desde Run, no ítem por ítem`,
       })
     }
     // `production: deferred` se produce en otra etapa y no debe dispararse desde el chat.
@@ -2312,7 +2327,10 @@ router.post('/nodes/:node_id/sessions/:session_id/generate-item-image', async (r
       // contrato dice «mínimo una» y el número lo decide el plan—, así que cuando falta se
       // cuentan los ítems que la PROPIA RESPUESTA declara. Ese número siempre existe: es el mismo
       // que el motor usó para despachar.
-      let esperadas = outputDef?.image_count ?? null
+      // Desde v2.9.31 puede ser un rango. Acá se toma el TECHO: con «3–5» declaradas y tres ya
+      // hechas, una cuarta todavía es legítima, así que cortar en el mínimo rechazaría trabajo
+      // bueno. La guarda existe para frenar el hueco NUEVO sobre un output ya completo.
+      let esperadas = require('../services/image-count').techoDeclarado(outputDef)
       const { data: sesión } = await db().from('forge_sessions')
         .select('project_id, project_node_id').eq('id', session_id).maybeSingle()
       if (!esperadas) {

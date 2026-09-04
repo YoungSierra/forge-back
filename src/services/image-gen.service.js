@@ -849,10 +849,14 @@ async function generateDeck({
   // 31 se cuela como si fuera una página. Por nombre, porque la pasada A no nombra sus slides
   // —solo da rangos— y la B las llama distinto que el workflow («One-Page Style Summary» contra
   // `26_OnePageSummary`). Adivinar acá cuesta renderizar 34 páginas cuando querías 3.
-  if (!solo && outDef?.image_count && outDef.image_count !== entry.inject_config.pages.length) {
+  // Un deck declara un número exacto de páginas. Si lo declarara como rango no habría un
+  // subconjunto que buscar, así que se compara contra el techo: para un entero son el mismo.
+  const techoDeck = require('./image-count').techoDeclarado(outDef)
+  if (!solo && techoDeck && techoDeck !== entry.inject_config.pages.length) {
     throw new Error(
-      `El output "${output_key}" declara ${outDef.image_count} de las ${entry.inject_config.pages.length} ` +
-      `páginas del workflow, pero no dice CUÁLES. Hace falta el campo \`pages\` en la DNA del output.`)
+      `El output "${output_key}" declara ${require('./image-count').textoDeCuenta(outDef)} de las ` +
+      `${entry.inject_config.pages.length} páginas del workflow, pero no dice CUÁLES. ` +
+      'Hace falta el campo `pages` en la DNA del output.')
   }
 
   // 1. Poblar: se clona el grafo y se le escribe a cada página su prompt.
