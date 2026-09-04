@@ -650,7 +650,7 @@ async function docGenDocx(title, content, projectId, nodeId, itemImages = []) {
     // lo nombra al justificar y otra vez al listar) y la imagen va solo en la primera.
     // Un marcador de imagen escrito en el texto: «[ IMAGE: <id> — descripción ]». El id va
     // primero, antes del guion largo o de los dos puntos.
-    const RX_HUECO_IMAGEN = /^\[\s*IMAGE\s*:\s*([^\]\n—:-]+)/i
+    const { RX_ANCLA_LINEA: RX_HUECO_IMAGEN, idDeAncla } = require('./anchor.format')
 
     // El id del último hueco dibujado, para reconocer su pie de foto en el bloque siguiente.
     let ultimoHueco = null
@@ -724,9 +724,9 @@ async function docGenDocx(title, content, projectId, nodeId, itemImages = []) {
       // «image image wide» y no coincide con nada.
       for (const s of contentSections) {
         for (const l of (s.lines || [])) {
-          const m = /^\[\s*IMAGE\s*:\s*([^\]\n—:-]+)/i.exec(String(l).trim())
+          const m = RX_HUECO_IMAGEN.exec(String(l).trim())
           if (!m) continue
-          const t = tituloDeItem(m[1].trim())
+          const t = tituloDeItem(idDeAncla(m[1]))
           if (t) anclas.add(t)
         }
       }
@@ -835,7 +835,7 @@ async function docGenDocx(title, content, projectId, nodeId, itemImages = []) {
           // Pero el corchete NOMBRA la imagen, así que sirve de ancla exacta: se dibuja ahí y el
           // corchete no se imprime. Si esa imagen no existe, tampoco se imprime el marcador — un
           // hueco callado es mejor que una instrucción interna en la página.
-          const id  = block.text.match(RX_HUECO_IMAGEN)[1].trim()
+          const id  = idDeAncla(block.text.match(RX_HUECO_IMAGEN)[1])
           const hit = buscarImagen(id)
           if (hit) {
             const alto = altoImagenDeItem(id, MARGIN)

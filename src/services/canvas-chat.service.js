@@ -753,8 +753,7 @@ async function resolverImagenesDeItems({ db, projectId, nodeId, sessionId, outKe
     // encabezados. Sacar los títulos del plan hermano fallaba en 3 de 4 (títulos vacíos) y las
     // imágenes terminaban ancladas al plan, no al pitch. Si el documento no trae marcadores se
     // sigue con el plan, que es lo que necesitan los documentos que no los usan.
-    const RX_MARCADOR = /\[\s*IMAGE\s*:\s*([^\]\n—:-]+)/gi
-    const idsDeMarcadores = txt => [...String(txt).matchAll(RX_MARCADOR)].map(m => m[1].trim())
+    const { idsDeAnclas: idsDeMarcadores } = require('./anchor.format')
 
     const { parseOutputItems, cleanItemText } = require('./image-gen.service')
     for (const clave of claves) {

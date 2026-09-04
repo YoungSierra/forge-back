@@ -486,7 +486,7 @@ async function pedirSoloElSobre({ node_id, targetOutputKey, contenido, executorS
   // `[]` —válido por contrato, «las development images son opcionales»— y el documento se queda
   // con marcadores que no resuelven a nada. Medido: sin la señal, 0 prompts; con ella, uno por
   // ancla, con su `placement` cayendo en secciones reales del documento.
-  const anclas = [...String(contenido).matchAll(/\[\s*IMAGE\s*:\s*([^\]\n]+)\]/gi)].map(m => m[1].trim())
+  const anclas = require('../services/anchor.format').idsDeAnclas(contenido)
   const señalAnclas = anclas.length
     ? `The document ALREADY anchors ${anclas.length} image(s) with these exact ids: ${anclas.join(', ')}. `
       + 'Emit one entry per anchor, reusing those ids verbatim — the document reserved a place for each, '
