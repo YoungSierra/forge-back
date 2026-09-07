@@ -669,7 +669,7 @@ async function imagenDelProyecto(projectId, nodeId) {
 //
 // El emparejamiento va por NÚMERO. Los nombres no coinciden entre los dos lados («05 Character
 // Design Language» contra `05_CharacterDesign`) y el número sí es el mismo en ambos.
-async function paginaDelASG(db, projectId, numero) {
+async function paginaDelASG(db, projectId, numero, nombre = null) {
   const { data: n } = await db().from('forge_nodes').select('id').eq('node_key', '3.20').maybeSingle()
   if (!n) return null
   const { data: assets } = await db()
@@ -679,11 +679,43 @@ async function paginaDelASG(db, projectId, numero) {
     .eq('format', 'png').in('status', ['approved', 'auto_approved'])
     .not('storage_url', 'is', null)
     .order('created_at', { ascending: false })
-  // Se busca el número y nada más. Atar el patrón al guion largo del nombre —«Art Style Guide —
-  // 01_KeyArt»— es frágil: ese carácter ya causó un problema de emparejamiento antes, y basta que
-  // alguien renombre el separador para que deje de encontrar nada.
+
+  // Primero POR NOMBRE, porque el número no sobrevive una restructura.
+  //
+  // El maestro del ASG pasó de 34 páginas a 25: se eliminaron once, se fusionaron dos y se
+  // agregaron tres. Medido contra el deck de 25, veintidós de las veintiséis páginas del Art
+  // Bible cargarían la página EQUIVOCADA si se resolviera por número —la de Costume tomaría
+  // Environment, la de VFX tomaría Asset Sheets— y cada una se pintaría desde una referencia de
+  // otro tema sin que nada avisara. La cita trae las dos cosas: «ASG · 05 Character Design
+  // Language». El nombre es lo estable.
+  //
+  // Exacto primero, y prefijo solo si es ÚNICO: el nombre del asset viene del prefijo del
+  // SaveImage y llega recortado —«05_CharacterDesign» por «Character Design Language»—, pero
+  // aflojar a «empieza con» sin exigir unicidad emparejaría «Video Marketing» con la lámina
+  // «Video Marketing Sheet», que es otra página.
+  const norm = s => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '')
+  const parteDePagina = a => String(a.name || '').split(/\s[—–-]\s/).pop()
+  const sinNumero = s => String(s).replace(/^\d+[_\s]*/, '')
+
+  if (nombre) {
+    const buscado = norm(nombre)
+    const candidatos = (assets || []).map(a => ({ a, k: norm(sinNumero(parteDePagina(a))) })).filter(x => x.k)
+    const exacto = candidatos.find(x => x.k === buscado)
+    if (exacto) return exacto.a.storage_url
+    const porPrefijo = candidatos.filter(x => buscado.startsWith(x.k) || x.k.startsWith(buscado))
+    const claves = new Set(porPrefijo.map(x => x.k))
+    if (claves.size === 1) return porPrefijo[0].a.storage_url
+    if (claves.size > 1) {
+      console.warn(`[ASG] «${nombre}» coincide con ${claves.size} páginas (${[...claves].join(', ')}) — se resuelve por número`)
+    }
+  }
+
+  // Y si el nombre no dice nada, el número. Atar el patrón al guion largo del nombre —«Art Style
+  // Guide — 01_KeyArt»— es frágil: ese carácter ya causó un problema de emparejamiento antes, y
+  // basta que alguien renombre el separador para que deje de encontrar nada.
   const dosDigitos = String(numero).padStart(2, '0')
   const hit = (assets || []).find(a => new RegExp(`(?:^|\\D)${dosDigitos}_`).test(a.name || ''))
+  if (hit && nombre) console.warn(`[ASG] «${nombre}» no existe entre las páginas renderizadas — se usó la ${dosDigitos} por número`)
   return hit?.storage_url ?? null
 }
 
@@ -974,10 +1006,12 @@ ${cola}`
       for (const p of desdeASG) {
         const gpt    = wf[p.prompt_node]
         const loadId = Object.values(gpt.inputs).find(v => Array.isArray(v))[0]
-        const cita   = (gpt.inputs.prompt || '').match(/Art Style Guide \(ASG\s*[·.\-]?\s*(\d{1,2})/i)
+        // La cita trae el número y, casi siempre, el nombre: «ASG · 05 Character Design Language».
+        // El nombre es el que sobrevive a una renumeración, así que se captura también.
+        const cita   = (gpt.inputs.prompt || '').match(/Art Style Guide \(ASG\s*[·.\-]?\s*(\d{1,2})\s*([^)]*)\)/i)
         if (!cita) { avisosRef.push(`${p.nombre}: el prompt no dice qué página del ASG usa`); sinRef.add(p.nombre); continue }
 
-        const url = await paginaDelASG(db, project_id, cita[1])
+        const url = await paginaDelASG(db, project_id, cita[1], (cita[2] || '').trim() || null)
         if (!url) {
           avisosRef.push(`${p.nombre}: la página ${cita[1]} del ASG todavía no está renderizada`)
           sinRef.add(p.nombre)
