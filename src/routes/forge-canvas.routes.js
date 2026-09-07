@@ -1089,7 +1089,15 @@ async function executeImageOutput({ project_id, node_id, targetOutputKey, member
     }
   }
 
-  const items  = parseOutputItems(replyText || '', outDef?.format || 'png', targetOutputKey)
+  // `soloDeclarado`: acá ya se agotaron el plan hermano, el sobre de la respuesta general y un
+  // re-pedido acotado del bloque. Si a esta altura no hay nada declarado, el output no se emitió
+  // — y lo que quedaba era leer la prosa del documento y mandarla a renderizar, que es de donde
+  // salieron los ocho renders del 3.3 para un contrato de una lámina.
+  //
+  // Medido sobre las corridas posteriores al contrato del sobre: 34 siguen despachando desde algo
+  // declarado, 6 desde su plan, y 3 se apagan — una de 1.1, una de 3.1 y una de 3.4, que son
+  // justamente los nodos a los que v2.9.31 les acaba de escribir su sobre.
+  const items  = parseOutputItems(replyText || '', outDef?.format || 'png', targetOutputKey, true)
 
   // Generar 1 imagen por ítem en paralelo (acota latencia en runs por tiers)
   const results = await Promise.all(items.map((itemText, idx) =>

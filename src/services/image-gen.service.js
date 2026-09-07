@@ -104,7 +104,7 @@ function textoDeItem(el) {
   return (cab.length || resto.length) ? [cab.join(' — '), ...resto].filter(Boolean).join('\n\n') : ''
 }
 
-function parseOutputItems(content, format, outputKey = null) {
+function parseOutputItems(content, format, outputKey = null, soloDeclarado = false) {
   // Fuera antes de mirar nada: `gaps_for_downstream` —que la enmienda M-8 obliga a emitir al
   // cierre de todo output de concepto— son huecos pendientes para los nodos de abajo, no
   // contenido ilustrable. Sus líneas empiezan con «- gap:», así que la regla de viñetas las tomaba
@@ -427,6 +427,22 @@ function parseOutputItems(content, format, outputKey = null) {
       console.warn(`[img] ${outputKey || '(sin clave)'}: hay un sobre pero no se pudo usar — 0 ítems, no se adivina.`)
       return []
     }
+  }
+
+  // —— De acá para abajo empieza la prosa ——
+  //
+  // Todo lo anterior son formas DECLARADAS: el sobre en su propia sección, un arreglo con nombre,
+  // un bloque json. Lo que sigue adivina a partir del texto —viñetas, encabezados numerados, y al
+  // final «toda la respuesta es un prompt»— y es de donde salieron los renders que nadie pidió.
+  //
+  // `soloDeclarado` corta acá. Lo usa el despacho, que llega a este punto habiendo agotado el plan
+  // hermano, el sobre de la respuesta general y un re-pedido acotado: si después de eso no hay
+  // nada declarado, no es que el sobre esté mal escrito, es que el output no se emitió. Los
+  // demás llamadores —contar ítems, resolver títulos para el PDF— siguen leyendo la prosa, que
+  // para eso sí sirve.
+  if (soloDeclarado) {
+    console.warn(`[img] ${outputKey || '(sin clave)'}: no hay sobre ni plan — no se ilustra la prosa, 0 ítems.`)
+    return []
   }
 
   // Entidades enumeradas por encabezado — antes que las viñetas, que se llevan cualquier lista.
