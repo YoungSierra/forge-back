@@ -114,7 +114,7 @@ async function executeOneOutput({ project_id, node_id, targetOutputKey, member_i
 
   // La instancia viaja con la llamada: sin ella, un nodo que vive en varios lanes no puede saber
   // cuál de los dos es y se queda sin ningún input.
-  const { finalSystemPrompt, baseUserMsg, executorStr, activeTools, resolvedInputs, visualRefs, node, targetOutput } =
+  const { finalSystemPrompt, baseUserMsg, executorStr, activeTools, resolvedInputs, visualRefs, node, targetOutput, skillHeadings } =
     await buildSystemPrompt(db, { projectId: project_id, nodeId: node_id, sessionId: session.id, userMessage, targetOutputKey, projectNodeId: project_node_id })
 
   const { replyText, allToolCalls, docUrl, docFormat, meta } = await runReActLoop({
@@ -122,6 +122,14 @@ async function executeOneOutput({ project_id, node_id, targetOutputKey, member_i
     projectId: project_id, nodeId: node_id, nodeName: node.title,
     sessionId: session.id, targetOutput,
   })
+
+  // ¿Copió el playbook en vez de seguirlo? Se mide sobre los encabezados, que es la huella
+  // inconfundible, y se avisa: la respuesta ya está pagada, pero así el fallo tiene un número en
+  // vez de descubrirse leyendo 140.000 caracteres a mano.
+  {
+    const r = require('../services/regurgitacion').detectarRegurgitacion(replyText, skillHeadings)
+    if (r) console.warn(`[conformidad] ${node.node_key}: ${r.motivo}`)
+  }
 
   try { logExecution({
     project_id, node_id, session_id: session.id, triggered_by: member_id || null,

@@ -499,6 +499,11 @@ async function buildSystemPrompt(db, { projectId, nodeId, sessionId, userMessage
   const outputNames  = activeOutputDefs.map(o => o.key || o.name).filter(Boolean)
   const nodeHasTools = Array.isArray(node.tools) && node.tools.length > 0
 
+  // La huella de los skills de este nodo: sus encabezados, menos los genéricos y menos las
+  // claves de output, que en la respuesta SÍ van. Viaja con el armado para que quien reciba la
+  // respuesta pueda decir si el modelo copió el playbook en vez de seguirlo.
+  const skillHeadings = require('./regurgitacion').huellaDeSkills(skillTexts, outputNames)
+
   const FORMAT_HINTS = {
     structured:      'Output a FLAT numbered list ONLY — no subheadings, no category labels, no prose introduction. Each item MUST follow this exact format: `- Variation N: Name: brief description`',
     markdown_table:  'MUST be a markdown table with header row and `|---|` separator row.',
@@ -656,7 +661,7 @@ async function buildSystemPrompt(db, { projectId, nodeId, sessionId, userMessage
 
   const executorStr = node.executor?.model || process.env.DEFAULT_MODEL
 
-  return { finalSystemPrompt, baseUserMsg, executorStr, activeTools, outputDefs, resolvedInputs, visualRefs, node, targetOutput }
+  return { finalSystemPrompt, baseUserMsg, executorStr, activeTools, outputDefs, resolvedInputs, visualRefs, node, targetOutput, skillHeadings }
 }
 
 /**
