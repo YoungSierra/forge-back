@@ -723,7 +723,7 @@ async function resolverImagenesDeItems({ db, projectId, nodeId, sessionId, outKe
     const anclaDe = clave => new RegExp(`^#{1,4}\\s+\\*{0,2}\\s*${clave}\\b`, 'im')
     const seccionDe = clave => {
       const def = defs.find(o => (o.key || o.name) === clave)
-      const decl = (def?.uses?.siblings_if_present ?? def?.uses?.siblings ?? []).find(k => /plan$/i.test(k))
+      const decl = require('./plan-hermano').planHermano(def)
       if (!decl) return contenido
       const ini = anclaDe(decl).exec(contenido)
       if (!ini) return contenido

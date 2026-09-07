@@ -349,7 +349,7 @@ async function promptsDelPlanHermano({ project_id, node_id, project_node_id, tar
   const { data: dna } = await db().from('forge_nodes').select('outputs').eq('id', node_id).maybeSingle()
   const outs = Array.isArray(dna?.outputs) ? dna.outputs : []
   const def  = outs.find(o => (o.key || o.name) === targetOutputKey)
-  const plan = (def?.uses?.siblings_if_present ?? def?.uses?.siblings ?? []).find(k => /plan$/i.test(k))
+  const plan = require('../services/plan-hermano').planHermano(def)
 
   // Sin plan declarado, el sobre de la respuesta general es la única fuente
   if (!plan) {
@@ -3896,7 +3896,7 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
           const d = porClave.get(k)
           if (!d || d.production === 'deferred') return false
           // Un «cero imágenes» declarado es una respuesta, no un hueco: ni se despacha ni se avisa
-          const plan = (d.uses?.siblings_if_present ?? d.uses?.siblings ?? []).find(x => /plan$/i.test(x))
+          const plan = require('../services/plan-hermano').planHermano(d)
           if (decidioCero(replyText, k, plan)) {
             // Desde v2.9.21 hay outputs cuyo contrato prohíbe el cero (2.2 exige al menos una).
             // Si aun así lo declara, sigue siendo su respuesta —no se le inventan imágenes— pero
