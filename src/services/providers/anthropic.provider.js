@@ -28,6 +28,41 @@ async function streamFinalWithRetry(params, { retries = 4, signal = null } = {})
   }
 }
 
+// El tope de la Messages API son 32 MB por petición, medidos sobre el cuerpo que sale al cable.
+// Se corta en 30 para dejar aire a la estructura JSON y a las cabeceras.
+const TOPE_PETICION = 30 * 1024 * 1024
+
+/**
+ * Última guarda antes de mandar: si el mensaje armado se pasa del tope, se sueltan imágenes desde
+ * el final hasta que entre.
+ *
+ * Va acá y no en `vision.service` porque este es el único punto donde el system prompt, el texto y
+ * las imágenes existen a la vez — allá se puede acotar el peso de las imágenes, pero no saber con
+ * cuánto texto van a compartir la petición. Cortar allá con un número fijo obligaba a elegir entre
+ * descartar referencias que sí entraban o arriesgar el 413; acá el número es exacto.
+ *
+ * Se sueltan las ÚLTIMAS: las referencias llegan en el orden en que el nodo las declara, así que
+ * las primeras son las que el autor puso primero.
+ */
+function recortarImagenes(images, systemPrompt, userMessage) {
+  if (!images?.length) return images
+  const mb = n => (n / 1048576).toFixed(1)
+  const fijo = (systemPrompt?.length || 0) + (typeof userMessage === 'string' ? userMessage.length : 0)
+
+  const quedan = [...images]
+  let total = fijo + quedan.reduce((t, im) => t + im.base64.length, 0)
+  if (total <= TOPE_PETICION) return images
+
+  const antes = quedan.length
+  while (quedan.length && total > TOPE_PETICION) {
+    total -= quedan.pop().base64.length
+  }
+  console.warn(`[anthropic] petición de ${mb(fijo + images.reduce((t, im) => t + im.base64.length, 0))} MB ` +
+    `sobre el tope de ${mb(TOPE_PETICION)} MB — van ${quedan.length} de ${antes} imagen(es), ` +
+    `quedó en ${mb(total)} MB (texto ${mb(fijo)} MB)`)
+  return quedan
+}
+
 async function callAnthropic(systemPrompt, userMessage, options = {}) {
   const model     = options.model || 'claude-sonnet-4-6'
   const startTime = Date.now()
@@ -42,8 +77,9 @@ async function callAnthropic(systemPrompt, userMessage, options = {}) {
   // Las referencias visuales viajan como bloques de imagen, ANTES del texto: el modelo lee
   // mejor cuando ve primero el material y después la consigna. Sin `options.images` el mensaje
   // sigue siendo el string de siempre — este camino no cambia para nadie más.
-  const content = options.images?.length
-    ? require('../vision.format').contenidoAnthropic(options.images, userMessage)
+  const imagenes = recortarImagenes(options.images, systemPrompt, userMessage)
+  const content = imagenes?.length
+    ? require('../vision.format').contenidoAnthropic(imagenes, userMessage)
     : userMessage
 
   let response
@@ -60,22 +96,47 @@ async function callAnthropic(systemPrompt, userMessage, options = {}) {
     response = await streamFinalWithRetry(createParams, { signal: options.signal })
   } catch (err) {
     const status = err.status || err.statusCode
+    // `publico` marca los errores que el usuario PUEDE leer y accionar. El handler global manda
+    // «Internal server error» para todo lo demás, y eso es correcto para un stack inesperado —
+    // pero convertía diagnósticos exactos del proveedor en un mensaje que no dice nada. El 413
+    // del 08-09 traía escrito «Request exceeds the maximum size» y esa frase nunca salió del log.
     if (status === 429) {
       const e = new Error('Anthropic rate limit reached')
-      e.code   = 'RATE_LIMIT'
-      e.status = 429
+      e.code    = 'RATE_LIMIT'
+      e.status  = 429
+      e.publico = true
       throw e
     }
     if (status === 401) {
       const e = new Error('Anthropic API key invalid')
-      e.code   = 'INVALID_KEY'
-      e.status = 401
+      e.code    = 'INVALID_KEY'
+      e.status  = 401
+      e.publico = true
       throw e
     }
     if (status === 503 || status === 529) {
       const e = new Error('Anthropic model overloaded')
-      e.code   = 'MODEL_UNAVAILABLE'
-      e.status = 503
+      e.code    = 'MODEL_UNAVAILABLE'
+      e.status  = 503
+      e.publico = true
+      throw e
+    }
+    // 413: la petición pasó de 32 MB. Con el presupuesto de `vision.service` no debería volver a
+    // ocurrir por imágenes, así que si aparece es que el peso vino del TEXTO —un nodo con muchos
+    // inputs resueltos— y el mensaje tiene que decir de qué tamaño estamos hablando para que se
+    // pueda mirar el lado correcto.
+    if (status === 413) {
+      const mb = n => (n / 1048576).toFixed(1)
+      const pesoImgs = (imagenes || []).reduce((t, im) => t + im.base64.length, 0)
+      const detalle  = imagenes?.length
+        ? `${imagenes.length} imagen(es) pesan ${mb(pesoImgs)} MB en base64`
+        : 'la petición no lleva imágenes: el peso viene del texto'
+      const e = new Error(`La petición supera el tope de 32 MB de Anthropic — ${detalle}`)
+      e.code    = 'REQUEST_TOO_LARGE'
+      e.status  = 413
+      e.publico = true
+      console.error(`[anthropic] 413 · system ${mb(systemPrompt?.length || 0)} MB · ` +
+        `texto ${mb(typeof userMessage === 'string' ? userMessage.length : 0)} MB · ${detalle}`)
       throw e
     }
     throw err
@@ -151,4 +212,4 @@ async function callAnthropic(systemPrompt, userMessage, options = {}) {
   return { data: parsed, meta }
 }
 
-module.exports = { callAnthropic }
+module.exports = { callAnthropic, recortarImagenes, TOPE_PETICION }

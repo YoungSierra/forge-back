@@ -183,6 +183,19 @@ app.use((err, req, res, next) => {
   console.error(`[${timestamp}] Error:`, err.message)
 
   const isDev = process.env.NODE_ENV === 'development'
+
+  // Un error que alguien redactó a propósito viaja tal cual. Los proveedores devuelven
+  // diagnósticos exactos —«Request exceeds the maximum size», rate limit, clave inválida— y
+  // taparlos con «Internal server error» le quitaba al usuario justo el dato que resuelve el
+  // caso. Solo pasan los que se marcaron `publico`: un stack inesperado sigue siendo opaco.
+  if (err.publico) {
+    return res.status(err.status || 500).json({
+      success: false,
+      error:   err.message,
+      code:    err.code || 'ERROR',
+    })
+  }
+
   res.status(500).json({
     success: false,
     error: 'Internal server error',
