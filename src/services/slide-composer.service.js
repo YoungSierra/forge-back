@@ -40,12 +40,12 @@ const MARGEN = 31000   // se recorta antes de llegar al límite
 // dejaron de funcionar en el acto, con un 500 sin explicación —es el «Internal server error» del
 // punto 14 del informe v4—. `scripts/preflight-decks.js` comprueba que los tres coincidan.
 const DECKS = {
-  asg:      { workflow: 'V57_STUDIO_ArtStyleGuide_Template_25',   fuente: '3.9', paginas: 25 },
-  gdd:      { workflow: 'V57_STUDIO_Vertical_Slice_GDD_Template', fuente: '3.8', paginas: 21 },
+  asg:      { workflow: 'V57_STUDIO_ArtStyleGuide_Template_25',   fuente: '3.9', paginas: 25, documento: 'Art Style Guide' },
+  gdd:      { workflow: 'V57_STUDIO_Vertical_Slice_GDD_Template', fuente: '3.8', paginas: 21, documento: 'GDD Art Style' },
   // El Art Bible no se llena desde un documento: cada página recibe su página YA APROBADA del ASG
   // y pinta la obra final de ese tema. Por eso no tiene `fuente` — su insumo es una imagen, no
   // texto. Pasó de 18 a 26 con el rediseño del 24-ago, y a 20 con la restructura del 07-09.
-  artbible: { workflow: 'V57_STUDIO_ArtBible_Template_20',        fuente: null, paginas: 20 },
+  artbible: { workflow: 'V57_STUDIO_ArtBible_Template_20',        fuente: null, paginas: 20, documento: 'Art Bible' },
 }
 
 // ── Mapa etiqueta de página → sección del documento fuente ───────────────────
@@ -654,7 +654,7 @@ async function composeDeck({ db, projectId, deck = 'asg', fills = null, solo = n
     }
   })() : null
 
-  return { deck, workflow: cfg.workflow, fuente: cfg.fuente, paginas: vivas, avisos, fills: medida }
+  return { deck, workflow: cfg.workflow, fuente: cfg.fuente, documento: cfg.documento, paginas: vivas, avisos, fills: medida }
 }
 
 module.exports = {

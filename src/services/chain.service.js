@@ -211,6 +211,24 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
       throw new Error(`Step "${paso.clave}" runs once per output of "${paso.porCadaSalidaDe}", which produced none`)
     }
 
+    // Parado SOBRE una parte, se corre ESA parte y ninguna otra.
+    //
+    // La siembra de mitad de cadena reconstruye todos los hermanos del mismo job —hacen falta
+    // para el personaje, donde el 3D necesita el frente, el costado y la espalda a la vez—, y en
+    // el escenario eso son las veinte partes. Sin esta línea, apretar Run sobre la parte 18
+    // reconstruía las veinte, las ordenaba y arrancaba por la primera: el modelo salía de la
+    // parte 01, con el nombre de la 18 y la marca de la 01. Es el punto 3 del informe v4, y cada
+    // despacho equivocado se paga.
+    //
+    // Solo aplica cuando el origen ES una de las salidas del paso anterior. Con Run sobre la hoja
+    // madre —que no lleva marca de cadena— siguen corriendo las veinte, que es el lote que el
+    // usuario pidió desde el principio.
+    const rolOrigen = origen.metadata?.cadena?.rol
+    if (paso.porCadaSalidaDe && rolOrigen && instancias.includes(rolOrigen)) {
+      console.log(`[cadena] ${paso.clave}: Run sobre «${rolOrigen}» — se corre solo esa parte, no las ${instancias.length}`)
+      instancias = [rolOrigen]
+    }
+
     // `limitePorCada` corre solo las primeras N partes. Sirve para mirar una antes de
     // comprometer veinte: cada parte es un despacho pago y no reproducible, así que descubrir en
     // la número 3 que el encuadre no sirve cuesta las tres.
