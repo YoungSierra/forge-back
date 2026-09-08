@@ -29,13 +29,23 @@ const MARGEN = 31000   // se recorta antes de llegar al límite
 
 // ── Los tres decks ───────────────────────────────────────────────────────────
 // `fuente` es el node_key del nodo cuyo documento aprobado alimenta el deck.
+//
+// ESTA TABLA ES EL TERCER SITIO donde vive el nombre de un workflow: los otros dos son la DNA
+// (`image_gen_model`) y el registro (`comfyui_workflows`). Los tres tienen que decir lo mismo, y
+// el motor busca el deck POR NOMBRE DE WORKFLOW — así que renombrar en la DNA sin tocar acá deja
+// `deck` en `undefined` y el nodo no puede ni correr ni iterar.
+//
+// Pasó el 07-09: la restructura de Migue llevó el ASG a 25 páginas y el Art Bible a 20, la DNA
+// pasó a apuntar a `..._25` y `..._20`, y esta tabla quedó en los nombres viejos. Los dos decks
+// dejaron de funcionar en el acto, con un 500 sin explicación —es el «Internal server error» del
+// punto 14 del informe v4—. `scripts/preflight-decks.js` comprueba que los tres coincidan.
 const DECKS = {
-  asg:      { workflow: 'V57_STUDIO_ArtStyleGuide_Template',      fuente: '3.9', paginas: 34 },
+  asg:      { workflow: 'V57_STUDIO_ArtStyleGuide_Template_25',   fuente: '3.9', paginas: 25 },
   gdd:      { workflow: 'V57_STUDIO_Vertical_Slice_GDD_Template', fuente: '3.8', paginas: 21 },
   // El Art Bible no se llena desde un documento: cada página recibe su página YA APROBADA del ASG
   // y pinta la obra final de ese tema. Por eso no tiene `fuente` — su insumo es una imagen, no
-  // texto. Pasó de 18 a 26 páginas con el rediseño del 24-ago.
-  artbible: { workflow: 'V57_STUDIO_ArtBible_Template',            fuente: null, paginas: 26 },
+  // texto. Pasó de 18 a 26 con el rediseño del 24-ago, y a 20 con la restructura del 07-09.
+  artbible: { workflow: 'V57_STUDIO_ArtBible_Template_20',        fuente: null, paginas: 20 },
 }
 
 // ── Mapa etiqueta de página → sección del documento fuente ───────────────────
@@ -57,6 +67,29 @@ const MAPA_ASG = {
   'Art style & rendering':      ['Approved Style', 'Art Style Definition'],
   'Color palette':              ['Closed 4-Role Palette', 'Color Language'],
   'Mood & tone':                ['Tone & Mood Matrix', 'Tone and Mood'],
+
+  // ── Las de identidad del maestro de 25 (dialecto de flecha) ────────────────
+  // El template las nombra con su referencia al ADI —«CORE FANTASY (§1.2)»— y el documento que
+  // produce el 3.9 usa ESA MISMA numeración en sus encabezados («§1.2 Core Fantasy Statement»),
+  // así que el emparejado tiene fundamento y no es una corazonada. Donde la numeración no
+  // coincide se empareja por tema, y queda dicho por qué:
+  //
+  //   §2.4 del template (forma)  → el documento la publica como «§0.3 Shape Language»
+  //   §2.5 del template (color)  → el documento la publica como «§0.4 Color Language»
+  //
+  // Lo negativo no tiene sección propia en el documento: el ANTI-FANTASY vive dentro del §1.2 y
+  // las ANTI-KEYWORDS dentro del §2.3 —el intake 11.0 las pide en la misma línea, «Visual
+  // Keywords set with anti-keywords»—, así que apuntan a la sección que las contiene.
+  'CORE FANTASY':             ['Core Fantasy Statement', 'Core Fantasy'],
+  'ANTI-FANTASY':             ['Core Fantasy Statement', 'Negative References'],
+  'VISUAL KEYWORDS 8-12':     ['Visual Keywords'],
+  'ANTI-KEYWORDS':            ['Visual Keywords', 'Negative References'],
+  'APPROVED STYLE DIRECTION': ['Approved Style', 'Art Style Definition'],
+  'SHAPE FAMILY & RATIO':     ['Shape Language'],
+  'FORBIDDEN SHAPES':         ['Shape Language', 'Negative References'],
+  'CORE PALETTE - HEX + ROLES': ['Color Language', 'Closed 4-Role Palette'],
+  'CORE PALETTE':             ['Color Language', 'Closed 4-Role Palette'],
+  'COLOR HARMONY SCHEME':     ['Color Language', 'Closed 4-Role Palette'],
 
   'Key Art':                   ['Art Style Definition', 'Visual Keywords'],
   'Visual DNA':                ['Visual Language', 'Visual Pillars'],
@@ -199,9 +232,51 @@ function seccionPorNombre(contenido, nombre) {
 // ── Parser del bloque de intake ──────────────────────────────────────────────
 // Un solo parser para los tres delimitadores. Devuelve null cuando el workflow no tiene
 // bloque (el Art Bible), que NO es un error: significa que se llena con imágenes.
-const DELIMITADORES = [
-  /(━━━[^\n]*(?:INTAKE|SOURCE DATA)[^\n]*━+)\n([\s\S]*?)\n(━{4,})/,
-  /(-{4}[^\n]*(?:INTAKE|SOURCE DATA)[^\n]*-{4})\n([\s\S]*?)\n(-{4,})/,
+//
+// Hay DOS dialectos, porque Migue rediseñó el bloque con la restructura a 25 páginas:
+//
+//   viejo   ━━━ ART DIRECTION INTAKE ━━━        nuevo   ╔════╗
+//           Color palette: [INSERT …]                   ║ SECTION 1 — PASTE … ║
+//           This slide — Color System: [INSERT …]       ╚════╝
+//           ━━━━━━━━━━━━                                — GAME IDENTITY —
+//                                                       CORE PALETTE (§2.5) →
+//                                                       — THIS PAGE · ColorSystem —
+//                                                       COLOR HARMONY SCHEME (§2.5) →
+//                                                       ──────────
+//
+// El nuevo dice además de qué sección del ADI sale cada campo, que es información que antes había
+// que mantener a mano en MAPA_ASG. Cuando llegó, el parser solo conocía el viejo: las 25 páginas
+// del deck nuevo daban `null`, el prompt viajaba tal cual y se habrían renderizado con el texto de
+// la plantilla y cero contenido del juego, sin que nada avisara.
+//
+// Cada dialecto trae su forma de campo y cómo se escribe una vez lleno, porque el viejo sustituye
+// un marcador `[INSERT …]` y el nuevo escribe detrás de la flecha.
+const DIALECTOS = [
+  {
+    // El ASG viejo abre con `━━━` y el GDD con `----`; el resto del dialecto es el mismo, así que
+    // el delimitador acepta las dos reglas. Separarlos en dos dialectos fue el primer intento y
+    // dejó al GDD sin bloque: 21 páginas que pasaron a viajar sin un solo dato del proyecto.
+    nombre: 'insert',
+    delimitador: /((?:━━━|-{4})[^\n]*(?:INTAKE|SOURCE DATA)[^\n]*(?:━+|-{4}))\n([\s\S]*?)\n(?:(━{4,})|(-{4,}))/,
+    campo: /([^:\[\]\n]+?):[ \t]*(\[(?:INSERT|OPTIONAL)\b[^\]]*\])/g,
+    // «This slide — Color System» es la línea propia de la página; el resto es común al deck.
+    propia: /^This slide\b/i,
+    quitarPrefijo: /^This slide\s*(?:image)?\s*[—–-]?\s*/i,
+    escribir: (lab, t) => `${lab}:${t.includes('\n') ? '\n' : ' '}${t}`,
+  },
+  {
+    nombre: 'flecha',
+    // Abre en el recuadro y cierra en la regla que precede a SECTION 2. Se ancla en el cierre del
+    // recuadro para que la cabecera —que son instrucciones para quien rellena, no campos— quede
+    // fuera del bloque.
+    delimitador: /(╔[═]+╗[\s\S]*?╚[═]+╝)\n([\s\S]*?)\n(─{10,})/,
+    campo: /^[ \t]*([A-Z][^\n→]*?)[ \t]*→[ \t]*$/gm,
+    // El ámbito de página lo marca «— THIS PAGE · <nombre> —»; lo que sigue es propio de la hoja.
+    propia: null,          // se decide por sección, no por el nombre del campo
+    seccionPropia: /^—\s*THIS PAGE\b/i,
+    seccionComun: /^—\s*[A-Z]/,
+    escribir: (lab, t) => `${lab} →${t.includes('\n') ? '\n' : ' '}${t}`,
+  },
 ]
 
 // Un campo es «Etiqueta: [INSERT …]». OJO: hay líneas con VARIOS en la misma
@@ -215,33 +290,42 @@ const RE_CAMPO = /([^:\[\]\n]+?):[ \t]*(\[(?:INSERT|OPTIONAL)\b[^\]]*\])/g
 // campo («Mechanical role», «Abilities») y las tres se resolvían a la PRIMERA aparición del
 // documento — protagonista, antagonista y NPC salían con el texto idéntico, en silencio.
 // El ámbito se fija al empezar la línea y lo heredan los campos que vienen detrás en ella.
-const RE_ENTIDAD = /^([A-Z][A-Z0-9 /&'-]{2,30}?)\s*[-—–]\s+(?=[^\s])/
+const RE_ENTIDAD_LINEA = /^([A-Z][A-Z0-9 /&'-]{2,30}?)\s*[-—–]\s+(?=[^\s])/
 
 function parsearIntake(prompt) {
-  for (const re of DELIMITADORES) {
-    const m = String(prompt).match(re)
+  for (const d of DIALECTOS) {
+    const m = String(prompt).match(d.delimitador)
     if (!m) continue
     const campos = []
     // Se recorre por líneas para poder fijar el ámbito; el orden global se conserva porque el
     // bloque es lineal, y la sustitución posterior consume los valores en ese mismo orden.
+    let enPropia = false
     for (const linea of m[2].split('\n')) {
-      const ent = linea.match(RE_ENTIDAD)
+      // Dialecto de flecha: el ámbito de página lo abre un encabezado de sección, y todo lo que
+      // viene detrás pertenece a la hoja hasta la siguiente sección.
+      if (d.seccionPropia && d.seccionPropia.test(linea.trim())) { enPropia = true; continue }
+      if (d.seccionComun && d.seccionComun.test(linea.trim())) { enPropia = false; continue }
+
+      // El prefijo de ENTIDAD es del dialecto viejo (las fichas de personaje del GDD). En el nuevo
+      // hace daño: «CORE PALETTE - hex + roles (§2.5)» se leería como ámbito «CORE PALETTE» y la
+      // etiqueta quedaría en «hex + roles», que no le dice nada a nadie.
+      const ent = d.entidad ? linea.match(d.entidad) : null
       const ambito = ent ? ent[1].trim() : null
-      for (const c of linea.matchAll(RE_CAMPO)) {
+      for (const c of linea.matchAll(d.campo)) {
         let cruda = c[1].replace(/^[\s|·-]+/, '').trim()
         if (ambito && cruda.startsWith(ambito)) cruda = cruda.slice(ambito.length).replace(/^\s*[-—–]\s*/, '').trim()
         // «This slide — Color System» y «This slide image - hero / cover» son la línea propia de
         // la página; el resto son campos comunes a todo el deck.
-        const propia = /^This slide\b/i.test(cruda)
+        const propia = d.propia ? d.propia.test(cruda) : enPropia
         campos.push({
-          etiqueta: propia ? cruda.replace(/^This slide\s*(?:image)?\s*[—–-]?\s*/i, '').trim() : cruda,
+          etiqueta: propia && d.quitarPrefijo ? cruda.replace(d.quitarPrefijo, '').trim() : cruda,
           propia,
           ambito,
-          pista: c[2],
+          pista: c[2] ?? null,
         })
       }
     }
-    return { abre: m[1], cierra: m[3], bloque: m[2], campos }
+    return { abre: m[1], cierra: m[3], bloque: m[2], campos, dialecto: d }
   }
   return null
 }
@@ -294,8 +378,24 @@ function filaDeTabla(contenido, seccion, n) {
 //   string         → instrucción literal, no se busca nada
 // Si la etiqueta no está en el mapa se busca ella misma, que en el GDD acierta casi siempre.
 // Cada candidato se prueba primero como SECCIÓN y luego como CAMPO en negrita.
+// Las etiquetas del dialecto de flecha traen la referencia al ADI y a veces una glosa:
+// «ANTI-FANTASY / what the art must never do (§1.2)». La glosa y la referencia sirven a quien
+// rellena a mano, no al emparejado, y hacen que la misma idea aparezca escrita de tres formas.
+// Se normaliza para buscar: fuera el «(§…)», fuera lo que sigue a la barra, y sin distinguir
+// mayúsculas — así una sola entrada del mapa cubre las tres variantes.
+const claveDeEtiqueta = e => String(e)
+  .replace(/\s*\(§[^)]*\)\s*$/, '')
+  .split('/')[0]
+  .trim()
+  .toUpperCase()
+
 function resolverEtiqueta(etiqueta, mapa, assets, ambito = null) {
-  const cands = Object.prototype.hasOwnProperty.call(mapa, etiqueta) ? mapa[etiqueta] : [etiqueta]
+  let cands = Object.prototype.hasOwnProperty.call(mapa, etiqueta) ? mapa[etiqueta] : undefined
+  if (cands === undefined) {
+    const k = claveDeEtiqueta(etiqueta)
+    const hit = Object.keys(mapa).find(x => claveDeEtiqueta(x) === k)
+    cands = hit !== undefined ? mapa[hit] : [etiqueta]
+  }
   if (cands === null) return { texto: null, noAplica: true }
   if (typeof cands === 'string') return { texto: null, noAplica: true, instruccion: cands }
 
@@ -503,11 +603,13 @@ async function composeDeck({ db, projectId, deck = 'asg', fills = null, solo = n
     // El reemplazo va por función para que un `$&` dentro del documento no se interprete.
     const armar = () => {
       let k = 0
-      const cuerpo = intake.bloque.replace(RE_CAMPO, (_, lab) => {
+      // Con la forma de campo del dialecto que se reconoció, y escrito como ese dialecto lo pide:
+      // el viejo reemplaza el marcador `[INSERT …]`, el nuevo escribe detrás de la flecha.
+      const cuerpo = intake.bloque.replace(intake.dialecto.campo, (_, lab) => {
         const v = valores[k++]
         const t = v.fijo ?? v.texto
         // Un valor multilínea baja de renglón; uno corto se queda junto a su etiqueta.
-        return `${lab}:${t.includes('\n') ? '\n' : ' '}${t}`
+        return intake.dialecto.escribir(lab, t)
       })
       return prompt.replace(intake.bloque, () => cuerpo)
     }
