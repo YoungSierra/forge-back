@@ -589,7 +589,13 @@ async function pedirSeccionFaltante({ node_id, targetOutputKey, contenido, execu
       // error. Medido el 02-09 pidiendo `visual_pitch_plan` a MiniMax-M3: con 8.000 volvio vacio
       // tras 100 segundos; con 16.000 entrego la seccion entera. Vacio no significaba que el
       // modelo no supiera, significaba que no le dejamos sitio.
-      model: executorStr || 'anthropic:claude-sonnet-4-6', rawText: true, temperature: 0.4, maxOutputTokens: 16000,
+      //
+      // 32.000 y no 16.000 porque acá se re-piden SECCIONES ENTERAS, no un sobre de prompts. El
+      // 08-09 el 3.8 recuperó `gdd_source_md` en 54.659 caracteres y `gdd_complete` en 54.335: unos
+      // 14.000 tokens cada uno, rozando el techo de 16.000. Rozarlo corta la respuesta, la
+      // continuación entra a arreglarlo, y la sección vuelve a faltar — un re-pedido que se
+      // alimenta de su propio recorte.
+      model: executorStr || 'anthropic:claude-sonnet-4-6', rawText: true, temperature: 0.4, maxOutputTokens: 32000,
     })
     let texto = String(typeof res === 'string' ? res : (res?.data ?? res?.text ?? '')).trim()
     if (!texto) return null

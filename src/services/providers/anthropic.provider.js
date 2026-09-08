@@ -63,6 +63,25 @@ function recortarImagenes(images, systemPrompt, userMessage) {
   return quedan
 }
 
+// El system prompt viaja CACHEADO.
+//
+// El del 3.8 son 189.430 caracteres —unos 47.000 tokens— y se reenviaba entero en cada llamada.
+// Una corrida de ese nodo hace ocho o diez peticiones: la principal, un re-pedido por cada sección
+// que no salió, y las continuaciones. Todas cargan el mismo prompt, y sin caché todas lo pagan
+// completo, en dinero y en espera.
+//
+// El caching es por PREFIJO: basta con marcar el bloque del sistema para que las llamadas
+// siguientes de la misma corrida lo lean de la caché a una décima parte. Es GA, sin cabecera beta.
+// El contador ya existía —`cache_read_input_tokens` se lee desde siempre en el meta— pero nunca se
+// mandaba `cache_control`, así que medía un ahorro que no ocurría.
+//
+// Se pasa de string a bloque solo cuando hay prompt: los proveedores aceptan las dos formas, y un
+// prompt vacío marcado como cacheable es un bloque de texto vacío, que la API rechaza.
+const sistemaCacheable = prompt =>
+  prompt && String(prompt).trim()
+    ? [{ type: 'text', text: String(prompt), cache_control: { type: 'ephemeral' } }]
+    : prompt
+
 async function callAnthropic(systemPrompt, userMessage, options = {}) {
   const model     = options.model || 'claude-sonnet-4-6'
   const startTime = Date.now()
@@ -87,7 +106,7 @@ async function callAnthropic(systemPrompt, userMessage, options = {}) {
     const createParams = {
       model,
       max_tokens: maxTokens,
-      system:     systemPrompt,
+      system:     sistemaCacheable(systemPrompt),
       messages:   [{ role: 'user', content }],
     }
     if (supportsTemperature) createParams.temperature = temperature
@@ -143,40 +162,62 @@ async function callAnthropic(systemPrompt, userMessage, options = {}) {
   }
 
   // Texto + tokens, con AUTO-CONTINUACIÓN: si el modelo cortó por límite de tokens
-  // (stop_reason === 'max_tokens'), se continúa automáticamente vía assistant-prefill hasta
-  // completar. El usuario final NUNCA ve un output truncado ni tiene que pedir "continuá",
-  // y el output llega entero en una sola pieza (clave para "Accept as output").
+  // (stop_reason === 'max_tokens'), se continúa automáticamente hasta completar. El usuario final
+  // NUNCA ve un output truncado ni tiene que pedir «continuá», y el output llega entero en una
+  // sola pieza (clave para «Accept as output»).
+  //
+  // Se continuaba con un PREFILL del assistant —dejar el turno del modelo abierto para que siguiera
+  // escribiendo—. Anthropic retiró el prefill de toda la familia 4.6 en adelante y desde entonces
+  // devuelve 400: «This model does not support assistant message prefill. The conversation must end
+  // with a user message.» O sea que llevaba rota desde que los nodos pasaron a Sonnet 4.6, y cada
+  // intento reenviaba el mensaje completo —system, texto e imágenes— para cobrar un error. Medido
+  // el 08-09 en el 3.8: dos peticiones tiradas en una sola corrida.
+  //
+  // Ahora el turno parcial se deja como está y se pide la continuación con un mensaje de USUARIO,
+  // que es la forma que la API sí acepta. El texto se une igual, así que «Accept as output» sigue
+  // recibiendo una pieza sola.
   let fullText     = extractText(response)
   let stopReason   = response.stop_reason
   let inTokens     = response.usage?.input_tokens  ?? 0
   let outTokens    = response.usage?.output_tokens ?? 0
   let cachedTokens = response.usage?.cache_read_input_tokens ?? 0
+  // Escribir la caché cuesta 1,25× y leerla 0,1×. Sin este contador el gasto se subestima en
+  // la primera llamada de cada corrida, que es justo la que paga el prompt entero.
+  let cacheWrite   = response.usage?.cache_creation_input_tokens ?? 0
 
   const MAX_CONTINUATIONS = 6
   for (let cont = 0; stopReason === 'max_tokens' && cont < MAX_CONTINUATIONS; cont++) {
     console.log(`[anthropic] max_tokens alcanzado — auto-continuando (${cont + 1}/${MAX_CONTINUATIONS})`)
-    // El prefill del assistant no puede terminar en whitespace (regla de la API).
-    const prefill = fullText.replace(/\s+$/, '')
+    const escrito = fullText.replace(/\s+$/, '')
     try {
       const contParams = {
         model,
         max_tokens: maxTokens,
-        system:     systemPrompt,
+        system:     sistemaCacheable(systemPrompt),
         messages:   [
           // El MISMO contenido que la primera vuelta, imágenes incluidas. Si acá se mandara solo
           // el texto, la continuación seguiría escribiendo sin ver las referencias y se
           // contradiría con lo que ya llevaba escrito. Cuesta reenviarlas; salir mal cuesta más.
           { role: 'user',      content },
-          { role: 'assistant', content: prefill },
+          { role: 'assistant', content: escrito },
+          // La conversación tiene que TERMINAR en usuario. Y hay que decirle dónde retomar: sin
+          // esto el modelo saluda, resume lo que ya escribió, o vuelve a empezar el documento — y
+          // cualquiera de las tres cosas se pega al texto acumulado y lo arruina.
+          { role: 'user', content:
+            'Continue the response from exactly where it stopped. Do not repeat anything already ' +
+            'written, do not restart, and do not add any preamble, apology or summary — your reply ' +
+            'is concatenated verbatim to what you already produced, so it must read as the seamless ' +
+            'continuation of that last character.' },
         ],
       }
       if (supportsTemperature) contParams.temperature = temperature
       const contResp = await streamFinalWithRetry(contParams, { signal: options.signal })
-      fullText     = prefill + extractText(contResp)
+      fullText     = escrito + extractText(contResp)
       stopReason   = contResp.stop_reason
       inTokens    += contResp.usage?.input_tokens  ?? 0
       outTokens   += contResp.usage?.output_tokens ?? 0
       cachedTokens += contResp.usage?.cache_read_input_tokens ?? 0
+      cacheWrite   += contResp.usage?.cache_creation_input_tokens ?? 0
     } catch (err) {
       console.warn(`[anthropic] auto-continuación falló: ${err.message} — devuelvo lo acumulado`)
       break
@@ -188,7 +229,7 @@ async function callAnthropic(systemPrompt, userMessage, options = {}) {
   const meta = {
     provider: 'anthropic',
     model,
-    tokens_used: { input: inTokens, output: outTokens, cached: cachedTokens },
+    tokens_used: { input: inTokens, output: outTokens, cached: cachedTokens, cache_write: cacheWrite },
     duration_ms: Date.now() - startTime,
   }
 

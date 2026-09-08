@@ -66,9 +66,15 @@ function calculateLLMCost(provider, model, tokens) {
         + `El gasto que se registre de este modelo es una estimación gruesa hasta que se agregue a LLM_PRICING.`)
   }
   const prices = LLM_PRICING[key] || familia || LLM_PRICING[`${provider}:default`] || { input: 1.00, output: 2.00 }
+  // La caché tiene dos precios propios y hay que cobrarlos: LEERLA vale 0,1x el input y ESCRIBIRLA
+  // 1,25x. Antes daba igual porque nunca se cacheaba —`cached` era siempre 0— y sumar solo input y
+  // output daba el número correcto. Desde que el system prompt viaja con `cache_control`, ignorarlos
+  // subestima el gasto: un prompt de 47.000 tokens leido de cache se cobraba como CERO.
   const input_cost  = ((tokens.input  || 0) * prices.input)  / 1_000_000
   const output_cost = ((tokens.output || 0) * prices.output) / 1_000_000
-  return parseFloat((input_cost + output_cost).toFixed(8))
+  const cache_read  = ((tokens.cached || 0) * prices.input * 0.10) / 1_000_000
+  const cache_write = ((tokens.cache_write || 0) * prices.input * 1.25) / 1_000_000
+  return parseFloat((input_cost + output_cost + cache_read + cache_write).toFixed(8))
 }
 
 // ─── Insert no-bloqueante — nunca rompe el flujo principal ───────────────────
@@ -134,7 +140,12 @@ function logExecution(params) {
         started_at,
         status,
         error_code,
-        metadata,
+        // Los tokens de ESCRITURA de caché no tienen columna propia y no vale la pena crearla: van
+        // en metadata para poder auditar el costo sin tocar el esquema. `cached_tokens` sigue
+        // siendo la lectura, que es lo que interesa mirar en el día a día.
+        metadata: tokens?.cache_write
+          ? { ...metadata, cache_write_tokens: tokens.cache_write }
+          : metadata,
       }).select('id').single()
 
       // Frente 4: cobrar a la organización con margen (costo real -> credito). Solo si hay costo y org.
