@@ -59,6 +59,43 @@ function willExportDoc(targetOutput) {
   return !targetOutput || targetOutput.type === 'asset' || DOC_FORMATS.includes(fmt)
 }
 
+// Qué herramienta produce qué formato. Es el único vínculo que existe entre una herramienta y un
+// output: ninguna DNA declara herramientas por output —0 de 132 outputs activos tienen el campo—,
+// así que el `format` es lo que hay, y no se inventa uno nuevo.
+//
+// Solo `doc_gen_pptx`. `doc_gen_docx` NO va acá, y no es un olvido: se le esconde al LLM y su
+// disparo automático ya pasa por `willExportDoc`, que sabe que un output `md` de tipo `asset`
+// —el `tdd_complete` del 3.12, el `core_gameplay_spec` del 3.2 y otros nueve— sí se exporta.
+// Filtrarla por formato los dejaba a los once sin su PDF, que es un formato que esta tabla no
+// puede conocer sin duplicar esa decisión y desincronizarse.
+const FORMATOS_DE_HERRAMIENTA = {
+  doc_gen_pptx: ['pptx'],
+}
+
+/**
+ * Las herramientas que corresponden al output que se está corriendo.
+ *
+ * `node.tools` es del NODO, y un nodo mezcla outputs de distinta naturaleza. El 2.5 declara
+ * `doc_gen_pptx`, que pertenece a `investor_deck` (`format: pptx`), pero tiene además
+ * `visual_pitch_plan`, que es una `connection` sin formato. Corriendo enfocado en el plan, el
+ * modelo veía igual la herramienta del deck, concluía que el entregable era el deck y del plan
+ * devolvía un parte de novedades: «All 10 zones filled» — describiéndolas en vez de escribirlas.
+ * Medido el 08-09: 405 tokens de salida, sin la sección pedida, y un PPTX de 12 slides correcto
+ * que nadie había pedido en esa corrida.
+ *
+ * Sin output objetivo —el Run del nodo entero— van todas: ahí sí se producen todos los outputs.
+ * Y lo que no genera archivos (búsqueda, kb) no se filtra: sirve para cualquier output.
+ */
+function herramientasDelOutput(tools, targetOutput) {
+  if (!Array.isArray(tools) || !tools.length) return []
+  if (!targetOutput) return tools
+  const fmt = String(targetOutput.format || '').toLowerCase()
+  return tools.filter(t => {
+    const formatos = FORMATOS_DE_HERRAMIENTA[t]
+    return formatos ? formatos.includes(fmt) : true
+  })
+}
+
 // doc_gen_docx se le ESCONDE al LLM (el motor la corre solo sobre la respuesta). Sin decírselo,
 // un prompt de DNA que pide "produce the ... docx" deja al modelo sin forma de cumplir y termina
 // escribiendo un script de python-docx y FINGIENDO que lo ejecutó ("Saved -> /tmp/x.docx"), con
@@ -2109,4 +2146,4 @@ async function executeTool(name, args, context = {}) {
   }
 }
 
-module.exports = { getToolsBlock, getDocPolicyBlock, willExportDoc, isDataDump, parseToolCalls, executeTool }
+module.exports = { getToolsBlock, getDocPolicyBlock, willExportDoc, herramientasDelOutput, isDataDump, parseToolCalls, executeTool }

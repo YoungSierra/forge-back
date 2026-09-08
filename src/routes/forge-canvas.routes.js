@@ -737,10 +737,17 @@ async function executeImageOutput({ project_id, node_id, targetOutputKey, member
       // corta por el último guion largo para saber qué es, y el `label` de la DNA ya trae uno
       // («Art Style Guide — Content»), asi que sumarlo dejaba «… — Content 01_KeyArt» y las
       // páginas salían desordenadas porque nadie encontraba su número.
+      //
+      // Delante va el DOCUMENTO, no el título del nodo. El 3.20 produce tres —Art Style Guide,
+      // GDD Art Style y Art Bible— y ponerle a los tres el título del nodo hacía que las 21
+      // páginas del GDD se publicaran como «Art Style Guide — 03_CoreLoop»: el moodboard las
+      // agrupa por nombre, así que caían todas en la zona del ASG y el GDD Art Style parecía no
+      // tener espacio propio. Es el punto 5 del informe v4.
+      const documento = r.documento || dna.title
       let primero = null
       for (const p of r.paginas.sort((a, b) => a.index - b.index)) {
         const { data: asset } = await db().from('forge_assets').insert({
-          node_id, project_id, session_id: session.id, name: `${dna.title} — ${p.name}`,
+          node_id, project_id, session_id: session.id, name: `${documento} — ${p.name}`,
           format: 'png', status: 'approved', storage_url: p.url,
           approved_by: member_id || null, approved_at: new Date().toISOString(),
         }).select('id').single()
@@ -3332,16 +3339,24 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
     ].filter(Boolean)
 
     // ── Ensamblar system prompt ───────────────────────────────────
-    const { getToolsBlock, getDocPolicyBlock, willExportDoc, isDataDump, parseToolCalls, executeTool } = require('../services/tools.service')
+    const { getToolsBlock, getDocPolicyBlock, willExportDoc, herramientasDelOutput, isDataDump, parseToolCalls, executeTool } = require('../services/tools.service')
 
     const activeTools = Array.isArray(node.tools) && node.tools.length ? node.tools : []
+    // Las del OUTPUT que se está corriendo, no las del nodo entero: un nodo mezcla outputs de
+    // distinta naturaleza y ofrecerle al modelo la herramienta de un hermano lo hace producir el
+    // entregable equivocado. Ver `herramientasDelOutput`.
+    const toolsDelOutput  = herramientasDelOutput(activeTools, targetOutput)
     // doc_gen_docx se ejecuta automáticamente — no exponerla al LLM para evitar alucinaciones
     // doc_gen_pptx sí se expone: el modelo es responsable de llamarla con contenido + imágenes
-    const llmVisibleTools = activeTools.filter(t => t !== 'doc_gen_docx')
+    const llmVisibleTools = toolsDelOutput.filter(t => t !== 'doc_gen_docx')
     const toolsBlock      = getToolsBlock(llmVisibleTools)
     // Esconderla NO alcanza: hay que decirle que no tiene con qué generar archivos, o improvisa
     // un script y finge la ejecución (ver getDocPolicyBlock). Se omite si este output no se
     // exporta (una connection no se renderea): prometer un PDF que no llega es instrucción falsa.
+    // Con la lista COMPLETA del nodo a propósito, no con la del output: la prohibición de fingir
+    // la generación de archivos tiene que valer aunque este output no exporte, porque el modelo ve
+    // el nodo entero y un hermano que pide un docx lo empuja a escribir el script igual. Acotarla
+    // al output es exactamente el fallo del 2.2 del 27-08.
     const docPolicyBlock  = getDocPolicyBlock(activeTools, targetOutput)
 
     // Fecha actual para el LLM: sin esto usa su corte de entrenamiento (ej. un scan competitivo
@@ -3400,7 +3415,10 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
     // executor.type indica el tipo de ejecutor (llm, hybrid, comfyui...) — no es el provider
     const executorStr = node.executor?.model || process.env.DEFAULT_MODEL
 
-    const toolsList  = activeTools.length                                  ? activeTools.join(', ') : null
+    // El banner refleja lo que el modelo REALMENTE puede llamar en esta corrida. Imprimir la
+    // lista del nodo hacía leer el log como si la herramienta estuviera disponible cuando el
+    // filtro por output ya la había quitado.
+    const toolsList  = toolsDelOutput.length                               ? toolsDelOutput.join(', ') : null
     const skillsList = Array.isArray(node.skills) && node.skills.length ? node.skills.join(', ')  : null
 
     // El ensamble imprime su propio banner más abajo; este describiría una llamada que no ocurre.
@@ -3563,7 +3581,9 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
       meta      = result.meta
       replyText = typeof result.data === 'string' ? result.data : JSON.stringify(result.data)
 
-      const calls = activeTools.length ? parseToolCalls(replyText) : []
+      // Solo se atienden llamadas a herramientas de ESTE output: si el modelo igual pide la de
+      // un hermano, no se ejecuta. Cada despacho cuesta y produce un archivo que nadie pidió.
+      const calls = toolsDelOutput.length ? parseToolCalls(replyText) : []
       if (!calls.length) break   // sin tool calls → terminado
 
       console.log(`[forge-chat] tool calls iter=${iter + 1}:`, calls.map(c => c.tool))
@@ -3651,6 +3671,8 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
     }
 
     // Si el nodo tiene doc_gen_docx y el LLM no la llamó por su cuenta, generar automáticamente.
+    // Con la lista del nodo: `doc_gen_docx` no se filtra por formato (ver FORMATOS_DE_HERRAMIENTA).
+    // Quien decide si ESTE output exporta es `willExportDoc`, unas líneas más abajo.
     const hasDocTool   = activeTools.includes('doc_gen_docx')
     const alreadyCalled = allToolCalls.some(tc => tc.tool === 'doc_gen_docx')
     // Solo generar doc si NO hay target (run general → produce el asset doc) o si el target es un
@@ -3792,7 +3814,7 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
     }
 
     // Auto-generar PPTX si el nodo tiene doc_gen_pptx y el LLM produjo contenido
-    const hasPptxTool     = activeTools.includes('doc_gen_pptx')
+    const hasPptxTool     = toolsDelOutput.includes('doc_gen_pptx')
     const pptxAlreadyCalled = allToolCalls.some(tc => tc.tool === 'doc_gen_pptx')
 
     if (hasPptxTool && !pptxAlreadyCalled && replyText.trim().length > 200) {
