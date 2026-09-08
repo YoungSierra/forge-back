@@ -659,7 +659,7 @@ async function recuperarSeccionesFaltantes({ node_id, replyText, outputDefs, exe
 async function executeImageOutput({ project_id, node_id, targetOutputKey, member_id, project_node_id = null, respuestaPrevia = null }) {
   const { buildSystemPrompt, runReActLoop } = require('../services/canvas-chat.service')
   const { logExecution } = require('../services/execution-log.service')
-  const { parseOutputItems, generateOneImage, esDeck, generateDeck } = require('../services/image-gen.service')
+  const { parseOutputItems, generateOneImage, esDeck, generateDeck, idsDeclarados, nombreDeImagen } = require('../services/image-gen.service')
 
   // Sesión enfocada en este output de imagen
   const { data: session, error: sessErr } = await db()
@@ -1153,10 +1153,17 @@ async function executeImageOutput({ project_id, node_id, targetOutputKey, member
   }
 
   // Crear una fila forge_assets png por imagen → downstream las encuentra
-  const baseName = `${node.title} — ${outDef?.label || outDef?.name || targetOutputKey}`
+  //
+  // El nombre sale del id que el output declaró para ese encargo, no de un contador. Aguas abajo
+  // el documento cita sus imágenes por ese id, y con un contador genérico la cita no resuelve.
+  const idsDecl = idsDeclarados(replyText || '', targetOutputKey)
   let firstAssetId = null
   for (const r of ok) {
-    const assetName = ok.length > 1 ? `${baseName} ${r.idx + 1}` : baseName
+    const assetName = nombreDeImagen({
+      tituloNodo: node.title,
+      etiqueta:   outDef?.label || outDef?.name || targetOutputKey,
+      ids: idsDecl, idx: r.idx, total: ok.length,
+    })
     const { data: asset } = await db()
       .from('forge_assets')
       .insert({
@@ -2209,9 +2216,15 @@ router.post('/nodes/:node_id/accept', async (req, res, next) => {
       (o.format === 'png' || o.format === 'image') && o.image_gen
     )
 
+    const { idsDeclarados, nombreDeImagen } = require('../services/image-gen.service')
+
     const imageAssets = pngOutputDefs.flatMap(outDef => {
       // `output_images` se indexa por KEY; buscar por `name` no encontraba nada cuando difieren.
       const items = (outputImages[outDef.key || outDef.name] || outputImages[outDef.name] || [])
+      // Mismo criterio de nombre que el despacho del back: el id que el output declaró para ese
+      // encargo. Aceptar por este camino y despachar por el otro producía dos juegos de nombres
+      // para el mismo output, y el plan no reconocía ninguno.
+      const idsDecl = idsDeclarados(content, outDef.key || outDef.name)
       return items.flatMap(item => {
         // Formato nuevo: variations[] — el historial del ítem.
         if (Array.isArray(item.variations)) {
@@ -2225,10 +2238,11 @@ router.post('/nodes/:node_id/accept', async (req, res, next) => {
             node_id,
             project_id,
             session_id,
-            // Con el índice, para que el orden y la identidad de cada imagen sobrevivan.
-            name:        items.length > 1
-              ? `${node.title} — ${outDef.label || outDef.name} ${(item.index ?? 0) + 1}`
-              : `${node.title} — ${outDef.label || outDef.name}`,
+            name:        nombreDeImagen({
+              tituloNodo: node.title,
+              etiqueta:   outDef.label || outDef.name,
+              ids: idsDecl, idx: item.index ?? 0, total: items.length,
+            }),
             format:      'png',
             status:      'approved',
             content:     null,
@@ -2256,9 +2270,28 @@ router.post('/nodes/:node_id/accept', async (req, res, next) => {
       })
     })
 
+    // Una imagen que ya tiene fila no vuelve a insertarse. El despacho del back crea el asset al
+    // producir la imagen, y este camino los reconstruye desde `output_images` al aceptar: los dos
+    // corren para la misma corrida, así que cada imagen quedaba registrada dos veces. Medido sobre
+    // los 394 png de la base: 46 filas de más en 5 proyectos, todas dentro de la MISMA sesión.
+    //
+    // El duplicado no es cosmético — ocupa un cupo de los doce que viajan al modelo, se paga su
+    // transporte, y en la librería del proyecto aparece la misma hoja dos veces.
     if (imageAssets.length > 0) {
-      const { error: imgErr } = await db().from('forge_assets').insert(imageAssets)
-      if (imgErr) console.error('[accept] Error guardando image assets:', imgErr.message)
+      const urls = imageAssets.map(a => a.storage_url).filter(Boolean)
+      const { data: yaEstan } = urls.length
+        ? await db().from('forge_assets').select('storage_url')
+            .eq('project_id', project_id).in('storage_url', urls)
+        : { data: [] }
+      const vistas = new Set((yaEstan || []).map(r => r.storage_url))
+      const nuevos = imageAssets.filter(a => !a.storage_url || !vistas.has(a.storage_url))
+      if (nuevos.length < imageAssets.length) {
+        console.log(`[accept] ${imageAssets.length - nuevos.length} imagen(es) ya registradas — no se duplican`)
+      }
+      if (nuevos.length) {
+        const { error: imgErr } = await db().from('forge_assets').insert(nuevos)
+        if (imgErr) console.error('[accept] Error guardando image assets:', imgErr.message)
+      }
     }
 
     // El nodo acaba de reconstruirse con los inputs de ahora, así que ya no está desactualizado.

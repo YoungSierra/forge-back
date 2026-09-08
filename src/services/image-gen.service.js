@@ -104,6 +104,99 @@ function textoDeItem(el) {
   return (cab.length || resto.length) ? [cab.join(' — '), ...resto].filter(Boolean).join('\n\n') : ''
 }
 
+// Trae URL y no trae prompt: es una REFERENCIA a arte que ya existe, no un encargo. Estaba
+// escrito dos veces con el mismo cuerpo —dentro del lector del sobre y en quien filtra los
+// encargos—; ahora es uno solo, porque el nombrado de las imagenes depende de que las dos
+// listas se filtren EXACTAMENTE igual o los nombres se corren de lugar.
+const esReferenciaDeArte = o => o && typeof o === 'object'
+  && ['url', 'path', 'src', 'image_url'].some(k => typeof o[k] === 'string' && /^(https?:|\/)/.test(o[k].trim()))
+  && !['prompt', 'image_prompt'].some(k => typeof o[k] === 'string' && o[k].trim())
+
+// El SOBRE declarado de un output: el arreglo de entradas que la respuesta emite dentro de la
+// seccion de ese output. Vive a nivel de modulo —y no dentro de `parseOutputItems`— porque lo
+// consultan dos: el lector que decide QUE se renderiza, y el que decide COMO SE LLAMA cada
+// imagen resultante. Con dos implementaciones, una deriva y el nombre deja de corresponder al
+// encargo, que es exactamente el fallo del 07-09 en el 2.4.
+function sobreDeLaSeccion (content, outputKey) {
+    if (!outputKey) return null
+    const esc = outputKey.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const anc = new RegExp(`^#{1,4}[ \\t]+\\**\\s*${esc}\\b.*$`, 'im').exec(content)
+    if (!anc) return null
+    const desde = content.slice(anc.index + anc[0].length)
+
+    // No vale «el primer arreglo después del encabezado»: la sección del 2.4 abre con su tabla
+    // de paleta y una lista de tres hex, y esa se llevaba el cupo — a ComfyUI le habrían llegado
+    // «#E8930A», «#04060F» y «#7B2FBE» como prompts. Un sobre de imágenes se reconoce por lo que
+    // trae dentro: objetos con `prompt`/`image_prompt`/`depicts`. Se recorren todos los arreglos
+    // balanceados de la sección y se toma el PRIMERO que lo parezca.
+    // No se exige NINGÚN nombre de campo. Perseguirlos fue perder un día entero: cuatro corridas
+    // del 2.2, la misma DNA, cuatro esquemas — `subject`+`composition_notes`, luego `prompt`,
+    // luego `subject`+`composition`+`mood`+`negative`, y ahora `purpose`+`type`+
+    // `style_inheritance`+`placement_in_concept_document`. Cada nombre nuevo era otro arreglo, y
+    // el que faltaba dejaba el output en cero.
+    //
+    // Lo que SÍ define un sobre, y no cambia: está dentro de la sección de este output, sus
+    // entradas son objetos, y cada una se identifica y se describe. Un `id` y un texto con
+    // cuerpo suficiente para ser una imagen. La lista de paleta del 2.4 —tres cadenas de hex
+    // sueltas— no pasa: ni son objetos ni tienen id.
+    // «Se describe» cuenta también un nivel hacia adentro. El 2.5 puso toda la descripción en
+    // `fills` —un objeto con título, subtítulo, zonas y paleta— y en el primer nivel solo quedaban
+    // etiquetas cortas: `placement: "sheet"`, `format: "vertical_portrait"`. Mirando solo la
+    // superficie, un sobre perfectamente descriptivo parecía metadatos y se descartaba.
+    const textoLargo = o => Object.entries(o).some(([k, v]) =>
+      k !== 'id' && typeof v === 'string' && v.trim().length >= 40)
+    const describe = o => textoLargo(o) || Object.entries(o).some(([k, v]) =>
+      k !== 'id' && v && typeof v === 'object' && !Array.isArray(v) && textoLargo(v))
+    // Trae URL y no trae prompt: es una referencia a arte que ya existe, no un encargo.
+    const esSobre = v => Array.isArray(v) && v.length
+      && v.every(o => o && typeof o === 'object' && !Array.isArray(o))
+      && v.filter(o => typeof o.id === 'string' && o.id.trim()).length >= Math.ceil(v.length / 2)
+      && v.some(describe)
+
+    for (let ini = desde.indexOf('['); ini !== -1; ini = desde.indexOf('[', ini + 1)) {
+      let nivel = 0
+      for (let i = ini; i < desde.length; i++) {
+        if (desde[i] === '[') nivel++
+        else if (desde[i] === ']' && --nivel === 0) {
+          try {
+            const v = JSON.parse(desde.slice(ini, i + 1))
+            // Un candidato hecho SOLO de referencias no es el sobre: es el inventario de arte
+            // aprobado que la seccion cita. El 2.5 lleva una lista `{id, role, url, anchor}` de
+            // cuatro imagenes antes de su sobre real, y quedarse con ella devolvia cero con el
+            // sobre legible unas lineas mas abajo. Se sigue buscando.
+            if (esSobre(v) && !v.every(esReferenciaDeArte)) return v
+          } catch { /* no era un arreglo legible; se prueba el siguiente */ }
+          break
+        }
+      }
+    }
+
+    // Un output de UNA imagen puede emitir el objeto suelto en vez de un arreglo de uno. Es la
+    // misma variación de forma que ya absorbemos por dentro: el 2.5 emitió
+    // `{ "image_emission": { id, placement, fills: {…} } }` y el lector, que solo miraba
+    // arreglos, no encontró nada — cero imágenes con un sobre perfectamente legible delante.
+    //
+    // Se acepta el objeto y se desenvuelve una capa si viene envuelto en una clave única. Se
+    // exige lo mismo que a una entrada de arreglo: que se identifique y que se describa.
+    for (let ini = desde.indexOf('{'); ini !== -1; ini = desde.indexOf('{', ini + 1)) {
+      let nivel = 0
+      for (let i = ini; i < desde.length; i++) {
+        if (desde[i] === '{') nivel++
+        else if (desde[i] === '}' && --nivel === 0) {
+          try {
+            let v = JSON.parse(desde.slice(ini, i + 1))
+            // `{ image_emission: {…} }` → la entrada está una capa adentro.
+            const claves = v && typeof v === 'object' && !Array.isArray(v) ? Object.keys(v) : []
+            if (claves.length === 1 && v[claves[0]] && typeof v[claves[0]] === 'object' && !Array.isArray(v[claves[0]])) v = v[claves[0]]
+            if (esSobre([v]) && !esReferenciaDeArte(v)) return [v]
+          } catch { /* no era éste; se prueba el siguiente */ }
+          break
+        }
+      }
+    }
+    return null
+}
+
 function parseOutputItems(content, format, outputKey = null, soloDeclarado = false) {
   // Fuera antes de mirar nada: `gaps_for_downstream` —que la enmienda M-8 obliga a emitir al
   // cierre de todo output de concepto— son huecos pendientes para los nodos de abajo, no
@@ -187,90 +280,8 @@ function parseOutputItems(content, format, outputKey = null, soloDeclarado = fal
     //
     // Los cercados son decoración; el dato es el arreglo. Se ancla en la sección DEL OUTPUT y se
     // lee el primer arreglo balanceado que venga después, cerrando por conteo de corchetes.
-    const sobreDeLaSeccion = () => {
-      if (!outputKey) return null
-      const esc = outputKey.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-      const anc = new RegExp(`^#{1,4}[ \\t]+\\**\\s*${esc}\\b.*$`, 'im').exec(content)
-      if (!anc) return null
-      const desde = content.slice(anc.index + anc[0].length)
-
-      // No vale «el primer arreglo después del encabezado»: la sección del 2.4 abre con su tabla
-      // de paleta y una lista de tres hex, y esa se llevaba el cupo — a ComfyUI le habrían llegado
-      // «#E8930A», «#04060F» y «#7B2FBE» como prompts. Un sobre de imágenes se reconoce por lo que
-      // trae dentro: objetos con `prompt`/`image_prompt`/`depicts`. Se recorren todos los arreglos
-      // balanceados de la sección y se toma el PRIMERO que lo parezca.
-      // No se exige NINGÚN nombre de campo. Perseguirlos fue perder un día entero: cuatro corridas
-      // del 2.2, la misma DNA, cuatro esquemas — `subject`+`composition_notes`, luego `prompt`,
-      // luego `subject`+`composition`+`mood`+`negative`, y ahora `purpose`+`type`+
-      // `style_inheritance`+`placement_in_concept_document`. Cada nombre nuevo era otro arreglo, y
-      // el que faltaba dejaba el output en cero.
-      //
-      // Lo que SÍ define un sobre, y no cambia: está dentro de la sección de este output, sus
-      // entradas son objetos, y cada una se identifica y se describe. Un `id` y un texto con
-      // cuerpo suficiente para ser una imagen. La lista de paleta del 2.4 —tres cadenas de hex
-      // sueltas— no pasa: ni son objetos ni tienen id.
-      // «Se describe» cuenta también un nivel hacia adentro. El 2.5 puso toda la descripción en
-      // `fills` —un objeto con título, subtítulo, zonas y paleta— y en el primer nivel solo quedaban
-      // etiquetas cortas: `placement: "sheet"`, `format: "vertical_portrait"`. Mirando solo la
-      // superficie, un sobre perfectamente descriptivo parecía metadatos y se descartaba.
-      const textoLargo = o => Object.entries(o).some(([k, v]) =>
-        k !== 'id' && typeof v === 'string' && v.trim().length >= 40)
-      const describe = o => textoLargo(o) || Object.entries(o).some(([k, v]) =>
-        k !== 'id' && v && typeof v === 'object' && !Array.isArray(v) && textoLargo(v))
-      // Trae URL y no trae prompt: es una referencia a arte que ya existe, no un encargo.
-      const esReferenciaSobre = o => o && typeof o === 'object'
-        && ['url', 'path', 'src', 'image_url'].some(k => typeof o[k] === 'string' && /^(https?:|\/)/.test(o[k].trim()))
-        && !['prompt', 'image_prompt'].some(k => typeof o[k] === 'string' && o[k].trim())
-      const esSobre = v => Array.isArray(v) && v.length
-        && v.every(o => o && typeof o === 'object' && !Array.isArray(o))
-        && v.filter(o => typeof o.id === 'string' && o.id.trim()).length >= Math.ceil(v.length / 2)
-        && v.some(describe)
-
-      for (let ini = desde.indexOf('['); ini !== -1; ini = desde.indexOf('[', ini + 1)) {
-        let nivel = 0
-        for (let i = ini; i < desde.length; i++) {
-          if (desde[i] === '[') nivel++
-          else if (desde[i] === ']' && --nivel === 0) {
-            try {
-              const v = JSON.parse(desde.slice(ini, i + 1))
-              // Un candidato hecho SOLO de referencias no es el sobre: es el inventario de arte
-              // aprobado que la seccion cita. El 2.5 lleva una lista `{id, role, url, anchor}` de
-              // cuatro imagenes antes de su sobre real, y quedarse con ella devolvia cero con el
-              // sobre legible unas lineas mas abajo. Se sigue buscando.
-              if (esSobre(v) && !v.every(esReferenciaSobre)) return v
-            } catch { /* no era un arreglo legible; se prueba el siguiente */ }
-            break
-          }
-        }
-      }
-
-      // Un output de UNA imagen puede emitir el objeto suelto en vez de un arreglo de uno. Es la
-      // misma variación de forma que ya absorbemos por dentro: el 2.5 emitió
-      // `{ "image_emission": { id, placement, fills: {…} } }` y el lector, que solo miraba
-      // arreglos, no encontró nada — cero imágenes con un sobre perfectamente legible delante.
-      //
-      // Se acepta el objeto y se desenvuelve una capa si viene envuelto en una clave única. Se
-      // exige lo mismo que a una entrada de arreglo: que se identifique y que se describa.
-      for (let ini = desde.indexOf('{'); ini !== -1; ini = desde.indexOf('{', ini + 1)) {
-        let nivel = 0
-        for (let i = ini; i < desde.length; i++) {
-          if (desde[i] === '{') nivel++
-          else if (desde[i] === '}' && --nivel === 0) {
-            try {
-              let v = JSON.parse(desde.slice(ini, i + 1))
-              // `{ image_emission: {…} }` → la entrada está una capa adentro.
-              const claves = v && typeof v === 'object' && !Array.isArray(v) ? Object.keys(v) : []
-              if (claves.length === 1 && v[claves[0]] && typeof v[claves[0]] === 'object' && !Array.isArray(v[claves[0]])) v = v[claves[0]]
-              if (esSobre([v]) && !esReferenciaSobre(v)) return [v]
-            } catch { /* no era éste; se prueba el siguiente */ }
-            break
-          }
-        }
-      }
-      return null
-    }
     {
-      const arr = sobreDeLaSeccion()
+      const arr = sobreDeLaSeccion(content, outputKey)
       if (arr) {
         // Una entrada que trae URL y no trae prompt NO es un encargo: es una REFERENCIA a arte que
         // ya existe. El 2.4 —Visual Convergence— no genera nada: converge el arte aprobado del 2.2
@@ -281,10 +292,7 @@ function parseOutputItems(content, format, outputKey = null, soloDeclarado = fal
         // Es la misma regla que v2.9.27 le puso al sobre por el lado de la DNA —«no URL, no path
         // dentro del bloque; el sobre transporta ids y texto de prompt»—, aplicada acá para los
         // nodos que ese delta todavía no cubre.
-        const esReferencia = o => o && typeof o === 'object'
-          && ['url', 'path', 'src', 'image_url'].some(k => typeof o[k] === 'string' && /^(https?:|\/)/.test(o[k].trim()))
-          && !['prompt', 'image_prompt'].some(k => typeof o[k] === 'string' && o[k].trim())
-        const refs = arr.filter(esReferencia).length
+        const refs = arr.filter(esReferenciaDeArte).length
         if (refs) {
           console.warn(`[img] ${outputKey}: ${refs} de ${arr.length} entrada(s) son REFERENCIAS a arte ya existente`
             + ' (traen url y no prompt) — no se renderizan.')
@@ -293,7 +301,7 @@ function parseOutputItems(content, format, outputKey = null, soloDeclarado = fal
         // Un `prompt` declarado va tal cual. Sin él, la entrada se arma con sus campos —sujeto,
         // composición, ánimo, paleta— que es exactamente lo que describe la imagen; serializar el
         // objeto entero le mandaría llaves y comillas al modelo de imagen.
-        const items = arr.filter(o => !esReferencia(o)).map(o => {
+        const items = arr.filter(o => !esReferenciaDeArte(o)).map(o => {
           if (typeof o === 'string') return o
           for (const campo of ['prompt', 'image_prompt']) {
             const v = o?.[campo]
@@ -1180,4 +1188,42 @@ ${cola}`
   }
 }
 
-module.exports = { imageOutputsOf, parseOutputItems, tieneEntidades, cleanItemText, generateOneImage, generateDeck, esDeck, paginaDelASG, imagenDeNodoPorTitulo }
+/**
+ * Los ids que el output DECLARO para sus imagenes, en el mismo orden y con el mismo filtro que
+ * `parseOutputItems` usa para decidir que se renderiza.
+ *
+ * Existe para que una imagen se llame como su encargo. Habia tres formas de nombrar el mismo tipo
+ * de activo —`${titulo} — ${id}` por un camino, `${titulo} — ${etiqueta} ${n}` por los otros dos—
+ * y cual corria dependia de quien despachaba. El 07-09 el 2.4 corrio de las dos maneras con un
+ * minuto de diferencia: el plan que quedo guardado nombra `orient_01_splash`, sus propias imagenes
+ * quedaron como «Convergence Images 1..4», y las que si se llaman `orient_*` son de la otra
+ * corrida y con otros roles. El plan no puede senalar ninguna de sus imagenes, y aguas abajo el
+ * 2.5 recibio las dos generaciones a la vez sin forma de distinguirlas.
+ *
+ * Devuelve `null` cuando el output no declaro sobre —ahi no hay id que usar y el contador sigue
+ * siendo lo unico que hay—.
+ */
+function idsDeclarados (content, outputKey) {
+  const arr = sobreDeLaSeccion(String(content || ''), outputKey)
+  if (!arr) return null
+  const ids = arr
+    .filter(o => !esReferenciaDeArte(o))
+    .map(o => (typeof o?.id === 'string' && o.id.trim()) ? o.id.trim() : null)
+  return ids.every(Boolean) ? ids : null
+}
+
+/**
+ * Como se llama la imagen numero `idx` de un output.
+ *
+ * Un unico criterio para los tres caminos de despacho. El id del encargo manda; el contador es el
+ * respaldo para cuando no hay sobre. Se exige que la cuenta COINCIDA: si el sobre declaro cuatro y
+ * salieron cinco imagenes, emparejar por posicion le pondria a una imagen el nombre del encargo de
+ * otra, que es peor que un nombre generico.
+ */
+function nombreDeImagen ({ tituloNodo, etiqueta, ids, idx, total }) {
+  const base = `${tituloNodo} — ${etiqueta}`
+  if (Array.isArray(ids) && ids.length === total && ids[idx]) return `${tituloNodo} — ${ids[idx]}`
+  return total > 1 ? `${base} ${idx + 1}` : base
+}
+
+module.exports = { imageOutputsOf, parseOutputItems, idsDeclarados, nombreDeImagen, sobreDeLaSeccion, tieneEntidades, cleanItemText, generateOneImage, generateDeck, esDeck, paginaDelASG, imagenDeNodoPorTitulo }
