@@ -3550,21 +3550,30 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
       const { assemble, defaultGlue }      = require('../services/assembler.service')
       const { resolveAssemblyPools }       = require('../services/canvas-chat.service')
 
-      const tpl = await getTemplate(node.node_key, asmKey)
+      // La plantilla v2 la nombra el propio output (`template_ref`) y es un DOCUMENTO markdown
+      // con `{{slot:ID}}`, no una lista de slots que haya que maquetar: su forma —encabezados,
+      // línea *Source:* por sección, la caja de REAL NUMBERS— vive en la plantilla y no acá.
+      // Si el output no la nombra, o no está en el catálogo, sigue el camino v1 tal cual.
+      const { assembleV2, getTemplateV2, glueV2 } = require('../services/assembler-v2.service')
+      const tplV2 = targetOutput.template_ref ? getTemplateV2(targetOutput.template_ref) : null
+
+      const tpl = tplV2 || await getTemplate(node.node_key, asmKey)
       if (!tpl) {
         return res.status(422).json({ success: false, error:
-          `El output ${node.node_key}/${asmKey} está marcado como assembly pero no existe su plantilla (${templateIdFor(node.node_key, asmKey)}).` })
+          `El output ${node.node_key}/${asmKey} está marcado como assembly pero no existe su plantilla (${targetOutput.template_ref || templateIdFor(node.node_key, asmKey)}).` })
       }
 
       const pools = await resolveAssemblyPools(db, {
         projectId: project_id, currentPNodeId: currentPNode?.id, node, outputDefs: allOutputDefs,
       })
-      const r = await assemble(tpl, pools.inputs, pools.siblings, { glue: defaultGlue })
+      const r = tplV2
+        ? await assembleV2(tpl, pools.inputs, pools.siblings, { glue: glueV2 })
+        : await assemble(tpl, pools.inputs, pools.siblings, { glue: defaultGlue })
       const glued = r.manifest.slots.filter(s => s.llm_generated).length
 
       console.log('\n─── [forge-chat] ENSAMBLE (por plantilla) ───────────')
       console.log(`  nodo/output:  ${node.node_key}/${asmKey}`)
-      console.log(`  plantilla:    ${tpl.template_id} (${tpl.slots.length} slots)`)
+      console.log(`  plantilla:    ${tpl.template_id} (${(tpl.slots || tpl.manifest?.slots || []).length} slots${tplV2 ? ', v2' : ''})`)
       console.log(`  inputs:       ${Object.keys(pools.inputs).join(', ') || '(ninguno)'}`)
       console.log(`  siblings:     ${Object.keys(pools.siblings).join(', ') || '(ninguno)'}`)
       console.log(`  slots llenos: ${r.manifest.slots.filter(s => s.filled).length}/${r.manifest.slots.length}  (${glued} por pegamento LLM)`)

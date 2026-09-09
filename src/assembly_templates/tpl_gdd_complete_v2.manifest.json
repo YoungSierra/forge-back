@@ -1,0 +1,705 @@
+{
+ "template": "tpl_gdd_complete_v2",
+ "derived_from": "gdd_template_population.md v2.4.0 (Drive 1aweaWlruqjd0ngGyaoCkkFWJEqOP1HOc)",
+ "sections": 15,
+ "assembler_rules": [
+  "order: transcribe → pointer → glue (glue slots read assembled sections) — never glue first",
+  "transcribe slots: copy from the named input; verbatim_fields byte-for-byte; absent source → omit (decision 4)",
+  "glue slots: the ONLY model-authored text — scoped to `reads`, obeying `rules`; never re-derive a transcribe slot",
+  "pointer slots: assembled from metadata, no model",
+  "no validation pass at assembly (decision 3): upstream approval is the guarantee",
+  "every rendered section ends with its italic Source line"
+ ],
+ "slots": [
+  {
+   "slot": "s0.executive_summary",
+   "section": "0",
+   "kind": "glue",
+   "source": {
+    "reads": "§1, §2"
+   },
+   "required": true,
+   "must_contain": "Five sentences: what the game is (elevator line verbatim), who it is for, the pillar names, the core loop verbs, the platform commitment. Nothing that §1–§8 do not carry.",
+   "ceiling_words": 120,
+   "downstream": null,
+   "rules": [
+    "one page max",
+    "commitments, not descriptions",
+    "REAL NUMBERS RULE",
+    "BANNED WORDS",
+    "verbatim names for anything locked upstream (mechanics, pillars, characters, factions)",
+    "CITATION RULE: downstream documents by TITLE, never node numbers",
+    "ends with the italic Source line",
+    "if an input it reads is absent, write from what IS present — never name, describe or estimate the missing input"
+   ],
+   "when_absent": "never absent: authored"
+  },
+  {
+   "slot": "s1.title",
+   "section": "1",
+   "kind": "transcribe",
+   "source": {
+    "input": "concept_data",
+    "fields": [
+     "title"
+    ]
+   },
+   "required": true,
+   "verbatim_fields": [
+    "title"
+   ],
+   "when_absent": "OMIT the slot; if every slot of the section is absent, omit the section and its heading (decision 4)"
+  },
+  {
+   "slot": "s1.elevator_line",
+   "section": "1",
+   "kind": "transcribe",
+   "source": {
+    "input": "concept_data",
+    "fields": [
+     "elevator_line"
+    ]
+   },
+   "required": true,
+   "verbatim_fields": [
+    "elevator_line"
+   ],
+   "when_absent": "OMIT the slot; if every slot of the section is absent, omit the section and its heading (decision 4)"
+  },
+  {
+   "slot": "s1.one_liner",
+   "section": "1",
+   "kind": "transcribe",
+   "source": {
+    "input": "concept_data",
+    "fields": [
+     "one_liner"
+    ]
+   },
+   "required": true,
+   "verbatim_fields": [
+    "one_liner"
+   ],
+   "when_absent": "OMIT the slot; if every slot of the section is absent, omit the section and its heading (decision 4)"
+  },
+  {
+   "slot": "s1.fact_sheet",
+   "section": "1",
+   "kind": "transcribe",
+   "source": {
+    "input": "concept_data",
+    "fields": [
+     "fact_sheet.genre",
+     "fact_sheet.perspective",
+     "fact_sheet.platform",
+     "fact_sheet.audience",
+     "fact_sheet.scope",
+     "fact_sheet.target_rating",
+     "fact_sheet.engine",
+     "fact_sheet.team_profile",
+     "fact_sheet.reference_stack"
+    ]
+   },
+   "required": true,
+   "verbatim_fields": [
+    "fact_sheet.audience"
+   ],
+   "when_absent": "OMIT the slot; if every slot of the section is absent, omit the section and its heading (decision 4)",
+   "rules": [
+    "engine marked [PROJECTED] if not final",
+    "team profile marked [ASSUMPTION] if not user-provided"
+   ]
+  },
+  {
+   "slot": "s2.pillars",
+   "section": "2",
+   "kind": "transcribe",
+   "source": {
+    "input": "design_pillars",
+    "fields": [
+     "pillars[].name",
+     "pillars[].statement"
+    ]
+   },
+   "required": true,
+   "verbatim_fields": [
+    "pillars[].statement"
+   ],
+   "when_absent": "OMIT the slot; if every slot of the section is absent, omit the section and its heading (decision 4)"
+  },
+  {
+   "slot": "s2.anti_pillars",
+   "section": "2",
+   "kind": "transcribe",
+   "source": {
+    "input": "design_pillars",
+    "fields": [
+     "anti_pillars[]"
+    ]
+   },
+   "required": true,
+   "when_absent": "OMIT the slot; if every slot of the section is absent, omit the section and its heading (decision 4)"
+  },
+  {
+   "slot": "s2.feel_statement",
+   "section": "2",
+   "kind": "transcribe",
+   "source": {
+    "input": "feel_statement",
+    "fields": [
+     "*"
+    ]
+   },
+   "required": true,
+   "verbatim_fields": [
+    "*"
+   ],
+   "when_absent": "OMIT the slot; if every slot of the section is absent, omit the section and its heading (decision 4)"
+  },
+  {
+   "slot": "s3.core_loop",
+   "section": "3",
+   "kind": "transcribe",
+   "source": {
+    "input": "core_loop",
+    "fields": [
+     "verbs[] numbered"
+    ]
+   },
+   "required": true,
+   "verbatim_fields": [
+    "verbs[]"
+   ],
+   "when_absent": "OMIT the slot; if every slot of the section is absent, omit the section and its heading (decision 4)"
+  },
+  {
+   "slot": "s3.signature_mechanics",
+   "section": "3",
+   "kind": "transcribe",
+   "source": {
+    "input": "mechanic_specs",
+    "fields": [
+     "mechanics[]: name, player_facing_intent, rules (real numbers), io_events, dependencies, acceptance_criteria"
+    ]
+   },
+   "required": true,
+   "verbatim_fields": [
+    "mechanics[].name"
+   ],
+   "when_absent": "OMIT the slot; if every slot of the section is absent, omit the section and its heading (decision 4)",
+   "rules": [
+    "exactly the mechanics the input carries — never a 4th, never a merged one",
+    "≥1 testable acceptance criterion each"
+   ]
+  },
+  {
+   "slot": "s3.difficulty_curve",
+   "section": "3",
+   "kind": "transcribe",
+   "source": {
+    "input": "mechanic_specs",
+    "fields": [
+     "difficulty_curve"
+    ]
+   },
+   "required": true,
+   "when_absent": "OMIT the slot; if every slot of the section is absent, omit the section and its heading (decision 4)"
+  },
+  {
+   "slot": "s4.progression",
+   "section": "4",
+   "kind": "transcribe",
+   "source": {
+    "input": "progression_sys",
+    "fields": [
+     "*"
+    ]
+   },
+   "required": false,
+   "when_absent": "OMIT the slot; if every slot of the section is absent, omit the section and its heading (decision 4)"
+  },
+  {
+   "slot": "s4.economy",
+   "section": "4",
+   "kind": "transcribe",
+   "source": {
+    "input": "economy_design",
+    "fields": [
+     "sources",
+     "sinks",
+     "target_rates"
+    ]
+   },
+   "required": false,
+   "when_absent": "OMIT the slot; if every slot of the section is absent, omit the section and its heading (decision 4)"
+  },
+  {
+   "slot": "s4.player_stats",
+   "section": "4",
+   "kind": "transcribe",
+   "source": {
+    "input": "player_stats",
+    "fields": [
+     "*"
+    ]
+   },
+   "required": false,
+   "when_absent": "OMIT the slot; if every slot of the section is absent, omit the section and its heading (decision 4)",
+   "rules": [
+    "every stat with a number"
+   ]
+  },
+  {
+   "slot": "s4.item_catalog",
+   "section": "4",
+   "kind": "transcribe",
+   "source": {
+    "input": "item_catalog",
+    "fields": [
+     "categories",
+     "counts",
+     "items[] (name, value, drop_rate 0–1, stack_limit, mechanic)"
+    ]
+   },
+   "required": false,
+   "verbatim_fields": [
+    "items[].name"
+   ],
+   "when_absent": "OMIT the slot; if every slot of the section is absent, omit the section and its heading (decision 4)"
+  },
+  {
+   "slot": "s5.world_premise",
+   "section": "5",
+   "kind": "transcribe",
+   "source": {
+    "input": "world_lore",
+    "fields": [
+     "premise",
+     "rules"
+    ]
+   },
+   "required": false,
+   "when_absent": "OMIT the slot; if every slot of the section is absent, omit the section and its heading (decision 4)"
+  },
+  {
+   "slot": "s5.environments",
+   "section": "5",
+   "kind": "transcribe",
+   "source": {
+    "input": "environments_x4",
+    "fields": [
+     "environments[]: name, identity, function, grounding"
+    ]
+   },
+   "required": false,
+   "verbatim_fields": [
+    "environments[].name"
+   ],
+   "when_absent": "OMIT the slot; if every slot of the section is absent, omit the section and its heading (decision 4)",
+   "rules": [
+    "minimum 4"
+   ]
+  },
+  {
+   "slot": "s5.factions",
+   "section": "5",
+   "kind": "transcribe",
+   "source": {
+    "input": "faction_map",
+    "fields": [
+     "factions[]: name, goals, values, method, conflicts"
+    ]
+   },
+   "required": false,
+   "verbatim_fields": [
+    "factions[].name"
+   ],
+   "when_absent": "OMIT the slot; if every slot of the section is absent, omit the section and its heading (decision 4)"
+  },
+  {
+   "slot": "s5.narrative_arc",
+   "section": "5",
+   "kind": "transcribe",
+   "source": {
+    "input": "narrative_arc",
+    "fields": [
+     "structure",
+     "progression_interlock"
+    ]
+   },
+   "required": false,
+   "when_absent": "OMIT the slot; if every slot of the section is absent, omit the section and its heading (decision 4)"
+  },
+  {
+   "slot": "s5.dialogue_system",
+   "section": "5",
+   "kind": "transcribe",
+   "source": {
+    "input": "dialogue_system",
+    "fields": [
+     "trigger_architecture",
+     "tree_structure",
+     "scope"
+    ]
+   },
+   "required": false,
+   "when_absent": "OMIT the slot; if every slot of the section is absent, omit the section and its heading (decision 4)"
+  },
+  {
+   "slot": "s6.level_structure",
+   "section": "6",
+   "kind": "transcribe",
+   "source": {
+    "input": "level_map",
+    "fields": [
+     "structure",
+     "levels[] table"
+    ]
+   },
+   "required": false,
+   "when_absent": "OMIT the slot; if every slot of the section is absent, omit the section and its heading (decision 4)",
+   "rules": [
+    "one row per level, every cell a value"
+   ]
+  },
+  {
+   "slot": "s6.encounters",
+   "section": "6",
+   "kind": "transcribe",
+   "source": {
+    "input": "encounter_design",
+    "fields": [
+     "archetypes[]: mechanic_tie, intent, composition"
+    ]
+   },
+   "required": false,
+   "when_absent": "OMIT the slot; if every slot of the section is absent, omit the section and its heading (decision 4)"
+  },
+  {
+   "slot": "s6.pacing",
+   "section": "6",
+   "kind": "transcribe",
+   "source": {
+    "input": "level_map",
+    "fields": [
+     "pacing"
+    ]
+   },
+   "required": false,
+   "when_absent": "OMIT the slot; if every slot of the section is absent, omit the section and its heading (decision 4)"
+  },
+  {
+   "slot": "s7.player_characters",
+   "section": "7",
+   "kind": "transcribe",
+   "source": {
+    "input": "char_profiles",
+    "fields": [
+     "player_characters[]: identity, mechanical_role"
+    ]
+   },
+   "required": false,
+   "verbatim_fields": [
+    "*.name"
+   ],
+   "when_absent": "OMIT the slot; if every slot of the section is absent, omit the section and its heading (decision 4)"
+  },
+  {
+   "slot": "s7.principal_cast",
+   "section": "7",
+   "kind": "transcribe",
+   "source": {
+    "input": "char_profiles",
+    "fields": [
+     "cast[]: name, voice, want, mechanical_role"
+    ]
+   },
+   "required": false,
+   "verbatim_fields": [
+    "cast[].name"
+   ],
+   "when_absent": "OMIT the slot; if every slot of the section is absent, omit the section and its heading (decision 4)",
+   "rules": [
+    "minimum 3 profiles"
+   ]
+  },
+  {
+   "slot": "s7.abilities",
+   "section": "7",
+   "kind": "transcribe",
+   "source": {
+    "input": "char_abilities",
+    "fields": [
+     "abilities[]"
+    ]
+   },
+   "required": false,
+   "verbatim_fields": [
+    "abilities[].name"
+   ],
+   "when_absent": "OMIT the slot; if every slot of the section is absent, omit the section and its heading (decision 4)"
+  },
+  {
+   "slot": "s7.character_faction_map",
+   "section": "7",
+   "kind": "transcribe",
+   "source": {
+    "input": "char_profiles",
+    "fields": [
+     "faction_map"
+    ]
+   },
+   "required": false,
+   "when_absent": "OMIT the slot; if every slot of the section is absent, omit the section and its heading (decision 4)"
+  },
+  {
+   "slot": "s8.hud",
+   "section": "8",
+   "kind": "transcribe",
+   "source": {
+    "input": "hud_layout",
+    "fields": [
+     "per_state_layouts",
+     "persistence_rules"
+    ]
+   },
+   "required": false,
+   "when_absent": "OMIT the slot; if every slot of the section is absent, omit the section and its heading (decision 4)",
+   "rules": [
+    "max 7 simultaneous elements or written justification"
+   ]
+  },
+  {
+   "slot": "s8.menu_architecture",
+   "section": "8",
+   "kind": "transcribe",
+   "source": {
+    "input": "menu_tree",
+    "fields": [
+     "navigation_graph"
+    ]
+   },
+   "required": false,
+   "when_absent": "OMIT the slot; if every slot of the section is absent, omit the section and its heading (decision 4)"
+  },
+  {
+   "slot": "s8.controls",
+   "section": "8",
+   "kind": "transcribe",
+   "source": {
+    "input": "control_map",
+    "fields": [
+     "*"
+    ]
+   },
+   "required": false,
+   "when_absent": "OMIT the slot; if every slot of the section is absent, omit the section and its heading (decision 4)"
+  },
+  {
+   "slot": "s8.feedback",
+   "section": "8",
+   "kind": "transcribe",
+   "source": {
+    "input": "feedback_system",
+    "fields": [
+     "events[]: trigger, visual_rule, duration_ms"
+    ]
+   },
+   "required": false,
+   "when_absent": "OMIT the slot; if every slot of the section is absent, omit the section and its heading (decision 4)",
+   "rules": [
+    "duration in ms, a number"
+   ]
+  },
+  {
+   "slot": "s8.onboarding",
+   "section": "8",
+   "kind": "transcribe",
+   "source": {
+    "input": "hud_layout",
+    "fields": [
+     "onboarding_first_10_minutes"
+    ]
+   },
+   "required": false,
+   "when_absent": "OMIT the slot; if every slot of the section is absent, omit the section and its heading (decision 4)"
+  },
+  {
+   "slot": "s8.accessibility",
+   "section": "8",
+   "kind": "transcribe",
+   "source": {
+    "input": "hud_layout",
+    "fields": [
+     "accessibility[]"
+    ]
+   },
+   "required": false,
+   "when_absent": "OMIT the slot; if every slot of the section is absent, omit the section and its heading (decision 4)",
+   "rules": [
+    "minimum 5, each with a technical description"
+   ]
+  },
+  {
+   "slot": "s9.audio_brief",
+   "section": "9",
+   "kind": "glue",
+   "source": {
+    "reads": "§1–§8"
+   },
+   "required": true,
+   "must_contain": "Music intent per game state (per pillars & feel) · SFX priorities (the sounds that must be nailed) · Diegetic vs non-diegetic split · Middleware implications, flagged for the Technical Design Document",
+   "ceiling_words": 450,
+   "downstream": "Audio Direction Document (3.10)",
+   "rules": [
+    "one page max",
+    "commitments, not descriptions",
+    "REAL NUMBERS RULE",
+    "BANNED WORDS",
+    "verbatim names for anything locked upstream (mechanics, pillars, characters, factions)",
+    "CITATION RULE: downstream documents by TITLE, never node numbers",
+    "ends with the italic Source line",
+    "if an input it reads is absent, write from what IS present — never name, describe or estimate the missing input"
+   ],
+   "when_absent": "never absent: authored"
+  },
+  {
+   "slot": "s10.technical_brief",
+   "section": "10",
+   "kind": "glue",
+   "source": {
+    "reads": "§1 fact sheet, §3 mechanic_specs, §4 systems, §8 HUD/feedback"
+   },
+   "required": true,
+   "must_contain": "Engine target restated as a commitment ([PROJECTED] if §1 marks it) · Custom systems required, each with a why-not-off-the-shelf line · Platform commitments · Performance targets with numbers (FPS, resolution, memory) · Data-authoring conventions (naming, folders, test-assembly prefix) — seeds pipeline_design",
+   "ceiling_words": 450,
+   "downstream": "Technical Design Document (3.12)",
+   "rules": [
+    "one page max",
+    "commitments, not descriptions",
+    "REAL NUMBERS RULE",
+    "BANNED WORDS",
+    "verbatim names for anything locked upstream (mechanics, pillars, characters, factions)",
+    "CITATION RULE: downstream documents by TITLE, never node numbers",
+    "ends with the italic Source line",
+    "if an input it reads is absent, write from what IS present — never name, describe or estimate the missing input"
+   ],
+   "when_absent": "never absent: authored"
+  },
+  {
+   "slot": "s11.mvp_scope",
+   "section": "11",
+   "kind": "glue",
+   "source": {
+    "reads": "§2 pillars, §3 core loop + mechanics, §6 pacing"
+   },
+   "required": true,
+   "must_contain": "What the prototype must prove (1–2 hypotheses, testable) · Mechanics IN scope (named subset of §3, verbatim names) · Mechanics explicitly OUT of scope · Success criteria: 3–5, binary, externally observable, each with a number",
+   "ceiling_words": 400,
+   "downstream": "Prototype Specification (3.16)",
+   "rules": [
+    "one page max",
+    "commitments, not descriptions",
+    "REAL NUMBERS RULE",
+    "BANNED WORDS",
+    "verbatim names for anything locked upstream (mechanics, pillars, characters, factions)",
+    "CITATION RULE: downstream documents by TITLE, never node numbers",
+    "ends with the italic Source line",
+    "if an input it reads is absent, write from what IS present — never name, describe or estimate the missing input"
+   ],
+   "when_absent": "never absent: authored"
+  },
+  {
+   "slot": "s12.product_scope_seed",
+   "section": "12",
+   "kind": "glue",
+   "source": {
+    "reads": "§1, §3–§8"
+   },
+   "required": true,
+   "must_contain": "Shippable-product definition in ONE paragraph · In/out boundary at feature level as a MoSCoW seed (Must/Should/Could/Won't, verbatim feature names) · Known scope risks (risk → section it threatens)",
+   "ceiling_words": 350,
+   "downstream": "Product Scope (3.15)",
+   "rules": [
+    "one page max",
+    "commitments, not descriptions",
+    "REAL NUMBERS RULE",
+    "BANNED WORDS",
+    "verbatim names for anything locked upstream (mechanics, pillars, characters, factions)",
+    "CITATION RULE: downstream documents by TITLE, never node numbers",
+    "ends with the italic Source line",
+    "if an input it reads is absent, write from what IS present — never name, describe or estimate the missing input"
+   ],
+   "when_absent": "never absent: authored"
+  },
+  {
+   "slot": "s13.monetization",
+   "section": "13",
+   "kind": "transcribe",
+   "source": {
+    "input": "financial_case",
+    "fields": [
+     "model",
+     "price_point",
+     "design_guardrails"
+    ]
+   },
+   "required": false,
+   "when_absent": "OMIT the slot; if every slot of the section is absent, omit the section and its heading (decision 4)",
+   "rules": [
+    "never authored, never estimated",
+    "financial_case (2.3) is NOT wired to 3.8 today → renders the when_absent line by contract"
+   ]
+  },
+  {
+   "slot": "s14.downstream_documents",
+   "section": "14",
+   "kind": "pointer",
+   "source": {
+    "metadata": "downstream documents this GDD spawns"
+   },
+   "required": true,
+   "must_contain": "Table: document TITLE · consuming node — Art Direction Document (3.9), Audio Direction Document (3.10), Technical Design Document (3.12), Product Scope (3.15), Production Plan (3.16), Prototype Specification (3.16)",
+   "when_absent": "assembled from metadata; cannot be absent"
+  },
+  {
+   "slot": "s14.reference_stack",
+   "section": "14",
+   "kind": "pointer",
+   "source": {
+    "input": "concept_data",
+    "fields": [
+     "fact_sheet.reference_stack"
+    ]
+   },
+   "required": true,
+   "must_contain": "The §1 reference stack restated as a table (title · what it is a reference for)",
+   "when_absent": "assembled from metadata; cannot be absent"
+  },
+  {
+   "slot": "appendix.section_map",
+   "section": "appendix",
+   "kind": "pointer",
+   "source": {
+    "assembler": "one row per section from the slot table"
+   },
+   "required": true,
+   "must_contain": "Columns: section, source_node, source_connection, verbatim_fields, gaps — §9–§12 rows carry source_node = 3.8 (authored). This table IS the section_map the gdd_ref pointer references.",
+   "when_absent": "assembled from metadata; cannot be absent"
+  }
+ ],
+ "decisions_2026-09-09": {
+  "1_glue_slots": "five (s0.executive_summary, s9, s10, s11, s12) — the only model-authored text",
+  "2_wiring": "feel_statement, char_abilities, menu_tree, control_map, financial_case wired to 3.8 in v2.9.34",
+  "3_validation": "no separate consistency pass: upstream nodes are approved before 3.8 runs — that approval is what the template relies on; gdd_consistency_validation is not invoked at assembly",
+  "4_absent_sections": "a section (or sub-slot) whose source is absent is OMITTED from the document — no [FORGE] tag, no placeholder, no empty heading; numbering of the remaining sections is preserved",
+  "5_slot_syntax": "Young's tpl_gdd_complete_v1 syntax; the {{slot:ID}} markers here are a proposal — map the manifest, keep his keys"
+ },
+ "wiring_added_in_v2.9.34": [
+  "feel_statement (3.1)",
+  "char_abilities (3.6)",
+  "menu_tree (3.7)",
+  "control_map (3.7)",
+  "financial_case (2.3)"
+ ]
+}
