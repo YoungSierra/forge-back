@@ -40,6 +40,9 @@ const RX_REFIMG = /reference image (\d+)\s*(?:=|\()\s*([^)\n]+)/gi
 // imagen es del proyecto. Sin esto, Marketing_Video pasaba como si sus dos LoadImage fueran
 // maquetas y se habría renderizado con las dos imágenes de muestra del autor, en silencio.
 const RX_MENCION = /reference image (\d+)/gi
+// Y la tercera forma viva, la del UIUX: «IMAGE 2 = The VISUAL REFERENCE, LOGO & CONCEPT ART (from
+// Pitch/GDD)». Dice de dónde sale, solo que entre paréntesis y sin la palabra «coming».
+const RX_PAREN = /IMAGE (\d+) = [^\n]*?\(from ([^)\n]+)\)/gi
 // El Art Bible cita en cambio la página del ASG que le sirve de canon.
 const RX_ASG = /Art Style Guide \(ASG\s*[·.\-]?\s*(\d{1,2})\s*([^)]*)\)/i
 
@@ -53,17 +56,19 @@ const tipoDe = c => /Audio/i.test(c) ? 'audio'
   : /Video|WEBM|AnimatedWEBP|Gif/i.test(c) ? 'video'
     : 'image'
 
-// Todo lo alcanzable caminando hacia atrás por los inputs. Es el mismo paseo que hace el podado
-// del motor, y sirve igual para un grafo de tres nodos que para el ASG de 25 páginas.
+// Todo lo alcanzable caminando hacia atrás por los inputs, CON su distancia al productor. Es el
+// mismo paseo que hace el podado del motor, y sirve igual para un grafo de tres nodos que para el
+// ASG de 25 páginas. La distancia importa cuando un deck encadena etapas: la sprite sheet del
+// UIUX cuelga de la pantalla, así que el prompt de la pantalla también le queda aguas arriba.
 function aguasArriba (wf, raiz) {
-  const vistos = new Set(), cola = [raiz]
+  const dist = new Map(), cola = [[raiz, 0]]
   while (cola.length) {
-    const id = cola.pop()
-    if (!id || vistos.has(id) || !wf[id]) continue
-    vistos.add(id)
-    for (const [, v] of enlaces(wf[id])) cola.push(v[0])
+    const [id, d] = cola.shift()
+    if (!id || dist.has(id) || !wf[id]) continue
+    dist.set(id, d)
+    for (const [, v] of enlaces(wf[id])) cola.push([v[0], d + 1])
   }
-  return vistos
+  return dist
 }
 
 // El prompt de la página: el string literal que trae la caja del intake. Si ninguno la trae —un
@@ -71,16 +76,19 @@ function aguasArriba (wf, raiz) {
 // versión anterior asumía sin decirlo.
 function hallarPrompt (wf, ids) {
   const cand = []
-  for (const id of ids) {
+  for (const [id, d] of ids) {
     for (const [campo, v] of Object.entries(wf[id]?.inputs || {})) {
       if (Array.isArray(v) || typeof v !== 'string') continue
       if (!CAMPOS.includes(campo) && !/prompt|text/i.test(campo)) continue
-      cand.push({ id, campo, texto: v, caja: /╔/.test(v) })
+      cand.push({ id, campo, texto: v, caja: /╔/.test(v), dist: d })
     }
   }
   const conCaja = cand.filter(c => c.caja)
   const pool = conCaja.length ? conCaja : cand
-  return pool.sort((a, b) => b.texto.length - a.texto.length)[0] || null
+  // Manda la CERCANÍA, no el tamaño. Las cuatro sprite sheets del UIUX cuelgan de su pantalla, y
+  // el prompt de la pantalla es más largo que el suyo: por tamaño, las ocho páginas del deck
+  // terminaban compartiendo cuatro prompts y las sprite sheets quedaban sin el suyo.
+  return pool.sort((a, b) => a.dist - b.dist || b.texto.length - a.texto.length)[0] || null
 }
 
 ;(async () => {
@@ -103,11 +111,23 @@ function hallarPrompt (wf, ids) {
     const pr = hallarPrompt(wf, ids)
     if (!pr) { console.warn(`la página ${nombre} no tiene ningún prompt legible`); continue }
 
-    // Las fuentes que el prompt declara, por número de slot.
+    // Las fuentes que se declaran, por número de slot. Se leen del prompt de la página y también
+    // de los que le quedan aguas arriba, del más cercano al más lejano: en un deck encadenado la
+    // página derivada no vuelve a nombrar la referencia —la sprite sheet del UIUX trabaja sobre la
+    // pantalla ya generada— pero comparte su LoadImage, y quien la nombra es la pantalla.
     const fuentes = new Map()
-    for (const m of pr.texto.matchAll(RX_FUENTE)) fuentes.set(m[1], m[2].trim())
-    for (const m of pr.texto.matchAll(RX_REFIMG)) if (!fuentes.has(m[1])) fuentes.set(m[1], m[2].trim())
-    const mencionados = new Set([...pr.texto.matchAll(RX_MENCION)].map(m => m[1]))
+    const mencionados = new Set()
+    const textos = [...ids.entries()]
+      .sort((a, b) => a[1] - b[1])
+      .flatMap(([id]) => Object.entries(wf[id]?.inputs || {})
+        .filter(([c, v]) => typeof v === 'string' && (CAMPOS.includes(c) || /prompt|text/i.test(c)))
+        .map(([, v]) => v))
+    for (const t of textos) {
+      for (const m of t.matchAll(RX_FUENTE)) if (!fuentes.has(m[1])) fuentes.set(m[1], m[2].trim())
+      for (const m of t.matchAll(RX_REFIMG)) if (!fuentes.has(m[1])) fuentes.set(m[1], m[2].trim())
+      for (const m of t.matchAll(RX_PAREN)) if (!fuentes.has(m[1])) fuentes.set(m[1], m[2].trim())
+      for (const m of t.matchAll(RX_MENCION)) mencionados.add(m[1])
+    }
 
     // Los LoadImage alcanzables. Cuál es hueco del proyecto y cuál es la maqueta del estudio:
     //   · marcador REPLACE_WITH en el nombre del archivo → hueco declarado por el autor
@@ -115,7 +135,7 @@ function hallarPrompt (wf, ids) {
     //   · cableado a un slot `image_N`/`reference_image` cuya fuente el prompt nombra → hueco
     // Cualquier otro LoadImage es la maqueta del estudio y NO se inyecta.
     const refs = []
-    for (const id of ids) {
+    for (const id of ids.keys()) {
       const n = wf[id]
       if (!esLoad(n?.class_type)) continue
       const archivo = String(n.inputs?.image || '')
@@ -125,7 +145,7 @@ function hallarPrompt (wf, ids) {
       const marcador = /^REPLACE_WITH/i.test(archivo) && !/TEMPLATE/i.test(archivo)
 
       let slot = null, dueño = null
-      for (const otro of ids) {
+      for (const otro of ids.keys()) {
         for (const [campo, v] of enlaces(wf[otro])) {
           if (v[0] !== id) continue
           dueño = otro
@@ -135,6 +155,9 @@ function hallarPrompt (wf, ids) {
       }
       const lote = dueño && /ImageBatch/i.test(wf[dueño]?.class_type || '')
       const segundaRama = Boolean(lote) && enlaces(wf[dueño])[1]?.[1]?.[0] === id
+      // En un ImageBatch el prompt las llama IMAGE 1 y IMAGE 2 por su rama: la segunda es la del
+      // proyecto. Sin esto el hueco quedaba sin fuente aunque el prompt la nombrara.
+      if (!slot && lote) slot = String(enlaces(wf[dueño]).findIndex(([, v]) => v[0] === id) + 1)
       const fuente = slot ? fuentes.get(slot) : null
 
       const hueco = marcador || segundaRama || Boolean(fuente) || (slot && mencionados.has(slot))
