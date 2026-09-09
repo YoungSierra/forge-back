@@ -8,6 +8,16 @@
 
 const { logExecution } = require('./execution-log.service')
 
+// Con qué mime se guarda lo que devuelve un deck. Un deck ya no es solo imágenes: el de Marketing
+// entrega mp4 y el de Audio mp3, y subirlos como image/png los deja sin abrir en ningún visor.
+const MIME_POR_EXT = {
+  png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif',
+  mp4: 'video/mp4', webm: 'video/webm', mov: 'video/quicktime',
+  mp3: 'audio/mpeg', wav: 'audio/wav', flac: 'audio/flac', ogg: 'audio/ogg', m4a: 'audio/mp4',
+}
+const CLASE_POR_EXT = ext =>
+  /^(mp4|webm|mov)$/.test(ext) ? 'video' : /^(mp3|wav|flac|ogg|m4a)$/.test(ext) ? 'audio' : 'image'
+
 // ─── Filtro estricto de outputs de imagen auto-generables ──────────────────────
 // Solo png/image con image_gen:true. Los outputs prose/markdown con image_gen:true
 // (botón ✦ manual) quedan user-decided y NO se auto-generan.
@@ -693,7 +703,7 @@ async function imagenDelProyecto(projectId, nodeId) {
 //
 // El emparejamiento va por NÚMERO. Los nombres no coinciden entre los dos lados («05 Character
 // Design Language» contra `05_CharacterDesign`) y el número sí es el mismo en ambos.
-async function paginaDelASG(db, projectId, numero, nombre = null) {
+async function paginaDelASG(db, projectId, numero, nombre = null, frase = false) {
   const { data: n } = await db().from('forge_nodes').select('id').eq('node_key', '3.20').maybeSingle()
   if (!n) return null
   const { data: assets } = await db()
@@ -731,6 +741,27 @@ async function paginaDelASG(db, projectId, numero, nombre = null) {
     if (claves.size === 1) return porPrefijo[0].a.storage_url
     if (claves.size > 1) {
       console.warn(`[ASG] «${nombre}» coincide con ${claves.size} páginas (${[...claves].join(', ')}) — se resuelve por número`)
+    }
+
+    // Y cuando lo que llega no es un nombre sino una FRASE —«the game's VISUAL DNA page», que es
+    // como las láminas de Marketing y de Audio nombran su referencia—, vale la página cuya clave
+    // está contenida en la frase, y solo si es una. Exigirle a la frase que empiece por el nombre
+    // de la página no la reconoce nunca; aceptar la primera que aparezca emparejaría «Video
+    // Marketing» con la lámina «Video Marketing Sheet». Se pide unicidad por eso.
+    if (frase) {
+      const dentro = candidatos.filter(x => buscado.includes(x.k))
+      const claves = [...new Set(dentro.map(x => x.k))].sort((a, b) => b.length - a.length)
+      if (claves.length === 1) return dentro[0].a.storage_url
+      // Cuando una clave contiene a la otra, gana la LARGA: es la que la frase nombró de verdad.
+      // «the game's VIDEO MARKETING sheet, 6 panels…» encaja con `18_VideoMarketing` y con
+      // `33_VideoMarketingSheet`, y la lámina de las seis viñetas es la segunda. Si las claves no
+      // se contienen entre sí son dos páginas distintas y no hay cómo elegir: no se resuelve.
+      if (claves.length > 1) {
+        const larga = claves[0]
+        if (claves.every(k => larga.includes(k))) return dentro.find(x => x.k === larga).a.storage_url
+        console.warn(`[ASG] la frase «${nombre}» nombra ${claves.length} páginas distintas (${claves.join(', ')}) — no se resuelve`)
+      }
+      return null
     }
   }
 
@@ -923,9 +954,14 @@ async function generateDeck({
   // la página siga siendo la página —mismo layout, mismas cajas, misma tipografía— y anteponerle
   // la instrucción del usuario la convertiría en el encargo principal.
   const cola = String(extraPrompt || '').trim()
+  // Dónde vive el prompt de esta página. `prompt` en los decks de imagen, `text_prompt` en el de
+  // audio, `value` en el de video —ahí el texto está tres nodos aguas arriba, detrás de dos
+  // `StringConcatenate`—. El registro lo deja escrito; escribir siempre en `.prompt` dejaba el
+  // grafo con el prompt de muestra del autor y un campo nuevo que nadie lee.
+  const campoDe = p => p.prompt_field || 'prompt'
   for (const p of armado.paginas) {
     if (!wf[p.prompt_node]?.inputs) continue
-    wf[p.prompt_node].inputs.prompt = cola
+    wf[p.prompt_node].inputs[campoDe(p)] = cola
       ? `${p.prompt}
 
 ALREADY-APPLIED DESIGN EDIT — keep it in this render:
@@ -942,8 +978,9 @@ ${cola}`
     if (titulo) {
       for (const p of armado.paginas) {
         const n = wf[p.prompt_node]
-        if (typeof n?.inputs?.prompt === 'string') {
-          n.inputs.prompt = n.inputs.prompt.replace(/\[\s*PASTE THE CURRENT GAME'?S TITLE HERE\s*\]/gi, titulo)
+        const c = campoDe(p)
+        if (typeof n?.inputs?.[c] === 'string') {
+          n.inputs[c] = n.inputs[c].replace(/\[\s*PASTE THE CURRENT GAME'?S TITLE HERE\s*\]/gi, titulo)
         }
       }
     }
@@ -1051,6 +1088,52 @@ ${cola}`
       }
       console.log(`[deck] páginas del ASG como canon: ${desdeASG.length - sinRef.size}/${desdeASG.length}`)
     }
+
+    // 1d. Referencias DIRECTAS: sin ImageBatch y sin plantilla que conservar. El nodo del modelo
+    // trae sus slots (`model.images.image_1`, `reference_mode.reference_image`) cableados a un
+    // LoadImage cada uno, y en el archivo esos LoadImage vienen con una imagen de muestra del
+    // autor. Es la forma de las láminas de Marketing y del deck de Audio.
+    //
+    // Acá no se puentea nada: si la referencia falta, la página NO se manda. Renderizarla igual
+    // significa entregar la imagen de muestra del autor como si fuera el arte del juego.
+    const directas = armado.paginas.filter(p =>
+      (p.image_inputs?.length || p.image_input) && !conBatch.includes(p) && !desdeASG.includes(p))
+
+    if (directas.length) {
+      const { uploadImageToComfyUI } = require('./providers/comfyui.provider')
+      const subidas = new Map()
+
+      for (const p of directas) {
+        const huecos = p.image_inputs?.length
+          ? p.image_inputs
+          : [{ node: p.image_input, source: null }]
+
+        for (const h of huecos) {
+          if (wf[h.node]?.class_type !== 'LoadImage') continue
+          const fuente = String(h.source || '').trim()
+          if (!fuente) {
+            avisosRef.push(`${p.nombre}: el prompt no dice de dónde sale su referencia`)
+            sinRef.add(p.nombre); continue
+          }
+          // Puede ser un nodo del canvas («Pitch Document») o una página del ASG nombrada dentro
+          // de una frase («the game's VISUAL DNA page»). Se prueban las dos, en ese orden.
+          const url = await imagenDeNodoPorTitulo(db, project_id, fuente)
+                   || await paginaDelASG(db, project_id, null, fuente, true)
+          if (!url) {
+            avisosRef.push(`${p.nombre}: no hay imagen de «${fuente}» en el proyecto todavía`)
+            sinRef.add(p.nombre); continue
+          }
+          try {
+            if (!subidas.has(url)) subidas.set(url, await uploadImageToComfyUI(url))
+            wf[h.node].inputs.image = subidas.get(url)
+          } catch (e) {
+            avisosRef.push(`${p.nombre}: no se pudo subir la referencia (${e.message})`)
+            sinRef.add(p.nombre)
+          }
+        }
+      }
+      console.log(`[deck] referencias directas: ${directas.length - sinRef.size}/${directas.length} páginas`)
+    }
   }
 
   // Una página que pide referencia y no la consiguió NO se manda. Dejarla pasar significa
@@ -1115,7 +1198,12 @@ ${cola}`
     const estado = j?.status || j?.execution_status || ''
 
     for (const [nodeId, nd] of Object.entries(j?.outputs || {})) {
-      for (const f of (nd?.images || [])) {
+      // Un deck no siempre produce imágenes. `SaveVideo` devuelve sus archivos bajo `videos` y
+      // `SaveAudioAdvanced` bajo `audio`; mirando solo `images` el job terminaba bien, el back
+      // no recogía nada y la corrida se veía igual que una que falló. Se toman todas las
+      // canastas que ComfyUI usa para archivos, sea cual sea el nodo que las llenó.
+      const archivos = [...(nd?.images || []), ...(nd?.videos || []), ...(nd?.gifs || []), ...(nd?.audio || [])]
+      for (const f of archivos) {
         if (!f.filename || vistos.has(f.filename)) continue
         vistos.add(f.filename)
         const pag = porSaveNode[nodeId]
@@ -1128,9 +1216,21 @@ ${cola}`
           // La ruta lleva el job: sin eso cada render pisa al anterior en R2 y el versionado es
           // mentira — las dos versiones terminan apuntando al mismo archivo y la imagen vieja se
           // pierde. Costó perder el primer render de la página 09 descubrirlo.
-          const dest = `projects/${project_id}/deck/${node_key}/${output_key}/${pag?.nombre || f.filename}-${jobId.slice(0, 8)}.png`
-          const url2 = await uploadToStorage(buf, dest, 'image/png')
-          const item = { index: (pag?.indice ?? paginas.length + 1) - 1, name: pag?.nombre || f.filename, url: url2 }
+          // La extensión y el mime salen del archivo que ComfyUI entregó, no de un `.png` fijo:
+          // un mp4 subido como image/png se descarga y no abre en ningún lado.
+          const ext  = (/\.([a-z0-9]{2,4})$/i.exec(f.filename)?.[1] || 'png').toLowerCase()
+          const mime = MIME_POR_EXT[ext] || 'application/octet-stream'
+          const dest = `projects/${project_id}/deck/${node_key}/${output_key}/${pag?.nombre || f.filename}-${jobId.slice(0, 8)}.${ext}`
+          const url2 = await uploadToStorage(buf, dest, mime)
+          // `kind` viaja con la página: quien la muestre tiene que saber si es una lámina, un
+          // video o una pista de audio, y el nombre del archivo es el único que lo sabe de cierto
+          // (el `kind` del registro dice qué se pidió, no qué llegó).
+          const item = {
+            index: (pag?.indice ?? paginas.length + 1) - 1,
+            name: pag?.nombre || f.filename,
+            url: url2,
+            kind: CLASE_POR_EXT(ext),
+          }
           paginas.push(item)
 
           // Se anota en la sesión apenas llega, no al final: es lo que lee el modal del nodo
@@ -1143,7 +1243,7 @@ ${cola}`
                 output_images: {
                   [output_key]: [...paginas]
                     .sort((x, y) => x.index - y.index)
-                    .map(p => ({ index: p.index, name: p.name, variations: [{ url: p.url, condition: null }] })),
+                    .map(p => ({ index: p.index, name: p.name, kind: p.kind, variations: [{ url: p.url, condition: null, kind: p.kind }] })),
                 },
               }).eq('id', session_id)
             } catch (e) { console.error('[deck] no se pudo anotar la página en la sesión:', e.message) }

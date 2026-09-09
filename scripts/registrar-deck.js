@@ -190,8 +190,11 @@ function hallarPrompt (wf, ids) {
       // El campo del prompt viaja siempre que no sea el de siempre: el inyector escribe
       // `.inputs.prompt` a ciegas, y en Audio el campo es `text_prompt` y en Video `value`.
       if (p.campo !== 'prompt') fila.prompt_field = p.campo
+      // `image_input` sigue siendo el primero, por los consumidores que ya lo leen. `image_inputs`
+      // viaja siempre que haya hueco: lleva la FUENTE de cada uno, que es lo que el motor necesita
+      // para no renderizar con la imagen de muestra del autor.
       if (propios[0]) fila.image_input = propios[0].id
-      if (propios.length > 1) fila.image_inputs = propios.map(r => ({ node: r.id, slot: r.slot, source: r.fuente }))
+      if (propios.length) fila.image_inputs = propios.map(r => ({ node: r.id, slot: r.slot, source: r.fuente }))
       return fila
     }),
   }

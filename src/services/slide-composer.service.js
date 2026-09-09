@@ -546,14 +546,20 @@ async function composeDeck({ db, projectId, deck = 'asg', fills = null, solo = n
   const paginas = paginasCfg.map((p, i) => {
     // Subconjunto: las dos pasadas del ASG comparten workflow (31 de contenido + 3 de sintesis)
     if (solo && !solo.includes(i + 1)) return null
-    const prompt = wf[p.prompt_node]?.inputs?.prompt || ''
+    // El campo del prompt no siempre se llama `prompt`: en el deck de audio es `text_prompt`, y
+    // en el de video es `value`, tres nodos aguas arriba. El registro lo deja escrito.
+    const campo  = p.prompt_field || 'prompt'
+    const prompt = wf[p.prompt_node]?.inputs?.[campo] || ''
     const intake = parsearIntake(prompt)
     const pag = {
       indice: i + 1,
       nombre: p.name,
       prompt_node: p.prompt_node,
+      prompt_field: campo,
+      kind: p.kind || 'image',
       save_node: p.save_node,
       image_input: p.image_input,
+      image_inputs: p.image_inputs,
       llenos: [],
       faltantes: [],
       recortado: false,
