@@ -31,7 +31,12 @@ const DOWNSTREAM = [
   ['Product Scope', '3.11'],
 ]
 
-function getTemplateV2(id) {
+function getTemplateV2(ref) {
+  // El `template_ref` de la DNA viene con glosa —«tpl_gdd_complete_v2 (md + manifest)»—, que es
+  // para quien lee la fila. El id es la primera palabra. Sin recortarla no se encuentra el
+  // archivo y el despacho se cae a la plantilla v1: el nodo produce, y produce el documento viejo.
+  const id = String(ref || '').trim().split(/[\s(]/)[0]
+  if (!id) return null
   const md = path.join(TPL_DIR, id + '.md')
   const mf = path.join(TPL_DIR, id + '.manifest.json')
   if (!fs.existsSync(md) || !fs.existsSync(mf)) return null
