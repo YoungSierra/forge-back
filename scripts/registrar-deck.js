@@ -1,10 +1,17 @@
-// Registra un workflow de ComfyUI que renderiza un DECK: muchas páginas en un solo grafo, cada
-// una con su prompt, su salida y —a veces— un hueco para una imagen de referencia del proyecto.
+// Registra un workflow de ComfyUI que renderiza un DECK: una o muchas páginas en un solo grafo,
+// cada una con su prompt, su salida y —a veces— un hueco para una imagen de referencia del proyecto.
 //
-// El `inject_config` se DERIVA del grafo, nunca se escribe a mano. Una página es un nodo de
-// modelo con su SaveImage colgando; si su entrada viene de un ImageBatch, la primera rama es la
-// plantilla del estudio y la segunda el hueco del proyecto. Escribir esa tabla a mano es como se
-// llegó a un config que apuntaba a nodos inexistentes y a láminas con el marcador sin reemplazar.
+// El `inject_config` se DERIVA del grafo, nunca se escribe a mano. Escribir esa tabla a mano es
+// como se llegó a un config que apuntaba a nodos inexistentes y a láminas con el marcador sin
+// reemplazar.
+//
+// Se reconoce por FORMA, no por nombre de clase. La versión anterior buscaba `GPTImage|KSampler`
+// colgando de un `SaveImage`, y con eso solo veía decks de imagen: el 09-09 los workflows de
+// Marketing_Video (`GeminiVideoOmni` → `SaveVideo`) y Audio_Base (`ByteDanceSeedAudio` →
+// `SaveAudioAdvanced`) daban «0 páginas» y no se podían registrar, aunque los archivos estaban
+// bien. Ahora una página es CUALQUIER nodo `Save*` con algo colgando, y el prompt es el string
+// literal que trae la caja del intake, esté en el propio nodo del modelo (`text_prompt` en Audio)
+// o tres nodos aguas arriba, detrás de dos `StringConcatenate` (`value` en Video).
 //
 // Registra una fila NUEVA por nombre. Reemplazar el deck que un nodo ya usa lo deja pidiendo
 // páginas que no existen: los outputs fijan `pages` por índice y `image_count` por número, así que
@@ -25,9 +32,56 @@ if (!RUTA || !NOMBRE) {
 
 // De dónde saca su referencia una página que tiene hueco. El motor lo lee del propio prompt, así
 // que una página con hueco y sin esta frase se renderiza solo con la plantilla, en silencio.
-const RX_FUENTE = /IMAGE 2 = [^\n]*coming from ([^.]+)\./
+// Dos convenciones vivas: la del ASG/Art Bible y la que traen las láminas de Marketing.
+const RX_FUENTE = /IMAGE (\d+) = [^\n]*coming from ([^.]+)\./gi
+const RX_REFIMG = /reference image (\d+)\s*(?:=|\()\s*([^)\n]+)/gi
+// Y el slot que el prompt MENCIONA aunque no diga de dónde sale. Es la diferencia entre una
+// maqueta del estudio y un hueco que nadie llenó: si el prompt habla de «reference image 2», esa
+// imagen es del proyecto. Sin esto, Marketing_Video pasaba como si sus dos LoadImage fueran
+// maquetas y se habría renderizado con las dos imágenes de muestra del autor, en silencio.
+const RX_MENCION = /reference image (\d+)/gi
 // El Art Bible cita en cambio la página del ASG que le sirve de canon.
 const RX_ASG = /Art Style Guide \(ASG\s*[·.\-]?\s*(\d{1,2})\s*([^)]*)\)/i
+
+const esSave = c => /^Save/i.test(c || '')
+const esLoad = c => /^LoadImage/i.test(c || '')
+const CAMPOS = ['prompt', 'text_prompt', 'value', 'text', 'string', 'positive']
+const enlaces = n => Object.entries(n?.inputs || {}).filter(([, v]) => Array.isArray(v) && typeof v[0] === 'string')
+
+// Qué clase de activo produce esta página. Lo dice el nodo que lo guarda.
+const tipoDe = c => /Audio/i.test(c) ? 'audio'
+  : /Video|WEBM|AnimatedWEBP|Gif/i.test(c) ? 'video'
+    : 'image'
+
+// Todo lo alcanzable caminando hacia atrás por los inputs. Es el mismo paseo que hace el podado
+// del motor, y sirve igual para un grafo de tres nodos que para el ASG de 25 páginas.
+function aguasArriba (wf, raiz) {
+  const vistos = new Set(), cola = [raiz]
+  while (cola.length) {
+    const id = cola.pop()
+    if (!id || vistos.has(id) || !wf[id]) continue
+    vistos.add(id)
+    for (const [, v] of enlaces(wf[id])) cola.push(v[0])
+  }
+  return vistos
+}
+
+// El prompt de la página: el string literal que trae la caja del intake. Si ninguno la trae —un
+// deck viejo, sin caja— se cae al literal más largo de los campos conocidos, que es lo que la
+// versión anterior asumía sin decirlo.
+function hallarPrompt (wf, ids) {
+  const cand = []
+  for (const id of ids) {
+    for (const [campo, v] of Object.entries(wf[id]?.inputs || {})) {
+      if (Array.isArray(v) || typeof v !== 'string') continue
+      if (!CAMPOS.includes(campo) && !/prompt|text/i.test(campo)) continue
+      cand.push({ id, campo, texto: v, caja: /╔/.test(v) })
+    }
+  }
+  const conCaja = cand.filter(c => c.caja)
+  const pool = conCaja.length ? conCaja : cand
+  return pool.sort((a, b) => b.texto.length - a.texto.length)[0] || null
+}
 
 ;(async () => {
   const wf = JSON.parse(fs.readFileSync(RUTA, 'utf8'))
@@ -38,39 +92,86 @@ const RX_ASG = /Art Style Guide \(ASG\s*[·.\-]?\s*(\d{1,2})\s*([^)]*)\)/i
     process.exit(1)
   }
 
-  const entradaArreglo = n => Object.values(n?.inputs || {}).find(v => Array.isArray(v))
-  const modelos = Object.entries(wf).filter(([, n]) => /GPTImage|KSampler/i.test(n.class_type || ''))
-
   const paginas = []
-  for (const [gid, gpt] of modelos) {
-    const save = Object.entries(wf).find(([, n]) => n.class_type === 'SaveImage' && entradaArreglo(n)?.[0] === gid)
-    if (!save) { console.warn(`el nodo de prompt ${gid} no tiene SaveImage`); continue }
-    const nombre = String(save[1].inputs?.filename_prefix || '').split('/').pop() || `pagina_${gid}`
+  for (const [sid, save] of Object.entries(wf)) {
+    if (!esSave(save.class_type)) continue
+    const productor = enlaces(save)[0]?.[1]?.[0]
+    if (!productor) { console.warn(`el nodo ${sid} (${save.class_type}) no tiene nada colgando`); continue }
 
-    const origen = wf[entradaArreglo(gpt)?.[0]]
-    let refNode = null
-    if (origen?.class_type === 'ImageBatch') {
-      const segunda = Object.values(origen.inputs || {}).map(v => v?.[0])[1]
-      if (wf[segunda]?.class_type === 'LoadImage') refNode = String(segunda)
+    const ids = aguasArriba(wf, productor)
+    const nombre = String(save.inputs?.filename_prefix || '').split('/').pop() || `pagina_${sid}`
+    const pr = hallarPrompt(wf, ids)
+    if (!pr) { console.warn(`la página ${nombre} no tiene ningún prompt legible`); continue }
+
+    // Las fuentes que el prompt declara, por número de slot.
+    const fuentes = new Map()
+    for (const m of pr.texto.matchAll(RX_FUENTE)) fuentes.set(m[1], m[2].trim())
+    for (const m of pr.texto.matchAll(RX_REFIMG)) if (!fuentes.has(m[1])) fuentes.set(m[1], m[2].trim())
+    const mencionados = new Set([...pr.texto.matchAll(RX_MENCION)].map(m => m[1]))
+
+    // Los LoadImage alcanzables. Cuál es hueco del proyecto y cuál es la maqueta del estudio:
+    //   · marcador REPLACE_WITH en el nombre del archivo → hueco declarado por el autor
+    //   · segunda rama de un ImageBatch                  → la regla vieja, la del ASG/Art Bible
+    //   · cableado a un slot `image_N`/`reference_image` cuya fuente el prompt nombra → hueco
+    // Cualquier otro LoadImage es la maqueta del estudio y NO se inyecta.
+    const refs = []
+    for (const id of ids) {
+      const n = wf[id]
+      if (!esLoad(n?.class_type)) continue
+      const archivo = String(n.inputs?.image || '')
+      // El marcador dice «acá va una imagen», no de quién. `REPLACE_WITH__TEMPLATE_…` es la
+      // maqueta del estudio —la lámina maestra del ASG— y NO se inyecta; sin esta salvedad el
+      // ASG de 25 pasaba de 8 huecos a 25 y habría pisado sus propias maquetas.
+      const marcador = /^REPLACE_WITH/i.test(archivo) && !/TEMPLATE/i.test(archivo)
+
+      let slot = null, dueño = null
+      for (const otro of ids) {
+        for (const [campo, v] of enlaces(wf[otro])) {
+          if (v[0] !== id) continue
+          dueño = otro
+          const m = /image_(\d+)|reference_image/i.exec(campo)
+          if (m) slot = m[1] || '1'
+        }
+      }
+      const lote = dueño && /ImageBatch/i.test(wf[dueño]?.class_type || '')
+      const segundaRama = Boolean(lote) && enlaces(wf[dueño])[1]?.[1]?.[0] === id
+      const fuente = slot ? fuentes.get(slot) : null
+
+      const hueco = marcador || segundaRama || Boolean(fuente) || (slot && mencionados.has(slot))
+      refs.push({
+        id: String(id), slot, archivo, hueco,
+        fuente: fuente || (marcador ? archivo.replace(/^REPLACE_WITH_*/i, '').replace(/\.[a-z0-9]+$/i, '') : null),
+      })
     }
-    paginas.push({ nombre, gid: String(gid), save: String(save[0]), ref: refNode, prompt: String(gpt.inputs?.prompt || '') })
+
+    paginas.push({
+      nombre, gid: String(pr.id), campo: pr.campo, save: String(sid),
+      tipo: tipoDe(save.class_type), clase: save.class_type,
+      refs, prompt: pr.texto,
+    })
   }
   paginas.sort((a, b) => a.nombre.localeCompare(b.nombre, 'en', { numeric: true }))
 
+  const huecos = paginas.flatMap(p => p.refs.filter(r => r.hueco))
   console.log(`${NOMBRE}`)
-  console.log(`  nodos: ${Object.keys(wf).length} · páginas: ${paginas.length} · con hueco de referencia: ${paginas.filter(p => p.ref).length}\n`)
+  console.log(`  nodos: ${Object.keys(wf).length} · páginas: ${paginas.length}`
+    + ` · con hueco de referencia: ${paginas.filter(p => p.refs.some(r => r.hueco)).length}`)
+  console.log(`  tipos: ${[...new Set(paginas.map(p => p.tipo))].join(', ') || '—'}\n`)
   for (const p of paginas) {
-    const fuente = RX_FUENTE.exec(p.prompt)?.[1]?.trim()
     const asg = RX_ASG.exec(p.prompt)
-    console.log(`  ${p.nombre.padEnd(28)} prompt=${p.gid.padStart(3)} save=${p.save.padStart(3)}`
-      + (p.ref ? `  ref=${p.ref.padStart(3)} ← ${fuente || '¡no dice de dónde!'}` : '')
+    console.log(`  ${p.nombre.padEnd(28)} ${p.tipo.padEnd(5)} prompt=${p.gid.padStart(5)}.${p.campo.padEnd(11)}`
+      + ` save=${p.save.padStart(3)} (${p.clase})`
       + (asg ? `  canon ← ASG ${asg[1]} ${(asg[2] || '').trim()}` : ''))
+    for (const r of p.refs) {
+      console.log(`      ${r.hueco ? 'hueco  ' : 'maqueta'} LoadImage ${r.id}${r.slot ? ` slot ${r.slot}` : ''}`
+        + (r.hueco ? ` ← ${r.fuente || '¡no dice de dónde!'}` : ` (${r.archivo.slice(0, 40)})`))
+    }
   }
 
   // Puerta 2 · una página con hueco tiene que declarar su fuente.
-  const sinFuente = paginas.filter(p => p.ref && !RX_FUENTE.exec(p.prompt))
+  const sinFuente = huecos.filter(r => !r.fuente)
   if (sinFuente.length) {
-    console.error(`\n*** ${sinFuente.length} página(s) con hueco pero sin declarar su fuente ***`)
+    console.error(`\n*** ${sinFuente.length} hueco(s) sin declarar su fuente ***`)
     process.exit(1)
   }
   if (!paginas.length) { console.error('\n*** no encontré ninguna página ***'); process.exit(1) }
@@ -78,13 +179,19 @@ const RX_ASG = /Art Style Guide \(ASG\s*[·.\-]?\s*(\d{1,2})\s*([^)]*)\)/i
   const inject_config = {
     mode: 'per_page',
     note: 'Un prompt por página. NO usar inject.prompt: este workflow no tiene un prompt único.'
-      + (paginas.some(p => p.ref)
-        ? ` Solo ${paginas.filter(p => p.ref).length} página(s) admiten referencia del proyecto; en las demás el único LoadImage es la maqueta del estudio y no se inyecta.`
+      + (huecos.length
+        ? ` Solo ${paginas.filter(p => p.refs.some(r => r.hueco)).length} página(s) admiten referencia del proyecto;`
+          + ' en las demás el único LoadImage es la maqueta del estudio y no se inyecta.'
         : ''),
     seed: { field: 'seed' },
     pages: paginas.map(p => {
-      const fila = { name: p.nombre, save_node: p.save, prompt_node: p.gid }
-      if (p.ref) fila.image_input = p.ref
+      const propios = p.refs.filter(r => r.hueco)
+      const fila = { name: p.nombre, save_node: p.save, prompt_node: p.gid, kind: p.tipo }
+      // El campo del prompt viaja siempre que no sea el de siempre: el inyector escribe
+      // `.inputs.prompt` a ciegas, y en Audio el campo es `text_prompt` y en Video `value`.
+      if (p.campo !== 'prompt') fila.prompt_field = p.campo
+      if (propios[0]) fila.image_input = propios[0].id
+      if (propios.length > 1) fila.image_inputs = propios.map(r => ({ node: r.id, slot: r.slot, source: r.fuente }))
       return fila
     }),
   }
