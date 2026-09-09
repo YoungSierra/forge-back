@@ -1197,6 +1197,18 @@ async function resolveAssemblyPools(db, { projectId, currentPNodeId, node, outpu
                || (cand || []).find(a => norm(a.name) === want)
 
     if (asset?.content) inputs[portKey] = asset.content
+
+    // Respaldo: el asset de nodo entero de la fuente. Cuando el nodo aguas arriba corrió completo
+    // —no output por output— deja un solo asset con todas las secciones juntas y su sesión no
+    // declara output_key, así que no empata ni por clave ni por nombre. Medido el 09-09 sobre el
+    // proyecto del 3.8: 0 de 18 inputs resueltos, y las 18 secciones estaban ahí dentro bajo su
+    // propio "## clave". El contenido existe y está aprobado; solo había que abrirlo.
+    if (!inputs[portKey]) {
+      const entero   = (cand || []).find(a => a.content)
+      const hermanas = defs.map(o => o.key || o.name).filter(Boolean)
+      const seccion  = entero?.content ? extractSection(entero.content, outKey, hermanas) : null
+      if (seccion) inputs[portKey] = seccion
+    }
   }
 
   const { data: own } = await db()
@@ -1215,7 +1227,13 @@ async function resolveAssemblyPools(db, { projectId, currentPNodeId, node, outpu
     const want = norm(`${node.title} — ${labelOf(def)}`)
     const hit = (own || []).find(a => a.forge_sessions?.output_key === k)
              || (own || []).find(a => norm(a.name) === want)
-    if (hit?.content) siblings[k] = hit.content
+    if (hit?.content) { siblings[k] = hit.content; continue }
+
+    // Mismo respaldo para los hermanos: el nodo pudo haber corrido entero también.
+    const entero   = (own || []).find(a => a.content)
+    const hermanas = (outputDefs || []).map(o => o.key || o.name).filter(Boolean)
+    const seccion  = entero?.content ? extractSection(entero.content, k, hermanas) : null
+    if (seccion) siblings[k] = seccion
   }
 
   return { inputs, siblings }
