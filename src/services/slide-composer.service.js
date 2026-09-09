@@ -46,6 +46,14 @@ const DECKS = {
   // y pinta la obra final de ese tema. Por eso no tiene `fuente` — su insumo es una imagen, no
   // texto. Pasó de 18 a 26 con el rediseño del 24-ago, y a 20 con la restructura del 07-09.
   artbible: { workflow: 'V57_STUDIO_ArtBible_Template_20',        fuente: null, paginas: 20, documento: 'Art Bible' },
+
+  // Las dos piezas sueltas del Vertical Slice: una lámina promocional y una pista de audio. No son
+  // decks de muchas páginas —una cada uno— pero entran por acá y no por las cadenas de producción
+  // porque su prompt es un formulario del ADI («GAME TITLE (§1.1) →»), y rellenar ese formulario
+  // es justo lo que hace este compositor. Registrarlos como cadena los dejaría con los campos en
+  // blanco, que es peor que no tenerlos.
+  marketing_image: { workflow: 'V57_STUDIO_2D_marketing_image', fuente: '3.9', paginas: 1, documento: 'Marketing Key Art' },
+  audio_base:      { workflow: 'V57_STUDIO_2D_audio_base',      fuente: '3.9', paginas: 1, documento: 'Audio Base' },
 }
 
 // ── Mapa etiqueta de página → sección del documento fuente ───────────────────
@@ -229,6 +237,27 @@ function seccionPorNombre(contenido, nombre) {
   return out.join('\n').trim()
 }
 
+// Y la misma sección buscada por su NÚMERO, que es como el intake la cita: «CORE FANTASY (§1.2)».
+// El documento que publica el 3.9 encabeza con esa misma numeración —«## §1.2 Core Fantasy
+// Statement»—, así que la referencia que el autor del template ya escribió alcanza para encontrarla
+// y no hace falta una entrada de mapa por campo.
+//
+// Se exige que el número termine ahí: sin el corte, «§1.1» encontraría «§1.10».
+function seccionPorNumero(contenido, numero) {
+  const L = String(contenido || '').split('\n')
+  const rx = new RegExp(`^#{1,5}\\s*§\\s*${String(numero).replace(/\./g, '\\.')}(?![\\d.])`)
+  const i = L.findIndex(l => rx.test(l))
+  if (i < 0) return null
+  const nivel = (L[i].match(/^#+/) || ['#'])[0].length
+  const out = [L[i]]
+  for (let j = i + 1; j < L.length; j++) {
+    const m = L[j].match(/^(#+) /)
+    if (m && m[1].length <= nivel) break
+    out.push(L[j])
+  }
+  return out.join('\n').trim()
+}
+
 // ── Parser del bloque de intake ──────────────────────────────────────────────
 // Un solo parser para los tres delimitadores. Devuelve null cuando el workflow no tiene
 // bloque (el Art Bible), que NO es un error: significa que se llena con imágenes.
@@ -269,7 +298,11 @@ const DIALECTOS = [
     // Abre en el recuadro y cierra en la regla que precede a SECTION 2. Se ancla en el cierre del
     // recuadro para que la cabecera —que son instrucciones para quien rellena, no campos— quede
     // fuera del bloque.
-    delimitador: /(╔[═]+╗[\s\S]*?╚[═]+╝)\n([\s\S]*?)\n(─{10,})/,
+    // …o directamente en el encabezado de SECTION 2, que es lo que traen las láminas de Marketing:
+    // tienen el recuadro y los campos, pero no la regla. Sin esta alternativa `parsearIntake`
+    // devolvía null, el prompt viajaba tal cual y la lámina se pedía con los nueve campos vacíos
+    // —sin un aviso, porque «sin bloque» es legítimo para el Art Bible.
+    delimitador: /(╔[═]+╗[\s\S]*?╚[═]+╝)\n([\s\S]*?)\n(?:(─{10,})|(?=[ \t]*SECTION\s*2\b))/,
     campo: /^[ \t]*([A-Z][^\n→]*?)[ \t]*→[ \t]*$/gm,
     // El ámbito de página lo marca «— THIS PAGE · <nombre> —»; lo que sigue es propio de la hoja.
     propia: null,          // se decide por sección, no por el nombre del campo
@@ -391,10 +424,29 @@ const claveDeEtiqueta = e => String(e)
 
 function resolverEtiqueta(etiqueta, mapa, assets, ambito = null) {
   let cands = Object.prototype.hasOwnProperty.call(mapa, etiqueta) ? mapa[etiqueta] : undefined
+  let enMapa = cands !== undefined
   if (cands === undefined) {
     const k = claveDeEtiqueta(etiqueta)
     const hit = Object.keys(mapa).find(x => claveDeEtiqueta(x) === k)
-    cands = hit !== undefined ? mapa[hit] : [etiqueta]
+    enMapa = hit !== undefined
+    cands = enMapa ? mapa[hit] : [etiqueta]
+  }
+
+  // La § que el propio rótulo cita, cuando el mapa no dice nada de este campo.
+  //
+  // El mapa se autoró a mano porque el template y el documento usan vocabulario distinto para lo
+  // mismo, y sus entradas son mediciones: la de §2.5, que el documento publica como «§0.4 Color
+  // Language», solo se sabe habiéndola mirado. Por eso el mapa manda cuando existe. Pero para
+  // todo lo demás la referencia ya está escrita en el rótulo y el documento la respeta: medido el
+  // 09-09 contra los documentos vivos, 7 de las 9 § que piden los intakes de Marketing y Audio
+  // están publicadas con ese mismo número. Resolverlas por ahí es cobertura sin mantenimiento;
+  // mapearlas a mano serían veinte entradas nuevas por cada lámina que Migue exporte.
+  const ref = /\(§\s*([\d.]+)\s*\)/.exec(etiqueta)?.[1]
+  if (!enMapa && ref && !ambito) {
+    for (const a of assets) {
+      const s = seccionPorNumero(a.content, ref)
+      if (s) return { texto: s, via: `§${ref}` }
+    }
   }
   if (cands === null) return { texto: null, noAplica: true }
   if (typeof cands === 'string') return { texto: null, noAplica: true, instruccion: cands }
@@ -572,6 +624,12 @@ async function composeDeck({ db, projectId, deck = 'asg', fills = null, solo = n
     // Un valor por placeholder, EN EL MISMO ORDEN en que aparecen en el bloque: la sustitución
     // los consume en secuencia, así el template conserva su formato y las líneas con varios
     // campos (la 13, personajes) no se rompen.
+    // Una § no se reparte entre varios campos de la misma página. El intake de Audio pide tono
+    // PRIMARIO, SECUNDARIO y PROHIBIDO citando los tres la §2.2, así que resolverlos por número
+    // les daba a los tres la misma matriz: decirle al modelo que los tonos prohibidos son los
+    // mismos que los primarios es peor que no decirle nada. El primero se la lleva y los demás se
+    // declaran huecos — el documento no los responde por separado.
+    const seccionesUsadas = new Set()
     const valores = intake.campos.map(c => {
       // Los fills mandan cuando estan: son lo que el LLM escribio para ESTE deck. Sin ellos se
       // extrae del documento, que es como venia funcionando antes de v2.9.7.
@@ -579,9 +637,14 @@ async function composeDeck({ db, projectId, deck = 'asg', fills = null, solo = n
       // o con el nombre del archivo («09_ColorSystem»). El LLM usa cualquiera de las dos, así que
       // se aceptan ambas en vez de exigirle una forma que no controlamos.
       const desdeFills = fillDe(mapaFills, c.etiqueta) ?? (c.propia ? fillDe(mapaFills, p.name) : null)
-      const r = desdeFills != null
+      let r = desdeFills != null
         ? { texto: desdeFills, via: 'fills' }
         : resolverEtiqueta(c.etiqueta, mapa, assets, c.ambito)
+      // Resuelto por § y ya lo tomó otro campo de esta página: no se repite.
+      if (r?.via?.startsWith?.('§')) {
+        if (seccionesUsadas.has(r.via)) r = null
+        else seccionesUsadas.add(r.via)
+      }
       if (r?.noAplica) {
         // No es un gap del proyecto: nadie debe producirlo aguas arriba.
         pag.llenos.push({ etiqueta: c.etiqueta, via: 'no aplica' })
