@@ -185,7 +185,11 @@ async function callAnthropic(systemPrompt, userMessage, options = {}) {
   // la primera llamada de cada corrida, que es justo la que paga el prompt entero.
   let cacheWrite   = response.usage?.cache_creation_input_tokens ?? 0
 
-  const MAX_CONTINUATIONS = 6
+  // …salvo cuando lo que se pidió es corto POR CONTRATO. Un slot de pegamento del ensamblador
+  // declara su techo de palabras, y ahí continuar es lo contrario de lo que hace falta: la
+  // continuación convirtió un brief de 350 palabras en uno de 2.101 y el gate lo rechazó, después
+  // de pagar seis peticiones para llegar ahí.
+  const MAX_CONTINUATIONS = options.sinContinuacion ? 0 : 6
   for (let cont = 0; stopReason === 'max_tokens' && cont < MAX_CONTINUATIONS; cont++) {
     console.log(`[anthropic] max_tokens alcanzado — auto-continuando (${cont + 1}/${MAX_CONTINUATIONS})`)
     const escrito = fullText.replace(/\s+$/, '')

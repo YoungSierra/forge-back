@@ -84,7 +84,9 @@ async function defaultGlue({ slot, sources }) {
     temperature:     0.3,
     maxOutputTokens: rules.max_tokens || 300,
   })
-  const text = String(res?.text ?? res ?? '').trim()
+  // `callLLM` devuelve el texto en `data`. Leerlo de `text` no daba vacío: daba el objeto
+  // convertido a cadena, «[object Object]», y el slot quedaba «lleno» con eso.
+  const text = String(res?.data ?? res?.text ?? '').trim()
   // El pegamento no puede traer estructura: si el modelo metió headings o fences, se limpian.
   return text.replace(/^```[\s\S]*?```$/gm, '').replace(/^#{1,6} .*$/gm, '').trim() || null
 }

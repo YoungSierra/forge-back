@@ -22,6 +22,11 @@ const TPL_DIR = path.join(__dirname, '..', 'assembly_templates')
 
 const sha = t => crypto.createHash('sha256').update(String(t), 'utf8').digest('hex').slice(0, 12)
 
+// Piso de un slot de pegamento. El techo más bajo del manifiesto son las 120 palabras del resumen
+// ejecutivo, que Pedro define como cinco frases: por debajo de veinte palabras no hay cinco frases
+// de nada.
+const MINIMO_GLUE = 20
+
 // Los documentos que este GDD engendra. Del `must_contain` de s14.downstream_documents; se puede
 // sobrescribir por `opts.downstream` sin tocar la plantilla.
 const DOWNSTREAM = [
@@ -236,12 +241,29 @@ async function glueV2({ slot, sections }) {
     model: process.env.ASSEMBLY_GLUE_MODEL || 'anthropic:claude-haiku-4-5-20251001',
     rawText: true,
     temperature: 0.3,
-    // Con holgura sobre el techo: un presupuesto justo se gasta razonando y devuelve vacío, que
-    // no es lo mismo que no poder escribirlo. El techo lo hace cumplir el verificador.
-    maxOutputTokens: Math.round(techo * 3),
+    // Holgura sobre el techo para que termine la frase, pero SIN auto-continuación: el proveedor
+    // continúa cuando el modelo corta por límite, y eso es correcto para un documento y ruinoso
+    // para un brief con techo — §12 salió con 2.101 palabras de las 350 que declara, en seis
+    // peticiones. Lo que pase del techo se recorta acá abajo.
+    maxOutputTokens: Math.round(techo * 2.2),
+    sinContinuacion: true,
   })
-  const texto = String(res?.text ?? res ?? '').trim()
-  return texto.replace(/^```[\s\S]*?```$/gm, '').replace(/^#{1,2} .*$/gm, '').trim() || null
+  // `callLLM` devuelve el texto en `data`. Leerlo de `text` no daba vacío —daba el objeto
+  // convertido a cadena, «[object Object]»— y eso pasaba el gate como un slot lleno de 2 palabras.
+  const texto = String(res?.data ?? res?.text ?? '').trim()
+  const limpio = texto.replace(/^```[\s\S]*?```$/gm, '').replace(/^#{1,2} .*$/gm, '').trim()
+  return recortarAlTecho(limpio, techo) || null
+}
+
+// El techo es del contrato, no una sugerencia: se corta en el último final de frase que quepa,
+// no a mitad de palabra. Si ni la primera frase entra, se deja entera — un brief cortado por la
+// mitad no sirve para nada y el verificador lo va a marcar igual.
+function recortarAlTecho(texto, techo) {
+  const palabras = String(texto).trim().split(/\s+/)
+  if (!techo || palabras.length <= techo) return texto
+  const cortado = palabras.slice(0, techo).join(' ')
+  const fin = Math.max(cortado.lastIndexOf('. '), cortado.lastIndexOf('.\n'), cortado.lastIndexOf('\n\n'))
+  return (fin > cortado.length * 0.4 ? cortado.slice(0, fin + 1) : cortado).trim()
 }
 
 // ── Ensamblado ───────────────────────────────────────────────────────────────
@@ -355,7 +377,15 @@ function verificar(template, manifest, doc) {
       pass: glue.every(s => !s.words || !porId[s.slot]?.ceiling_words || s.words <= porId[s.slot].ceiling_words),
       detail: glue.filter(s => s.words).map(s => `${s.slot}:${s.words}/${porId[s.slot]?.ceiling_words ?? '∞'}`).join(' ') || '—',
     },
+    // El techo solo mira por arriba. Un slot que devolvió dos palabras también está mal, y así
+    // pasó el gate un ensamble entero cuyos cinco pegamentos decían «[object Object]»: el
+    // documento tenía sus 41 slots llenos y sus cinco secciones autoradas no decían nada.
+    {
+      rule: 'R5 ningún glue sale demasiado corto',
+      pass: glue.every(s => !s.filled || (s.words || 0) >= MINIMO_GLUE),
+      detail: glue.filter(s => s.filled && (s.words || 0) < MINIMO_GLUE).map(s => `${s.slot}:${s.words}`).join(' ') || '—',
+    },
   ]
 }
 
-module.exports = { assembleV2, getTemplateV2, glueV2, extraerCampos, seccionesQueLee, seccionDelDoc, omitirSeccionesVacias, hundirEncabezados }
+module.exports = { assembleV2, getTemplateV2, glueV2, recortarAlTecho, extraerCampos, seccionesQueLee, seccionDelDoc, omitirSeccionesVacias, hundirEncabezados }
