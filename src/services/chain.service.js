@@ -336,6 +336,18 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
           },
         }).select('id, name, storage_url, format, metadata').single()
         if (error) throw error
+
+        // Un modelo se mide al nacer: leer su caja cuesta 200 ms contra el propio archivo y es lo
+        // que después necesita el escalado del kit para calcular el factor. Si falla, se sigue —
+        // la pieza ya está publicada y la medida se puede pedir después; perderla no vale tirar
+        // una corrida que ya se pagó.
+        if (sal.kind === 'model') {
+          try {
+            const { medirActivo } = require('./glb-medidas.service')
+            await medirActivo(db, a)
+          } catch (e) { console.warn(`[cadena] no se pudo medir "${a.name}": ${e.message}`) }
+        }
+
         // El id del activo viaja junto a la url: el paso siguiente lo necesita para colgar de él.
         acumulado[cada ? cada : rol] = { ...sal, assetId: a.id }
         nuevos.push(a)

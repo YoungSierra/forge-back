@@ -5537,6 +5537,27 @@ router.post('/assets/:asset_id/advance', async (req, res, next) => {
   }
 })
 
+// ─── Medidas de un modelo 3D ────────────────────────────────────────────────
+// Cuánto mide un `.glb` almacenado, leyendo su propia declaración de caja envolvente. Se calcula
+// una vez y queda en la metadata del activo: la caja de un archivo no cambia, y cada render
+// escribe una ruta nueva.
+router.get('/assets/:asset_id/medidas', async (req, res, next) => {
+  try {
+    const { id: project_id, asset_id } = req.params
+    const { data: asset } = await db().from('forge_assets')
+      .select('id, name, format, storage_url, metadata')
+      .eq('id', asset_id).eq('project_id', project_id).single()
+    if (!asset) return res.status(404).json({ success: false, error: 'Asset not found' })
+
+    const { medirActivo } = require('../services/glb-medidas.service')
+    const medidas = await medirActivo(db, asset, { forzar: req.query.forzar === '1' })
+    res.json({ success: true, medidas })
+  } catch (err) {
+    // Que un modelo no se pueda medir no es una falla del servidor: es el estado de ese archivo.
+    return res.status(400).json({ success: false, error: err.message })
+  }
+})
+
 // ─── Herramientas de una imagen: Segmentación y Nuevo Ángulo ────────────────
 // Qué ofrece el radial sobre ESTA pieza. La habilitación es por procedencia y se decide acá, no
 // en el front: si dependiera de la interfaz, cada visor tendría que repetir la regla y bastaría
