@@ -14,14 +14,22 @@
 // se sube, que es lo que produce el pintor de máscara del front y lo que `LoadImage` publica en
 // su salida MASK. Sin la bandera, el front no ofrece pintar.
 //
-// Uso:  node scripts/registrar-herramienta.js <workflow_api.json> <nombre> ["descripción"] [--mask] [--apply]
+// `--controles <archivo.json>` declara qué campos del grafo puede tocar el usuario y con qué
+// presets. El RANGO y el TIPO no se declaran: se leen de ComfyUI (`/api/object_info`), que es la
+// única fuente que no envejece. Lo que sí hay que declarar son los nombres de los presets —«Perfil
+// Der», «Cenital»— porque son una decisión de producto y no existen en el nodo. Cada preset se
+// valida contra el rango declarado antes de escribir: un valor fuera de rango lo rechaza ComfyUI
+// recién al correr, o sea después de pagar la corrida.
+//
+// Uso:  node scripts/registrar-herramienta.js <workflow_api.json> <nombre> ["descripción"] [--mask] [--controles f.json] [--apply]
 require('dotenv').config()
 const fs = require('fs')
 const { db } = require('../src/services/supabase.service')
 
 const [, , RUTA, NOMBRE, DESCRIPCION] = process.argv
-const APLICAR = process.argv.includes('--apply')
-const MASK    = process.argv.includes('--mask')
+const APLICAR   = process.argv.includes('--apply')
+const MASK      = process.argv.includes('--mask')
+const CONTROLES = (i => i > -1 ? process.argv[i + 1] : null)(process.argv.indexOf('--controles'))
 if (!RUTA || !NOMBRE) {
   console.error('uso: node scripts/registrar-herramienta.js <workflow_api.json> <nombre> ["descripción"] [--mask] [--apply]')
   process.exit(1)
@@ -67,10 +75,47 @@ function aguasArriba (wf, raiz) {
   const salidas = Object.fromEntries(saves.map(([id, n]) =>
     [id, String(n.inputs?.filename_prefix || `salida_${id}`).split('/').pop()]))
 
+  // Controles del usuario: los presets se declaran, el rango se descubre.
+  let controles = null
+  if (CONTROLES) {
+    const decl = JSON.parse(fs.readFileSync(CONTROLES, 'utf8'))
+    const nodo = wf[decl.nodo]
+    if (!nodo) { console.error(`*** el nodo ${decl.nodo} de los controles no está en este workflow ***`); process.exit(1) }
+
+    const BASE = (process.env.COMFYUI_BASE_URL || '').replace(/\/$/, '')
+    const KEY  = process.env.COMFYUI_API_KEY
+    const info = await (await fetch(`${BASE}/api/object_info`, { headers: KEY ? { Authorization: `Bearer ${KEY}` } : {} })).json()
+    const decls = info[nodo.class_type]?.input?.required || {}
+
+    const campos = []
+    for (const c of decl.campos || []) {
+      const d = decls[c.campo]
+      if (!d) { console.error(`*** ${nodo.class_type} no declara el campo "${c.campo}" ***`); process.exit(1) }
+      const meta = d[1] || {}
+      const fuera = (c.presets || []).filter(p =>
+        (meta.min !== undefined && p.valor < meta.min) || (meta.max !== undefined && p.valor > meta.max))
+      if (fuera.length) {
+        console.error(`*** presets fuera del rango de ${c.campo} (${meta.min}…${meta.max}): ` +
+          fuera.map(p => `${p.nombre}=${p.valor}`).join(', ') + ' ***')
+        process.exit(1)
+      }
+      campos.push({
+        campo: c.campo,
+        etiqueta: c.etiqueta || meta.display_name || c.campo,
+        tipo: d[0],
+        min: meta.min, max: meta.max, step: meta.step, defecto: meta.default,
+        ayuda: meta.tooltip || null,
+        presets: c.presets || [],
+      })
+    }
+    controles = { nodo: String(decl.nodo), titulo: decl.titulo || null, nota: decl.nota || null, campos }
+  }
+
   const inject_config = {
     ...(conSeed ? { seed: { node: conSeed[0], field: 'seed' } } : {}),
     extra: { image: { node: entradaId, type: 'image', field: 'image' } },
     salidas,
+    ...(controles ? { controles } : {}),
   }
 
   console.log(`${NOMBRE}`)
@@ -79,6 +124,10 @@ function aguasArriba (wf, raiz) {
   console.log(`  semilla:  ${conSeed ? `nodo ${conSeed[0]} (${wf[conSeed[0]].class_type})` : '— ninguna'}`)
   console.log(`  salidas:  ${Object.entries(salidas).map(([id, n]) => `${n} (nodo ${id}, ${wf[id].class_type})`).join(' · ')}`)
   console.log(`  máscara:  ${MASK ? 'sí — el front ofrece pintarla' : 'no'}`)
+  if (controles) {
+    console.log(`  controles: nodo ${controles.nodo} (${wf[controles.nodo].class_type})`)
+    for (const c of controles.campos) console.log(`      ${c.etiqueta.padEnd(12)} ${c.campo.padEnd(18)} ${c.tipo} ${c.min}…${c.max}  ·  ${c.presets.length} presets: ${c.presets.map(p => p.nombre).join(", ")}`)
+  }
   console.log(`\n  inject_config: ${JSON.stringify(inject_config)}`)
 
   const { data: ya } = await db().from('comfyui_workflows').select('id,name').eq('name', NOMBRE).maybeSingle()

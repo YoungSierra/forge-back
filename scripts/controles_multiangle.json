@@ -1,0 +1,40 @@
+{
+  "nodo": "111",
+  "titulo": "Ángulo de cámara",
+  "nota": "Una vista por corrida. El usuario combina un preset de cada eje, o ajusta a mano dentro del rango. Tabla de Miguel, Moodboard_Segmentacion_NuevoAngulo_Integracion_Forge.md §4.",
+  "campos": [
+    {
+      "campo": "horizontal_angle",
+      "etiqueta": "Horizontal",
+      "presets": [
+        { "nombre": "Frente", "valor": 0 },
+        { "nombre": "3/4 Frontal-Der", "valor": 45 },
+        { "nombre": "Perfil Der", "valor": 90 },
+        { "nombre": "3/4 Trasero-Der", "valor": 135 },
+        { "nombre": "Espalda", "valor": 180 },
+        { "nombre": "3/4 Trasero-Izq", "valor": 225 },
+        { "nombre": "Perfil Izq", "valor": 270 },
+        { "nombre": "3/4 Frontal-Izq", "valor": 315 }
+      ]
+    },
+    {
+      "campo": "vertical_angle",
+      "etiqueta": "Vertical",
+      "presets": [
+        { "nombre": "Contrapicado", "valor": -30 },
+        { "nombre": "Nivel", "valor": 0 },
+        { "nombre": "Picado", "valor": 45 },
+        { "nombre": "Cenital", "valor": 60 }
+      ]
+    },
+    {
+      "campo": "zoom",
+      "etiqueta": "Zoom",
+      "presets": [
+        { "nombre": "Plano abierto", "valor": 2 },
+        { "nombre": "Medio", "valor": 5 },
+        { "nombre": "Primer plano", "valor": 8 }
+      ]
+    }
+  ]
+}
