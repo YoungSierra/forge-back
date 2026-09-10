@@ -5537,6 +5537,53 @@ router.post('/assets/:asset_id/advance', async (req, res, next) => {
   }
 })
 
+// ─── Herramientas de una imagen: Segmentación y Nuevo Ángulo ────────────────
+// Qué ofrece el radial sobre ESTA pieza. La habilitación es por procedencia y se decide acá, no
+// en el front: si dependiera de la interfaz, cada visor tendría que repetir la regla y bastaría
+// abrir el menú desde otro lado para saltársela.
+router.get('/assets/:asset_id/tools', async (req, res, next) => {
+  try {
+    const { id: project_id, asset_id } = req.params
+    const { data: asset } = await db().from('forge_assets')
+      .select('id, name, metadata, storage_url')
+      .eq('id', asset_id).eq('project_id', project_id).single()
+    if (!asset) return res.status(404).json({ success: false, error: 'Asset not found' })
+
+    const { herramientasDe } = require('../services/herramienta.service')
+    const { getWorkflowByName } = require('../services/config.service')
+
+    // Los controles viajan con la herramienta: el ángulo y el zoom con sus rangos y sus presets
+    // salen del registro del workflow, que es donde se validaron contra lo que declara el nodo.
+    const lista = []
+    for (const h of herramientasDe(asset)) {
+      const entry = await getWorkflowByName(h.workflow)
+      lista.push({ ...h, disponible: !!entry, controles: entry?.inject_config?.controles || null })
+    }
+    res.json({ success: true, herramientas: lista })
+  } catch (err) { next(err) }
+})
+
+// Correrla. Publica una pieza NUEVA colgada del origen (§7): no reemplaza la página.
+router.post('/assets/:asset_id/tool', async (req, res, next) => {
+  try {
+    const { id: project_id, asset_id } = req.params
+    const clave        = String(req.body?.herramienta || '')
+    const member_id    = req.body?.member_id || null
+    const imagen_comfy = req.body?.imagen_comfy || null
+    const opciones     = req.body?.opciones && typeof req.body.opciones === 'object' ? req.body.opciones : null
+
+    const { correrHerramienta } = require('../services/herramienta.service')
+    const r = await correrHerramienta({ db, project_id, asset_id, clave, opciones, imagen_comfy, member_id })
+    res.json({ success: true, ...r })
+  } catch (err) {
+    // Ninguno de los dos es una falla del servidor: son el estado de la pieza que se eligió.
+    if (err.code === 'NO_APLICA' || err.code === 'SIN_MASCARA') {
+      return res.status(400).json({ success: false, error: err.message, code: err.code })
+    }
+    next(err)
+  }
+})
+
 router.post('/assets/:asset_id/iterate', async (req, res, next) => {
   try {
     const { id: project_id, asset_id } = req.params
