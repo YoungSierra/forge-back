@@ -25,7 +25,17 @@
 //   node src/services/slide-composer.service.js --workflow asg --dump <dir>
 
 const LIMITE = 32000   // límite duro del modelo de imagen
-const MARGEN = 31000   // se recorta antes de llegar al límite
+// El tope de ComfyUI para el grafo entero. Se recorta antes de llegar.
+const MARGEN = 31000
+
+// Y el tope del NODO, que es otra cosa y más baja. `ByteDanceSeedAudio` rechaza un `text_prompt`
+// de más de 3.000 caracteres, y no lo declara en `object_info`: lo aplica al ejecutar, así que
+// solo se descubre pagando la corrida. Por eso se declara con el deck, donde se puede leer y
+// corregir sin tocar código.
+//
+// Medido el 11-09: el intake de Audio rellenado desde el ADI salía con 5.813 caracteres y ComfyUI
+// devolvía «Field 'text_prompt' cannot be longer than 3000 characters».
+const TOPE_DE_NODO = { audio_base: 3000 }
 
 // ── Los tres decks ───────────────────────────────────────────────────────────
 // `fuente` es el node_key del nodo cuyo documento aprobado alimenta el deck.
@@ -630,6 +640,7 @@ async function composeDeck({ db, projectId, deck = 'asg', fills = null, solo = n
     // mismos que los primarios es peor que no decirle nada. El primero se la lleva y los demás se
     // declaran huecos — el documento no los responde por separado.
     const seccionesUsadas = new Set()
+    const topeChico = (TOPE_DE_NODO[deck] ?? Infinity) < 8000
     const valores = intake.campos.map(c => {
       // Los fills mandan cuando estan: son lo que el LLM escribio para ESTE deck. Sin ellos se
       // extrae del documento, que es como venia funcionando antes de v2.9.7.
@@ -660,7 +671,13 @@ async function composeDeck({ db, projectId, deck = 'asg', fills = null, solo = n
       }
       if (!r) {
         pag.faltantes.push(c.etiqueta)
-        return { fijo: `[UPSTREAM GAP: "${c.etiqueta}" — el documento del nodo ${cfg.fuente} no lo produjo. NO lo inventes: escribe «TBD».]` }
+        // El aviso largo existe para que el modelo no rellene el hueco de su cosecha. Cuando el
+        // nodo topa bajo —el de audio admite 3.000 caracteres— ese aviso deja de ser una
+        // salvaguarda y pasa a ser lo que desborda: siete huecos son 770 caracteres de los 3.000.
+        // Ahí alcanza con la marca corta, porque la sección de instrucciones ya dice qué hacer.
+        return { fijo: topeChico
+          ? '[TBD]'
+          : `[UPSTREAM GAP: "${c.etiqueta}" — el documento del nodo ${cfg.fuente} no lo produjo. NO lo inventes: escribe «TBD».]` }
       }
       pag.llenos.push({ etiqueta: c.etiqueta, via: r.via, chars: r.texto.length })
       return { texto: r.texto }
@@ -682,12 +699,16 @@ async function composeDeck({ db, projectId, deck = 'asg', fills = null, solo = n
       })
       return prompt.replace(intake.bloque, () => cuerpo)
     }
+    // El más estricto de los dos topes manda: el del grafo o el del propio nodo.
+    const tope = Math.min(MARGEN, TOPE_DE_NODO[deck] ?? Infinity)
     let vueltas = 0
-    while (armar().length > MARGEN && vueltas++ < 200) {
+    while (armar().length > tope && vueltas++ < 200) {
       const gordos = valores.filter(v => !v.fijo)
       if (!gordos.length) break
       const max = gordos.reduce((a, b) => (b.texto.length > a.texto.length ? b : a))
-      if (max.texto.length < 300) break                     // ya no hay de dónde recortar
+      // Con un tope chico hay que poder rebanar hasta el final: el piso de 300 es para el grafo
+      // de 31.000, donde recortar un campo a menos de eso no arregla nada y sí lo vacía.
+      if (max.texto.length < (tope < 8000 ? 40 : 300)) break
       pag.recortado = true
       // Se quita la marca anterior antes de volver a cortar: si no, cada vuelta rebana la marca
       // por la mitad y deja basura a medias dentro del texto.

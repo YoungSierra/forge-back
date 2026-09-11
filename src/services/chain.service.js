@@ -66,6 +66,26 @@ const CADENAS = {
     ],
   },
 
+  // La pista de audio del Vertical Slice. Un solo paso, y corre por el camino de DECK en vez del
+  // de cadena: su prompt es el formulario del ADI —«CORE FANTASY (§1.2) →»— y rellenarlo es lo que
+  // hace el compositor de láminas, no el inyector de cadenas. Registrarlo como paso normal habría
+  // mandado el formulario en blanco, que es peor que no mandarlo.
+  //
+  // La referencia —la propia página Audio Sheet del ASG— la resuelve el deck por su nombre, así
+  // que no hace falta cablearla acá.
+  audio_sheet: {
+    etiqueta: 'Audio Sheet',
+    pasos: [
+      {
+        clave: 'audio', workflow: 'V57_STUDIO_2D_audio_base', etiqueta: 'Audio',
+        deck: 'audio_base',
+        que:    'One audio track to the right of this sheet.',
+        porque: 'The slice needs its sound, and this sheet is what tells the model how it should feel.',
+        entradas: {},
+      },
+    ],
+  },
+
   environment_sheet: {
     etiqueta: 'Environment Sheet',
     pasos: [
@@ -93,14 +113,30 @@ const CADENAS = {
 // Qué cadena le toca a un activo. Hoy solo la de Character Sheet está definida; el documento dice
 // que las demás páginas «usan sus propios workflows, que están por definir más adelante», así que
 // devolver null es la respuesta correcta y no un caso de error.
+// Qué formato y mime guardar. La extensión del archivo manda: un `.mp3` etiquetado `image/png`
+// se descarga y no suena en ningún lado.
+const MIMES = {
+  glb: 'model/gltf-binary', png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp',
+  mp4: 'video/mp4', webm: 'video/webm', mp3: 'audio/mpeg', wav: 'audio/wav', flac: 'audio/flac', ogg: 'audio/ogg',
+}
+function formatoDe(sal) {
+  const ext = (/\.([a-z0-9]{2,4})(?:[?#]|$)/i.exec(String(sal.url || ''))?.[1] || '').toLowerCase()
+  if (ext && MIMES[ext]) return { format: ext, mime_type: MIMES[ext] }
+  // Sin extensión legible se cae a lo que declaró el productor, que es como funcionaba hasta hoy.
+  return sal.kind === 'model'
+    ? { format: 'glb', mime_type: 'model/gltf-binary' }
+    : { format: 'png', mime_type: 'image/png' }
+}
+
 function cadenaDe(asset) {
   const n = String(asset?.name || '')
   if (/character\s*sheet/i.test(n))    return 'character_sheet'
   if (/prop\s*sheet/i.test(n))         return 'prop_sheet'
   if (/environment\s*sheet/i.test(n))  return 'environment_sheet'
-  // UI Component Sheet (ASG_31) y VFX Sheet (ASG_32) existen en el ASG pero todavía no tienen
-  // workflow; Audio Sheet tiene workflow pero no tiene página. Marketing necesita rellenar el ADI
-  // en su prompt, que es ensamblado y no cableado. Los tres casos devuelven null a propósito.
+  if (/audio\s*sheet/i.test(n))        return 'audio_sheet'
+  // UI Component Sheet y VFX Sheet existen en el ASG y todavía no tienen workflow; Marketing lo
+  // tiene, pero produce una pieza del proyecto entero y no de una hoja, así que no es una cadena.
+  // Los tres devuelven null a propósito.
   return null
 }
 
@@ -270,19 +306,40 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
 
       const t0 = Date.now()
       if (cada) console.log(`[cadena] ${paso.clave}: despachando ${cada} (${instancias.indexOf(cada) + 1}/${instancias.length})`)
-      const jobId = await submitWorkflow(paso.workflow, paso.pide_prompt ? (prompt || '') : '', 1024, 1024, extras, opciones)
-      await pollUntilDone(jobId, 300_000)   // Tripo y gpt-image-2 tardan bastante más que un render local
-      const base = `projects/${project_id}/chain/${nombreCadena}/${paso.clave}/${cada ? cada + '-' : ''}${jobId.slice(0, 8)}`
-      const salidas = await downloadOutputsByNode(jobId, base)
 
-      // Del nodo al rol. Con mapa declarado manda el mapa Y NADA MÁS: un workflow publica más de
-      // lo que interesa guardar —el de 3D tiene un `Preview3D` que emite el MISMO .glb que el
-      // `SaveGLB`, así que aceptar lo no declarado creaba dos activos idénticos del mismo archivo.
-      const porRol = {}
-      for (const [nodo, sal] of Object.entries(salidas)) {
-        if (roles && !roles[nodo]) continue
-        porRol[roles?.[nodo] || nodo] = sal
+      let jobId, porRol = {}
+
+      if (paso.deck) {
+        // Un paso de DECK: su prompt es un formulario del ADI y hay que rellenarlo antes de
+        // mandarlo. Eso lo hace el compositor de láminas, no el inyector de cadenas, así que el
+        // paso se despacha por ese camino y vuelve con las páginas ya subidas. La referencia —la
+        // propia hoja del ASG— la resuelve el deck por su nombre.
+        const { generateDeck } = require('./image-gen.service')
+        const r = await generateDeck({
+          db, project_id, node_id: origen.node_id, node_key: paso.deck,
+          output_key: paso.clave, image_gen_model: `comfyui:${paso.workflow}`,
+          deck: paso.deck, member_id,
+        })
+        jobId = r.jobId
+        if (!r.paginas?.length) {
+          throw new Error(`Step "${paso.clave}" produced nothing${r.avisos?.length ? `: ${r.avisos.join(' · ')}` : ''}`)
+        }
+        for (const pg of r.paginas) porRol[pg.name] = { url: pg.url, kind: pg.kind || 'image' }
+      } else {
+        jobId = await submitWorkflow(paso.workflow, paso.pide_prompt ? (prompt || '') : '', 1024, 1024, extras, opciones)
+        await pollUntilDone(jobId, 300_000)   // Tripo y gpt-image-2 tardan bastante más que un render local
+        const base = `projects/${project_id}/chain/${nombreCadena}/${paso.clave}/${cada ? cada + '-' : ''}${jobId.slice(0, 8)}`
+        const salidas = await downloadOutputsByNode(jobId, base)
+
+        // Del nodo al rol. Con mapa declarado manda el mapa Y NADA MÁS: un workflow publica más de
+        // lo que interesa guardar —el de 3D tiene un `Preview3D` que emite el MISMO .glb que el
+        // `SaveGLB`, así que aceptar lo no declarado creaba dos activos idénticos del mismo archivo.
+        for (const [nodo, sal] of Object.entries(salidas)) {
+          if (roles && !roles[nodo]) continue
+          porRol[roles?.[nodo] || nodo] = sal
+        }
       }
+
       if (!Object.keys(porRol).length) {
         throw new Error(`Step "${paso.clave}" produced output, but none from the declared nodes (${Object.keys(roles || {}).join(', ')})`)
       }
@@ -321,8 +378,9 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
         const { data: a, error } = await db().from('forge_assets').insert({
           project_id, node_id: origen.node_id, session_id: ses.id,
           name: `${origen.name} — ${paso.etiqueta}${sufijo}`,
-          format: sal.kind === 'model' ? 'glb' : 'png',
-          mime_type: sal.kind === 'model' ? 'model/gltf-binary' : 'image/png',
+          // Una cadena ya no produce solo imágenes y modelos: la del Audio Sheet devuelve un mp3.
+          // El formato sale de la extensión del archivo que se subió, no de una suposición.
+          ...formatoDe(sal),
           status: 'approved', approved_by: member_id, approved_at: new Date().toISOString(),
           storage_url: sal.url, file_size_bytes: sal.size_bytes,
           derived_from_id: padre,
