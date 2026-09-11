@@ -588,6 +588,24 @@ async function composeDeck({ db, projectId, deck = 'asg', fills = null, solo = n
     if (!assets.length) avisos.push(`node ${cfg.fuente} has no approved assets in this project`)
   }
 
+  // Datos que Forge sabe de SÍ MISMO, y que ningún documento tiene por qué darle.
+  //
+  // La portada del Art Style Guide pide «GAME TITLE (§1.1)» y «VERSION / DATE / ART DIRECTOR
+  // (§1.1)», y el documento del 3.9 no publica §1.1 — verificado el 10-09—, así que las cuatro
+  // líneas de la portada salían con «TBD». Dos de esos datos no estaban perdidos: el título es el
+  // nombre del proyecto y la fecha es hoy. Los otros dos no los sabe nadie todavía, y se dicen
+  // así, en vez de inventar una versión 1.0 que nadie aprobó.
+  const { data: proyecto } = await db().from('projects').select('name').eq('id', projectId).maybeSingle()
+  const hoy = new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })
+  const PROPIOS = [
+    [/GAME TITLE/i, () => proyecto?.name || null],
+    [/VERSION\s*\/\s*DATE\s*\/\s*ART DIRECTOR/i, () => `Version: not set · Date: ${hoy} · Art Director: not set`],
+  ]
+  const propioDe = etiqueta => {
+    for (const [rx, fn] of PROPIOS) if (rx.test(etiqueta)) return fn()
+    return null
+  }
+
   const mapa = deck === 'gdd' ? MAPA_GDD : MAPA_ASG
   const mapaFills = parsearFills(fills)
 
@@ -647,10 +665,15 @@ async function composeDeck({ db, projectId, deck = 'asg', fills = null, solo = n
       // La línea de una página puede venir rotulada con la etiqueta del intake («Color System»)
       // o con el nombre del archivo («09_ColorSystem»). El LLM usa cualquiera de las dos, así que
       // se aceptan ambas en vez de exigirle una forma que no controlamos.
+      // Lo que Forge sabe de sí mismo manda sobre el documento: el nombre del proyecto no se
+      // busca en el ADI, se sabe.
+      const propio = propioDe(c.etiqueta)
       const desdeFills = fillDe(mapaFills, c.etiqueta) ?? (c.propia ? fillDe(mapaFills, p.name) : null)
-      let r = desdeFills != null
-        ? { texto: desdeFills, via: 'fills' }
-        : resolverEtiqueta(c.etiqueta, mapa, assets, c.ambito)
+      let r = propio != null
+        ? { texto: propio, via: 'forge' }
+        : desdeFills != null
+          ? { texto: desdeFills, via: 'fills' }
+          : resolverEtiqueta(c.etiqueta, mapa, assets, c.ambito)
       // Resuelto por § y ya lo tomó otro campo de esta página: no se repite.
       if (r?.via?.startsWith?.('§')) {
         if (seccionesUsadas.has(r.via)) r = null
