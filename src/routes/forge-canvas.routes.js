@@ -5537,6 +5537,59 @@ router.post('/assets/:asset_id/advance', async (req, res, next) => {
   }
 })
 
+// ─── Maps_App: generar el mapa de un nivel ──────────────────────────────────
+// El catálogo se pide a la herramienta, nunca se escribe acá: una lista fija en el repositorio
+// envejece en silencio y el error aparecería recién al generar.
+router.get('/mapas/arquetipos', async (_req, res, next) => {
+  try {
+    const { arquetipos, BASE } = require('../services/mapas.service')
+    if (!BASE()) return res.status(503).json({ success: false, error: 'MAPS_APP_URL no está configurada' })
+    res.json({ success: true, arquetipos: await arquetipos() })
+  } catch (err) { next(err) }
+})
+
+// Traduce el Level Design a parámetros, genera y publica el resultado colgado del activo de
+// origen. Si `parametros` viene en el cuerpo, se usa tal cual: es el camino para rehacer un mapa
+// cambiando un número sin volver a pasar por el modelo.
+router.post('/assets/:asset_id/mapa', async (req, res, next) => {
+  try {
+    const { id: project_id, asset_id } = req.params
+    const member_id = req.body?.member_id || null
+
+    const { data: origen } = await db().from('forge_assets')
+      .select('id, node_id, name').eq('id', asset_id).eq('project_id', project_id).single()
+    if (!origen) return res.status(404).json({ success: false, error: 'Asset not found' })
+
+    const { parametrosDesdeLevelDesign, generarYPublicar, BASE } = require('../services/mapas.service')
+    if (!BASE()) return res.status(503).json({ success: false, error: 'MAPS_APP_URL no está configurada' })
+
+    let parametros = req.body?.parametros
+    let traduccion = null
+    if (!parametros) {
+      // El documento de Level Design del proyecto: es la fuente de los parámetros, no el activo
+      // sobre el que se apretó. El botón vive sobre la pieza; el dato vive en el nodo 3.5.
+      const { data: n35 } = await db().from('forge_nodes').select('id').eq('node_key', '3.5').maybeSingle()
+      const { data: docs } = await db().from('forge_assets').select('content')
+        .eq('project_id', project_id).eq('node_id', n35?.id)
+        .not('content', 'is', null).order('created_at', { ascending: false }).limit(1)
+      const levelMap = docs?.[0]?.content
+      if (!levelMap) {
+        return res.status(400).json({
+          success: false, code: 'SIN_LEVEL_MAP',
+          error: 'Este proyecto todavía no tiene un documento de Level Design del que sacar los parámetros.',
+        })
+      }
+      traduccion = await parametrosDesdeLevelDesign({ levelMap, nivel: req.body?.nivel || null })
+      parametros = traduccion.parametros
+    }
+
+    const r = await generarYPublicar({
+      db, project_id, origen_asset_id: origen.id, node_id: origen.node_id, parametros, member_id,
+    })
+    res.json({ success: true, ...r, parametros, ...(traduccion ? { por_que: traduccion.por_que } : {}) })
+  } catch (err) { next(err) }
+})
+
 // ─── Medidas de un modelo 3D ────────────────────────────────────────────────
 // Cuánto mide un `.glb` almacenado, leyendo su propia declaración de caja envolvente. Se calcula
 // una vez y queda en la metadata del activo: la caja de un archivo no cambia, y cada render
