@@ -1,17 +1,85 @@
 const PDFDocument        = require('pdfkit')
 const { uploadToStorage } = require('./storage.service')
 
-// ─── Constantes de diseño PDF ─────────────────────────────────────────────────
+// ─── Tema del PDF ─────────────────────────────────────────────────────────────
+//
+// Los colores dejaron de estar sueltos por el archivo: son un TEMA con roles. El dictamen del
+// 10-09 es que los documentos de Forge se exportan en modo oscuro, y que **cada proyecto usa su
+// propia paleta bloqueada** —la del Color Language de su Art Direction Document—, así que lo que
+// no puede quedar es un color escrito a mano en medio del renderizador.
+//
+// `oscuro` son los valores del mapeo extendido del plan de producción (su §2). No los de su tabla
+// de roles (§1): ahí `Lumin Teal` viene como `#3F3D38`, que sobre el fondo da **1,67:1** y deja
+// los títulos casi invisibles. Los de §2 pasan todos —títulos 10,35:1, ámbar 9,39:1, atenuado
+// 10,51:1— y además cubren los catorce elementos que este archivo pinta de verdad.
+//
+// `claro` es exactamente lo que el PDF hacía hasta hoy, para la salida de impresión: un GDD se
+// anota en papel, y una página oscura a sangre se lee mal y se come la tinta.
+const TEMAS = {
+  oscuro: {
+    fondo:            '#101010',   // Vesper Dark — fondo de página
+    texto:            '#E8F4F8',   // Aether White — cuerpo
+    titulo:           '#D0BE8C',   // Lumin Teal — títulos y jerarquía
+    acento:           '#F5A623',   // Ignis Amber — barra superior, indicador de sección, tabla
+    acento_texto:     '#0D2B35',   // lo que va ENCIMA del ámbar: blanco ahí da 2,03:1
+    atenuado:         '#CCC09E',   // texto atenuado y pie
+    linea:            '#7B2FBE',   // Umbra Violet — bordes y divisorias
+    franja:           '#25221F',   // franja alterna de tabla
+    codigo_fondo:     '#101010',
+    portada_fondo:    '#101010',
+    portada_titulo:   '#F3FBFE',
+    portada_sub:      '#CCC09E',
+    portada_dim:      '#CCC09E',
+    // Un asset segmentado viene sobre blanco por contrato, y sobre página oscura queda como un
+    // rectángulo brillante. El plan pide componerlo con un marco sutil en vez de dejarlo suelto.
+    marco_imagen:     '#7B2FBE',
+  },
+  claro: {
+    fondo:            '#ffffff',
+    texto:            '#111827',
+    titulo:           '#374151',
+    acento:           '#F59E0B',
+    acento_texto:     '#ffffff',
+    atenuado:         '#6b7280',
+    linea:            '#e5e7eb',
+    franja:           '#f9fafb',
+    codigo_fondo:     '#f9fafb',
+    portada_fondo:    '#0d0f14',
+    portada_titulo:   '#ffffff',
+    portada_sub:      '#9ca3af',
+    portada_dim:      '#6b7280',
+    marco_imagen:     null,
+  },
+}
 
-// Portada: oscura / páginas de contenido: blancas
-const PDF_COVER_BG  = '#0d0f14'
-const PDF_BG        = '#ffffff'
-const PDF_EMBER     = '#F59E0B'
-const PDF_TEXT      = '#111827'
-const PDF_DIM       = '#6b7280'
-const PDF_SUBTLE    = '#f9fafb'
-const PDF_LINE      = '#e5e7eb'
-const PDF_H3_CLR    = '#374151'
+// El dictamen del 10-09: los PDF de Forge salen oscuros. `FORGE_PDF_TEMA=claro` devuelve la
+// salida de impresión sin tocar código.
+const TEMA = TEMAS[process.env.FORGE_PDF_TEMA] || TEMAS.oscuro
+
+const PDF_COVER_BG  = TEMA.portada_fondo
+const PDF_BG        = TEMA.fondo
+const PDF_EMBER     = TEMA.acento
+const PDF_TEXT      = TEMA.texto
+const PDF_DIM       = TEMA.atenuado
+const PDF_SUBTLE    = TEMA.franja
+const PDF_LINE      = TEMA.linea
+const PDF_H3_CLR    = TEMA.titulo
+
+// Un marco fino alrededor de una imagen incrustada.
+//
+// Casi todo lo que este PDF incrusta viene sobre blanco POR CONTRATO —un asset segmentado, una
+// sprite sheet con el fondo quitado, una lámina del Art Style Guide— y sobre una página oscura eso
+// aparece como un rectángulo brillante flotando. El plan de producción pide componerlo con un
+// contenedor sutil en vez de dejarlo suelto; es una línea de un píxel y resuelve el corte.
+function marcoImagen (doc, x, y, ancho, alto) {
+  if (!TEMA.marco_imagen) return
+  doc.save()
+     .lineWidth(0.75)
+     .strokeColor(TEMA.marco_imagen)
+     .rect(x - 3, y - 3, ancho + 6, alto + 6)
+     .stroke()
+     .restore()
+}
 
 // ─── Descripción de herramientas disponibles ──────────────────────────────────
 
@@ -461,7 +529,7 @@ function drawCover(doc, docType, gameTitle, subtitle) {
     .text(docType.toUpperCase(), MX, 40, { characterSpacing: 1.5, lineBreak: false })
 
   // CONFIDENTIAL a la derecha
-  doc.font('Helvetica').fontSize(8).fillColor('#6b7280')
+  doc.font('Helvetica').fontSize(8).fillColor(TEMA.portada_dim)
     .text('CONFIDENTIAL', W - MX - 80, 42, { width: 80, align: 'right', lineBreak: false })
 
   // Barra vertical decorativa
@@ -470,21 +538,21 @@ function drawCover(doc, docType, gameTitle, subtitle) {
 
   // Nombre del juego — protagonista
   const mainTitle = gameTitle || docType
-  doc.font('Helvetica-Bold').fontSize(48).fillColor('#ffffff')
+  doc.font('Helvetica-Bold').fontSize(48).fillColor(TEMA.portada_titulo)
     .text(mainTitle, MX, 90, { width: W - MX * 2, lineGap: 4 })
 
   const afterTitle = doc.y + 16
   doc.rect(MX, afterTitle, 80, 3).fill(PDF_EMBER)
 
   if (subtitle) {
-    doc.font('Helvetica').fontSize(13).fillColor('#9ca3af')
+    doc.font('Helvetica').fontSize(13).fillColor(TEMA.portada_sub)
       .text(subtitle, MX, afterTitle + 22, { width: W - MX * 2, lineGap: 4 })
   }
 
   // Footer
   doc.font('Helvetica-Bold').fontSize(8).fillColor(PDF_EMBER)
     .text('FORGE AI', MX, H - 48, { lineBreak: false })
-  doc.font('Helvetica').fontSize(8).fillColor('#6b7280')
+  doc.font('Helvetica').fontSize(8).fillColor(TEMA.portada_dim)
     .text(new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }), MX, H - 34, { lineBreak: false })
   doc.rect(0, H - 8, W, 8).fill(PDF_EMBER)
 }
@@ -730,6 +798,7 @@ async function docGenDocx(title, content, projectId, nodeId, itemImages = []) {
       if (y + alto > doc.page.height - 60) checkPageBreak(alto + 40)
       try {
         doc.image(buf, x, y + 6, { width: ancho })
+        marcoImagen(doc, x, y + 6, ancho, alto)
         y += alto + 16
       } catch (e) {
         console.warn('[doc_gen] no se pudo incrustar la imagen de', hit.t, e.message)
@@ -786,6 +855,7 @@ async function docGenDocx(title, content, projectId, nodeId, itemImages = []) {
           if (!(alto > 0)) continue
           checkPageBreak(alto + 40)
           doc.image(buf, MARGIN, y, { width: CONTENT_W })
+          marcoImagen(doc, MARGIN, y, CONTENT_W, alto)
           y += alto + 18
         } catch (e) { console.warn('[doc_gen] portada sin imagen:', e.message) }
       }
@@ -952,7 +1022,7 @@ async function docGenDocx(title, content, projectId, nodeId, itemImages = []) {
               doc.rect(MARGIN, y, CONTENT_W, hH).fill(PDF_EMBER)
               doc.rect(MARGIN, y + hH, CONTENT_W, 0.5).fill(PDF_LINE)
               for (let ci = 0; ci < colCount; ci++) {
-                doc.font('Helvetica-Bold').fontSize(fontSize).fillColor('#ffffff')
+                doc.font('Helvetica-Bold').fontSize(fontSize).fillColor(TEMA.acento_texto)
                   .text(clean(header[ci]), MARGIN + ci * colW + cellPad, y + cellPad, { width: colW - cellPad * 2, lineGap: 1 })
               }
               y += hH
@@ -966,7 +1036,7 @@ async function docGenDocx(title, content, projectId, nodeId, itemImages = []) {
               const cx = MARGIN + ci * colW
               doc.font(isHeader ? 'Helvetica-Bold' : 'Helvetica')
                 .fontSize(fontSize)
-                .fillColor(isHeader ? '#ffffff' : PDF_TEXT)
+                .fillColor(isHeader ? TEMA.acento_texto : PDF_TEXT)
                 .text(clean(row[ci]), cx + cellPad, y + cellPad, {
                   width:   colW - cellPad * 2,
                   lineGap: 1,
