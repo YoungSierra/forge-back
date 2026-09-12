@@ -5590,6 +5590,79 @@ router.post('/assets/:asset_id/mapa', async (req, res, next) => {
   } catch (err) { next(err) }
 })
 
+// ─── El paquete para Blender ────────────────────────────────────────────────
+// Último paso de Forge en este tramo: junta el grafo del nivel, las medidas de cada modelo y la
+// orden de montaje en un bundle `montaje/1.0`, y lo devuelve como un `.zip` descargable. De ahí
+// en adelante trabaja el addon de LoopForge.
+router.post('/mapas/bundle', async (req, res, next) => {
+  try {
+    const { id: project_id } = req.params
+    const { level_graph, grammar, asset_ids, level_id, kit_scale_spec } = req.body || {}
+    const estrategia = req.body?.strategy || 'modular_hex'
+
+    if (!level_graph) return res.status(400).json({ success: false, error: 'falta level_graph' })
+    if (!grammar?.estructura) {
+      return res.status(400).json({
+        success: false, code: 'SIN_GRAMATICA',
+        error: 'La gramática no declara `estructura`. Sin ella el montaje sale con cero objetos: '
+             + 'qué pieza juega cada papel estructural es una decisión de arte, no una medición.',
+      })
+    }
+    if (!asset_ids?.length) return res.status(400).json({ success: false, error: 'falta asset_ids: el kit no tiene modelos' })
+
+    const { data: activos } = await db().from('forge_assets')
+      .select('id, name, storage_url, metadata, format')
+      .eq('project_id', project_id).in('id', asset_ids)
+    const sinModelo = (activos || []).filter(a => a.format !== 'glb')
+    if (sinModelo.length) {
+      return res.status(400).json({ success: false, error: `no son modelos 3D: ${sinModelo.map(a => a.name).join(', ')}` })
+    }
+
+    // Se mide lo que no esté medido: el bundle declara dimensiones y no puede declararlas a medias.
+    const { medirActivo } = require('../services/glb-medidas.service')
+    for (const a of activos || []) {
+      if (!a.metadata?.medidas) a.metadata = { ...(a.metadata || {}), medidas: await medirActivo(db, a) }
+    }
+
+    const bm = require('../services/bundle-montaje.service')
+    const { assets, inventario } = bm.kitDesdeMedidas(activos || [], kit_scale_spec || null, req.body?.clases || {})
+    if (!Object.keys(assets).length) return res.status(400).json({ success: false, error: 'ningún modelo pudo medirse' })
+
+    const { ordenDeMontaje, ALTURA_POR_DEFECTO, BASE } = require('../services/mapas.service')
+    if (!BASE()) return res.status(503).json({ success: false, error: 'MAPS_APP_URL no está configurada' })
+
+    const r = await ordenDeMontaje({
+      level_graph, kit_catalog: { assets }, grammar,
+      strategy: estrategia, strategy_params: req.body?.strategy_params || {},
+      prefix: req.body?.prefix || null, assembly_profile_id: req.body?.assembly_profile_id || null,
+    })
+
+    const modelos = await bm.traerModelos(inventario)
+    const altura = Number(req.body?.player_height_m) || ALTURA_POR_DEFECTO
+    const manifiesto = bm.manifiesto({
+      level_id: level_id || level_graph.level_id || 'nivel',
+      modelos, alturaJugador: altura,
+      fuenteAltura: req.body?.player_height_m ? 'declarada en la petición' : 'valor por defecto (el 3.6 no publica una medida real)',
+      escalaSpec: kit_scale_spec || null,
+    })
+
+    const zip = await bm.armarZip({
+      bundle: manifiesto, orden: r.order, kit: { assets },
+      validacion: r.validation || {}, modelos,
+      shell: req.body?.incluir_referencia ? r.shell : null,
+    })
+
+    const { uploadToStorage } = require('../services/storage.service')
+    const ruta = `projects/${project_id}/bundles/${manifiesto.bundle_id}.zip`
+    const url = await uploadToStorage(zip, ruta, 'application/zip')
+
+    res.json({
+      success: true, url, bundle_id: manifiesto.bundle_id,
+      bytes: zip.length, resumen: r.resumen, avisos: r.warnings || [],
+    })
+  } catch (err) { next(err) }
+})
+
 // ─── Medidas de un modelo 3D ────────────────────────────────────────────────
 // Cuánto mide un `.glb` almacenado, leyendo su propia declaración de caja envolvente. Se calcula
 // una vez y queda en la metadata del activo: la caja de un archivo no cambia, y cada render

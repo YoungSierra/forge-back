@@ -210,4 +210,21 @@ async function generarYPublicar({ db, project_id, origen_asset_id = null, node_i
   return { creados, pisos: pisos.length, stats: pisos.map(p => p.stats) }
 }
 
-module.exports = { arquetipos, parametrosDesdeLevelDesign, generar, generarYPublicar, ALTURA_POR_DEFECTO, BASE }
+/**
+ * Del grafo del nivel a la orden de montaje.
+ *
+ * Lo corre el mismo servicio que genera los mapas, porque el paquete de montaje es Python y
+ * `forge-back` es Node: no hay intérprete con `level_generator` de este lado. La ruta vive en un
+ * archivo propio del despliegue y no toca una línea de Maps_App.
+ *
+ * La gramática no es opcional aunque el contrato la deje pasar vacía: dice qué pieza juega cada
+ * papel estructural, y sin ella el montaje termina «bien» con cero objetos.
+ */
+async function ordenDeMontaje({ level_graph, kit_catalog, grammar, strategy = 'modular_hex', strategy_params = {}, assets_dir = 'modelos/', prefix = null, assembly_profile_id = null }) {
+  return pedir('/api/assembly', {
+    method: 'POST',
+    body: JSON.stringify({ level_graph, kit_catalog, grammar, strategy, strategy_params, assets_dir, prefix, assembly_profile_id }),
+  })
+}
+
+module.exports = { arquetipos, parametrosDesdeLevelDesign, generar, generarYPublicar, ordenDeMontaje, ALTURA_POR_DEFECTO, BASE }
