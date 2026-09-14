@@ -262,8 +262,22 @@ function seccionPorNombre(contenido, nombre) {
 // Se exige que el número termine ahí: sin el corte, «§1.1» encontraría «§1.10».
 function seccionPorNumero(contenido, numero) {
   const L = String(contenido || '').split('\n')
-  const rx = new RegExp(`^#{1,5}\\s*§\\s*${String(numero).replace(/\./g, '\\.')}(?![\\d.])`)
-  const i = L.findIndex(l => rx.test(l))
+  const buscar = n => {
+    const rx = new RegExp(`^#{1,5}\\s*§\\s*${String(n).replace(/\./g, '\\.')}(?![\\d.])`)
+    return L.findIndex(l => rx.test(l))
+  }
+
+  // La plantilla cita a veces una subsección más fina de la que el documento llega a escribir: la
+  // página 24 del ASG pide sus tres campos de «§7.9.1» y el ADI titula «§7.9 Animation Style
+  // Direction», con la locomoción y los verbos dentro. Exigiendo el número exacto la página salía
+  // con los tres huecos y el documento tenía el dato. Se sube de nivel hasta §X.Y y no más: caer
+  // al capítulo entero devolvería medio documento por cualquier cita fallada.
+  let i = buscar(numero)
+  let partes = String(numero).split('.')
+  while (i < 0 && partes.length > 2) {
+    partes = partes.slice(0, -1)
+    i = buscar(partes.join('.'))
+  }
   if (i < 0) return null
   const nivel = (L[i].match(/^#+/) || ['#'])[0].length
   const out = [L[i]]
@@ -681,10 +695,23 @@ async function composeDeck({ db, projectId, deck = 'asg', fills = null, solo = n
         : desdeFills != null
           ? { texto: desdeFills, via: 'fills' }
           : resolverEtiqueta(c.etiqueta, mapa, assets, c.ambito)
-      // Resuelto por § y ya lo tomó otro campo de esta página: no se repite.
+      // Resuelto por § y ya lo tomó otro campo de esta página: no se repite. Pegar la misma
+      // sección cuatro veces infla el prompt sin añadir nada.
+      //
+      // Pero tampoco es un hueco: el dato ESTÁ y ya viajó en el campo de arriba. Decir «el
+      // documento no lo produjo» es mentira —la página 24 pedía sus cuatro campos a la misma
+      // §7.9.1 y salía con tres huecos teniendo el ADI la sección entera— y encima invita al
+      // modelo a escribir «TBD» sobre información que tiene delante.
+      let repetida = null
       if (r?.via?.startsWith?.('§')) {
-        if (seccionesUsadas.has(r.via)) r = null
+        if (seccionesUsadas.has(r.via)) { repetida = r.via; r = null }
         else seccionesUsadas.add(r.via)
+      }
+      if (repetida) {
+        pag.llenos.push({ etiqueta: c.etiqueta, via: `${repetida} (arriba)` })
+        return { fijo: topeChico
+          ? `[see ${repetida}]`
+          : `[take it from ${repetida}, already pasted in an earlier field of this page — do not write «TBD»]` }
       }
       if (r?.noAplica) {
         // No es un gap del proyecto: nadie debe producirlo aguas arriba.
