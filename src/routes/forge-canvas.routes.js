@@ -5748,6 +5748,32 @@ router.post('/assets/:asset_id/tool', async (req, res, next) => {
   }
 })
 
+// ─── El Laboratory ──────────────────────────────────────────────────────────
+// Si el botón tiene a dónde ir. Se pregunta al pintar, y no empuja nada.
+router.get('/laboratory', async (req, res, next) => {
+  try {
+    const { estadoDelLaboratorio } = require('../services/laboratorio.service')
+    res.json({ success: true, ...await estadoDelLaboratorio({ db, project_id: req.params.id }) })
+  } catch (err) { next(err) }
+})
+
+// Empujar el TDD y devolver con qué dirección abrirlo. Es POST porque escribe del otro lado.
+router.post('/laboratory/abrir', async (req, res, next) => {
+  try {
+    const { abrirLaboratorio } = require('../services/laboratorio.service')
+    const { data: pr } = await db().from('projects').select('name').eq('id', req.params.id).maybeSingle()
+    const r = await abrirLaboratorio({ db, project_id: req.params.id, nombreProyecto: pr?.name })
+    res.json({ success: true, ...r })
+  } catch (err) {
+    // Ninguno de los dos es una falla del servidor: uno es el estado del proyecto y el otro el
+    // del despliegue.
+    if (err.code === 'SIN_TDD' || err.code === 'SIN_LAB') {
+      return res.status(400).json({ success: false, error: err.message, code: err.code })
+    }
+    next(err)
+  }
+})
+
 // ─── El disparador del montaje de un nivel ──────────────────────────────────
 // Si el sector existe sobre esta pieza, y si responde. Las dos cosas las decide el back por la
 // misma razón que las herramientas: la regla vive en un solo sitio. `aplica: false` es la
