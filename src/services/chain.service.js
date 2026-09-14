@@ -224,6 +224,22 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
   }
   const def = CADENAS[nombreCadena]
 
+  // De qué se llama lo que produce esta cadena. Heredar el nombre entero del origen le pegaba el
+  // prefijo del DOCUMENTO —«Art Style Guide — 25_VideoMarketingSheet — Key Art»— y cualquier
+  // resolvedor por nombre lo leía como una página del Art Style Guide llamada Key Art, tapando a
+  // la de verdad. La pieza no es una página del documento: es lo que una cadena hizo A PARTIR de
+  // una. Así que el nombre empieza por la cadena y conserva la hoja, que es la procedencia útil.
+  //
+  // El moodboard la sigue poniendo en el bloque de su hoja: la zona ya no se deduce del prefijo
+  // sino de `derived_from`, que es quien sabe de dónde salió.
+  const PREFIJO_DOC = /^\s*(Art Style Guide|GDD Art Style|Art Bible)\s*[—–-]\s*/i
+  const sinDocumento = String(origen.name || '').replace(PREFIJO_DOC, '')
+  // Si el origen ya es una pieza de esta cadena, su nombre YA empieza por la etiqueta: no se
+  // vuelve a anteponer, o el segundo paso saldría «Marketing — Marketing — …».
+  const raiz = sinDocumento.toLowerCase().startsWith(def.etiqueta.toLowerCase())
+    ? sinDocumento
+    : `${def.etiqueta} — ${sinDocumento}`
+
   // Las salidas de cada paso, para que el siguiente las pida por rol.
   const salidasPorPaso = {}
   const creados = []
@@ -409,7 +425,7 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
         const sufijo = cada ? ` — ${cada}` : (publicables.length > 1 ? ` — ${rol}` : '')
         const { data: a, error } = await db().from('forge_assets').insert({
           project_id, node_id: origen.node_id, session_id: ses.id,
-          name: `${origen.name} — ${paso.etiqueta}${sufijo}`,
+          name: `${raiz} — ${paso.etiqueta}${sufijo}`,
           // Una cadena ya no produce solo imágenes y modelos: la del Audio Sheet devuelve un mp3.
           // El formato sale de la extensión del archivo que se subió, no de una suposición.
           ...formatoDe(sal),
