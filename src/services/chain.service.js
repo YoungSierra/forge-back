@@ -97,6 +97,26 @@ const CADENAS = {
     ],
   },
 
+  // La hoja de poses de cada movimiento. Es la cadena más corta y la única que NO termina dentro
+  // de Forge: entrega las láminas y de ahí el flujo sigue en Cascadeur, por script, fuera del
+  // Moodboard. Eso no es un hueco a cerrar —no hay forma de correr Cascadeur desde ComfyUI
+  // cloud—, es dónde termina este tramo, y el paquete que lo especifica lo dice así.
+  //
+  // El ancla no es la lámina que se pulsó sino el personaje; los clips salen del ADI. Los dos
+  // detalles están explicados en `animacion.service`.
+  animation_sheet: {
+    etiqueta: 'Animation Sheet',
+    pasos: [
+      {
+        clave: 'pose_sheet', workflow: 'V57_STUDIO_2D_Character_Pose_Sheet', etiqueta: 'Pose sheet',
+        porCadaClip: true,
+        que:    'One pose sheet per animation clip — three views across as many columns as the movement has key poses.',
+        porque: 'Cascadeur builds the real keyframes from these sheets; without them the rig has nothing to pose against.',
+        entradas: { image: 'ancla_personaje' },
+      },
+    ],
+  },
+
   audio_sheet: {
     etiqueta: 'Audio Sheet',
     pasos: [
@@ -158,6 +178,7 @@ function cadenaDe(asset) {
   if (/prop\s*sheet/i.test(n))         return 'prop_sheet'
   if (/environment\s*sheet/i.test(n))  return 'environment_sheet'
   if (/audio\s*sheet/i.test(n))        return 'audio_sheet'
+  if (/animation\s*sheet/i.test(n))    return 'animation_sheet'
   // Marketing sí es una cadena, y la hoja de Video Marketing es su origen: los dos workflows leen
   // ESA lámina —sus seis viñetas HOOK/WORLD/FANTASY/UNIQUE/CLIMAX/TITLE— más la de Visual DNA.
   // Antes devolvía null razonando que «produce una pieza del proyecto entero y no de una hoja»,
@@ -295,6 +316,19 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
       throw new Error(`Step "${paso.clave}" runs once per output of "${paso.porCadaSalidaDe}", which produced none`)
     }
 
+    // Y un paso `porCadaClip` despacha una vez por movimiento a animar. La diferencia con
+    // `porCadaSalidaDe` es de dónde sale la lista: allí son las salidas del paso anterior, acá es
+    // un documento —el ADI de animación— que enumera los movimientos con sus reglas. Cada clip es
+    // una lámina distinta, y cada lámina se paga.
+    let anim = null
+    if (paso.porCadaClip) {
+      anim = await require('./animacion.service').clipsDelProyecto({ db, project_id })
+      instancias = anim.clips.map(c => c.nombre)
+      if (anim.descartados?.length) {
+        console.log(`[cadena] ${paso.clave}: el ADI nombra más movimientos de los que se corren — quedan fuera ${anim.descartados.join(', ')}`)
+      }
+    }
+
     // Parado SOBRE una parte, se corre ESA parte y ninguna otra.
     //
     // La siembra de mitad de cadena reconstruye todos los hermanos del mismo job —hacen falta
@@ -319,7 +353,7 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
     //
     // Recorta SOLO este paso. Lo que ya produjo el anterior está pagado y sigue publicado; el
     // resto de las partes se pueden avanzar después, porque cada una arranca desde sí misma.
-    if (paso.porCadaSalidaDe && limitePorCada > 0 && instancias.length > limitePorCada) {
+    if ((paso.porCadaSalidaDe || paso.porCadaClip) && limitePorCada > 0 && instancias.length > limitePorCada) {
       console.log(`[cadena] ${paso.clave}: ${instancias.length} partes, se corren ${limitePorCada} — el resto queda para otro Run`)
       instancias = instancias.slice(0, limitePorCada)
     }
@@ -333,6 +367,14 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
       for (const [campo, ref] of Object.entries(paso.entradas)) {
         let url
         if (ref === 'origen') url = anterior.storage_url
+        // La hoja de poses no se ancla en la lámina que se pulsó —esa es una plantilla— sino en
+        // el personaje: su vista frontal, que produjo la cadena de Character Sheet. Es el hueco
+        // que el propio paquete marcaba: «nadie ató automáticamente la vista Frontal al nodo 17».
+        else if (ref === 'ancla_personaje') {
+          const ancla = await require('./animacion.service').anclaDelPersonaje({ db, project_id })
+          url = ancla.url
+          if (instancias.indexOf(cada) === 0) console.log(`[cadena] ${paso.clave}: ancla «${ancla.nombre}»`)
+        }
         else if (ref === '<cada>') url = salidasPorPaso[paso.porCadaSalidaDe]?.[cada]?.url
         else {
           const [pasoRef, rol] = ref.split(':')
@@ -350,6 +392,18 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
       // semilla en las tres el modelo devuelve tres veces el mismo ángulo.
       for (const clave of Object.keys(entry.inject_config?.extra || {})) {
         if (clave.startsWith('seed_')) extras[clave] = Math.floor(Math.random() * 2147483647)
+      }
+
+      // Los beats de ESTE clip, y su nombre, que además nombra el archivo que devuelve ComfyUI.
+      // Se componen justo antes de despachar y no todos de una: si uno falla, los anteriores ya
+      // están rendidos y pagados, y componer los ocho para descubrirlo al final no ahorra nada.
+      let promptDelDespacho = paso.pide_prompt ? (prompt || '') : ''
+      if (paso.porCadaClip) {
+        const clip = anim.clips.find(c => c.nombre === cada)
+        const beats = await require('./animacion.service').beatsDeClip({ clip, adi: anim.adi })
+        promptDelDespacho = beats.texto
+        extras.clip = cada
+        console.log(`[cadena] ${paso.clave}: «${cada}» — ${beats.poses} poses`)
       }
 
       const t0 = Date.now()
@@ -374,7 +428,7 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
         }
         for (const pg of r.paginas) porRol[pg.name] = { url: pg.url, kind: pg.kind || 'image' }
       } else {
-        jobId = await submitWorkflow(paso.workflow, paso.pide_prompt ? (prompt || '') : '', 1024, 1024, extras, opciones)
+        jobId = await submitWorkflow(paso.workflow, promptDelDespacho, 1024, 1024, extras, opciones)
         await pollUntilDone(jobId, 300_000)   // Tripo y gpt-image-2 tardan bastante más que un render local
         const base = `projects/${project_id}/chain/${nombreCadena}/${paso.clave}/${cada ? cada + '-' : ''}${jobId.slice(0, 8)}`
         const salidas = await downloadOutputsByNode(jobId, base)
