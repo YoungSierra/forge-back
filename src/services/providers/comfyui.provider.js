@@ -295,7 +295,16 @@ async function uploadImageToComfyUI(imageUrl) {
   if (!imgRes.ok) throw new Error(`Failed to fetch reference image: ${imgRes.status} ${imageUrl}`)
   const buffer = Buffer.from(await imgRes.arrayBuffer())
   const mime   = imgRes.headers.get('content-type') || 'image/png'
-  const ext    = mime.includes('jpeg') ? 'jpg' : 'png'
+  return subir(buffer, mime)
+}
+
+/** Lo mismo, con la imagen ya en memoria: la usa quien la compone en vez de traerla de una URL. */
+async function uploadBufferToComfyUI(buffer, mime = 'image/png') {
+  return subir(buffer, mime)
+}
+
+async function subir(buffer, mime) {
+  const ext = mime.includes('jpeg') ? 'jpg' : 'png'
 
   let ultimo = null
   for (let intento = 1; intento <= INTENTOS_SUBIDA; intento++) {
@@ -346,4 +355,4 @@ async function generateImageComfyUI(workflowName, prompt, width, height, storage
   return result
 }
 
-module.exports = { generateImageComfyUI, uploadImageToComfyUI, submitWorkflow, pollUntilDone, downloadOutput, downloadOutputsByNode }
+module.exports = { generateImageComfyUI, uploadImageToComfyUI, uploadBufferToComfyUI, submitWorkflow, pollUntilDone, downloadOutput, downloadOutputsByNode }

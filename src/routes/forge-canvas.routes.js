@@ -5724,10 +5724,13 @@ router.post('/assets/:asset_id/tool', async (req, res, next) => {
     const clave        = String(req.body?.herramienta || '')
     const member_id    = req.body?.member_id || null
     const imagen_comfy = req.body?.imagen_comfy || null
+    // Los trazos de la máscara, en crudo. Se componen contra la lámina en el servidor: hacerlo en
+    // el navegador perdía el color debajo del alfa y ComfyUI recibía una silueta negra.
+    const mascara_base64 = req.body?.mascara_base64 || null
     const opciones     = req.body?.opciones && typeof req.body.opciones === 'object' ? req.body.opciones : null
 
     const { correrHerramienta } = require('../services/herramienta.service')
-    const r = await correrHerramienta({ db, project_id, asset_id, clave, opciones, imagen_comfy, member_id })
+    const r = await correrHerramienta({ db, project_id, asset_id, clave, opciones, imagen_comfy, mascara_base64, member_id })
     res.json({ success: true, ...r })
   } catch (err) {
     // Ninguno de los dos es una falla del servidor: son el estado de la pieza que se eligió.

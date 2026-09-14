@@ -12,7 +12,8 @@
 // workflow, bajar las salidas declaradas, publicar el activo colgado de su origen. Eso se hace
 // aquí una vez, en vez de repetirlo.
 
-const { submitWorkflow, pollUntilDone, downloadOutputsByNode, uploadImageToComfyUI } = require('./providers/comfyui.provider')
+const { submitWorkflow, pollUntilDone, downloadOutputsByNode, uploadImageToComfyUI, uploadBufferToComfyUI } = require('./providers/comfyui.provider')
+const { PNG } = require('pngjs')
 const { getWorkflowByName } = require('./config.service')
 const { logExecution } = require('./execution-log.service')
 
@@ -43,6 +44,50 @@ const HERRAMIENTAS = {
   },
 }
 
+/**
+ * La lámina con su canal alfa marcado donde el usuario pintó, compuesta ACÁ y no en el navegador.
+ *
+ * Por qué se movió al servidor. El front la componía en un `canvas`: copiaba la lámina y ponía
+ * alfa 0 sobre lo pintado, que es lo que `LoadImage` publica como MASK. El problema es que un
+ * canvas guarda el color PREMULTIPLICADO por su alfa — con alfa 0 el RGB se pierde al codificar —,
+ * así que lo que llegaba a ComfyUI tenía un agujero negro justo en la parte que se quería aislar.
+ * El workflow hacía su trabajo sin fallar: recortaba contra la máscara, rellenaba de blanco
+ * alrededor, y le entregaba a GPT una silueta negra. Y GPT devolvía una silueta negra pulida,
+ * que es exactamente lo que Miguel reportó (informe v5, puntos 3 y 4).
+ *
+ * `pngjs` escribe el PNG sin premultiplicar, así que el RGB sobrevive debajo del alfa. Se compone
+ * una vez, acá, y deja de depender de cómo cada navegador maneje su canvas.
+ */
+async function componerMascara(urlOrigen, mascaraBase64) {
+  const r = await fetch(urlOrigen)
+  if (!r.ok) throw new Error(`no se pudo traer la lámina: HTTP ${r.status}`)
+  const bufOrigen = Buffer.from(await r.arrayBuffer())
+
+  let lamina, mascara
+  try { lamina = PNG.sync.read(bufOrigen) } catch {
+    throw new Error('la pieza de origen no es un PNG: la máscara solo se puede componer sobre PNG')
+  }
+  try { mascara = PNG.sync.read(Buffer.from(mascaraBase64, 'base64')) } catch {
+    throw new Error('la máscara enviada no es un PNG válido')
+  }
+  if (mascara.width !== lamina.width || mascara.height !== lamina.height) {
+    throw new Error(
+      `la máscara mide ${mascara.width}×${mascara.height} y la lámina ${lamina.width}×${lamina.height}`)
+  }
+
+  // Pintado → alfa 0, que `LoadImage` publica como MASK = 1 y el workflow lee como «esto se
+  // conserva». Sin pintar → opaco. El RGB no se toca: es justo lo que se perdía antes.
+  let pintados = 0
+  for (let i = 0; i < lamina.data.length; i += 4) {
+    const dentro = mascara.data[i + 3] > 10
+    lamina.data[i + 3] = dentro ? 0 : 255
+    if (dentro) pintados++
+  }
+  if (!pintados) throw new Error('la máscara llegó vacía: no hay nada marcado para aislar')
+
+  return { buffer: PNG.sync.write(lamina), pintados, total: lamina.data.length / 4 }
+}
+
 function herramientasDe(origen) {
   return Object.entries(HERRAMIENTAS)
     .filter(([, h]) => h.aplica(origen))
@@ -52,13 +97,11 @@ function herramientasDe(origen) {
 /**
  * Corre una herramienta sobre un activo y publica el resultado colgado de él.
  *
- * `imagen_comfy` es el nombre de un archivo YA subido a ComfyUI: así viaja la máscara. El front la
- * compone sobre la propia lámina —alfa marcado donde se pintó, que es exactamente lo que
- * `LoadImage` publica en su salida MASK— y la sube por el mismo endpoint que ya usa el refinador.
- * Sin eso habría que inventar un segundo puerto de entrada que el workflow no tiene, o mandar la
- * imagen entera en el cuerpo de esta petición.
+ * `mascara_base64` son SOLO los trazos: el front manda lo que se pintó y la lámina se compone
+ * acá (ver `componerMascara`). El workflow no tiene un segundo puerto de entrada para la máscara,
+ * así que viaja en el canal alfa de la propia imagen — pero quien escribe ese alfa es el servidor.
  */
-async function correrHerramienta({ db, project_id, asset_id, clave, opciones = null, imagen_comfy = null, member_id = null }) {
+async function correrHerramienta({ db, project_id, asset_id, clave, opciones = null, imagen_comfy = null, mascara_base64 = null, member_id = null }) {
   const h = HERRAMIENTAS[clave]
   if (!h) throw new Error(`Unknown tool "${clave}"`)
 
@@ -72,7 +115,7 @@ async function correrHerramienta({ db, project_id, asset_id, clave, opciones = n
     err.code = 'NO_APLICA'
     throw err
   }
-  if (h.pide_mascara && !imagen_comfy) {
+  if (h.pide_mascara && !mascara_base64 && !imagen_comfy) {
     const err = new Error('This tool needs a painted mask: nothing was sent')
     err.code = 'SIN_MASCARA'
     throw err
@@ -84,9 +127,17 @@ async function correrHerramienta({ db, project_id, asset_id, clave, opciones = n
   const roles = cfg.salidas || null
   const campo = Object.keys(cfg.extra || {})[0] || 'image'
 
-  // La imagen entra por el puerto que declaró el registro. Con máscara ya viene subida —el front
-  // la compuso—; sin ella se sube la del propio activo.
-  const extras = { [campo]: imagen_comfy || await uploadImageToComfyUI(origen.storage_url) }
+  // La imagen entra por el puerto que declaró el registro. Con trazos se compone acá y se sube el
+  // resultado; `imagen_comfy` queda como camino viejo
+  // —una imagen ya subida por el llamador— para no romper a quien todavía lo use.
+  let extras
+  if (mascara_base64) {
+    const m = await componerMascara(origen.storage_url, mascara_base64)
+    console.log(`[herramienta] máscara compuesta en el servidor: ${m.pintados}/${m.total} píxeles marcados`)
+    extras = { [campo]: await uploadBufferToComfyUI(m.buffer) }
+  } else {
+    extras = { [campo]: imagen_comfy || await uploadImageToComfyUI(origen.storage_url) }
+  }
 
   const t0 = Date.now()
   const jobId = await submitWorkflow(h.workflow, '', 1024, 1024, extras, opciones)
