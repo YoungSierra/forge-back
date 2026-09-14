@@ -5731,6 +5731,20 @@ router.post('/assets/:asset_id/tool', async (req, res, next) => {
   }
 })
 
+// ─── El disparador del montaje de un nivel ──────────────────────────────────
+// Si el sector existe sobre esta pieza, y si responde. Las dos cosas las decide el back por la
+// misma razón que las herramientas: la regla vive en un solo sitio. `aplica: false` es la
+// respuesta normal para casi todo el moodboard —solo las hojas de entorno lo traen— y no es un
+// error, así que sale 200.
+router.get('/assets/:asset_id/montaje', async (req, res, next) => {
+  try {
+    const { id: project_id, asset_id } = req.params
+    const { estadoDeMontaje } = require('../services/montaje-nivel.service')
+    const estado = await estadoDeMontaje({ db, project_id, asset_id })
+    res.json({ success: true, ...estado })
+  } catch (err) { next(err) }
+})
+
 router.post('/assets/:asset_id/iterate', async (req, res, next) => {
   try {
     const { id: project_id, asset_id } = req.params

@@ -32,13 +32,26 @@ const CONTRATO = 'montaje/1.0'
 
 const sha256 = buf => crypto.createHash('sha256').update(buf).digest('hex')
 
-/** Un id de archivo a partir del nombre humano de un activo. */
-const slugDe = nombre => String(nombre)
-  .normalize('NFD').replace(/[̀-ͯ]/g, '')
-  .replace(/\s*[—–-]\s*/g, '_')
-  .replace(/[^A-Za-z0-9_]+/g, '_')
-  .replace(/_+/g, '_').replace(/^_|_$/g, '')
-  .toLowerCase().slice(0, 60) || 'asset'
+/**
+ * Un id de archivo a partir del nombre humano de un activo.
+ *
+ * El tope de 60 caracteres no puede ser un corte a secas. Forge nombra por PROCEDENCIA —«Art
+ * Style Guide — 29_EnvironmentSheet — Concept art — parte_01 — 3D production»— así que lo que
+ * distingue a dos piezas hermanas vive al FINAL del nombre, justo donde caía la tijera: medido
+ * sobre los nombres vivos, 4 de 6 modelos llegaban al tope y dos páginas ya colapsaban al mismo
+ * id. Cuando hay que cortar se deja sitio para la huella del nombre completo.
+ */
+const slugDe = nombre => {
+  const limpio = String(nombre)
+    .normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .replace(/\s*[—–-]\s*/g, '_')
+    .replace(/[^A-Za-z0-9_]+/g, '_')
+    .replace(/_+/g, '_').replace(/^_|_$/g, '')
+    .toLowerCase()
+  if (!limpio) return 'asset'
+  if (limpio.length <= 60) return limpio
+  return `${limpio.slice(0, 53)}_${sha256(String(nombre)).slice(0, 6)}`
+}
 
 /**
  * El `kit.json` que consume el montaje, armado desde lo que Forge ya midió.
@@ -56,7 +69,11 @@ function kitDesdeMedidas(activos, escala = null, gramaticaClases = {}) {
   for (const a of activos) {
     const m = a.metadata?.medidas
     if (!m?.dim) continue
-    const id = slugDe(a.name)
+    // Dos nombres distintos pueden dar el mismo slug sin llegar al tope —«… — visual_pitch» y
+    // «… — Visual Pitch» son nueve pares en la base de hoy— y en un kit eso no es un id feo: es
+    // un modelo pisando al otro sin decirlo. El segundo se desempata con su huella.
+    let id = slugDe(a.name)
+    if (porId[`${id}.glb`]) id = `${id.slice(0, 53)}_${sha256(a.id).slice(0, 6)}`
     const objetoEscala = escala?.objetos
       ? Object.values(escala.objetos).find(o => o.forge_asset_id === a.id)
       : null
