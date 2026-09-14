@@ -166,7 +166,7 @@ async function resolveNodeInputs(db, { projectId, currentPNodeId, targetOutput, 
       if (outputKey || outputLabel) {
         const { data: cand } = await db()
           .from('forge_assets')
-          .select('name, content, forge_sessions!session_id(output_key, project_node_id)')
+          .select('name, content, output_key, forge_sessions!session_id(output_key, project_node_id)')
           .eq('project_id', projectId)
           .eq('node_id', sourcePNode.node_id)
           .in('status', ['approved', 'auto_approved'])
@@ -184,7 +184,7 @@ async function resolveNodeInputs(db, { projectId, currentPNodeId, targetOutput, 
         }
         const propios = (cand || []).filter(delLane)
         const want  = outputLabel ? normAssetName(`${nodeTitle} — ${outputLabel}`) : null
-        const match = (outputKey && propios.find(a => a.forge_sessions?.output_key === outputKey))
+        const match = (outputKey && propios.find(a => (a.output_key ?? a.forge_sessions?.output_key) === outputKey))
                    || (want     && propios.find(a => normAssetName(a.name) === want))
         if (match?.content) {
           content   = match.content
@@ -1184,16 +1184,17 @@ async function resolveAssemblyPools(db, { projectId, currentPNodeId, node, outpu
 
     const { data: cand } = await db()
       .from('forge_assets')
-      .select('name, content, forge_sessions!session_id(output_key)')
+      .select('name, content, output_key, forge_sessions!session_id(output_key)')
       .eq('project_id', projectId)
       .eq('node_id', src.node_id)
       .in('status', ['approved', 'auto_approved'])
       .neq('format', 'png')
       .order('created_at', { ascending: false })
 
-    // Por output_key de la sesión (el contrato); el name normalizado queda de respaldo.
+    // Por output_key de la PIEZA (migración 054), con la de su sesión como respaldo para filas
+    // anteriores; el name normalizado queda como último recurso.
     const want  = norm(`${src.forge_nodes?.title} — ${label}`)
-    const asset = (cand || []).find(a => a.forge_sessions?.output_key === outKey)
+    const asset = (cand || []).find(a => (a.output_key ?? a.forge_sessions?.output_key) === outKey)
                || (cand || []).find(a => norm(a.name) === want)
 
     if (asset?.content) inputs[portKey] = asset.content
@@ -1213,7 +1214,7 @@ async function resolveAssemblyPools(db, { projectId, currentPNodeId, node, outpu
 
   const { data: own } = await db()
     .from('forge_assets')
-    .select('name, content, forge_sessions!session_id(output_key)')
+    .select('name, content, output_key, forge_sessions!session_id(output_key)')
     .eq('project_id', projectId)
     .eq('node_id', node.id)
     .in('status', ['approved', 'auto_approved'])
@@ -1225,7 +1226,7 @@ async function resolveAssemblyPools(db, { projectId, currentPNodeId, node, outpu
     const k = def.key || def.name
     if (!k) continue
     const want = norm(`${node.title} — ${labelOf(def)}`)
-    const hit = (own || []).find(a => a.forge_sessions?.output_key === k)
+    const hit = (own || []).find(a => (a.output_key ?? a.forge_sessions?.output_key) === k)
              || (own || []).find(a => norm(a.name) === want)
     if (hit?.content) { siblings[k] = hit.content; continue }
 

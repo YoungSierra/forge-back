@@ -320,7 +320,7 @@ async function executeAssemblyOutput({ project_id, node_id, targetOutputKey, mem
   })
 
   const { data: asset } = await db().from('forge_assets').insert({
-    node_id, project_id, session_id: ses.id,
+    node_id, project_id, session_id: ses.id, output_key: targetOutputKey,
     name: `${nodeDna.title} — ${def.label || targetOutputKey}`,
     format: 'markdown', status: 'approved', content: cuerpo,
     approved_by: member_id || null, approved_at: new Date().toISOString(),
@@ -753,7 +753,8 @@ async function executeImageOutput({ project_id, node_id, targetOutputKey, member
       let primero = null
       for (const p of r.paginas.sort((a, b) => a.index - b.index)) {
         const { data: asset } = await db().from('forge_assets').insert({
-          node_id, project_id, session_id: session.id, name: `${documento} — ${p.name}`,
+          node_id, project_id, session_id: session.id, output_key: targetOutputKey,
+          name: `${documento} — ${p.name}`,
           format: 'png', status: 'approved', storage_url: p.url,
           approved_by: member_id || null, approved_at: new Date().toISOString(),
         }).select('id').single()
@@ -795,7 +796,7 @@ async function executeImageOutput({ project_id, node_id, targetOutputKey, member
         }).select('id').single()
 
         const { data: hAsset } = await db().from('forge_assets').insert({
-          node_id, project_id, session_id: hSes.id,
+          node_id, project_id, session_id: hSes.id, output_key: hermano,
           name: `${dna.title} — ${hDef.label || hermano}`,
           format: 'markdown', status: 'approved', content: cuerpo,
           approved_by: member_id || null, approved_at: new Date().toISOString(),
@@ -954,7 +955,7 @@ async function executeImageOutput({ project_id, node_id, targetOutputKey, member
     let primerAsset = null
     for (const r of listos) {
       const { data: a, error: eA } = await db().from('forge_assets').insert({
-        node_id, project_id, session_id: session.id,
+        node_id, project_id, session_id: session.id, output_key: targetOutputKey,
         name: `${dnaP?.title || 'Output'} — ${r.id}`,
         format: 'png', status: 'approved', storage_url: r.url,
         approved_by: member_id || null, approved_at: new Date().toISOString(),
@@ -2244,6 +2245,9 @@ router.post('/nodes/:node_id/accept', async (req, res, next) => {
             node_id,
             project_id,
             session_id,
+            // De qué salida es esta pieza. Deducirlo saltando a la sesión no siempre llega: en
+            // modo nodo entero la sesión no declara ninguna. Acá se sabe, así que se escribe.
+            output_key: outDef.key || outDef.name,
             name:        nombreDeImagen({
               tituloNodo: node.title,
               etiqueta:   outDef.label || outDef.name,
@@ -2263,6 +2267,9 @@ router.post('/nodes/:node_id/accept', async (req, res, next) => {
             node_id,
             project_id,
             session_id,
+            // De qué salida es esta pieza. Deducirlo saltando a la sesión no siempre llega: en
+            // modo nodo entero la sesión no declara ninguna. Acá se sabe, así que se escribe.
+            output_key: outDef.key || outDef.name,
             name:        `${node.title} — ${outDef.name}`,
             format:      'png',
             status:      'approved',
@@ -2511,7 +2518,7 @@ router.post('/nodes/:node_id/sessions/:session_id/generate-item-image', async (r
         .eq('session_id', session_id).eq('format', 'png').eq('name', assetName).maybeSingle()
 
       const fila = {
-        node_id, project_id, session_id, name: assetName,
+        node_id, project_id, session_id, output_key, name: assetName,
         format: 'png', status: 'approved', content: item_text, storage_url: result.url,
         approved_by: memberId || null, approved_at: new Date().toISOString(),
       }

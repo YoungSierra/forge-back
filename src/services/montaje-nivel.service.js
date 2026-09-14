@@ -106,7 +106,7 @@ function nivelesDelEntorno(md, entorno) {
  */
 async function estadoDeMontaje({ db, project_id, asset_id }) {
   const { data: asset } = await db().from('forge_assets')
-    .select('id, name, format, storage_url, session_id')
+    .select('id, name, format, storage_url, output_key')
     .eq('id', asset_id).eq('project_id', project_id).maybeSingle()
   if (!asset) return { aplica: false, motivo: 'Asset not found' }
 
@@ -114,12 +114,12 @@ async function estadoDeMontaje({ db, project_id, asset_id }) {
   if (!entorno) return { aplica: false }
 
   // El nombre ya dijo que es una hoja de entorno; la clave de salida lo confirma contra el nodo
-  // que la emitió. No al revés: 168 de 468 imágenes se generaron en modo nodo entero y no tienen
-  // clave, así que exigirla sola dejaría fuera piezas legítimas.
-  const { data: ses } = asset.session_id
-    ? await db().from('forge_sessions').select('output_key').eq('id', asset.session_id).maybeSingle()
-    : { data: null }
-  if (ses?.output_key && ses.output_key !== 'world_visuals') return { aplica: false }
+  // que la emitió. No al revés: buena parte de las imágenes se generaron en modo nodo entero y no
+  // tienen clave, así que exigirla sola dejaría fuera piezas legítimas.
+  //
+  // La clave la lleva la propia pieza desde la migración 054. Antes había que saltar a su sesión
+  // para averiguarla, que es el rodeo que daban los tres consumidores de este dato.
+  if (asset.output_key && asset.output_key !== 'world_visuals') return { aplica: false }
 
   const faltantes = []
 
