@@ -5774,6 +5774,29 @@ router.post('/laboratory/abrir', async (req, res, next) => {
   }
 })
 
+// Publicar el jugable que armó el Laboratory: se trae la build, se sube a R2 y se devuelve la
+// dirección con la que se juega y se comparte.
+router.post('/laboratory/publicar', async (req, res, next) => {
+  try {
+    const { publicarJugable } = require('../services/publicar-jugable.service')
+    const { slugDe } = require('../services/laboratorio.service')
+    const { data: pr } = await db().from('projects').select('name').eq('id', req.params.id).maybeSingle()
+    const r = await publicarJugable({
+      db, project_id: req.params.id,
+      slug: req.body?.slug || slugDe(pr?.name || req.params.id),
+      nombreProyecto: pr?.name || null,
+      member_id: req.body?.member_id || null,
+    })
+    res.json({ success: true, ...r })
+  } catch (err) {
+    // Que todavía no haya jugable no es una falla del servidor: es el estado del laboratorio.
+    if (err.code === 'SIN_JUGABLE' || err.code === 'SIN_LAB' || err.code === 'LAB_ERROR') {
+      return res.status(400).json({ success: false, error: err.message, code: err.code })
+    }
+    next(err)
+  }
+})
+
 // ─── El disparador del montaje de un nivel ──────────────────────────────────
 // Si el sector existe sobre esta pieza, y si responde. Las dos cosas las decide el back por la
 // misma razón que las herramientas: la regla vive en un solo sitio. `aplica: false` es la
