@@ -706,13 +706,25 @@ async function imagenDelProyecto(projectId, nodeId) {
 async function paginaDelASG(db, projectId, numero, nombre = null, frase = false) {
   const { data: n } = await db().from('forge_nodes').select('id').eq('node_key', '3.20').maybeSingle()
   if (!n) return null
-  const { data: assets } = await db()
+  const { data: crudos } = await db()
     .from('forge_assets')
-    .select('name, storage_url, created_at')
+    .select('name, storage_url, created_at, metadata')
     .eq('project_id', projectId).eq('node_id', n.id)
     .eq('format', 'png').in('status', ['approved', 'auto_approved'])
     .not('storage_url', 'is', null)
     .order('created_at', { ascending: false })
+
+  // Solo PÁGINAS, no lo que salió de ellas. Una cadena nombra lo suyo `${hoja} — ${paso}` y hereda
+  // el prefijo del documento, así que «Art Style Guide — 25_VideoMarketingSheet — Key Art» es, para
+  // un resolvedor por nombre, una página del ASG llamada Key Art — y tapaba a la de verdad,
+  // `01_KeyArt`, porque el orden es por fecha y la derivada es más nueva. Medido el 14-09: en cuanto
+  // se publicó la Key Art de Marketing, pedir `01_KeyArt` devolvía el póster.
+  //
+  // El nombre no puede distinguirlas y renombrarlas tampoco sirve: el moodboard reparte las zonas
+  // por ese mismo prefijo, y sacarlas de «Art Style Guide» las desparrama fuera de su bloque. Lo que
+  // sí distingue es la procedencia, que cada pieza ya lleva escrita: una página del deck no tiene
+  // `cadena` ni `herramienta` en su metadata; todo lo derivado, sí.
+  const assets = (crudos || []).filter(a => !a.metadata?.cadena && !a.metadata?.herramienta)
 
   // Primero POR NOMBRE, porque el número no sobrevive una restructura.
   //
