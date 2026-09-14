@@ -282,33 +282,58 @@ async function downloadOutputsByNode(promptId, basePath) {
   return porNodo
 }
 
+// Subir una referencia falla de a ratos, y no por la imagen. Medido el 14-09 con dos láminas de
+// 2,5 MB: la misma imagen sube en 12 s, y al intento siguiente se cuelga 223 s y muere con
+// `terminated`. Las dos fallaron una vez y las dos subieron otra. Sin reintento, un deck que ya
+// compuso sus prompts se cae justo ANTES de despachar, y el aviso que quedaba —«el proyecto
+// todavía no produjo esa imagen»— culpaba al proyecto de un fallo de red.
+const INTENTOS_SUBIDA = 3
+const TOPE_SUBIDA_MS  = 90_000
+
 async function uploadImageToComfyUI(imageUrl) {
   const imgRes = await fetch(imageUrl)
   if (!imgRes.ok) throw new Error(`Failed to fetch reference image: ${imgRes.status} ${imageUrl}`)
   const buffer = Buffer.from(await imgRes.arrayBuffer())
   const mime   = imgRes.headers.get('content-type') || 'image/png'
   const ext    = mime.includes('jpeg') ? 'jpg' : 'png'
-  const filename = `ref_${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`
 
-  const form = new FormData()
-  form.append('image', new Blob([buffer], { type: mime }), filename)
-  form.append('type', 'input')
-  form.append('overwrite', 'true')
+  let ultimo = null
+  for (let intento = 1; intento <= INTENTOS_SUBIDA; intento++) {
+    // Nombre nuevo por intento: si el anterior llegó a medias, no se pisa un archivo a medio subir.
+    const filename = `ref_${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`
+    const form = new FormData()
+    form.append('image', new Blob([buffer], { type: mime }), filename)
+    form.append('type', 'input')
+    form.append('overwrite', 'true')
 
-  const uploadRes = await fetch(`${BASE_URL()}/api/upload/image`, {
-    method: 'POST',
-    headers: { 'X-API-Key': API_KEY() },
-    body: form,
-  })
-  if (!uploadRes.ok) {
-    const body = await uploadRes.text()
-    throw new Error(`ComfyUI upload failed: ${uploadRes.status} ${body}`)
+    try {
+      // El tope es lo que convierte un cuelgue en un reintento. Sin él la petición se queda
+      // esperando hasta que el otro lado corta, y para entonces ya se perdieron cuatro minutos.
+      const uploadRes = await fetch(`${BASE_URL()}/api/upload/image`, {
+        method: 'POST',
+        headers: { 'X-API-Key': API_KEY() },
+        body: form,
+        signal: AbortSignal.timeout(TOPE_SUBIDA_MS),
+      })
+      if (!uploadRes.ok) {
+        const body = await uploadRes.text()
+        throw new Error(`ComfyUI upload failed: ${uploadRes.status} ${body}`)
+      }
+      const json = await uploadRes.json()
+      const uploadedName = json.name ?? json.filename
+      if (!uploadedName) throw new Error(`ComfyUI upload: no filename in response: ${JSON.stringify(json)}`)
+      if (intento > 1) console.log(`[ComfyUI] la subida entró al intento ${intento}`)
+      console.log(`[ComfyUI] Uploaded reference image → ${uploadedName}`)
+      return uploadedName
+    } catch (e) {
+      ultimo = e
+      // Un 4xx es la petición, no la red: reintentarla da lo mismo tres veces.
+      if (/upload failed: 4\d\d/.test(e.message)) break
+      console.warn(`[ComfyUI] subida fallida (intento ${intento}/${INTENTOS_SUBIDA}): ${e.message}`)
+      if (intento < INTENTOS_SUBIDA) await new Promise(r => setTimeout(r, 1500 * intento))
+    }
   }
-  const json = await uploadRes.json()
-  const uploadedName = json.name ?? json.filename
-  if (!uploadedName) throw new Error(`ComfyUI upload: no filename in response: ${JSON.stringify(json)}`)
-  console.log(`[ComfyUI] Uploaded reference image → ${uploadedName}`)
-  return uploadedName
+  throw new Error(`no se pudo subir la referencia tras ${INTENTOS_SUBIDA} intentos: ${ultimo?.message}`)
 }
 
 async function generateImageComfyUI(workflowName, prompt, width, height, storagePath, extras = {}, timeoutMs = 120_000) {

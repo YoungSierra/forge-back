@@ -5485,7 +5485,7 @@ router.get('/assets/:asset_id/next-step', async (req, res, next) => {
       .eq('id', asset_id).eq('project_id', project_id).single()
     if (!asset) return res.status(404).json({ success: false, error: 'Asset not found' })
 
-    const { proximoPaso } = require('../services/chain.service')
+    const { proximoPaso, etiquetasDeCadenas } = require('../services/chain.service')
     const paso = proximoPaso(asset)
 
     // Cuántos despachos son. Un paso normal es uno; uno que corre por cada salida del anterior son
@@ -5505,7 +5505,14 @@ router.get('/assets/:asset_id/next-step', async (req, res, next) => {
       despachos = roles.size || 1
     }
 
-    res.json({ success: true, paso: paso ? { ...paso, despachos } : null })
+    // Cuáles hay, para cuando no hay ninguna. El aviso del front las nombraba a mano y se quedó
+    // diciendo «Character Sheet is the only chain» cuando ya eran cinco: quien lee el aviso se va
+    // creyendo que su hoja no tiene workflow, y lo tiene.
+    res.json({
+      success: true,
+      paso: paso ? { ...paso, despachos } : null,
+      ...(paso ? {} : { cadenas: etiquetasDeCadenas() }),
+    })
   } catch (err) { next(err) }
 })
 

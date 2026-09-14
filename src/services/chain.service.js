@@ -73,6 +73,30 @@ const CADENAS = {
   //
   // La referencia —la propia página Audio Sheet del ASG— la resuelve el deck por su nombre, así
   // que no hace falta cablearla acá.
+  // Las dos piezas promocionales salen de la MISMA hoja y no una de la otra: son hermanas, no
+  // pasos encadenados. Van como dos pasos igual porque así es como Run las entrega —de a una, con
+  // su recuadro de confirmación cada una— y cada despacho es pago. Primero la lámina, después el
+  // teaser, que es el orden en que se revisan.
+  marketing: {
+    etiqueta: 'Marketing',
+    pasos: [
+      {
+        clave: 'key_art', workflow: 'V57_STUDIO_2D_marketing_image', etiqueta: 'Key Art',
+        deck: 'marketing_image',
+        que:    'One promotional key image to the right of this sheet.',
+        porque: 'The slice needs a poster, and this sheet already holds the beats it has to sell.',
+        entradas: {},
+      },
+      {
+        clave: 'video', workflow: 'V57_STUDIO_2D_marketing_video', etiqueta: 'Teaser',
+        deck: 'marketing_video',
+        que:    'One promotional teaser with its own audio, to the right of this sheet.',
+        porque: 'The six panels of this sheet are the storyboard the teaser follows.',
+        entradas: {},
+      },
+    ],
+  },
+
   audio_sheet: {
     etiqueta: 'Audio Sheet',
     pasos: [
@@ -134,11 +158,19 @@ function cadenaDe(asset) {
   if (/prop\s*sheet/i.test(n))         return 'prop_sheet'
   if (/environment\s*sheet/i.test(n))  return 'environment_sheet'
   if (/audio\s*sheet/i.test(n))        return 'audio_sheet'
-  // UI Component Sheet y VFX Sheet existen en el ASG y todavía no tienen workflow; Marketing lo
-  // tiene, pero produce una pieza del proyecto entero y no de una hoja, así que no es una cadena.
-  // Los tres devuelven null a propósito.
+  // Marketing sí es una cadena, y la hoja de Video Marketing es su origen: los dos workflows leen
+  // ESA lámina —sus seis viñetas HOOK/WORLD/FANTASY/UNIQUE/CLIMAX/TITLE— más la de Visual DNA.
+  // Antes devolvía null razonando que «produce una pieza del proyecto entero y no de una hoja»,
+  // y por eso al pulsar Run sobre la hoja el aviso decía que no había nada que correr, con el
+  // workflow registrado y funcionando.
+  if (/video\s*marketing/i.test(n))    return 'marketing'
+  // UI Component Sheet y VFX Sheet existen en el ASG y todavía no tienen su cadena: el de UI está
+  // registrado pero sus ocho páginas no resuelven la referencia que piden, y el de VFX no existe.
   return null
 }
+
+/** Las cadenas que hay, para que quien avise de que no hay ninguna pueda nombrarlas. */
+const etiquetasDeCadenas = () => Object.values(CADENAS).map(c => c.etiqueta)
 
 // En qué paso está parado el activo: los que produjo la cadena lo llevan anotado; cualquier otro
 // es el punto de partida.
@@ -424,4 +456,4 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
   return { cadena: nombreCadena, creados }
 }
 
-module.exports = { CADENAS, cadenaDe, pasoDe, proximoPaso, avanzar }
+module.exports = { CADENAS, cadenaDe, pasoDe, proximoPaso, avanzar, etiquetasDeCadenas }

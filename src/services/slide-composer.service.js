@@ -57,13 +57,20 @@ const DECKS = {
   // texto. Pasó de 18 a 26 con el rediseño del 24-ago, y a 20 con la restructura del 07-09.
   artbible: { workflow: 'V57_STUDIO_ArtBible_Template_20',        fuente: null, paginas: 20, documento: 'Art Bible' },
 
-  // Las dos piezas sueltas del Vertical Slice: una lámina promocional y una pista de audio. No son
-  // decks de muchas páginas —una cada uno— pero entran por acá y no por las cadenas de producción
-  // porque su prompt es un formulario del ADI («GAME TITLE (§1.1) →»), y rellenar ese formulario
-  // es justo lo que hace este compositor. Registrarlos como cadena los dejaría con los campos en
-  // blanco, que es peor que no tenerlos.
+  // Las piezas sueltas del Vertical Slice: una lámina promocional, un teaser y una pista de audio.
+  // No son decks de muchas páginas —una cada uno— pero entran por acá y no por las cadenas de
+  // producción porque su prompt es un formulario del ADI («GAME TITLE (§1.1) →»), y rellenar ese
+  // formulario es justo lo que hace este compositor. Registrarlos como cadena los dejaría con los
+  // campos en blanco, que es peor que no tenerlos.
   marketing_image: { workflow: 'V57_STUDIO_2D_marketing_image', fuente: '3.9', paginas: 1, documento: 'Marketing Key Art' },
+  marketing_video: { workflow: 'V57_STUDIO_2D_marketing_video', fuente: '3.9', paginas: 1, documento: 'Marketing Video' },
   audio_base:      { workflow: 'V57_STUDIO_2D_audio_base',      fuente: '3.9', paginas: 1, documento: 'Audio Base' },
+
+  // El de UI es de otra familia: sus ocho prompts NO traen formulario del ADI. Cada uno describe
+  // una pantalla —menú, pausa, HUD, derrota— y sus dos hojas sprite, y pide DOS imágenes: la
+  // maqueta de la pantalla, que ya viaja dentro del workflow, y una referencia visual del juego.
+  // Por eso va sin `fuente`, igual que el Art Bible: lo que lo alimenta son imágenes, no texto.
+  uiux: { workflow: 'V57_STUDIO_2D_uiux', fuente: null, paginas: 8, documento: 'UI Screens' },
 }
 
 // ── Mapa etiqueta de página → sección del documento fuente ───────────────────

@@ -1190,6 +1190,9 @@ ${cola}`
   //    de camino no pierde lo ya rendido.
   const paginas = []
   const vistos  = new Set()
+  // Cuántas veces falló la descarga de cada archivo. Un fallo no lo da por perdido: lo devuelve a
+  // la cola del sondeo siguiente.
+  const fallosDescarga = new Map()
   const total   = armado.paginas.length
   for (let it = 0; it < 480 && vistos.size < total; it++) {
     await new Promise(r => setTimeout(r, 5000))
@@ -1205,13 +1208,21 @@ ${cola}`
       const archivos = [...(nd?.images || []), ...(nd?.videos || []), ...(nd?.gifs || []), ...(nd?.audio || [])]
       for (const f of archivos) {
         if (!f.filename || vistos.has(f.filename)) continue
-        vistos.add(f.filename)
+        // Se marca como visto DESPUÉS de guardarla, no antes. Marcarla antes significaba que una
+        // descarga caída —`terminated`, que en este proveedor pasa de a ratos— no se reintentaba
+        // nunca y el bucle salía con `vistos.size >= total`: el job quedaba «completo» con cero
+        // páginas y la corrida, ya pagada, se perdía entera. Medido el 14-09 con el deck de
+        // Marketing: 269 s, job terminado, 0/1.
         const pag = porSaveNode[nodeId]
         const url = `${BASE}/api/view?filename=${encodeURIComponent(f.filename)}` +
                     `&subfolder=${encodeURIComponent(f.subfolder || '')}&type=${f.type || 'output'}`
         try {
-          const ir = await fetch(url, { headers: KEY ? { Authorization: `Bearer ${KEY}` } : {}, redirect: 'follow' })
-          if (!ir.ok) continue
+          const ir = await fetch(url, {
+            headers: KEY ? { Authorization: `Bearer ${KEY}` } : {},
+            redirect: 'follow',
+            signal: AbortSignal.timeout(120_000),
+          })
+          if (!ir.ok) throw new Error(`HTTP ${ir.status} al bajar ${f.filename}`)
           const buf  = Buffer.from(await ir.arrayBuffer())
           // La ruta lleva el job: sin eso cada render pisa al anterior en R2 y el versionado es
           // mentira — las dos versiones terminan apuntando al mismo archivo y la imagen vieja se
@@ -1232,6 +1243,7 @@ ${cola}`
             kind: CLASE_POR_EXT(ext),
           }
           paginas.push(item)
+          vistos.add(f.filename)
 
           // Se anota en la sesión apenas llega, no al final: es lo que lee el modal del nodo
           // (`forge_sessions.output_images`), y escribirlo progresivamente hace que las páginas
@@ -1251,7 +1263,19 @@ ${cola}`
 
           console.log(`[deck]   ${String(vistos.size).padStart(2)}/${total}  ${item.name}`)
           onPage?.(item, vistos.size, total)
-        } catch (e) { console.error('[deck] página perdida:', e.message) }
+        } catch (e) {
+          // El archivo sigue en ComfyUI: la próxima vuelta del sondeo vuelve a intentarlo. Se
+          // abandona tras tres intentos para que un archivo que de verdad no está no deje el
+          // bucle dando vueltas hasta el tope.
+          const n = (fallosDescarga.get(f.filename) || 0) + 1
+          fallosDescarga.set(f.filename, n)
+          if (n >= 3) {
+            vistos.add(f.filename)
+            console.error(`[deck] página perdida tras ${n} intentos: ${e.message}`)
+          } else {
+            console.warn(`[deck] descarga fallida (${n}/3), se reintenta: ${e.message}`)
+          }
+        }
       }
     }
     if (/error|fail/i.test(estado) && it > 3) break
