@@ -5811,6 +5811,50 @@ router.get('/assets/:asset_id/montaje', async (req, res, next) => {
   } catch (err) { next(err) }
 })
 
+// Qué papel juega un modelo en el montaje. Es la única decisión de arte que el nivel necesita y
+// no sale de ninguna medición, así que se marca a mano. `papel: null` la borra.
+router.put('/assets/:asset_id/montaje/papel', async (req, res, next) => {
+  try {
+    const { id: project_id, asset_id } = req.params
+    const { marcarPapel } = require('../services/montaje-nivel.service')
+    const r = await marcarPapel({
+      db, project_id, asset_id,
+      papel: req.body?.papel ?? null,
+      member_id: req.body?.member_id || null,
+    })
+    res.json({ success: true, ...r })
+  } catch (err) {
+    if (['PAPEL_DESCONOCIDO', 'NO_ES_MODELO'].includes(err.code)) {
+      return res.status(400).json({ success: false, code: err.code, error: err.message })
+    }
+    if (err.code === 'NO_ASSET') return res.status(404).json({ success: false, error: err.message })
+    next(err)
+  }
+})
+
+// Monta el nivel y devuelve el paquete para Blender. Si el entorno lo usan varios niveles no
+// elige: contesta `necesita_nivel` con la lista, y quien pulsó decide.
+router.post('/assets/:asset_id/montaje', async (req, res, next) => {
+  try {
+    const { id: project_id, asset_id } = req.params
+    const { montarNivel } = require('../services/montaje-nivel.service')
+    const r = await montarNivel({
+      db, project_id, asset_id,
+      nivel: req.body?.nivel || null,
+      member_id: req.body?.member_id || null,
+      incluir_referencia: Boolean(req.body?.incluir_referencia),
+    })
+    res.json({ success: true, ...r })
+  } catch (err) {
+    // Lo que falta no es un fallo del servidor: es el estado del proyecto, y el front lo dice con
+    // nombre propio para que se pueda ir a resolverlo.
+    if (['FALTA', 'SIN_MURO_EXTERIOR', 'SIN_LEVEL_MAP', 'NIVEL_AJENO', 'NO_APLICA'].includes(err.code)) {
+      return res.status(400).json({ success: false, code: err.code, error: err.message, faltantes: err.faltantes || null })
+    }
+    next(err)
+  }
+})
+
 router.post('/assets/:asset_id/iterate', async (req, res, next) => {
   try {
     const { id: project_id, asset_id } = req.params
@@ -5976,8 +6020,164 @@ router.post('/assets/:asset_id/versions/:version_id/approve', async (req, res, n
       storage_url: ver.storage_url, approved_by: member_id, approved_at: new Date().toISOString(),
     }).eq('id', asset_id)
 
-    res.json({ success: true, version_number: ver.version_number, storage_url: ver.storage_url })
+    // ── La cascada ───────────────────────────────────────────────────────────
+    // Se dispara al APROBAR y no al iterar: una iteración es un intento —«cada página regenerada
+    // pasa por revisión antes de aprobarse»— y marcar media guía por un experimento que se va a
+    // descartar es peor que no marcar. Aprobar es cuando el cambio se vuelve oficial.
+    //
+    // Y no regenera nada: marca. Generar cuesta y no es reproducible, así que la decisión es de
+    // una persona, una por una.
+    let cascada = null
+    try {
+      const { propagarDesdePagina, revalidar } = require('../services/actualizacion.service')
+      // Esta página acaba de cambiar por decisión de alguien: su propia marca ya no aplica.
+      await revalidar({ db, project_id, asset_id, member_id }).catch(() => {})
+      cascada = await propagarDesdePagina({
+        db, project_id, asset_id, member_id,
+        motivo: `version ${ver.version_number} approved`,
+      })
+    } catch (e) {
+      // Que la cascada falle no invalida la aprobación, que ya está escrita: se dice y se sigue.
+      console.warn('[actualizacion] la cascada falló (no fatal):', e.message)
+    }
+
+    res.json({ success: true, version_number: ver.version_number, storage_url: ver.storage_url, cascada })
   } catch (err) { next(err) }
+})
+
+// ─── «Agregar contexto» ──────────────────────────────────────────────────────
+// Paso 3: a dónde iría esto. No escribe nada — es lo que la ventana enseña para que una persona
+// confirme o cambie el destino antes de que quede escrito.
+router.post('/contexto/destino', async (req, res, next) => {
+  try {
+    const { resolverDestino, ROLES } = require('../services/contexto.service')
+    const r = resolverDestino({
+      rol: req.body?.rol, ambito: req.body?.ambito,
+      cual: req.body?.cual || null, formato: req.body?.formato || 'imagen',
+    })
+    res.json({ success: true, ...r, roles: Object.entries(ROLES).map(([k, v]) => ({ clave: k, etiqueta: v.etiqueta })) })
+  } catch (err) {
+    if (['ROL_DESCONOCIDO', 'AMBITO_DESCONOCIDO'].includes(err.code)) {
+      return res.status(400).json({ success: false, code: err.code, error: err.message })
+    }
+    next(err)
+  }
+})
+
+// Paso 4: aprobar. Guarda el contexto con sus metadatos, lo deja colgado del 3.9 y dispara la
+// cascada sobre la página destino si la hay.
+router.post('/contexto', async (req, res, next) => {
+  try {
+    const { guardarContexto } = require('../services/contexto.service')
+    const r = await guardarContexto({
+      db, project_id: req.params.id,
+      nombre: req.body?.nombre || 'Context',
+      url: req.body?.url || null,
+      texto: req.body?.texto || null,
+      destino: req.body?.destino || null,
+      rol: req.body?.rol, ambito: req.body?.ambito,
+      estado: req.body?.estado || 'approved',
+      primary: Boolean(req.body?.primary),
+      member_id: req.body?.member_id || null,
+    })
+    res.json({ success: true, ...r })
+  } catch (err) {
+    if (err.code === 'VACIO') return res.status(400).json({ success: false, error: err.message })
+    next(err)
+  }
+})
+
+// ─── El alcance del Vertical Slice, ítem por ítem ────────────────────────────
+// Cuántas hojas pide el slice de cada tipo, leído del Vertical Slice Specification del proyecto.
+// Es de solo lectura y no despacha nada: quien instancie las hojas tiene que poder enseñar ESTA
+// lista antes de gastar, porque cada instancia es un despacho pago.
+router.get('/alcance', async (req, res, next) => {
+  try {
+    const { itemsDelAlcance } = require('../services/alcance-vs.service')
+    const r = await itemsDelAlcance({ db, project_id: req.params.id })
+    const instancias = Object.values(r.porHoja || {}).reduce((n, xs) => n + xs.length, 0)
+    res.json({ success: true, ...r, instancias })
+  } catch (err) { next(err) }
+})
+
+// Qué hojas se instanciarían y cuántos despachos son, SIN despachar ninguno. Es lo que el recuadro
+// previo tiene que poder enseñar: cada instancia se paga.
+router.get('/alcance/plan', async (req, res, next) => {
+  try {
+    const { planDeInstancias } = require('../services/instanciar-hojas.service')
+    res.json({ success: true, ...await planDeInstancias({ db, project_id: req.params.id, deck: req.query.deck || 'asg' }) })
+  } catch (err) { next(err) }
+})
+
+// Y el que sí gasta. Las páginas las nombra quien llama —nunca por defecto— y hay tope duro.
+router.post('/alcance/instanciar', async (req, res, next) => {
+  try {
+    const { id: project_id } = req.params
+    const { instanciarHojas } = require('../services/instanciar-hojas.service')
+
+    const { data: nodo } = await db().from('forge_nodes').select('id, node_key, dna').eq('node_key', '3.20').maybeSingle()
+    if (!nodo) return res.status(400).json({ success: false, error: 'node 3.20 is not registered' })
+    const def = (nodo.dna?.outputs || []).find(o => (o.key || o.name) === (req.body?.output_key || 'art_style_guide_images'))
+
+    const r = await instanciarHojas({
+      db, project_id,
+      node_id: nodo.id, node_key: nodo.node_key,
+      output_key: req.body?.output_key || 'art_style_guide_images',
+      image_gen_model: def?.image_gen_model || 'comfyui:V57_STUDIO_ArtStyleGuide_Template_25',
+      paginas: req.body?.paginas,
+      deck: req.body?.deck || 'asg',
+      documento: req.body?.documento || 'Art Style Guide',
+      member_id: req.body?.member_id || null,
+      limite: Number(req.body?.limite) || 0,
+    })
+    res.json({ success: true, ...r })
+  } catch (err) {
+    if (['SIN_PAGINAS', 'TOPE'].includes(err.code)) {
+      return res.status(400).json({ success: false, code: err.code, error: err.message })
+    }
+    next(err)
+  }
+})
+
+// ─── Sistema de actualización conectada ──────────────────────────────────────
+// Qué está desactualizado hoy, y quién lo da por bueno. Regenerar no vive acá: se hace por el
+// camino normal —Run o iterar— y la pieza nueva nace sin marca.
+router.get('/actualizacion', async (req, res, next) => {
+  try {
+    const { pendientesDelProyecto } = require('../services/actualizacion.service')
+    res.json({ success: true, pendientes: await pendientesDelProyecto({ db, project_id: req.params.id }) })
+  } catch (err) { next(err) }
+})
+
+// Lo que dispararía tocar esta página, ANTES de tocarla: es lo que el aviso previo necesita decir.
+router.get('/assets/:asset_id/actualizacion', async (req, res, next) => {
+  try {
+    const { id: project_id, asset_id } = req.params
+    const { paginaDe, loQueDispara } = require('../services/actualizacion.service')
+    const { data: asset } = await db().from('forge_assets')
+      .select('id, name, metadata').eq('id', asset_id).eq('project_id', project_id).maybeSingle()
+    if (!asset) return res.status(404).json({ success: false, error: 'Asset not found' })
+    const pagina = paginaDe(asset)
+    res.json({
+      success: true,
+      pagina,
+      dispara: pagina ? loQueDispara(pagina) : null,
+      marca: asset.metadata?.desactualizado || null,
+    })
+  } catch (err) { next(err) }
+})
+
+// El gate humano: revalidar es mirarla y confirmar que sigue valiendo.
+router.post('/assets/:asset_id/revalidar', async (req, res, next) => {
+  try {
+    const { id: project_id, asset_id } = req.params
+    const { revalidar } = require('../services/actualizacion.service')
+    const r = await revalidar({ db, project_id, asset_id, member_id: req.body?.member_id || null })
+    res.json({ success: true, ...r })
+  } catch (err) {
+    if (err.code === 'NO_ASSET') return res.status(404).json({ success: false, error: err.message })
+    next(err)
+  }
 })
 
 // ─── POST /api/projects/:id/canvas/nodes/:node_id/stop ───────────────────────

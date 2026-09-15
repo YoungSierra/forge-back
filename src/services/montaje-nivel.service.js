@@ -174,7 +174,286 @@ async function estadoDeMontaje({ db, project_id, asset_id }) {
     niveles,
     faltantes,
     listo: faltantes.length === 0,
+    // Los modelos con los que se montaría, y el papel que tiene puesto cada uno. Viaja con el
+    // estado porque quien abre el radial es justo quien va a marcarlos: pedirlo aparte obligaría
+    // a una segunda vuelta para dibujar la misma ventana.
+    modelos: (medidos || []).map(m => ({
+      id: m.id, nombre: m.name, papel: m.metadata?.montaje?.clase || null,
+    })),
+    papeles: catalogoDePapeles(),
   }
 }
 
-module.exports = { estadoDeMontaje, entornoDe, nivelesDelEntorno, PREFIJO_ENTORNO }
+// ─── El papel que juega cada modelo ──────────────────────────────────────────
+//
+// Qué pieza es el muro exterior no sale de la geometría: nada en un bbox lo dice. Es la única
+// decisión de arte que el montaje necesita y la que faltaba para que el sector respondiera.
+//
+// El vocabulario no lo inventamos: son las clases que declara el kit de Maps_App
+// (`level_generator/assembly/kit.py`). Los papeles ESTRUCTURALES viajan en la gramática, donde
+// `estructura.<papel>.asset` nombra UNA pieza concreta; los de PROP viajan como `clase` del
+// asset y Maps_App los reparte por densidad, varias piezas por sala.
+//
+// Un modelo sin papel se queda fuera del montaje a propósito. El kit por defecto los mandaba a
+// `piso_libre` —el pool de props—, así que un muro sin marcar se colocaba además como si fuera un
+// mueble. Aquí nada se coloca por descarte: lo que no tiene papel, no entra.
+const PAPELES = {
+  piso:             { etiqueta: 'Floor',               donde: ['piso'] },
+  muro_exterior:    { etiqueta: 'Exterior wall',       donde: ['arista_exterior'] },
+  muro_interior:    { etiqueta: 'Interior wall',       donde: ['arista_interior'] },
+  muro_con_puerta:  { etiqueta: 'Wall with a doorway', donde: ['arista_con_puerta', 'muro'] },
+  marco_de_puerta:  { etiqueta: 'Door frame',          donde: ['arista_con_puerta', 'marco'] },
+  hoja_de_puerta:   { etiqueta: 'Door leaf',           donde: ['arista_con_puerta', 'hojas'] },
+  columna:          { etiqueta: 'Column',              donde: ['vertice', 'columna_de_arte'] },
+  prop_contra_muro: { etiqueta: 'Prop against a wall', clase: 'piso_muro' },
+  prop_libre:       { etiqueta: 'Free-standing prop',  clase: 'piso_libre' },
+  accesorio_muro:   { etiqueta: 'Wall accessory',      clase: 'accesorio_muro' },
+}
+
+/** El catálogo, para que la interfaz no repita esta lista ni invente una clase que el kit ignora. */
+const catalogoDePapeles = () => Object.entries(PAPELES).map(([clave, p]) => ({
+  clave, etiqueta: p.etiqueta, estructural: Boolean(p.donde),
+}))
+
+/**
+ * Marca —o borra, con `papel: null`— el papel de un modelo.
+ *
+ * Se guarda en el propio activo y no en una tabla aparte porque es una propiedad de la pieza: el
+ * mismo muro juega el mismo papel en todos los niveles que lo usen.
+ */
+async function marcarPapel({ db, project_id, asset_id, papel, member_id = null }) {
+  if (papel !== null && !PAPELES[papel]) {
+    const err = new Error(`“${papel}” is not a structural role. Valid: ${Object.keys(PAPELES).join(', ')}`)
+    err.code = 'PAPEL_DESCONOCIDO'
+    throw err
+  }
+  const { data: asset } = await db().from('forge_assets')
+    .select('id, name, format, metadata').eq('id', asset_id).eq('project_id', project_id).maybeSingle()
+  if (!asset) { const e = new Error('Asset not found'); e.code = 'NO_ASSET'; throw e }
+  if (asset.format !== 'glb') {
+    const e = new Error(`“${asset.name}” is not a 3D model: only models take part in an assembly`)
+    e.code = 'NO_ES_MODELO'
+    throw e
+  }
+
+  const montaje = { ...(asset.metadata?.montaje || {}) }
+  if (papel === null) delete montaje.clase
+  else Object.assign(montaje, { clase: papel, marcado_en: new Date().toISOString(), marcado_por: member_id })
+
+  const metadata = { ...(asset.metadata || {}), montaje }
+  const { error } = await db().from('forge_assets').update({ metadata }).eq('id', asset_id)
+  if (error) throw error
+  return { id: asset.id, nombre: asset.name, papel: papel || null }
+}
+
+/**
+ * De los papeles marcados a la gramática que consume Maps_App.
+ *
+ * Trabaja sobre el kit YA armado y no sobre las filas de la base porque la clave de la gramática
+ * es la del kit —«muro_piedra_01.glb»—, y esa clave la decide `kitDesdeMedidas`, que desempata
+ * dos nombres que colapsan al mismo slug. Deducirla otra vez acá sería deducirla distinto.
+ *
+ * Un papel estructural nombra UNA pieza. Si dos modelos piden el mismo, gana el primero por
+ * nombre —para que dos corridas den la misma gramática— y el otro se reporta: callarlo dejaría al
+ * montaje eligiendo en silencio cuál de los dos muros es el exterior.
+ */
+function gramaticaDesdePapeles(assets, papelPorAssetId) {
+  const estructura = {}
+  const avisos = []
+  const tomado = {}
+
+  for (const clave of Object.keys(assets).sort()) {
+    const entrada = assets[clave]
+    const papel = papelPorAssetId[entrada.forge_asset_id] || null
+    const def = papel ? PAPELES[papel] : null
+
+    if (!def) { entrada.clase = 'sin_papel'; continue }
+    if (def.clase) { entrada.clase = def.clase; continue }
+
+    // Estructural: fuera del pool de props, o la misma pieza se coloca dos veces.
+    entrada.clase = 'estructural'
+    const ruta = def.donde.join('.')
+    if (tomado[ruta]) {
+      avisos.push(`“${entrada.forge_asset_nombre}” también pide ser ${def.etiqueta}; se usa “${tomado[ruta]}”.`)
+      continue
+    }
+    tomado[ruta] = entrada.forge_asset_nombre
+
+    if (papel === 'columna') {
+      estructura.vertice = { ...(estructura.vertice || {}), columna_de_arte: { usar: true, asset: clave } }
+    } else if (def.donde.length === 2) {
+      const [seccion, sub] = def.donde
+      estructura[seccion] = { ...(estructura[seccion] || {}), [sub]: { asset: clave } }
+    } else {
+      estructura[def.donde[0]] = { asset: clave }
+    }
+  }
+
+  return { estructura, avisos }
+}
+
+/**
+ * El grafo del nivel: el que ya exista para ESE nivel, o uno nuevo.
+ *
+ * Se reusa a propósito. Generarlo otra vez cuesta una llamada al modelo —el que traduce el
+ * documento de Level Design a parámetros— y devuelve OTRA planta, porque la semilla cambia: quien
+ * solo quería rearmar el paquete se encontraría con un nivel distinto debajo.
+ */
+async function grafoDelNivel({ db, project_id, origen, nivel, member_id }) {
+  const { data: previos } = await db().from('forge_assets')
+    .select('id, name, storage_url, metadata')
+    .eq('project_id', project_id).eq('format', 'json')
+    .like('name', 'Mapa — % — level_graph')
+    .order('created_at', { ascending: false })
+
+  const mismo = (previos || []).find(g => String(g.metadata?.mapa?.nivel ?? '') === String(nivel))
+  if (mismo?.storage_url) {
+    const r = await fetch(mismo.storage_url)
+    if (r.ok) return { level_graph: await r.json(), grafo: { id: mismo.id, generado: false } }
+  }
+
+  const { parametrosDesdeLevelDesign, generarYPublicar } = require('./mapas.service')
+  const { data: n35 } = await db().from('forge_nodes').select('id').eq('node_key', '3.5').maybeSingle()
+  const { data: docs } = await db().from('forge_assets').select('content')
+    .eq('project_id', project_id).eq('node_id', n35?.id)
+    .not('content', 'is', null).order('created_at', { ascending: false }).limit(1)
+  const levelMap = docs?.[0]?.content
+  if (!levelMap) {
+    const e = new Error('Level Design (node 3.5) has not produced its level map yet')
+    e.code = 'SIN_LEVEL_MAP'
+    throw e
+  }
+
+  const { parametros } = await parametrosDesdeLevelDesign({ levelMap, nivel })
+  const r = await generarYPublicar({
+    db, project_id, origen_asset_id: origen.id, node_id: origen.node_id, parametros, member_id, nivel,
+  })
+  const creado = (r.creados || []).find(a => /— level_graph$/.test(a.name))
+  if (!creado?.storage_url) throw new Error('the map was generated but published no level graph')
+  const resp = await fetch(creado.storage_url)
+  if (!resp.ok) throw new Error(`could not read the level graph just published: HTTP ${resp.status}`)
+  return { level_graph: await resp.json(), grafo: { id: creado.id, generado: true } }
+}
+
+/**
+ * Monta el nivel: el paquete que abre Blender, a partir del grafo del nivel y de los modelos que
+ * el arte marcó.
+ *
+ * Es el último paso de Forge en este tramo. De aquí en adelante trabaja el addon de LoopForge, que
+ * escala, recentra e instancia; Forge no vuelve a intervenir hasta que el `.glb` del nivel montado
+ * entra al moodboard.
+ *
+ * Nunca monta «el primero»: si el entorno lo usan varios niveles devuelve la lista para que se
+ * elija, que es el guarda que pide la spec —fallar señalando qué falta antes que generar con datos
+ * parciales.
+ */
+async function montarNivel({ db, project_id, asset_id, nivel = null, member_id = null, incluir_referencia = false }) {
+  const estado = await estadoDeMontaje({ db, project_id, asset_id })
+  if (!estado.aplica) {
+    const e = new Error('This piece does not trigger a level assembly')
+    e.code = 'NO_APLICA'
+    throw e
+  }
+  if (estado.faltantes.length) {
+    const e = new Error(estado.faltantes.map(f => f.dice).join(' · '))
+    e.code = 'FALTA'
+    e.faltantes = estado.faltantes
+    throw e
+  }
+
+  const elegido = nivel || (estado.niveles.length === 1 ? estado.niveles[0].nivel : null)
+  if (!elegido) return { necesita_nivel: true, niveles: estado.niveles }
+  if (!estado.niveles.some(n => String(n.nivel) === String(elegido))) {
+    const e = new Error(`“${elegido}” is not one of the levels that use “${estado.entorno}”`)
+    e.code = 'NIVEL_AJENO'
+    throw e
+  }
+
+  const { data: origen } = await db().from('forge_assets')
+    .select('id, node_id, name').eq('id', asset_id).eq('project_id', project_id).single()
+
+  const { level_graph, grafo } = await grafoDelNivel({ db, project_id, origen, nivel: elegido, member_id })
+
+  // El kit: lo que Forge ya midió de cada modelo, en la convención que consume el montaje.
+  const { data: modelos } = await db().from('forge_assets')
+    .select('id, name, storage_url, metadata, format')
+    .eq('project_id', project_id).eq('format', 'glb').not('storage_url', 'is', null)
+  const medidos = (modelos || []).filter(m => m.metadata?.medidas?.dim)
+
+  const bm = require('./bundle-montaje.service')
+  const { assets, inventario } = bm.kitDesdeMedidas(medidos, null)
+  const papeles = Object.fromEntries(medidos.map(m => [m.id, m.metadata?.montaje?.clase || null]))
+  const { estructura, avisos } = gramaticaDesdePapeles(assets, papeles)
+
+  if (!estructura.arista_exterior) {
+    const e = new Error('No model is marked as the exterior wall, and every wall of the level is built from that one')
+    e.code = 'SIN_MURO_EXTERIOR'
+    throw e
+  }
+
+  // Lo que no tiene papel no viaja. Sin esto el `.zip` carga los modelos de todo el proyecto —cada
+  // uno son megas— para que el montaje no los coloque en ningún sitio.
+  for (const [clave, entrada] of Object.entries(assets)) {
+    if (entrada.clase === 'sin_papel') delete assets[clave]
+  }
+  const inventarioUsado = inventario.filter(i => assets[`${i.asset_id}.glb`])
+
+  const { ordenDeMontaje, ALTURA_POR_DEFECTO } = require('./mapas.service')
+  const orden = await ordenDeMontaje({
+    level_graph, kit_catalog: { assets }, grammar: { estructura }, strategy: 'modular_hex',
+  })
+
+  const modelosBin = await bm.traerModelos(inventarioUsado)
+  const manifiesto = bm.manifiesto({
+    level_id: level_graph.level_id || String(elegido),
+    modelos: modelosBin,
+    alturaJugador: ALTURA_POR_DEFECTO,
+    fuenteAltura: 'valor por defecto (el 3.6 no publica una medida real)',
+    escalaSpec: null,
+  })
+  const zip = await bm.armarZip({
+    bundle: manifiesto, orden: orden.order, kit: { assets },
+    validacion: orden.validation || {}, modelos: modelosBin,
+    shell: incluir_referencia ? orden.shell : null,
+  })
+
+  const { uploadToStorage } = require('./storage.service')
+  const url = await uploadToStorage(zip, `projects/${project_id}/bundles/${manifiesto.bundle_id}.zip`, 'application/zip')
+
+  // Queda como pieza del proyecto, colgada de la hoja de entorno: el paquete es el resultado de
+  // este tramo y buscarlo en un enlace que alguien copió es perderlo.
+  const { data: ses } = await db().from('forge_sessions').insert({
+    project_id, node_id: origen.node_id, output_key: null, status: 'auto_approved',
+    iteration_count: 1, started_at: new Date().toISOString(), completed_at: new Date().toISOString(),
+    triggered_by: member_id,
+  }).select('id').single()
+
+  const { data: pieza } = await db().from('forge_assets').insert({
+    project_id, node_id: origen.node_id, session_id: ses?.id || null,
+    name: `Level assembly — ${elegido}`,
+    format: 'zip', mime_type: 'application/zip', storage_url: url,
+    status: 'approved', approved_by: member_id, approved_at: new Date().toISOString(),
+    derived_from_id: origen.id,
+    metadata: {
+      montaje: {
+        nivel: elegido, entorno: estado.entorno, bundle_id: manifiesto.bundle_id,
+        contrato: manifiesto.contrato || 'montaje/1.0', level_graph_asset_id: grafo.id,
+        piezas: Object.keys(assets).length,
+      },
+      resumen: orden.resumen || null,
+    },
+  }).select('id, name, storage_url').single()
+
+  return {
+    url, bundle_id: manifiesto.bundle_id, bytes: zip.length,
+    nivel: elegido, entorno: estado.entorno, grafo, asset: pieza || null,
+    resumen: orden.resumen || null,
+    avisos: [...avisos, ...(orden.warnings || [])],
+  }
+}
+
+module.exports = {
+  estadoDeMontaje, entornoDe, nivelesDelEntorno, PREFIJO_ENTORNO,
+  PAPELES, catalogoDePapeles, marcarPapel, gramaticaDesdePapeles,
+  grafoDelNivel, montarNivel,
+}

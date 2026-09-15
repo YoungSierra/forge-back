@@ -117,6 +117,42 @@ const CADENAS = {
     ],
   },
 
+  // Las pantallas del slice. Corre por el camino de DECK y no por el de workflow suelto: son ocho
+  // prompts, uno por página, y el compositor es quien sabe repartirlos —mandarlo como un workflow
+  // de prompt único dejaría siete páginas sin pedido.
+  //
+  // Su referencia es la Key Art del propio juego, que cada página cita en su `image_inputs`.
+  // Medido el 15-09 contra la base viva: resuelve en 8 de 8 páginas en los cinco proyectos que
+  // tienen ASG renderizado. Estaba anotado como que no resolvía, y ya no es verdad.
+  ui_component_sheet: {
+    etiqueta: 'UI Component Sheet',
+    pasos: [
+      {
+        clave: 'ui', workflow: 'V57_STUDIO_2D_uiux', deck: 'uiux', etiqueta: 'UI screens',
+        que:    'Eight pages to the right: the four screens — main menu, pause, HUD and defeat — and a sprite sheet for each.',
+        porque: 'The slice ships with a screen the player reads and one for failing, and the engine needs the sheet, not the mockup.',
+        entradas: {},
+      },
+    ],
+  },
+
+  // El flipbook de un efecto. Un solo paso y catorce salidas, porque el workflow encadena solo:
+  // la lámina aprobada entra por su único `LoadImage`, de ahí sale el lookdev, del lookdev el
+  // atlas de 12 celdas, y de ese atlas se recorta cada frame. Publicar solo el atlas dejaría al
+  // motor de juego partiéndolo a mano; publicar solo los frames tiraría la hoja que el artista
+  // revisa. Van los catorce.
+  vfx_sheet: {
+    etiqueta: 'VFX Sheet',
+    pasos: [
+      {
+        clave: 'flipbook', workflow: 'V57_STUDIO_2D_vfx_flipbook', etiqueta: 'VFX flipbook',
+        que:    'Fourteen pages to the right: the lookdev, the 12-cell atlas, and each frame from START through PEAK to DISSIPATE.',
+        porque: 'The slice needs the effect of the main action and the one for taking damage, and an engine plays them frame by frame.',
+        entradas: { image: 'origen' },
+      },
+    ],
+  },
+
   audio_sheet: {
     etiqueta: 'Audio Sheet',
     pasos: [
@@ -179,14 +215,14 @@ function cadenaDe(asset) {
   if (/environment\s*sheet/i.test(n))  return 'environment_sheet'
   if (/audio\s*sheet/i.test(n))        return 'audio_sheet'
   if (/animation\s*sheet/i.test(n))    return 'animation_sheet'
+  if (/vfx\s*sheet/i.test(n))          return 'vfx_sheet'
+  if (/ui\s*component\s*sheet/i.test(n)) return 'ui_component_sheet'
   // Marketing sí es una cadena, y la hoja de Video Marketing es su origen: los dos workflows leen
   // ESA lámina —sus seis viñetas HOOK/WORLD/FANTASY/UNIQUE/CLIMAX/TITLE— más la de Visual DNA.
   // Antes devolvía null razonando que «produce una pieza del proyecto entero y no de una hoja»,
   // y por eso al pulsar Run sobre la hoja el aviso decía que no había nada que correr, con el
   // workflow registrado y funcionando.
   if (/video\s*marketing/i.test(n))    return 'marketing'
-  // UI Component Sheet y VFX Sheet existen en el ASG y todavía no tienen su cadena: el de UI está
-  // registrado pero sus ocho páginas no resuelven la referencia que piden, y el de VFX no existe.
   return null
 }
 

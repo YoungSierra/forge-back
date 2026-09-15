@@ -48,6 +48,48 @@ const TIPOS = {
 
 const tipoDe = ruta => TIPOS[(/\.([a-z0-9]+)$/i.exec(ruta)?.[1] || '').toLowerCase()] || 'application/octet-stream'
 
+// ─── De rutas de raíz a rutas relativas ──────────────────────────────────────
+//
+// La build del Laboratory está escrita para servirse desde la RAÍZ de un servidor: su propio
+// `EXPORT.json` lo dice —«From this folder run: node server.mjs → http://127.0.0.1:8080/»— y por
+// eso el `index.html` pide `/play.js` y cada módulo importa `/runtime/Engine.js`.
+//
+// En R2 el juego no vive en una raíz sino dentro de una carpeta, así que esa barra inicial apunta
+// al bucket entero: medido el 15-09, `/play.js` daba 404 mientras el MISMO archivo en ruta
+// relativa daba 200. El navegador cargaba el `index.html`, no encontraba el script y dejaba la
+// página en blanco, sin error visible.
+//
+// Se reescribe por FORMA declarada —`src=`, `href=`, `import from`, `url()`— y no con un reemplazo
+// general de «/» : una barra suelta aparece en expresiones regulares, en textos y en divisiones, y
+// tocarlas rompería el juego de una manera mucho más difícil de ver que una página en blanco.
+const REESCRIBIBLES = new Set(['html', 'js', 'mjs', 'css'])
+
+/** `a/b/c.js` a dos carpetas de hondo → `../../`; en la raíz → `./`. */
+const prefijoDe = ruta => {
+  const hondo = String(ruta).split('/').length - 1
+  return hondo ? '../'.repeat(hondo) : './'
+}
+
+function aRutasRelativas(texto, rutaDelArchivo) {
+  const pre = prefijoDe(rutaDelArchivo)
+  // `//host` es protocolo-relativo y `/` a secas no lleva a ningún archivo: ninguno se toca.
+  const destino = (barra, resto) => (resto && !resto.startsWith('/') ? `${pre}${resto}` : barra + resto)
+
+  return String(texto)
+    // <script src="/play.js">, <link href="/play.css">
+    .replace(/\b(src|href)=("|')\/([^"'>]*)\2/g, (_, attr, q, resto) => `${attr}=${q}${destino('/', resto)}${q}`)
+    // import x from "/runtime/Engine.js" · import "/x.js" · import("/x.js")
+    // El separador se conserva tal cual venía: reconstruirlo convertía un `import "/x.js"` sin
+    // paréntesis en `import("/x.js"` y dejaba el archivo sin cerrar.
+    .replace(/\b(from|import)(\s*\(?\s*)("|')\/([^"']*)\3/g, (_, kw, sep, q, resto) =>
+      `${kw}${sep}${q}${destino('/', resto)}${q}`)
+    // fetch("/x.json") y new URL("/x.png", …): las otras dos formas con las que un módulo pide un
+    // archivo por ruta de raíz.
+    .replace(/\b(fetch|URL)\(\s*("|')\/([^"']*)\2/g, (_, kw, q, resto) => `${kw}(${q}${destino('/', resto)}${q}`)
+    // url(/x.png) en CSS
+    .replace(/\burl\(\s*(["']?)\/([^)"']*)\1\s*\)/g, (_, q, resto) => `url(${q}${destino('/', resto)}${q})`)
+}
+
 // Un techo para no subir en silencio una build enorme. El runtime de Three.js ya pesa lo suyo y
 // cada publicación es espacio que se queda; si una build lo supera, se dice antes de empezar.
 const TOPE_BUILD = 120 * 1024 * 1024
@@ -91,11 +133,22 @@ async function publicarJugable({ db, project_id, slug, nombreProyecto = null, me
   const t0 = Date.now()
   let subidos = 0
   let bytes = 0
+  let reescritos = 0
 
   for (const f of build.files) {
     const ar = await fetch(`${base}/api/exports/${encodeURIComponent(build.export)}/${f.path}`)
     if (!ar.ok) throw new Error(`Could not fetch "${f.path}" from the build: HTTP ${ar.status}`)
-    const buf = Buffer.from(await ar.arrayBuffer())
+    let buf = Buffer.from(await ar.arrayBuffer())
+
+    // Las rutas de raíz, a relativas. Solo en los cuatro formatos que las declaran; un `.glb` o un
+    // `.png` se suben byte a byte como vienen.
+    const ext = (/\.([a-z0-9]+)$/i.exec(f.path)?.[1] || '').toLowerCase()
+    if (REESCRIBIBLES.has(ext)) {
+      const antes = buf.toString('utf8')
+      const despues = aRutasRelativas(antes, f.path)
+      if (despues !== antes) { buf = Buffer.from(despues, 'utf8'); reescritos++ }
+    }
+
     await uploadToStorage(buf, `${raiz}/${f.path}`, tipoDe(f.path))
     subidos++
     bytes += buf.length
@@ -104,7 +157,7 @@ async function publicarJugable({ db, project_id, slug, nombreProyecto = null, me
 
   const publico = (process.env.CF_R2_PUBLIC_URL || '').replace(/\/$/, '')
   const url = `${publico}/${raiz}/${build.entry || 'index.html'}`
-  console.log(`[jugable] ${subidos} archivos · ${(bytes / 1024 / 1024).toFixed(1)} MB · ${Math.round((Date.now() - t0) / 1000)}s`)
+  console.log(`[jugable] ${subidos} archivos · ${(bytes / 1024 / 1024).toFixed(1)} MB · ${Math.round((Date.now() - t0) / 1000)}s · ${reescritos} con rutas reescritas`)
 
   // 3 · Y queda como pieza del proyecto, para que se encuentre desde el moodboard y no solo desde
   //     el enlace que alguien copió.
@@ -121,11 +174,11 @@ async function publicarJugable({ db, project_id, slug, nombreProyecto = null, me
     format: 'html', mime_type: 'text/html',
     status: 'approved', approved_by: member_id, approved_at: new Date().toISOString(),
     storage_url: url,
-    metadata: { jugable: { slug, export: build.export, archivos: subidos, bytes } },
+    metadata: { jugable: { slug, export: build.export, archivos: subidos, bytes, reescritos } },
   }).select('id, name, storage_url').single()
   if (error) console.warn('[jugable] no se pudo registrar el activo (el enlace igual sirve):', error.message)
 
   return { url, archivos: subidos, bytes, segundos: Math.round((Date.now() - t0) / 1000), asset_id: activo?.id || null }
 }
 
-module.exports = { publicarJugable, tipoDe, TOPE_BUILD }
+module.exports = { publicarJugable, tipoDe, TOPE_BUILD, aRutasRelativas, prefijoDe }

@@ -146,7 +146,7 @@ async function generar(parametros) {
  * el perfil como documentos. Cuelgan del activo de origen, así que se dibujan a su derecha con el
  * mismo criterio que todo lo demás.
  */
-async function generarYPublicar({ db, project_id, origen_asset_id = null, node_id = null, parametros, member_id = null }) {
+async function generarYPublicar({ db, project_id, origen_asset_id = null, node_id = null, parametros, member_id = null, nivel = null }) {
   const { uploadToStorage } = require('./storage.service')
   const t0 = Date.now()
   const r = await generar(parametros)
@@ -177,7 +177,10 @@ async function generarYPublicar({ db, project_id, origen_asset_id = null, node_i
       status: 'approved', approved_by: member_id, approved_at: new Date().toISOString(),
       ...(origen_asset_id ? { derived_from_id: origen_asset_id } : {}),
       metadata: {
-        mapa: { archetype: parametros.archetype, seed: parametros.seed, piso: pisos.length > 1 ? i + 1 : null },
+        // `nivel` es de qué nivel del `level_map` es este mapa. Sin él, un proyecto con tres
+        // niveles deja tres grafos indistinguibles y el montaje del segundo nivel reusaría el
+        // primero que encontrara.
+        mapa: { archetype: parametros.archetype, seed: parametros.seed, piso: pisos.length > 1 ? i + 1 : null, nivel },
         parametros, stats: piso.stats,
         // De dónde salió la altura: del documento o del valor por defecto. El propio paquete pide
         // que quede registrado, para que nunca quede en duda cuál se usó.
