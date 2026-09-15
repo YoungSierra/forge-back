@@ -293,6 +293,78 @@ function gramaticaDesdePapeles(assets, papelPorAssetId) {
 }
 
 /**
+ * El mismo estado, preguntado desde la CADENA en vez de desde una pieza que nombra su entorno.
+ *
+ * Ofrece todos los niveles del `level_map` en vez de los de un entorno, y comparte con el
+ * disparador las comprobaciones que no dependen del entorno.
+ */
+async function estadoDesdeLevelMap({ db, project_id }) {
+  const faltantes = []
+  const niveles = []
+
+  const { data: ses } = await db().from('forge_sessions')
+    .select('id').eq('project_id', project_id).eq('output_key', 'level_map')
+  if ((ses || []).length) {
+    const { data: docs } = await db().from('forge_assets')
+      .select('content').in('session_id', ses.map(s => s.id)).not('content', 'is', null)
+    const md = (docs || []).map(d => d.content).join('\n\n')
+    for (const linea of md.split('\n')) {
+      if (!linea.includes('|')) continue
+      const celdas = linea.split('|').map(c => c.trim()).filter(Boolean)
+      if (celdas.length < 2 || /^[-: ]+$/.test(celdas[0]) || /^(level|life|zone)$/i.test(celdas[0])) continue
+      if (!niveles.some(n => n.nivel === celdas[0])) niveles.push({ nivel: celdas[0], entorno: celdas[1] })
+    }
+  }
+  if (!niveles.length) {
+    faltantes.push({ que: 'level_map', dice: 'Level Design (node 3.5) has not produced a level map with levels yet' })
+  }
+
+  const { modelos, faltantes: deKit } = await comprobarKit({ db, project_id })
+  faltantes.push(...deKit)
+
+  return {
+    aplica: true, entorno: null, niveles, faltantes,
+    listo: faltantes.length === 0,
+    modelos, papeles: catalogoDePapeles(),
+  }
+}
+
+/**
+ * Lo que no depende del entorno: modelos medidos, papeles puestos y el generador configurado.
+ *
+ * Vive aparte porque lo preguntan los dos caminos —el sector del radial y el paso de la cadena— y
+ * tenerlo dos veces era garantizar que un día dijeran cosas distintas.
+ */
+async function comprobarKit({ db, project_id }) {
+  const faltantes = []
+  const { data: todos } = await db().from('forge_assets')
+    .select('id, name, metadata').eq('project_id', project_id).eq('format', 'glb')
+    .not('storage_url', 'is', null)
+  const medidos = (todos || []).filter(m => m.metadata?.medidas?.dim)
+
+  if (!medidos.length) {
+    faltantes.push({
+      que: 'kit',
+      dice: (todos || []).length
+        ? `${todos.length} model(s) in this project, none of them measured yet`
+        : 'This project has no 3D models to assemble',
+    })
+  }
+  const conPapel = medidos.filter(m => m.metadata?.montaje?.clase)
+  if (medidos.length && !conPapel.length) {
+    faltantes.push({ que: 'gramatica', dice: 'No model has been assigned its structural role yet' })
+  }
+  if (!BASE()) {
+    faltantes.push({ que: 'maps_app', dice: 'The level generator is not configured on this server' })
+  }
+
+  return {
+    faltantes,
+    modelos: medidos.map(m => ({ id: m.id, nombre: m.name, papel: m.metadata?.montaje?.clase || null })),
+  }
+}
+
+/**
  * El grafo del nivel: el que ya exista para ESE nivel, o uno nuevo.
  *
  * Se reusa a propósito. Generarlo otra vez cuesta una llamada al modelo —el que traduce el
@@ -347,8 +419,14 @@ async function grafoDelNivel({ db, project_id, origen, nivel, member_id }) {
  * elija, que es el guarda que pide la spec —fallar señalando qué falta antes que generar con datos
  * parciales.
  */
-async function montarNivel({ db, project_id, asset_id, nivel = null, member_id = null, incluir_referencia = false }) {
-  const estado = await estadoDeMontaje({ db, project_id, asset_id })
+async function montarNivel({ db, project_id, asset_id, nivel = null, member_id = null, incluir_referencia = false, desdeCadena = false }) {
+  // Llamado desde la CADENA, el origen es la hoja del ASG —«Art Style Guide — 29_EnvironmentSheet»—
+  // y esa no nombra su entorno: el nombre vive en la imagen de `world_visuals`. Hasta que el
+  // instanciado dé una hoja por entorno, los niveles salen de la tabla entera del level_map y
+  // elige una persona, que es mejor que montar el primero.
+  const estado = desdeCadena
+    ? await estadoDesdeLevelMap({ db, project_id })
+    : await estadoDeMontaje({ db, project_id, asset_id })
   if (!estado.aplica) {
     const e = new Error('This piece does not trigger a level assembly')
     e.code = 'NO_APLICA'
@@ -453,7 +531,7 @@ async function montarNivel({ db, project_id, asset_id, nivel = null, member_id =
 }
 
 module.exports = {
-  estadoDeMontaje, entornoDe, nivelesDelEntorno, PREFIJO_ENTORNO,
+  estadoDeMontaje, estadoDesdeLevelMap, comprobarKit, entornoDe, nivelesDelEntorno, PREFIJO_ENTORNO,
   PAPELES, catalogoDePapeles, marcarPapel, gramaticaDesdePapeles,
   grafoDelNivel, montarNivel,
 }

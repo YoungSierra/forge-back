@@ -5824,8 +5824,12 @@ router.post('/laboratory/publicar', async (req, res, next) => {
 router.get('/assets/:asset_id/montaje', async (req, res, next) => {
   try {
     const { id: project_id, asset_id } = req.params
-    const { estadoDeMontaje } = require('../services/montaje-nivel.service')
-    const estado = await estadoDeMontaje({ db, project_id, asset_id })
+    // `?cadena=1` es el mismo estado pero preguntado desde la CADENA, donde el origen es la hoja
+    // del ASG y no la imagen que nombra su entorno: los niveles salen de la tabla entera.
+    const { estadoDeMontaje, estadoDesdeLevelMap } = require('../services/montaje-nivel.service')
+    const estado = req.query.cadena === '1'
+      ? await estadoDesdeLevelMap({ db, project_id })
+      : await estadoDeMontaje({ db, project_id, asset_id })
     res.json({ success: true, ...estado })
   } catch (err) { next(err) }
 })

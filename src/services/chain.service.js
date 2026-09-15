@@ -186,6 +186,18 @@ const CADENAS = {
         porCadaSalidaDe: 'concept_art',
         entradas: { image: '<cada>' },
       },
+      {
+        // El montaje es el paso siguiente de ESTA cadena, no una acción aparte: si de la hoja
+        // salieron las veinte partes y sus veinte modelos, lo que toca después es armar el nivel
+        // con ellos. Estaba colgado del radial y se pedía en otro sitio que todo lo demás.
+        //
+        // No despacha a ComfyUI: junta el grafo del nivel, las medidas y los papeles, y devuelve
+        // el paquete que abre Blender. Por eso va marcado y no lleva workflow.
+        clave: 'montaje', etiqueta: 'Level assembly', montaje: true,
+        que:    'One .zip: the level graph, the kit and the assembly order, ready for the LoopForge add-on.',
+        porque: 'The parts are modelled; this is what turns them into a level somebody can walk.',
+        entradas: {},
+      },
     ],
   },
 }
@@ -480,6 +492,23 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
       if (cada) console.log(`[cadena] ${paso.clave}: despachando ${cada} (${instancias.indexOf(cada) + 1}/${instancias.length})`)
 
       let jobId, porRol = {}
+
+      if (paso.montaje) {
+        // Sin workflow: lo arma el disparador de montaje, que ya sabe leer el nivel, componer la
+        // gramática desde los papeles y subir el paquete. Acá solo se le dice de qué hoja viene.
+        const { montarNivel } = require('./montaje-nivel.service')
+        const r = await montarNivel({ db, project_id, asset_id: origen.id, member_id, desdeCadena: true })
+        if (r.necesita_nivel) {
+          const e = new Error(`This environment is used by ${r.niveles.length} levels: pick which one to assemble`)
+          e.code = 'NECESITA_NIVEL'
+          e.niveles = r.niveles
+          throw e
+        }
+        creados.push({ id: r.asset?.id, name: r.asset?.name, storage_url: r.url, format: 'zip' })
+        console.log(`[cadena] montaje: nivel ${r.nivel} · ${Math.round((r.bytes || 0) / 1024)} KB`)
+        anterior = origen
+        continue
+      }
 
       if (paso.deck) {
         // Un paso de DECK: su prompt es un formulario del ADI y hay que rellenarlo antes de
