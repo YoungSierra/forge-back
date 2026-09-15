@@ -308,11 +308,26 @@ async function estadoDesdeLevelMap({ db, project_id }) {
     const { data: docs } = await db().from('forge_assets')
       .select('content').in('session_id', ses.map(s => s.id)).not('content', 'is', null)
     const md = (docs || []).map(d => d.content).join('\n\n')
+    // La tabla de niveles se reconoce por su columna `Environment`, igual que hace el disparador.
+    // Leer cualquier fila con barras se tragaba las OTRAS tablas del documento: en el proyecto de
+    // prueba salieron «Intent», «Teach», «Life range» y «1–4» ofrecidos como niveles.
+    let colEntorno = -1
     for (const linea of md.split('\n')) {
-      if (!linea.includes('|')) continue
-      const celdas = linea.split('|').map(c => c.trim()).filter(Boolean)
-      if (celdas.length < 2 || /^[-: ]+$/.test(celdas[0]) || /^(level|life|zone)$/i.test(celdas[0])) continue
-      if (!niveles.some(n => n.nivel === celdas[0])) niveles.push({ nivel: celdas[0], entorno: celdas[1] })
+      if (!linea.includes('|')) { colEntorno = -1; continue }
+      const celdas = linea.split('|').map(c => c.trim())
+      if (celdas[0] === '') celdas.shift()
+      if (celdas[celdas.length - 1] === '') celdas.pop()
+      if (!celdas.length) continue
+
+      if (colEntorno < 0) {
+        const i = celdas.findIndex(c => COL_ENTORNO.test(c))
+        if (i > 0) colEntorno = i
+        continue
+      }
+      if (/^[-: ]+$/.test(celdas[0])) continue
+      const nivel = celdas[0], entorno = celdas[colEntorno] || ''
+      if (!nivel || !entorno) continue
+      if (!niveles.some(n => n.nivel === nivel)) niveles.push({ nivel, entorno })
     }
   }
   if (!niveles.length) {

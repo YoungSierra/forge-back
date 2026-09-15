@@ -5866,6 +5866,9 @@ router.post('/assets/:asset_id/montaje', async (req, res, next) => {
       nivel: req.body?.nivel || null,
       member_id: req.body?.member_id || null,
       incluir_referencia: Boolean(req.body?.incluir_referencia),
+      // Quien viene del paso 3 del Run pulsa sobre un modelo, no sobre la imagen que nombra su
+      // entorno: sin decirlo, la comprobación lo rechaza con «esta pieza no dispara un montaje».
+      desdeCadena: Boolean(req.body?.cadena),
     })
     res.json({ success: true, ...r })
   } catch (err) {
