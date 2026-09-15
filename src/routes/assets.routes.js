@@ -250,8 +250,12 @@ router.get('/project-assets', async (req, res, next) => {
     const mediaOnly = req.query.media === '1' || req.query.media === 'true'
     // Los documentos entran al moodboard porque tienen su propia pestaña (Docs), pero SIEMPRE
     // sin el campo `content`: lo que pesaba era el texto, no la fila.
-    const MEDIA_FORMATS = ['image', 'png', 'jpg', 'jpeg', 'model_3d', 'glb', 'video', 'mp4', 'audio']
-    const DOC_FORMATS   = ['document', 'docx', 'pdf', 'pptx']
+    const MEDIA_FORMATS = ['image', 'png', 'jpg', 'jpeg', 'model_3d', 'glb', 'video', 'mp4', 'audio', 'zip']
+    // `json` entra porque hay archivos que son entregables y no basura interna: el
+    // `<clip>_beats.json` que se lleva a Cascadeur, el grafo de un nivel. Sin esto la pieza se
+    // escribe, existe en la base y en almacenamiento, y NO aparece en el moodboard — que es como
+    // se quedó invisible el primer beats. El `.zip` es el paquete de montaje, por lo mismo.
+    const DOC_FORMATS   = ['document', 'docx', 'pdf', 'pptx', 'json']
 
     // ── forge_assets ──────────────────────────────────────────────────────────
     let forgeQuery = db()
