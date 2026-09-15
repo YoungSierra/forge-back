@@ -73,8 +73,12 @@ const PDF_H3_CLR    = TEMA.titulo
 // contenedor sutil en vez de dejarlo suelto; es una línea de un píxel y resuelve el corte.
 function marcoImagen (doc, x, y, ancho, alto) {
   if (!TEMA.marco_imagen) return
+  // Sutil quiere decir sutil. A opacidad plena, el violeta de la paleta compite con la imagen en
+  // vez de contenerla —es lo que Miguel reportó el 15-09 como «marco violeta»—, y lo que el plan
+  // pide es un contenedor que evite que un asset sobre blanco flote en la página oscura.
   doc.save()
      .lineWidth(0.75)
+     .strokeOpacity(0.35)
      .strokeColor(TEMA.marco_imagen)
      .rect(x - 3, y - 3, ancho + 6, alto + 6)
      .stroke()
@@ -557,6 +561,11 @@ function drawCover(doc, docType, gameTitle, subtitle) {
   doc.rect(0, H - 8, W, 8).fill(PDF_EMBER)
 }
 
+// NO poner `margins.bottom` para que el texto que fluye se detenga antes del pie: se probó el
+// 15-09 y el mismo documento pasó de 4 páginas a 7, tres de ellas con la cabecera y nada más. El
+// margen hace que pdfkit corte por su cuenta y el renderizador manual añada OTRA página encima.
+// Es la misma trampa de páginas en blanco que ya costó una tarde. El número de página pisando la
+// última línea de un párrafo muy largo se queda como está hasta poder acotar el texto por altura.
 function drawContentPageBg(doc) {
   const W = doc.page.width
   doc.rect(0, 0, W, doc.page.height).fill(PDF_BG)
@@ -737,9 +746,38 @@ async function docGenDocx(title, content, projectId, nodeId, itemImages = []) {
     if (!contentSections.length) return
 
     // ── Primera página de contenido ───────────────────────────────────────────
+    //
+    // El fondo y la cabecera se pintan al NACER la página, no en cada sitio que crea una. pdfkit
+    // añade página por su cuenta cuando un párrafo desborda, y esa no pasaba por `checkPageBreak`:
+    // salía con el fondo blanco del papel y el texto claro encima —ilegible— y pegado al borde
+    // superior, porque el margen del documento es cero. Es el fallo que reportó Miguel en las
+    // páginas 3 y 4; reproducido con tres párrafos largos, la tercera página salía sin fondo.
+    //
+    // `save`/`restore` devuelve el estado gráfico del PDF, pero NO el que pdfkit lleva por su
+    // cuenta: la fuente, el cuerpo y el color de relleno. Sin reponerlos a mano, el párrafo que
+    // venía fluyendo continuaba en la página nueva con la letra de 7pt y el violeta de la
+    // cabecera. Lo vi al comprobar el arreglo, y es peor que el fallo que venía a arreglar.
+    let enContenido = false
+    doc.on('pageAdded', () => {
+      if (!enContenido) return
+      const fuente  = doc._font?.name || 'Helvetica'
+      const cuerpo  = doc._fontSize
+      const relleno = doc._fillColor
+
+      doc.save()
+      drawContentPageBg(doc)
+      drawPageHeader(doc, title)
+      doc.restore()
+
+      doc.font(fuente).fontSize(cuerpo)
+      if (relleno) doc.fillColor(relleno[0], relleno[1])
+      // Debajo de la cabecera, no en el borde: es donde el resto del renderizador empieza.
+      doc.x = 60
+      doc.y = 44
+    })
+
+    enContenido = true
     doc.addPage({ margin: 0, size: 'A4' })
-    drawContentPageBg(doc)
-    drawPageHeader(doc, title)
     let y = 44
 
     // La imagen que un ítem generó va JUSTO DEBAJO de su título.
@@ -807,9 +845,9 @@ async function docGenDocx(title, content, projectId, nodeId, itemImages = []) {
 
     function checkPageBreak(needed = 80) {
       if (y > doc.page.height - needed) {
+        // El fondo y la cabecera los pone el manejador de `pageAdded`: repetirlos acá volvería a
+        // pintar el fondo ENCIMA de la cabecera recién dibujada y la borraría.
         doc.addPage({ margin: 0, size: 'A4' })
-        drawContentPageBg(doc)
-        drawPageHeader(doc, title)
         y = 44
       }
     }
