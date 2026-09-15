@@ -177,9 +177,13 @@ async function estadoDeMontaje({ db, project_id, asset_id }) {
     // Los modelos con los que se montaría, y el papel que tiene puesto cada uno. Viaja con el
     // estado porque quien abre el radial es justo quien va a marcarlos: pedirlo aparte obligaría
     // a una segunda vuelta para dibujar la misma ventana.
-    modelos: (medidos || []).map(m => ({
-      id: m.id, nombre: m.name, papel: m.metadata?.montaje?.clase || null,
-    })),
+    modelos: (medidos || [])
+      .map(m => ({
+        id: m.id, nombre: m.name,
+        papel: m.metadata?.montaje?.clase || null,
+        cadena: m.metadata?.cadena?.nombre || null,
+      }))
+      .sort((a, b) => peso(a.cadena) - peso(b.cadena) || a.nombre.localeCompare(b.nombre)),
     papeles: catalogoDePapeles(),
   }
 }
@@ -375,9 +379,21 @@ async function comprobarKit({ db, project_id }) {
 
   return {
     faltantes,
-    modelos: medidos.map(m => ({ id: m.id, nombre: m.name, papel: m.metadata?.montaje?.clase || null })),
+    // De qué cadena salió cada modelo. Sin ese dato la ventana los ofrece todos por igual y en la
+    // primera prueba una vista FRONTAL de personaje acabó marcada como muro exterior: un gato no
+    // es una pared, pero la lista no daba forma de notarlo. Los del entorno van primero.
+    modelos: medidos
+      .map(m => ({
+        id: m.id, nombre: m.name,
+        papel: m.metadata?.montaje?.clase || null,
+        cadena: m.metadata?.cadena?.nombre || null,
+      }))
+      .sort((a, b) => peso(a.cadena) - peso(b.cadena) || a.nombre.localeCompare(b.nombre)),
   }
 }
+
+/** Qué cadena aporta piezas de nivel, y en qué orden se leen. */
+const peso = cadena => (cadena === 'environment_sheet' ? 0 : cadena === 'prop_sheet' ? 1 : 2)
 
 /**
  * El grafo del nivel: el que ya exista para ESE nivel, o uno nuevo.
@@ -393,7 +409,11 @@ async function grafoDelNivel({ db, project_id, origen, nivel, member_id }) {
     .like('name', 'Mapa — % — level_graph')
     .order('created_at', { ascending: false })
 
-  const mismo = (previos || []).find(g => String(g.metadata?.mapa?.nivel ?? '') === String(nivel))
+  // Un arquetipo de edificio publica una planta por piso, y todas llevan el mismo nivel. Tomar la
+  // más reciente dejaba el montaje en el piso 3 sin decirlo; se toma la PRIMERA, que es la planta
+  // baja — por donde se entra.
+  const delNivel = (previos || []).filter(g => String(g.metadata?.mapa?.nivel ?? '') === String(nivel))
+  const mismo = delNivel.sort((a, b) => (a.metadata?.mapa?.piso ?? 1) - (b.metadata?.mapa?.piso ?? 1))[0]
   if (mismo?.storage_url) {
     const r = await fetch(mismo.storage_url)
     if (r.ok) return { level_graph: await r.json(), grafo: { id: mismo.id, generado: false } }
@@ -415,7 +435,10 @@ async function grafoDelNivel({ db, project_id, origen, nivel, member_id }) {
   const r = await generarYPublicar({
     db, project_id, origen_asset_id: origen.id, node_id: origen.node_id, parametros, member_id, nivel,
   })
-  const creado = (r.creados || []).find(a => /— level_graph$/.test(a.name))
+  // Igual al reusar: de un edificio de tres plantas se monta la planta baja, no la última que se
+  // publicó. Cuál se montó viaja en la respuesta, para que no haya que adivinarlo.
+  const grafos = (r.creados || []).filter(a => /— level_graph$/.test(a.name))
+  const creado = grafos.find(a => !/piso \d/.test(a.name) || /piso 1/.test(a.name)) || grafos[0]
   if (!creado?.storage_url) throw new Error('the map was generated but published no level graph')
   const resp = await fetch(creado.storage_url)
   if (!resp.ok) throw new Error(`could not read the level graph just published: HTTP ${resp.status}`)
@@ -434,7 +457,7 @@ async function grafoDelNivel({ db, project_id, origen, nivel, member_id }) {
  * elija, que es el guarda que pide la spec —fallar señalando qué falta antes que generar con datos
  * parciales.
  */
-async function montarNivel({ db, project_id, asset_id, nivel = null, member_id = null, incluir_referencia = false, desdeCadena = false }) {
+async function montarNivel({ db, project_id, asset_id, nivel = null, member_id = null, incluir_referencia = false, desdeCadena = false, estrategia = null }) {
   // Llamado desde la CADENA, el origen es la hoja del ASG —«Art Style Guide — 29_EnvironmentSheet»—
   // y esa no nombra su entorno: el nombre vive en la imagen de `world_visuals`. Hasta que el
   // instanciado dé una hoja por entorno, los niveles salen de la tabla entera del level_map y
@@ -492,8 +515,14 @@ async function montarNivel({ db, project_id, asset_id, nivel = null, member_id =
   const inventarioUsado = inventario.filter(i => assets[`${i.asset_id}.glb`])
 
   const { ordenDeMontaje, ALTURA_POR_DEFECTO } = require('./mapas.service')
+  // `freeform` y no `modular_hex`. La retícula modular embebe el grafo en celdas de seis vecinos y
+  // falla en cuanto una sala tiene más conexiones que eso: medido el 15-09 con un edificio de tres
+  // plantas, Maps_App devolvió «no se pudo embeber el grafo en la reticula». Lo que genera Maps_App
+  // es una PLANTA REAL, y para eso su propia estrategia libre construye cada sala sobre su
+  // polígono, sin retícula. La modular es para niveles hechos de módulos, que no es este caso.
   const orden = await ordenDeMontaje({
-    level_graph, kit_catalog: { assets }, grammar: { estructura }, strategy: 'modular_hex',
+    level_graph, kit_catalog: { assets }, grammar: { estructura },
+    strategy: estrategia || 'freeform',
   })
 
   const modelosBin = await bm.traerModelos(inventarioUsado)
