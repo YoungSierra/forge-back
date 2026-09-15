@@ -292,7 +292,7 @@ async function anclaDelPersonaje({ db, project_id }) {
  * Cascadeur— y un enlace que solo vive en la respuesta de una petición no lo encuentra nadie dos
  * días después. El contenido viaja también en `content`, para poder leerlo sin descargarlo.
  */
-async function guardarBeats({ db, project_id, node_id = null, clip, json, member_id = null }) {
+async function guardarBeats({ db, project_id, node_id = null, clip, json, member_id = null, derivadoDe = null }) {
   const { uploadToStorage } = require('./storage.service')
   const texto = JSON.stringify(json, null, 2)
   const url = await uploadToStorage(
@@ -312,6 +312,9 @@ async function guardarBeats({ db, project_id, node_id = null, clip, json, member
     format: 'json', mime_type: 'application/json',
     storage_url: url, content: texto,
     status: 'approved', approved_by: member_id, approved_at: new Date().toISOString(),
+    // Cuelga de la hoja que lo originó: en el lienzo el archivo aparece junto a su Animation
+    // Sheet, que es donde alguien lo va a buscar. Suelto, cae en el bloque del nodo y se pierde.
+    ...(derivadoDe ? { derived_from_id: derivadoDe } : {}),
     // `origen` distingue este archivo de uno que subió una persona. Sin esa marca, la corrida
     // siguiente lo encuentra por nombre y lo toma por manual: el clip se queda congelado en sus
     // primeros beats para siempre y nada lo dice.

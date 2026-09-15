@@ -468,7 +468,7 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
           beats = await anm.beatsDeClip({ clip, adi: anim.adi })
           // El archivo se guarda SIEMPRE, aunque el despacho falle después: componerlo cuesta una
           // llamada al modelo, y lo que Cascadeur necesita es este json, no la lámina.
-          await anm.guardarBeats({ db, project_id, node_id: origen.node_id, clip: cada, json: beats.json, member_id })
+          await anm.guardarBeats({ db, project_id, node_id: origen.node_id, clip: cada, json: beats.json, member_id, derivadoDe: origen.id })
           console.log(`[cadena] ${paso.clave}: «${cada}» — ${beats.poses} poses, beats guardados`)
         }
 
