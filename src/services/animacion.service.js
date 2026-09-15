@@ -42,13 +42,19 @@ const SKILL_BEATS = 'cascadeur_movement_choreography'
 
 /** El texto de `ADI_11.6_AnimationProduction` de este proyecto, o null. */
 async function adiDeAnimacion(db, project_id) {
+  const fila = await filaDelAdi(db, project_id)
+  return fila?.content || null
+}
+
+/** La fila entera del ADI de animación: hace falta su `id` y su `metadata` para el caché. */
+async function filaDelAdi(db, project_id) {
   const { data: ses } = await db().from('forge_sessions')
     .select('id').eq('project_id', project_id).eq('output_key', 'ADI_11.6_AnimationProduction')
   if (!(ses || []).length) return null
   const { data: docs } = await db().from('forge_assets')
-    .select('content, created_at').in('session_id', ses.map(s => s.id))
+    .select('id, content, metadata, created_at').in('session_id', ses.map(s => s.id))
     .not('content', 'is', null).order('created_at', { ascending: false })
-  return docs?.[0]?.content || null
+  return docs?.[0] || null
 }
 
 /**
@@ -58,8 +64,22 @@ async function adiDeAnimacion(db, project_id) {
  * tiene reglas de movimiento, y sin reglas los beats salen genéricos — que es exactamente lo que
  * la skill de coreografía existe para evitar.
  */
-async function clipsDelProyecto({ db, project_id }) {
-  const adi = await adiDeAnimacion(db, project_id)
+async function clipsDelProyecto({ db, project_id, refrescar = false, soloCache = false }) {
+  const fila = await filaDelAdi(db, project_id)
+  const adi = fila?.content || null
+
+  // La lista se guarda junto al documento del que sale, con la huella de ese documento. Leerla
+  // cuesta una llamada al modelo, y quien abre el recuadro del Run para ELEGIR qué animaciones
+  // correr no puede pagar por abrirlo. Si el ADI cambia, la huella deja de casar y se vuelve a
+  // leer — el caché no puede sobrevivir al documento que lo originó.
+  const huella = adi ? `${adi.length}:${adi.slice(0, 64)}` : null
+  const cache = fila?.metadata?.clips_cache
+  if (!refrescar && cache?.huella && cache.huella === huella) {
+    return { clips: cache.clips, adi, descartados: cache.descartados || [], de_cache: true }
+  }
+  // `soloCache` es para quien solo quiere enseñar la lista: prefiere no tenerla a pagar por ella.
+  if (soloCache) return { clips: [], descartados: [], de_cache: false, sin_leer: true }
+
   if (!adi) {
     const err = new Error('Node 3.9 has not produced ADI_11.6 Animation Production yet: there is no clip list to animate')
     err.code = 'SIN_ADI'
@@ -112,7 +132,15 @@ async function clipsDelProyecto({ db, project_id }) {
   const descartados = clips.length > TOPE_CLIPS ? clips.slice(TOPE_CLIPS).map(c => c.nombre) : []
   clips = clips.slice(0, TOPE_CLIPS)
 
-  return { clips, adi, ...(descartados.length ? { descartados } : {}) }
+  // Al lado del documento que la originó, con su huella. La siguiente vez que alguien abra el
+  // recuadro para elegir animaciones, la lista sale gratis.
+  if (fila?.id) {
+    const metadata = { ...(fila.metadata || {}), clips_cache: { clips, descartados, huella, en: new Date().toISOString() } }
+    const { error } = await db().from('forge_assets').update({ metadata }).eq('id', fila.id)
+    if (error) console.warn('[clips] no se pudo guardar el caché (no es fatal):', error.message)
+  }
+
+  return { clips, adi, descartados, de_cache: false }
 }
 
 /**
@@ -129,26 +157,31 @@ async function beatsDeClip({ clip, adi, personaje = null }) {
     throw err
   }
 
+  // La skill YA define el archivo de beats entero —`movement`, `loop` y `beats[]` con `index`,
+  // `role`, `description`, `trajectory_notes` y `timing_weight`— y acá se le pedía texto plano:
+  // «devolvé SOLO los bloques Pose N». O sea que el `trajectory_notes` se pensaba y se tiraba en
+  // la misma llamada, y el archivo que Cascadeur necesita después no existía en ninguna parte.
+  // Es el punto 2 del informe de JuanK, y la causa era nuestra, no de la skill.
+  //
+  // Ahora se le deja emitir SU json. Las líneas «Pose N» que el nodo 2 del workflow espera se
+  // derivan de ahí, así que ComfyUI recibe exactamente lo mismo que antes y la lámina no cambia.
   const system = [
     skill,
     '',
     '─────────────────────────────────────────────────────────────',
     'SALIDA PARA ESTE ENCARGO',
     '',
-    'Devolvés SOLO los bloques de beats, uno por línea, en este formato y nada más:',
+    'Devolvés SOLO el archivo de beats en JSON, tal como lo define el método de arriba:',
+    '`movement`, `loop` y `beats[]` con `index`, `role`, `description`, `trajectory_notes` y',
+    '`timing_weight`. Sin comentarios y sin texto alrededor; las cercas de código se aceptan.',
     '',
-    'Pose 1 (<nombre de la fase>): <descripción precisa de la postura>',
-    'Pose 2 (<nombre de la fase>): <descripción precisa de la postura>',
+    'La cantidad de beats la decide el movimiento: el workflow lee tantas columnas como beats haya',
+    'y no tiene tope. `description` es de la POSTURA y solo de lo que una imagen puede mostrar;',
+    'todo lo espacial —altura del root, contacto con el piso, desplazamiento, asimetrías— va en',
+    '`trajectory_notes`, que es lo que consume Cascadeur después.',
     '',
-    'Sin encabezado, sin numeración extra, sin comentarios, sin cercas de código. La cantidad de',
-    'poses la decide el movimiento: el workflow lee tantas columnas como bloques haya y no tiene',
-    'tope. Cada descripción es de la POSTURA —dónde está cada parte del cuerpo, el peso, el eje—,',
-    'no de la intención narrativa.',
-    '',
-    'ESCRIBÍ LOS BEATS EN INGLÉS, incluido el nombre de la fase entre paréntesis. El texto viaja a',
-    'un modelo de imagen que después rotula la lámina, y el resto de lo que produce la plataforma',
-    'está en inglés: una hoja de poses con las columnas en español no se puede entregar junto a las',
-    'demás.',
+    'ESCRIBÍ `role` Y `description` EN INGLÉS. Ese texto rotula las columnas de la lámina y el',
+    'resto de lo que produce la plataforma está en inglés; JuanK lo confirmó el 15-09.',
   ].join('\n')
 
   const user = [
@@ -161,16 +194,59 @@ async function beatsDeClip({ clip, adi, personaje = null }) {
 
   const res = await callLLM(system, user,
     { model: MODELO, rawText: true, temperature: 0.4, maxOutputTokens: 3000 })
-  const texto = String(res?.data ?? res?.text ?? '').trim()
-    .replace(/^```\s*/i, '').replace(/```\s*$/, '')
+  const crudo = String(res?.data ?? res?.text ?? '').trim()
+    .replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '')
 
-  // Un beats sin un solo bloque «Pose N» no es un beats: el workflow lo mandaría tal cual al
-  // modelo de imagen y saldría una lámina sin columnas. Vale más no despachar.
-  const bloques = (texto.match(/^\s*Pose\s+\d+\s*\(/gim) || []).length
-  if (bloques < 2) {
-    throw new Error(`los beats de "${clip.nombre}" no traen bloques «Pose N» (${bloques}): ${texto.slice(0, 120)}`)
+  return beatsDesdeJson(crudo, clip)
+}
+
+/** Las líneas que el nodo 2 del workflow espera, derivadas de los beats. */
+const lineasDeBeats = beats => beats
+  .map((b, i) => `Pose ${b.index ?? i + 1} (${b.role || 'beat'}): ${b.description}`)
+  .join('\n')
+
+/**
+ * Valida el archivo de beats y devuelve las dos formas: el json que se guarda y el texto que se
+ * despacha.
+ *
+ * Se exige lo mismo que antes —dos beats como mínimo— y además que cada uno traiga su descripción:
+ * un beats con celdas vacías produce una lámina con columnas en blanco, que se paga igual.
+ * `trajectory_notes` puede venir vacío, que es lo que la propia skill permite cuando no aplica.
+ */
+function beatsDesdeJson(crudo, clip = {}) {
+  let doc
+  // Las cercas se quitan acá y no solo en quien compone: por este mismo sitio entra el archivo que
+  // alguien sube a mano, y copiarlo de un chat con ```json alrededor es lo más probable del mundo.
+  const limpio = typeof crudo === 'string'
+    ? crudo.trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim()
+    : crudo
+  try { doc = typeof limpio === 'string' ? JSON.parse(limpio) : limpio } catch {
+    throw new Error(`los beats de "${clip.nombre || '?'}" no son JSON válido: ${String(limpio).slice(0, 120)}`)
   }
-  return { texto, poses: bloques }
+  const beats = Array.isArray(doc?.beats) ? doc.beats : null
+  if (!beats || beats.length < 2) {
+    throw new Error(`los beats de "${clip.nombre || '?'}" traen ${beats ? beats.length : 0} beats: hacen falta al menos dos`)
+  }
+  const sinTexto = beats.filter(b => !String(b?.description || '').trim())
+  if (sinTexto.length) {
+    throw new Error(`${sinTexto.length} beat(s) de "${clip.nombre || '?'}" no traen description`)
+  }
+
+  const json = {
+    movement: doc.movement || clip.nombre || 'movement',
+    loop: typeof doc.loop === 'boolean' ? doc.loop : Boolean(clip.loop),
+    beats: beats.map((b, i) => ({
+      index: b.index ?? i + 1,
+      role: b.role || `beat ${i + 1}`,
+      description: String(b.description).trim(),
+      // Vacío es una respuesta: la skill dice que va '' cuando genuinamente no aplica. Lo que no
+      // puede es faltar, porque es el campo que Cascadeur lee.
+      trajectory_notes: String(b.trajectory_notes ?? '').trim(),
+      timing_weight: b.timing_weight || 'rapido',
+    })),
+  }
+
+  return { texto: lineasDeBeats(json.beats), poses: json.beats.length, json }
 }
 
 /**
@@ -209,4 +285,41 @@ async function anclaDelPersonaje({ db, project_id }) {
   return { url: vivos[0].storage_url, nombre: vivos[0].name, id: vivos[0].id }
 }
 
-module.exports = { clipsDelProyecto, beatsDeClip, adiDeAnimacion, anclaDelPersonaje, TOPE_CLIPS, SKILL_BEATS }
+/**
+ * Guarda `<clip>_beats.json` como pieza del proyecto y devuelve su enlace.
+ *
+ * Va a almacenamiento y además queda como activo: el archivo lo consume una persona —lo baja para
+ * Cascadeur— y un enlace que solo vive en la respuesta de una petición no lo encuentra nadie dos
+ * días después. El contenido viaja también en `content`, para poder leerlo sin descargarlo.
+ */
+async function guardarBeats({ db, project_id, node_id = null, clip, json, member_id = null }) {
+  const { uploadToStorage } = require('./storage.service')
+  const texto = JSON.stringify(json, null, 2)
+  const url = await uploadToStorage(
+    Buffer.from(texto, 'utf8'),
+    `projects/${project_id}/beats/${clip}_beats.json`,
+    'application/json; charset=utf-8')
+
+  const { data: ses } = await db().from('forge_sessions').insert({
+    project_id, node_id, output_key: null, status: 'auto_approved', iteration_count: 1,
+    started_at: new Date().toISOString(), completed_at: new Date().toISOString(),
+    triggered_by: member_id,
+  }).select('id').single()
+
+  const { data: activo, error } = await db().from('forge_assets').insert({
+    project_id, node_id, session_id: ses?.id || null,
+    name: `${clip}_beats.json`,
+    format: 'json', mime_type: 'application/json',
+    storage_url: url, content: texto,
+    status: 'approved', approved_by: member_id, approved_at: new Date().toISOString(),
+    metadata: { beats: { clip, poses: json.beats.length, loop: json.loop, para: 'cascadeur' } },
+  }).select('id, name, storage_url').single()
+  if (error) console.warn(`[beats] no se pudo registrar ${clip}_beats.json: ${error.message}`)
+
+  return { url, asset_id: activo?.id || null }
+}
+
+module.exports = {
+  clipsDelProyecto, beatsDeClip, beatsDesdeJson, guardarBeats, lineasDeBeats,
+  adiDeAnimacion, anclaDelPersonaje, TOPE_CLIPS, SKILL_BEATS,
+}

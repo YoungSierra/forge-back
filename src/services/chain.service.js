@@ -266,7 +266,7 @@ function proximoPaso(asset) {
 // 12). Valen para TODA la corrida —así lo confirmó Miguel—; regenerar una pieza suelta las pide
 // aparte. Se guardan además en el metadata de cada activo producido: es lo que deja mostrarlas
 // bajo la imagen y reusarlas al rehacerla.
-async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, member_id = null, limitePorCada = 0, opciones = null }) {
+async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, member_id = null, limitePorCada = 0, opciones = null, clips = null }) {
   const { data: origen, error: e0 } = await db().from('forge_assets')
     .select('id, project_id, node_id, session_id, name, storage_url, metadata')
     .eq('id', asset_id).single()
@@ -360,6 +360,15 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
     if (paso.porCadaClip) {
       anim = await require('./animacion.service').clipsDelProyecto({ db, project_id })
       instancias = anim.clips.map(c => c.nombre)
+      // Elegir QUÉ animaciones correr, en vez de producir siempre el set entero. Es el punto 1 del
+      // informe de JuanK: cada lámina es un despacho pago y el ADI nombra hasta ocho movimientos.
+      // Lo que no se elige no se pierde — sigue disponible para otra corrida.
+      if (Array.isArray(clips) && clips.length) {
+        const pedidos = new Set(clips)
+        const ajenos = clips.filter(c => !instancias.includes(c))
+        if (ajenos.length) throw new Error(`These are not clips of this project: ${ajenos.join(', ')}`)
+        instancias = instancias.filter(c => pedidos.has(c))
+      }
       if (anim.descartados?.length) {
         console.log(`[cadena] ${paso.clave}: el ADI nombra más movimientos de los que se corren — quedan fuera ${anim.descartados.join(', ')}`)
       }
@@ -436,10 +445,31 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
       let promptDelDespacho = paso.pide_prompt ? (prompt || '') : ''
       if (paso.porCadaClip) {
         const clip = anim.clips.find(c => c.nombre === cada)
-        const beats = await require('./animacion.service').beatsDeClip({ clip, adi: anim.adi })
+        const anm = require('./animacion.service')
+
+        // Un beats escrito a mano manda sobre el que compone la skill. Es lo que pidió JuanK:
+        // recibir Y crear. Si alguien subió `<clip>_beats.json` al proyecto, se usa ese — que es
+        // además la única forma de corregir una trayectoria sin volver a pagar la lámina.
+        const { data: puesto } = await db().from('forge_assets')
+          .select('id, name, content, storage_url')
+          .eq('project_id', project_id).eq('name', `${cada}_beats.json`)
+          .order('created_at', { ascending: false }).limit(1).maybeSingle()
+
+        let beats
+        if (puesto) {
+          const crudo = puesto.content || await (await fetch(puesto.storage_url)).text()
+          beats = anm.beatsDesdeJson(crudo, clip)
+          console.log(`[cadena] ${paso.clave}: «${cada}» — beats puestos a mano (${beats.poses} poses)`)
+        } else {
+          beats = await anm.beatsDeClip({ clip, adi: anim.adi })
+          // El archivo se guarda SIEMPRE, aunque el despacho falle después: componerlo cuesta una
+          // llamada al modelo, y lo que Cascadeur necesita es este json, no la lámina.
+          await anm.guardarBeats({ db, project_id, node_id: origen.node_id, clip: cada, json: beats.json, member_id })
+          console.log(`[cadena] ${paso.clave}: «${cada}» — ${beats.poses} poses, beats guardados`)
+        }
+
         promptDelDespacho = beats.texto
         extras.clip = cada
-        console.log(`[cadena] ${paso.clave}: «${cada}» — ${beats.poses} poses`)
       }
 
       const t0 = Date.now()

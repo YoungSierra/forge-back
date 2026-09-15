@@ -5512,12 +5512,24 @@ router.get('/assets/:asset_id/next-step', async (req, res, next) => {
       despachos = roles.size || 1
     }
 
+    // Las animaciones que se van a producir, para poder ELEGIRLAS antes de correr (informe de
+    // JuanK, punto 1). Salen del caché: leerlas del ADI cuesta una llamada al modelo y abrir un
+    // recuadro no puede gastar. Si todavía no se leyeron nunca, se dice y el Run las lee al correr.
+    let clips = null
+    if (paso?.clave === 'pose_sheet') {
+      const r = await require('../services/animacion.service')
+        .clipsDelProyecto({ db, project_id, soloCache: true })
+        .catch(() => null)
+      if (r?.clips?.length) { clips = r.clips.map(c => ({ nombre: c.nombre, etiqueta: c.etiqueta || c.nombre })); despachos = clips.length }
+      else clips = []
+    }
+
     // Cuáles hay, para cuando no hay ninguna. El aviso del front las nombraba a mano y se quedó
     // diciendo «Character Sheet is the only chain» cuando ya eran cinco: quien lee el aviso se va
     // creyendo que su hoja no tiene workflow, y lo tiene.
     res.json({
       success: true,
-      paso: paso ? { ...paso, despachos } : null,
+      paso: paso ? { ...paso, despachos, ...(clips ? { clips } : {}) } : null,
       ...(paso ? {} : { cadenas: etiquetasDeCadenas() }),
     })
   } catch (err) { next(err) }
@@ -5531,6 +5543,8 @@ router.post('/assets/:asset_id/advance', async (req, res, next) => {
     const prompt    = req.body?.prompt || null
     // El tope es la cadena más larga que existe: pedir 99 pasos no puede volverse un gasto abierto.
     const pasos     = Math.max(1, Math.min(3, Number(req.body?.pasos) || 1))
+    // Qué animaciones correr. Vacío = todas, que es como venía funcionando.
+    const clips     = Array.isArray(req.body?.clips) && req.body.clips.length ? req.body.clips : null
     // Cuántas partes correr en un paso que despacha una por cada salida del anterior. 0 = todas.
     // El Environment abre en veinte, y cada una es un despacho pago e irrepetible: poder mirar la
     // primera antes de comprometer las veinte es la diferencia entre una prueba y una apuesta.
@@ -5541,7 +5555,7 @@ router.post('/assets/:asset_id/advance', async (req, res, next) => {
     const opciones  = req.body?.opciones && typeof req.body.opciones === 'object' ? req.body.opciones : null
 
     const { avanzar } = require('../services/chain.service')
-    const r = await avanzar({ db, project_id, asset_id, pasos, prompt, member_id, limitePorCada: limite, opciones })
+    const r = await avanzar({ db, project_id, asset_id, pasos, prompt, member_id, limitePorCada: limite, opciones, clips })
     res.json({ success: true, ...r })
   } catch (err) {
     // «Esta página todavía no tiene cadena» no es una falla del servidor: es el estado real de
@@ -6097,6 +6111,16 @@ router.get('/alcance', async (req, res, next) => {
     const r = await itemsDelAlcance({ db, project_id: req.params.id })
     const instancias = Object.values(r.porHoja || {}).reduce((n, xs) => n + xs.length, 0)
     res.json({ success: true, ...r, instancias })
+  } catch (err) { next(err) }
+})
+
+// El progreso del alcance medido contra lo publicado, para que el panel deje de enseñar un avance
+// que nadie produjo. Lo que no se puede medir no viene: el panel conserva ahí lo que marcó una
+// persona, y `sin_medida` dice por qué.
+router.get('/alcance/estados', async (req, res, next) => {
+  try {
+    const { estadosMedidos } = require('../services/estados-alcance.service')
+    res.json({ success: true, ...await estadosMedidos({ db, project_id: req.params.id }) })
   } catch (err) { next(err) }
 })
 
