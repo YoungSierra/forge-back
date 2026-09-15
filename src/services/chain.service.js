@@ -450,10 +450,14 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
         // Un beats escrito a mano manda sobre el que compone la skill. Es lo que pidió JuanK:
         // recibir Y crear. Si alguien subió `<clip>_beats.json` al proyecto, se usa ese — que es
         // además la única forma de corregir una trayectoria sin volver a pagar la lámina.
-        const { data: puesto } = await db().from('forge_assets')
-          .select('id, name, content, storage_url')
+        // El más reciente con ese nombre. Solo cuenta como «puesto a mano» si NO lo escribimos
+        // nosotros: lo que guarda la corrida lleva `origen: 'skill'`, y sin mirarlo la segunda
+        // corrida reusaría sus propios beats creyéndolos de una persona.
+        const { data: ultimo } = await db().from('forge_assets')
+          .select('id, name, content, storage_url, metadata')
           .eq('project_id', project_id).eq('name', `${cada}_beats.json`)
           .order('created_at', { ascending: false }).limit(1).maybeSingle()
+        const puesto = ultimo && ultimo.metadata?.beats?.origen !== 'skill' ? ultimo : null
 
         let beats
         if (puesto) {

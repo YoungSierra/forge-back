@@ -312,7 +312,10 @@ async function guardarBeats({ db, project_id, node_id = null, clip, json, member
     format: 'json', mime_type: 'application/json',
     storage_url: url, content: texto,
     status: 'approved', approved_by: member_id, approved_at: new Date().toISOString(),
-    metadata: { beats: { clip, poses: json.beats.length, loop: json.loop, para: 'cascadeur' } },
+    // `origen` distingue este archivo de uno que subió una persona. Sin esa marca, la corrida
+    // siguiente lo encuentra por nombre y lo toma por manual: el clip se queda congelado en sus
+    // primeros beats para siempre y nada lo dice.
+    metadata: { beats: { clip, poses: json.beats.length, loop: json.loop, para: 'cascadeur', origen: 'skill' } },
   }).select('id, name, storage_url').single()
   if (error) console.warn(`[beats] no se pudo registrar ${clip}_beats.json: ${error.message}`)
 

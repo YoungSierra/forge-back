@@ -5517,8 +5517,13 @@ router.get('/assets/:asset_id/next-step', async (req, res, next) => {
     // recuadro no puede gastar. Si todavía no se leyeron nunca, se dice y el Run las lee al correr.
     let clips = null
     if (paso?.clave === 'pose_sheet') {
+      // Del caché, para que abrir el recuadro no cueste. Pero la primera vez no hay caché —se
+      // escribe al correr— y sin lista no hay nada que elegir, que es justo lo que JuanK pidió
+      // poder hacer ANTES de correr. Con `leer_clips=1` se lee del ADI y queda cacheada: es una
+      // llamada al modelo, así que la pide quien mira el recuadro, no se hace a sus espaldas.
+      const leer = req.query.leer_clips === '1'
       const r = await require('../services/animacion.service')
-        .clipsDelProyecto({ db, project_id, soloCache: true })
+        .clipsDelProyecto({ db, project_id, soloCache: !leer })
         .catch(() => null)
       if (r?.clips?.length) { clips = r.clips.map(c => ({ nombre: c.nombre, etiqueta: c.etiqueta || c.nombre })); despachos = clips.length }
       else clips = []
