@@ -284,6 +284,8 @@ async function armarPaquete({ db, project_id, asset_id, nivel = null, member_id 
   const level_id = idDeNivel(elegido)
   const terminos = terminosDeBusqueda(elegido, entornoDelNivel)
   const ausentes = []
+  // Lo que está pero conviene mirar. Distinto de una ausencia: acá hay dato, y es dudoso.
+  const avisos = []
 
   // 2 · Level design.
   const ldd = excerptDe({ md: texto('level_design_doc'), terminos, documento: 'Level Design Document' })
@@ -380,12 +382,45 @@ async function armarPaquete({ db, project_id, asset_id, nivel = null, member_id 
 
   // Los papeles estructurales. NO es un cálculo: es una decisión de arte que una persona marcó en
   // Forge, y nada en la geometría la puede reponer —ningún bbox dice cuál muro es el exterior—.
-  // El contrato no la pide, así que va como bloque opcional y declarado: si el proceso de Claude
-  // la deduce por su cuenta, la ignora; si no, está. Perderla en el traspaso sería una regresión
-  // silenciosa, que es lo único que este contrato no tolera.
-  const papeles = modelos
-    .filter(m => m.metadata?.montaje?.clase)
-    .map(m => ({ asset_id: archivoDe(m.name, ''), papel: m.metadata.montaje.clase }))
+  // El contrato no los pide; JuanK los pidió el 16-09 («si está con la definición para marcar
+  // mucho mejor»), así que van, como bloque declarado fuera de `contenido`.
+  //
+  // Con su VOCABULARIO al lado. Mandar `muro_exterior` a secas obliga a adivinar qué significa y
+  // qué otros valores existen; el catálogo es el mismo que dibuja la pantalla de marcar, leído de
+  // una sola fuente para que no haya dos listas.
+  //
+  // Y con la CADENA de la que salió cada modelo, que es el dato que deja ver un marcado erróneo:
+  // en este proyecto hay una vista frontal de personaje marcada como «piso», y sin saber que viene
+  // de `character_sheet` no hay forma de notarlo del otro lado.
+  const { catalogoDePapeles } = require('./montaje-nivel.service')
+  const conPapel = modelos.filter(m => m.metadata?.montaje?.clase)
+  const catalogo = catalogoDePapeles()
+  const porClave = new Map(catalogo.map(p => [p.clave, p]))
+  const papeles = {
+    catalogo,
+    modelos: conPapel.map(m => ({
+      asset_id: archivoDe(m.name, ''),
+      archivo: `modelos/${archivoDe(m.name, '.glb')}`,
+      papel: m.metadata.montaje.clase,
+      etiqueta: porClave.get(m.metadata.montaje.clase)?.etiqueta || null,
+      estructural: Boolean(porClave.get(m.metadata.montaje.clase)?.estructural),
+      cadena: m.metadata?.cadena?.nombre || null,
+    })),
+  }
+  const sinPapel = modelos.length - conPapel.length
+  if (sinPapel) {
+    ausentes.push(`papeles: ${sinPapel} of ${modelos.length} models have no structural role marked in Forge`)
+  }
+
+  // Un papel ESTRUCTURAL sobre un modelo que no salió del entorno casi siempre es un error de
+  // marcado: en este proyecto una vista frontal de personaje está marcada como «piso». La lista de
+  // la pantalla los ofrece a todos por igual y un gato no se distingue de una losa en una fila de
+  // texto. No se corrige acá —marcar es una decisión de arte, y adivinar la intención sería peor—,
+  // se señala: quien exporta lo ve antes de mandarlo, y quien lo recibe lo ve en el manifiesto.
+  const sospechosos = papeles.modelos.filter(m => m.estructural && m.cadena && m.cadena !== 'environment_sheet')
+  for (const m of sospechosos) {
+    avisos.push(`${m.asset_id}: marked as “${m.etiqueta}” but it comes from the ${m.cadena.replace(/_/g, ' ')} chain — check the role`)
+  }
 
   const package_id = `${level_id}__${new Date().toISOString().replace(/[:.]/g, '-')}`
   const manifest = {
@@ -426,7 +461,11 @@ async function armarPaquete({ db, project_id, asset_id, nivel = null, member_id 
     meta,
     // Ver el comentario de arriba. Fuera de `contenido` para que se lea como lo que es: un extra
     // declarado, no una pieza del contrato.
-    papeles_declarados: papeles.length ? papeles : { disponible: false, motivo: 'no model has been given its structural role in Forge yet' },
+    papeles_declarados: papeles.modelos.length
+      ? papeles
+      : { disponible: false, motivo: 'no model has been given its structural role in Forge yet', catalogo: papeles.catalogo },
+    // Lo que está y conviene revisar antes de usarlo.
+    avisos,
     // Todo lo que falta, junto y en un solo sitio. El contrato exige declararlo; tenerlo también
     // aquí evita abrir ocho nodos del manifiesto para saber qué le falta al paquete.
     ausencias: ausentes,
@@ -501,6 +540,7 @@ async function armarPaquete({ db, project_id, asset_id, nivel = null, member_id 
     url, package_id, level_id, nivel: elegido, entorno: entornoDelNivel,
     bytes: buffer.length, modelos: inventario.length, imagenes,
     ausencias: manifest.ausencias,
+    avisos,
     asset: pieza || null,
   }
 }
