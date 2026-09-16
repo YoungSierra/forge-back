@@ -66,11 +66,17 @@ const DECKS = {
   marketing_video: { workflow: 'V57_STUDIO_2D_marketing_video', fuente: '3.9', paginas: 1, documento: 'Marketing Video' },
   audio_base:      { workflow: 'V57_STUDIO_2D_audio_base',      fuente: '3.9', paginas: 1, documento: 'Audio Base' },
 
-  // El de UI es de otra familia: sus ocho prompts NO traen formulario del ADI. Cada uno describe
-  // una pantalla —menú, pausa, HUD, derrota— y sus dos hojas sprite, y pide DOS imágenes: la
-  // maqueta de la pantalla, que ya viaja dentro del workflow, y una referencia visual del juego.
-  // Por eso va sin `fuente`, igual que el Art Bible: lo que lo alimenta son imágenes, no texto.
-  uiux: { workflow: 'V57_STUDIO_2D_uiux', fuente: null, paginas: 8, documento: 'UI Screens' },
+  // El deck de UI se rellena desde el spec UX/UI aprobado del 3.7: qué elementos tiene el HUD, qué
+  // menús existen y qué pantallas de fin hay. El estilo NO sale del spec —sale de IMAGE 2 y del
+  // ADI— por eso el bloque de los prompts solo lleva estructura. `asset` acota la búsqueda al
+  // spec consolidado por `output_key` (el `name` del asset es un título legible, no una clave):
+  // 3.7 aprueba cinco assets y sin el filtro gana el primero que devuelva Supabase.
+  // `requerido`: sin el spec no hay deck. Los otros decks componen con huecos declarados y el
+  // modelo pinta lo que puede; acá los huecos son los botones y el HUD enteros, y despacharlos
+  // gasta crédito en ocho páginas vacías. Mejor parar antes con el motivo escrito. El mensaje se
+  // arma desde esta misma entrada (documento, fuente, asset) a propósito: es genérico para que
+  // cualquier deck que declare `requerido` lo herede sin escribir un texto nuevo en el motor.
+  uiux: { workflow: 'V57_STUDIO_2D_uiux', fuente: '3.7', asset: 'ux_ui_spec', requerido: true, paginas: 8, documento: 'UI Screens' },
 }
 
 // ── Mapa etiqueta de página → sección del documento fuente ───────────────────
@@ -212,6 +218,20 @@ const MAPA_GDD = {
   'Non-negotiable':     ['Non-negotiable scope'],
   'Price per platform (one per row)': ['Price point per platform'],
   'IAP catalog (optional)': ['IAP catalog'],
+}
+
+// ── Mapa del deck de UI → secciones del ux_ui_spec (3.7) ─────────────────────
+// Solo estructura: el spec no define estilo, material ni paleta (los delega al Art Direction
+// pass), así que esos campos no existen en el bloque. Cámara y género tampoco viven en el spec;
+// van como instrucción literal, agnóstica del juego, en vez de una segunda fuente en el motor.
+const MAPA_UIUX = {
+  'HUD elements':             ['HUD Element Table', 'HUD Layout'],
+  'HUD per-state behavior':   ['Per-State HUD Layout'],
+  'Legibility commitments':   ['Colorblind and Legibility Commitments'],
+  'Menu items':               ['Full Menu Tree', 'Menu Tree'],
+  'Navigation inventory':     ['Screen Inventory'],
+  'End-of-run states':        ['Full Menu Tree', 'Screen Inventory'],
+  'Camera / perspective':     'Infer the camera perspective (first-person, third-person, top-down, side-on) from IMAGE 2 and from the HUD elements listed above. Never assume a genre-default HUD or viewpoint.',
 }
 
 // Etiquetas que piden una IMAGEN, no un dato: diagramas, mockups, key art, hojas de personaje.
@@ -603,10 +623,26 @@ async function composeDeck({ db, projectId, deck = 'asg', fills = null, solo = n
   if (cfg.fuente) {
     const { data: n } = await db().from('forge_nodes').select('id').eq('node_key', cfg.fuente).single()
     if (!n) throw new Error(`no existe el nodo fuente ${cfg.fuente}`)
-    const { data } = await db().from('forge_assets').select('name,content')
+    let q = db().from('forge_assets').select('name,content')
       .eq('project_id', projectId).eq('node_id', n.id).in('status', ['approved', 'auto_approved'])
+    // Si el deck acota a un asset, se ignora el resto: evita que un asset parcial le gane al
+    // documento consolidado por orden de llegada.
+    if (cfg.asset) q = q.eq('output_key', cfg.asset)
+    const { data } = await q
     assets = data || []
-    if (!assets.length) avisos.push(`node ${cfg.fuente} has no approved assets in this project`)
+    if (!assets.length) {
+      // `publico` + 422: el handler global devuelve el mensaje tal cual en vez de «Internal
+      // server error», y el despacho en segundo plano ya lo escribe en el chat del nodo.
+      if (cfg.requerido) {
+        const que = cfg.asset ? `the "${cfg.asset}" output` : 'the source document'
+        const e = new Error(`Approve ${que} of node ${cfg.fuente} before rendering the ${cfg.documento} deck (no approved ${cfg.asset || 'source'} in this project)`)
+        e.publico = true
+        e.status = 422
+        e.code = 'SOURCE_NOT_APPROVED'
+        throw e
+      }
+      avisos.push(`node ${cfg.fuente} has no approved assets in this project`)
+    }
   }
 
   // Datos que Forge sabe de SÍ MISMO, y que ningún documento tiene por qué darle.
@@ -627,7 +663,8 @@ async function composeDeck({ db, projectId, deck = 'asg', fills = null, solo = n
     return null
   }
 
-  const mapa = deck === 'gdd' ? MAPA_GDD : MAPA_ASG
+  // Un mapa por deck; lo que no declara mapa propio sigue usando el del ASG, como hasta ahora.
+  const mapa = { gdd: MAPA_GDD, uiux: MAPA_UIUX }[deck] || MAPA_ASG
   const mapaFills = parsearFills(fills)
 
   // Control de tamano de los fills: son un limite de la DNA, no una sugerencia. El digest se
