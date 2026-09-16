@@ -71,7 +71,12 @@ const DECKS = {
   // ADI— por eso el bloque de los prompts solo lleva estructura. `asset` acota la búsqueda al
   // spec consolidado por `output_key` (el `name` del asset es un título legible, no una clave):
   // 3.7 aprueba cinco assets y sin el filtro gana el primero que devuelva Supabase.
-  uiux: { workflow: 'V57_STUDIO_2D_uiux', fuente: '3.7', asset: 'ux_ui_spec', paginas: 8, documento: 'UI Screens' },
+  // `requerido`: sin el spec no hay deck. Los otros decks componen con huecos declarados y el
+  // modelo pinta lo que puede; acá los huecos son los botones y el HUD enteros, y despacharlos
+  // gasta crédito en ocho páginas vacías. Mejor parar antes con el motivo escrito. El mensaje se
+  // arma desde esta misma entrada (documento, fuente, asset) a propósito: es genérico para que
+  // cualquier deck que declare `requerido` lo herede sin escribir un texto nuevo en el motor.
+  uiux: { workflow: 'V57_STUDIO_2D_uiux', fuente: '3.7', asset: 'ux_ui_spec', requerido: true, paginas: 8, documento: 'UI Screens' },
 }
 
 // ── Mapa etiqueta de página → sección del documento fuente ───────────────────
@@ -625,7 +630,19 @@ async function composeDeck({ db, projectId, deck = 'asg', fills = null, solo = n
     if (cfg.asset) q = q.eq('output_key', cfg.asset)
     const { data } = await q
     assets = data || []
-    if (!assets.length) avisos.push(`node ${cfg.fuente} has no approved assets in this project`)
+    if (!assets.length) {
+      // `publico` + 422: el handler global devuelve el mensaje tal cual en vez de «Internal
+      // server error», y el despacho en segundo plano ya lo escribe en el chat del nodo.
+      if (cfg.requerido) {
+        const que = cfg.asset ? `the "${cfg.asset}" output` : 'the source document'
+        const e = new Error(`Approve ${que} of node ${cfg.fuente} before rendering the ${cfg.documento} deck (no approved ${cfg.asset || 'source'} in this project)`)
+        e.publico = true
+        e.status = 422
+        e.code = 'SOURCE_NOT_APPROVED'
+        throw e
+      }
+      avisos.push(`node ${cfg.fuente} has no approved assets in this project`)
+    }
   }
 
   // Datos que Forge sabe de SÍ MISMO, y que ningún documento tiene por qué darle.
