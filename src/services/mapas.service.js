@@ -188,13 +188,22 @@ async function generarYPublicar({ db, project_id, origen_asset_id = null, node_i
       },
     }
 
-    for (const [nombre, url, formato, mime] of [
-      [`Mapa — ${parametros.archetype}${sufijo}`, urlPng, 'png', 'image/png'],
-      [`Mapa — ${parametros.archetype}${sufijo} — level_graph`, urlGrafo, 'json', 'application/json'],
-      [`Mapa — ${parametros.archetype}${sufijo} — profile`, urlPerfil, 'json', 'application/json'],
+    // El texto viaja también en la fila, y no solo en almacenamiento: es de donde sale el asomo
+    // que enseña la tarjeta. Sin él las tarjetas del grafo y del perfil salían vacías mientras la
+    // del beats —que sí lo guarda— mostraba su contenido. Con tope: un grafo mide unos 70 KB y
+    // eso cabe, pero uno de un nivel enorme no tiene por qué entrar en una fila.
+    const TOPE_EN_FILA = 256 * 1024
+    const enFila = t => (t && t.length <= TOPE_EN_FILA ? t : null)
+    const textoGrafo  = JSON.stringify(piso.level_graph, null, 2)
+    const textoPerfil = JSON.stringify(piso.profile, null, 2)
+
+    for (const [nombre, url, formato, mime, texto] of [
+      [`Mapa — ${parametros.archetype}${sufijo}`, urlPng, 'png', 'image/png', null],
+      [`Mapa — ${parametros.archetype}${sufijo} — level_graph`, urlGrafo, 'json', 'application/json', enFila(textoGrafo)],
+      [`Mapa — ${parametros.archetype}${sufijo} — profile`, urlPerfil, 'json', 'application/json', enFila(textoPerfil)],
     ]) {
       const { data: a, error } = await db().from('forge_assets')
-        .insert({ ...comun, name: nombre, format: formato, mime_type: mime, storage_url: url })
+        .insert({ ...comun, name: nombre, format: formato, mime_type: mime, storage_url: url, content: texto })
         .select('id, name, storage_url, format').single()
       if (error) throw error
       creados.push(a)
