@@ -51,12 +51,43 @@ async function tddDelProyecto(db, project_id) {
   return doc?.content ? doc : null
 }
 
-/** Si el botón tiene a dónde ir, sin empujar nada. */
+/**
+ * Si el botón tiene a dónde ir, sin empujar nada.
+ *
+ * Y de paso DESPIERTA el laboratorio. Corre en una instancia que se duerme sola: medido el 16-09,
+ * la primera petición tarda **22,5 segundos** y la siguiente 0,28. Si ese arranque empieza cuando
+ * alguien ya pulsó, se lo come esperando; empezándolo al abrir el panel, corre mientras lee.
+ *
+ * Cualquier petición lo despierta —no hace falta abrir su página—, así que se aprovecha la que ya
+ * hace falta para saber si hay un Final construido.
+ */
 async function estadoDelLaboratorio({ db, project_id }) {
   const doc = await tddDelProyecto(db, project_id)
+  const base = BASE()
+
+  // `ready` es del SERVICIO, no del proyecto: el laboratorio guarda un solo taller para todos.
+  // Sin preguntarlo, Publish se ofrecía siempre y el error llegaba del otro lado.
+  let jugable = null
+  if (base) {
+    const t0 = Date.now()
+    try {
+      const r = await fetch(`${base}/api/gameplay/status`, { signal: AbortSignal.timeout(90000) })
+      if (r.ok) jugable = await r.json()
+    } catch (e) {
+      // Que no conteste no es un fallo del proyecto: es el servicio arrancando o caído, y el
+      // panel lo dice en vez de prometer un botón que va a fallar.
+      jugable = { ready: false, motivo: e.name === 'TimeoutError' ? 'still waking up' : e.message }
+    }
+    console.log(`[lab] estado en ${Math.round((Date.now() - t0) / 1000)}s · ready: ${jugable?.ready}`)
+  }
+
   return {
-    configurado: Boolean(BASE()),
+    configurado: Boolean(base),
     tiene_tdd: Boolean(doc),
+    // Si hay build final en el laboratorio. Es lo que decide si Publish se puede ofrecer.
+    jugable_listo: Boolean(jugable?.ready),
+    lab_responde: jugable !== null && !jugable?.motivo,
+    ...(jugable?.motivo ? { lab_motivo: jugable.motivo } : {}),
     ...(doc ? { documento: doc.name, chars: doc.content.length } : {}),
   }
 }
@@ -79,6 +110,26 @@ async function abrirLaboratorio({ db, project_id, nombreProyecto }) {
 
   const slug = slugDe(nombreProyecto || project_id)
   const texto = `project_name: ${nombreProyecto || slug}\n\n${doc.content}`
+
+  // El taller del laboratorio es UNO para todo el servicio: el jugable vive siempre en
+  // `public/gameplay`. Abrir dos proyectos seguidos hacía que el segundo viera el prototipo del
+  // primero — lo reportó Miguel. Antes de empujar nada se le pide al laboratorio que aparte el
+  // taller que estaba y traiga el de este proyecto. Si esa versión del laboratorio todavía no lo
+  // soporta, se sigue como antes en vez de no abrir.
+  try {
+    const w = await fetch(`${base}/api/workspace/activate`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ slug }),
+    })
+    if (w.ok) {
+      const est = await w.json()
+      console.log(`[lab] taller «${slug}»${est.changed ? ` (antes: ${est.previous || 'ninguno'})` : ' ya puesto'} · build: ${est.ready}`)
+    } else {
+      console.warn(`[lab] este laboratorio no aísla por proyecto todavía (HTTP ${w.status})`)
+    }
+  } catch (e) {
+    console.warn('[lab] no se pudo cambiar de taller:', e.message)
+  }
 
   const r = await fetch(`${base}/api/tdds/push`, {
     method: 'POST',

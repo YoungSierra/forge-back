@@ -13,6 +13,7 @@
 const { submitWorkflow, pollUntilDone, downloadOutputsByNode, uploadImageToComfyUI } = require('./providers/comfyui.provider')
 const { getWorkflowByName } = require('./config.service')
 const { logExecution } = require('./execution-log.service')
+const progreso = require('./progreso.service')
 
 // `origen` = el activo sobre el que se apretó Run. `<paso>:<rol>` = una salida del paso anterior.
 // La cadena es la de PRODUCCIÓN, y `Moodboard Iteration` NO está en ella.
@@ -268,6 +269,16 @@ function proximoPaso(asset) {
     // para contar cuántos despachos son: apretar Run sobre una parte del escenario dispara las
     // veinte, y eso no puede quedar detrás de un botón que no lo dice.
     por_cada_salida_de: p.porCadaSalidaDe ?? null,
+
+    // La cadena entera, para poder DIBUJARLA antes de correr (informe v6 #7, opción a de Miguel).
+    // Solo los pasos de producción y con sus nombres llanos —«Concept art → 3D production»—; las
+    // herramientas de edición no entran acá porque no son pasos de la cadena, son otra cosa que se
+    // hace sobre una pieza ya hecha, y mezclarlas era justo lo que confundía.
+    pasos: def.pasos.map((q, j) => ({
+      clave: q.clave,
+      etiqueta: q.etiqueta,
+      estado: j < i ? 'hecho' : j === i ? 'siguiente' : 'despues',
+    })),
   }
 }
 
@@ -418,7 +429,18 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
     const acumulado = {}
     const nuevos = []
 
-    for (const cada of instancias) {
+    // Lo que está pasando sale AFUERA mientras pasa (informe v6, punto 4): esta llamada puede
+    // tardar minutos —veinte despachos a ComfyUI, uno detrás de otro— y desde el navegador era
+    // un botón girando. Ver progreso.service.js.
+    progreso.iniciar({
+      project_id, asset_id: origen.id, cadena: nombreCadena,
+      paso: paso.clave, etiqueta: paso.etiqueta, de: instancias.length,
+    })
+
+    for (const [nDespacho, cada] of instancias.entries()) {
+      progreso.marcar(project_id, origen.id, {
+        hecho: nDespacho, estado: 'preparando', que: cada || null,
+      })
       // Resolver las imágenes de entrada y subirlas a ComfyUI: el proveedor no acepta URLs ajenas.
       const extras = {}
       for (const [campo, ref] of Object.entries(paso.entradas)) {
@@ -528,7 +550,9 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
         for (const pg of r.paginas) porRol[pg.name] = { url: pg.url, kind: pg.kind || 'image' }
       } else {
         jobId = await submitWorkflow(paso.workflow, promptDelDespacho, 1024, 1024, extras, opciones)
+        progreso.marcar(project_id, origen.id, { estado: 'generando' })
         await pollUntilDone(jobId, 300_000)   // Tripo y gpt-image-2 tardan bastante más que un render local
+        progreso.marcar(project_id, origen.id, { estado: 'publicando' })
         const base = `projects/${project_id}/chain/${nombreCadena}/${paso.clave}/${cada ? cada + '-' : ''}${jobId.slice(0, 8)}`
         const salidas = await downloadOutputsByNode(jobId, base)
 

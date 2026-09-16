@@ -5472,10 +5472,28 @@ router.post('/assets/:asset_id/design-edit', async (req, res, next) => {
     }
     await db().from('forge_assets').update(parche).eq('id', asset_id)
 
+    // La cascada también acá. Solo disparaba al aprobar una versión, y Miguel reportó que
+    // «actualizar» la Environment Sheet no marcaba nada: un Design Edit reemplaza la página EN SU
+    // SITIO —eso es actualizarla— y lo que depende de ella queda igual de desactualizado.
+    //
+    // Nada se regenera: se marca [R]/[V] y decide una persona, como en el otro camino.
+    let cascada = null
+    try {
+      const { propagarDesdePagina, revalidar } = require('../services/actualizacion.service')
+      await revalidar({ db, project_id, asset_id, member_id }).catch(() => {})
+      cascada = await propagarDesdePagina({
+        db, project_id, asset_id, member_id,
+        motivo: `design edit: ${String(pedido).slice(0, 80)}`,
+      })
+    } catch (e) {
+      console.warn('[actualizacion] la cascada falló tras el design edit (no fatal):', e.message)
+    }
+
     res.json({
       success: true,
       version: { id: ver.id, version_number: ver.version_number, storage_url: salida.url },
       job: jobId,
+      cascada,
     })
   } catch (err) { next(err) }
 })
@@ -5560,14 +5578,38 @@ router.post('/assets/:asset_id/advance', async (req, res, next) => {
     const opciones  = req.body?.opciones && typeof req.body.opciones === 'object' ? req.body.opciones : null
 
     const { avanzar } = require('../services/chain.service')
-    const r = await avanzar({ db, project_id, asset_id, pasos, prompt, member_id, limitePorCada: limite, opciones, clips })
-    res.json({ success: true, ...r })
+    const progreso = require('../services/progreso.service')
+    try {
+      const r = await avanzar({ db, project_id, asset_id, pasos, prompt, member_id, limitePorCada: limite, opciones, clips })
+      res.json({ success: true, ...r })
+    } finally {
+      // Pase lo que pase deja de figurar como corriendo. El servicio caduca solo a los diez
+      // minutos, pero eso es la red de seguridad, no el camino normal: una corrida que falló a
+      // los veinte segundos no puede dejar la barra puesta durante diez minutos.
+      progreso.terminar(project_id, asset_id)
+    }
   } catch (err) {
     // «Esta página todavía no tiene cadena» no es una falla del servidor: es el estado real de
     // casi todas hasta que el equipo defina sus workflows.
     if (err.code === 'SIN_CADENA') return res.status(400).json({ success: false, error: err.message, code: err.code })
     next(err)
   }
+})
+
+// ─── En qué va lo que está corriendo ────────────────────────────────────────
+//
+// Informe v6, punto 4. Correr un paso es una sola petición que puede tardar minutos, y desde el
+// navegador eso era un botón girando: cerrar la ventana o recargar la página dejaba la corrida
+// viva y sin rastro. Acá se pregunta, cuantas veces haga falta, y no cuesta nada: son datos en
+// memoria del propio proceso, sin base de datos de por medio.
+//
+// Va por PROYECTO y no por pieza a propósito: la barra tiene que aparecer aunque quien recargó
+// no esté mirando la hoja que disparó la corrida.
+router.get('/progreso', async (req, res, next) => {
+  try {
+    const progreso = require('../services/progreso.service')
+    res.json({ success: true, corridas: progreso.delProyecto(req.params.id) })
+  } catch (err) { next(err) }
 })
 
 // ─── Maps_App: generar el mapa de un nivel ──────────────────────────────────
@@ -5730,15 +5772,18 @@ router.get('/assets/:asset_id/tools', async (req, res, next) => {
     if (!asset) return res.status(404).json({ success: false, error: 'Asset not found' })
 
     const { herramientasDe } = require('../services/herramienta.service')
-    const { getWorkflowByName } = require('../services/config.service')
+    const { getWorkflowLite } = require('../services/config.service')
 
     // Los controles viajan con la herramienta: el ángulo y el zoom con sus rangos y sus presets
     // salen del registro del workflow, que es donde se validaron contra lo que declara el nodo.
-    const lista = []
-    for (const h of herramientasDe(asset)) {
-      const entry = await getWorkflowByName(h.workflow)
-      lista.push({ ...h, disponible: !!entry, controles: entry?.inject_config?.controles || null })
-    }
+    //
+    // Se pide el registro SIN el grafo y las dos herramientas a la vez. Esta ruta corre cada vez
+    // que alguien abre el menú radial: antes leía los 28 workflows enteros —752 KB— uno detrás de
+    // otro, y el menú se dibujaba antes de tener la respuesta.
+    const lista = await Promise.all(herramientasDe(asset).map(async h => {
+      const entry = await getWorkflowLite(h.workflow)
+      return { ...h, disponible: !!entry, controles: entry?.inject_config?.controles || null }
+    }))
     res.json({ success: true, herramientas: lista })
   } catch (err) { next(err) }
 })

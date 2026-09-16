@@ -35,12 +35,20 @@ async function planDeInstancias({ db, project_id, deck = 'asg' }) {
   // —«18_CharacterSheet» → 18— funciona hoy y deja de funcionar en cuanto el maestro se
   // reordene, que ya pasó dos veces este año.
   const armado = await composeDeck({ db, projectId: project_id, deck })
+  // Por NOMBRE y no por número. El manifiesto y el lector del alcance hablan del maestro de 25
+  // páginas —«19_EnvironmentSheet»— y un proyecto puede correr otro, donde la misma hoja es la
+  // 29. Es la trampa que ya rompió la cascada de actualización: el número cambia, el nombre no.
+  const sinNumero = n => String(n || '').replace(/^d+[_s-]*/, '').toLowerCase().replace(/[^a-z0-9]+/g, '')
   const porNombre = new Map(armado.paginas.map(p => [p.nombre, p]))
+  for (const p of armado.paginas) {
+    const k = sinNumero(p.nombre)
+    if (k && !porNombre.has(k)) porNombre.set(k, p)
+  }
 
   const paginas = []
   const ausentes = []
   for (const [hoja, items] of Object.entries(alcance.porHoja || {})) {
-    const pag = porNombre.get(hoja)
+    const pag = porNombre.get(hoja) ?? porNombre.get(sinNumero(hoja))
     if (!pag) { ausentes.push(hoja); continue }
     paginas.push({
       pagina: hoja, indice: pag.indice, kind: pag.kind || 'image',
@@ -59,6 +67,9 @@ async function planDeInstancias({ db, project_id, deck = 'asg' }) {
     sin_clasificar: alcance.sinClasificar || [],
     no_son_laminas: alcance.noSonLaminas || [],
     avisos: alcance.avisos || [],
+    // De dónde salió la cuenta: el manifiesto del 3.20 o la prosa del VS Spec. Un número que se
+    // paga tiene que decir quién lo dijo.
+    fuente: alcance.fuente || null,
   }
 }
 

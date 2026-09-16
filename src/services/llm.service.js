@@ -43,6 +43,62 @@ async function callLLM(systemPrompt, userMessage, options = {}) {
   )
 
   let result
+  try {
+    result = await despachar(provider, systemPrompt, userMessage, callOptions)
+  } catch (err) {
+    throw clasificar(err, provider, model)
+  }
+
+  if (result?.data) result.data = stripThinkBlocks(result.data)
+  return result
+}
+
+/**
+ * De un error del proveedor a uno que se puede enseñar.
+ *
+ * El manejador de errores deja pasar el mensaje tal cual cuando el error viene marcado
+ * `publico`; sin esa marca, todo se convierte en «Internal server error». Eso es lo que vio
+ * Migue el 16-09: el proveedor rechazó la llamada por saldo y la pantalla dijo que había
+ * fallado el servidor, que manda a buscar el problema donde no está.
+ *
+ * Se clasifica acá y no en cada proveedor porque el agujero es de todos: hoy MiniMax, mañana
+ * el que toque. Lo que no se reconoce se deja opaco a propósito — un stack inesperado no es un
+ * mensaje para nadie.
+ */
+function clasificar(err, provider, model) {
+  if (err?.code === 'ABORTED') return err
+
+  const status = err.status || err.statusCode
+  const texto = `${err.message || ''} ${JSON.stringify(err.error || err.body || '')}`.toLowerCase()
+
+  // MiniMax manda «insufficient balance» con el código 1008 dentro del cuerpo, no como estado.
+  const sinSaldo = status === 402
+    || /insufficient (balance|credit|funds|quota)/.test(texto)
+    || /\b1008\b/.test(texto)
+    || /arrears|out of credit|billing/.test(texto)
+
+  if (sinSaldo) {
+    return Object.assign(new Error(
+      `${provider} rejected the call for lack of balance. Nothing was generated and nothing was charged — top up that provider account and run it again.`),
+      { publico: true, status: 402, code: 'SIN_SALDO_PROVEEDOR', provider })
+  }
+  if (status === 429 || err.code === 'RATE_LIMIT') {
+    return Object.assign(new Error(`${provider} is rate limiting: too many calls in a row. Wait a moment and run it again.`),
+      { publico: true, status: 429, code: 'RATE_LIMIT', provider, retry_after_ms: err.retry_after_ms })
+  }
+  if (status === 401 || err.code === 'INVALID_KEY') {
+    return Object.assign(new Error(`The ${provider} key is not valid on this server. That is configuration, not your run.`),
+      { publico: true, status: 401, code: 'CLAVE_INVALIDA', provider })
+  }
+  if (status === 503 || err.code === 'MODEL_UNAVAILABLE') {
+    return Object.assign(new Error(`${provider} has "${model}" unavailable right now. Nothing was charged.`),
+      { publico: true, status: 503, code: 'MODELO_NO_DISPONIBLE', provider })
+  }
+  return err
+}
+
+async function despachar(provider, systemPrompt, userMessage, callOptions) {
+  let result
   switch (provider) {
     case 'groq':       result = await callGroq(systemPrompt, userMessage, callOptions); break
     case 'together':   result = await callTogether(systemPrompt, userMessage, callOptions); break
@@ -55,8 +111,7 @@ async function callLLM(systemPrompt, userMessage, options = {}) {
     default:           result = await callGemini(systemPrompt, userMessage, callOptions); break
   }
 
-  if (result?.data) result.data = stripThinkBlocks(result.data)
   return result
 }
 
-module.exports = { callLLM, parseModelString }
+module.exports = { callLLM, parseModelString, clasificar }

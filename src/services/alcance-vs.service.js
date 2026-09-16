@@ -144,22 +144,71 @@ function itemsDesdeSpec(md) {
   return { porHoja, sinClasificar, noSonLaminas, avisos }
 }
 
-/** Lo mismo, leyendo el Vertical Slice Specification aprobado del proyecto. */
+// El 3.13 emite TRES salidas y el spec puede estar bajo cualquiera de ellas: `vs_spec_doc` es el
+// ensamblado, `vs_spec` el que escribe el nodo. Mirar solo una dejaba invisible un documento
+// APROBADO que estaba al lado — medido el 16-09 en 13_lives_kitten_TEST, donde `vs_spec` está
+// aprobado y `vs_spec_doc` sigue en `active`. Se prefiere el ensamblado y se cae al otro.
+const CLAVES_DEL_SPEC = ['vs_spec_doc', 'vs_spec']
+
+/** Lo mismo, leyendo el Vertical Slice Specification aprobado del proyecto.
+ *
+ *  Antes se pregunta por el MANIFIESTO del 3.20, que es la fuente correcta desde la v2.9.35:
+ *  un mapa declarado, con ids estables, en vez de tablas dentro de un documento en prosa. Su
+ *  propia nota lo dice — «prose the Moodboard cannot count from».
+ *
+ *  El spec sigue de respaldo y no es temporal: un proyecto que no haya vuelto a correr el 3.20
+ *  no puede quedarse sin poder instanciar. `fuente` dice de dónde salió la cuenta, porque al
+ *  mirar un número que se paga hay que poder saber quién lo dijo. */
 async function itemsDelAlcance({ db, project_id }) {
-  const { data: ses } = await db().from('forge_sessions').select('id')
-    .eq('project_id', project_id).eq('output_key', 'vs_spec_doc')
-    .in('status', ['approved', 'auto_approved'])
-  if (!(ses || []).length) {
-    return { hay: false, motivo: 'This project has no approved Vertical Slice Specification yet', porHoja: {}, sinClasificar: [], avisos: [] }
+  const { itemsDelManifiesto } = require('./manifiesto-hojas.service')
+  const manifiesto = await itemsDelManifiesto({ db, project_id })
+  if (manifiesto.hay) return { ...manifiesto, fuente: 'manifest' }
+
+  // Que el manifiesto exista PERO no sirva no se calla: si alguien lo produjo y no se está
+  // usando, hay que poder verlo sin abrir la base.
+  const avisoManifiesto = /has no sheet instance manifest/.test(manifiesto.motivo || '')
+    ? []
+    : [`sheet instance manifest not used — ${manifiesto.motivo}`]
+
+  const { data: ses } = await db().from('forge_sessions').select('id, output_key, status')
+    .eq('project_id', project_id).in('output_key', CLAVES_DEL_SPEC)
+
+  const aprobadas = (ses || []).filter(x => x.status === 'approved' || x.status === 'auto_approved')
+  if (!aprobadas.length) {
+    // Que exista sin aprobar y que no exista son dos problemas distintos y se arreglan de
+    // formas distintas. Decir lo mismo en los dos casos mandaba a correr un nodo que ya corrió.
+    const motivo = (ses || []).length
+      ? 'The Vertical Slice Specification exists but is not approved yet: approve the output of node 3.13'
+      : 'This project has no Vertical Slice Specification yet: run node 3.13'
+    return { hay: false, motivo, porHoja: {}, sinClasificar: [], avisos: avisoManifiesto }
   }
-  const { data: docs } = await db().from('forge_assets').select('content')
-    .in('session_id', ses.map(s => s.id)).not('content', 'is', null)
-    .order('created_at', { ascending: false }).limit(1)
-  const md = docs?.[0]?.content
-  if (!md) return { hay: false, motivo: 'The Vertical Slice Specification has no text', porHoja: {}, sinClasificar: [], avisos: [] }
+
+  // En el orden de preferencia, no en el que devuelva la base.
+  const orden = CLAVES_DEL_SPEC
+    .flatMap(k => aprobadas.filter(x => x.output_key === k))
+  const { data: docs } = await db().from('forge_assets').select('content, session_id, created_at')
+    .in('session_id', orden.map(x => x.id)).not('content', 'is', null)
+    .order('created_at', { ascending: false })
+  const porSesion = new Map((docs || []).map(d => [d.session_id, d]))
+  const elegido = orden.map(x => porSesion.get(x.id)).find(Boolean)
+  const md = elegido?.content
+  if (!md) return { hay: false, motivo: 'The approved Vertical Slice Specification has no text', porHoja: {}, sinClasificar: [], avisos: avisoManifiesto }
 
   const r = itemsDesdeSpec(md)
-  return { hay: true, ...r }
+
+  // Un spec viejo se lee entero y no da NADA: los de antes de v2.9.2 no traen el inventario
+  // §A7.1 del que salen las cuentas. Sin decirlo, el panel enseña cero instancias y parece que
+  // el alcance está vacío, cuando lo que pasa es que el documento es de otra generación.
+  const total = Object.values(r.porHoja || {}).reduce((n, l) => n + l.length, 0)
+  if (!total) {
+    return {
+      hay: false,
+      motivo: 'The approved Vertical Slice Specification is from an older version of node 3.13: '
+            + 'it has no §A7.1 inventory, so there is nothing to count. Re-run node 3.13.',
+      porHoja: {}, sinClasificar: r.sinClasificar || [], avisos: [...avisoManifiesto, ...(r.avisos || [])],
+    }
+  }
+  return { hay: true, ...r, fuente: 'vs_spec', avisos: [...avisoManifiesto, ...(r.avisos || [])] }
 }
 
 module.exports = { itemsDelAlcance, itemsDesdeSpec, A_LA_HOJA, seccion, filasDeTabla }

@@ -1,6 +1,31 @@
 const express = require('express')
 const router = express.Router()
 const { db } = require('../services/supabase.service')
+const { miniaturaDe } = require('../services/miniatura.service')
+
+// GET /api/assets/thumb?url=&w=600
+//
+// La lámina reducida al tamaño de una tarjeta. Va ANTES de las rutas con `/:id` porque si no,
+// `thumb` entraría como un identificador.
+//
+// Contesta con un redirect y no con los bytes: el que pinta es R2, esto solo dice cuál es el
+// archivo. Así el back no queda sirviendo imágenes —una instancia gratis no aguanta veinte
+// tarjetas a la vez— y el navegador se queda con la dirección final cacheada.
+//
+// Sin token a propósito: `<img>` no manda cabeceras. No expone nada que el listado del proyecto
+// no exponga ya, y solo acepta direcciones de nuestro propio bucket público.
+router.get('/thumb', async (req, res) => {
+  const url = String(req.query.url || '')
+  try {
+    const destino = await miniaturaDe(url, req.query.w)
+    res.set('Cache-Control', 'public, max-age=86400')
+    return res.redirect(302, destino)
+  } catch (e) {
+    if (e.code === 'AJENA') return res.status(400).json({ success: false, error: e.message })
+    // Cualquier otro fallo se resuelve enseñando el original: el marco nunca se queda vacío.
+    return res.redirect(302, url)
+  }
+})
 
 // GET /api/assets?project_id=&step_key=
 router.get('/', async (req, res, next) => {

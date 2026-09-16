@@ -1,8 +1,8 @@
 // ─── Sistema de actualización conectada ──────────────────────────────────────
 //
-// Un archivo gráfico no es una isla: al ajustar una página, las que dependen de ella quedan
-// desactualizadas y el juego pierde coherencia visual —se cambia la paleta y los personajes
-// siguen llevando los colores viejos.
+// Un archivo gráfico no es una isla. Al ajustar una página, las que dependen de ella quedan
+// desactualizadas y el juego pierde coherencia visual —se cambia la paleta y los personajes siguen
+// llevando los colores viejos.
 //
 // **Nada se auto-regenera.** Es la política de la §2.1 del documento de Miguel y no un detalle de
 // implementación: generar cuesta y NO es reproducible —el mismo prompt da otra imagen y no hay
@@ -12,95 +12,129 @@
 //   [R] regenerar — el contenido depende del cambio; hay que volver a generar (pago, irreversible).
 //   [V] revalidar — probablemente sigue valiendo; una persona lo mira y confirma. No cuesta nada.
 //
-// La matriz de abajo es la §2 del documento, fila por fila. No se deduce de los nombres ni de una
-// heurística de parecido: es una relación declarada por dirección de arte, y cada arista lleva su
-// acción. Lo que no está en la matriz no se marca.
+// ── Por NOMBRE, no por número ────────────────────────────────────────────────
 //
-// Identidad de página: el DOCUMENTO más el número. Nunca el número solo — el 3.20 emite tres decks
-// y sus páginas colisionan en `NN_`, que es exactamente lo que hizo que el Art Bible citara
-// páginas del GDD. Acá la cascada es del Art Style Guide y solo de él.
+// La primera versión indexaba la matriz por el número de página: `19` era Environment Sheet. Los
+// dos proyectos vivos corren el maestro de 34 páginas, donde esa misma hoja es la 29 — así que la
+// cascada no reconocía ni una de sus hojas y no hacía nada, en silencio. Es el punto 3 del informe
+// v6, y Miguel pidió resolverlo por nombre.
+//
+// Y no es solo renumerar: el maestro de 25 FUSIONÓ páginas. `14_VisualHierarchy` y
+// `15_CameraReadability` son hoy `11_Readability`; `16_AnimationStyle` es `12_AnimationLanguage`.
+// Por eso cada página lleva sus alias, y dos nombres viejos pueden apuntar a la misma fila.
 
 const DOCUMENTO = 'Art Style Guide'
 
-// Las hojas de instancia: no propagan hacia adelante dentro de la guía, pero lo que salió de ellas
-// —las tres vistas, el modelo 3D, el teaser— queda para revalidar, y además revalidan la 17, que
-// es su espejo.
-const HOJAS = ['18', '19', '20', '21', '22', '23', '24', '25']
+/** Para comparar nombres de página: sin número, sin puntuación, sin mayúsculas. */
+const norm = s => String(s || '').replace(/^\d+[_\s-]*/, '').toLowerCase().replace(/[^a-z0-9]+/g, '')
 
+// Cada página con el número que tiene en el maestro de 25 —solo para poder nombrarla— y los
+// nombres con los que aparece en los maestros que hay en producción.
+const PAGINAS = {
+  key_art:              { n: '01', alias: ['KeyArt'] },
+  visual_dna:           { n: '02', alias: ['VisualDNA'] },
+  visual_pillars:       { n: '03', alias: ['VisualPillars'] },
+  shape_language:       { n: '04', alias: ['ShapeLanguage'] },
+  character_design:     { n: '05', alias: ['CharacterDesign', 'CharacterDesignLanguage', 'CostumeLanguage'] },
+  environment_language: { n: '06', alias: ['EnvironmentLanguage'] },
+  prop_language:        { n: '07', alias: ['PropLanguage'] },
+  color_system:         { n: '08', alias: ['ColorSystem'] },
+  lighting:             { n: '09', alias: ['LightingLanguage', 'Lighting'] },
+  texture_style:        { n: '10', alias: ['TextureStyle', 'Material'] },
+  // Fusión del maestro de 25: dos páginas del de 34 caen acá.
+  readability:          { n: '11', alias: ['Readability', 'VisualHierarchy', 'CameraReadability', 'DetailDensity'] },
+  animation_language:   { n: '12', alias: ['AnimationLanguage', 'AnimationStyle'] },
+  vfx_language:         { n: '13', alias: ['VFXLanguage'] },
+  audio_language:       { n: '14', alias: ['AudioLanguage'] },
+  video_marketing:      { n: '15', alias: ['VideoMarketing'] },
+  ui_language:          { n: '16', alias: ['UILanguage', 'UIStyle', 'Iconography'] },
+  asset_sheets:         { n: '17', alias: ['AssetSheets'] },
+  character_sheet:      { n: '18', alias: ['CharacterSheet'] },
+  environment_sheet:    { n: '19', alias: ['EnvironmentSheet'] },
+  prop_sheet:           { n: '20', alias: ['PropSheet'] },
+  ui_component_sheet:   { n: '21', alias: ['UIComponentSheet'] },
+  vfx_sheet:            { n: '22', alias: ['VFXSheet'] },
+  audio_sheet:          { n: '23', alias: ['AudioSheet'] },
+  animation_sheet:      { n: '24', alias: ['AnimationSheet'] },
+  video_marketing_sheet:{ n: '25', alias: ['VideoMarketingSheet'] },
+}
+
+// nombre normalizado → clave de página. Se arma una vez.
+const POR_ALIAS = {}
+for (const [clave, def] of Object.entries(PAGINAS)) {
+  for (const a of def.alias) POR_ALIAS[norm(a)] = clave
+}
+
+/** Las hojas de instancia: terminales dentro de la guía, pero revalidan lo que produjeron. */
+const HOJAS = ['character_sheet', 'environment_sheet', 'prop_sheet', 'ui_component_sheet',
+               'vfx_sheet', 'audio_sheet', 'animation_sheet', 'video_marketing_sheet']
+
+const R = p => ({ pagina: p, accion: 'R' })
+const V = p => ({ pagina: p, accion: 'V' })
+const LENGUAJE = ['shape_language', 'character_design', 'environment_language', 'prop_language',
+                  'lighting', 'texture_style', 'readability', 'animation_language',
+                  'vfx_language', 'video_marketing', 'ui_language']
+const SHEETS_R = ['character_sheet', 'environment_sheet', 'prop_sheet', 'ui_component_sheet',
+                  'vfx_sheet', 'animation_sheet', 'video_marketing_sheet']
+
+// La §2 del documento, fila por fila. Lo que no está acá no se marca.
 const MATRIZ = {
-  // 01 solo propaga en una redefinición de identidad, que es una decisión humana y no un efecto
-  // de haber tocado la portada. Se declara para poder decirlo, no para dispararlo.
-  '01': { rol: 'Gobernanza / estática', terminal: true, condicional: [
-    { pagina: '02', accion: 'V' }, { pagina: '03', accion: 'V' },
-  ] },
+  key_art: { rol: 'Gobernanza / estática', terminal: true,
+    condicional: [V('visual_dna'), V('visual_pillars')] },
 
-  '02': { rol: 'Fundacional', destinos: [
-    { pagina: '01', accion: 'R' },
-    ...['04', '05', '06', '07', '09', '10', '11', '12', '13', '15', '16'].map(p => ({ pagina: p, accion: 'R' })),
-    ...['18', '19', '20', '21', '22', '24', '25'].map(p => ({ pagina: p, accion: 'R' })),
-  ] },
-  '03': { rol: 'Fundacional', destinos: [
-    { pagina: '01', accion: 'R' },
-    ...['04', '05', '06', '07', '09', '10', '11', '12', '13', '15', '16'].map(p => ({ pagina: p, accion: 'R' })),
-    ...['18', '19', '20', '21', '22', '24', '25'].map(p => ({ pagina: p, accion: 'R' })),
-  ] },
+  visual_dna:     { rol: 'Fundacional', destinos: [R('key_art'), ...LENGUAJE.map(R), ...SHEETS_R.map(R)] },
+  visual_pillars: { rol: 'Fundacional', destinos: [R('key_art'), ...LENGUAJE.map(R), ...SHEETS_R.map(R)] },
 
-  '04': { rol: 'Lenguaje', destinos: [
-    { pagina: '05', accion: 'R' }, { pagina: '07', accion: 'R' },
-    { pagina: '18', accion: 'R' }, { pagina: '20', accion: 'R' },
-  ] },
-  '05': { rol: 'Lenguaje', destinos: [{ pagina: '18', accion: 'R' }, { pagina: '12', accion: 'V' }] },
-  '06': { rol: 'Lenguaje', destinos: [
-    { pagina: '19', accion: 'R' }, { pagina: '09', accion: 'V' }, { pagina: '11', accion: 'V' },
-  ] },
-  '07': { rol: 'Lenguaje', destinos: [{ pagina: '20', accion: 'R' }] },
+  shape_language:       { rol: 'Lenguaje', destinos: [R('character_design'), R('prop_language'), R('character_sheet'), R('prop_sheet')] },
+  character_design:     { rol: 'Lenguaje', destinos: [R('character_sheet'), V('animation_language')] },
+  environment_language: { rol: 'Lenguaje', destinos: [R('environment_sheet'), V('lighting'), V('readability')] },
+  prop_language:        { rol: 'Lenguaje', destinos: [R('prop_sheet')] },
 
-  '08': { rol: 'Fundacional', destinos: [
-    ...['18', '19', '20', '21', '22', '24', '25'].map(p => ({ pagina: p, accion: 'R' })),
-    { pagina: '13', accion: 'V' }, { pagina: '16', accion: 'V' },
-  ] },
+  color_system: { rol: 'Fundacional', destinos: [...SHEETS_R.map(R), V('vfx_language'), V('ui_language')] },
 
-  '09': { rol: 'Lenguaje', destinos: [{ pagina: '19', accion: 'R' }, { pagina: '08', accion: 'V' }] },
-  // Condicional 2D en el documento: se marca igual, porque marcar no cuesta y la persona decide.
-  '10': { rol: 'Lenguaje', destinos: [{ pagina: '20', accion: 'R' }] },
-  '11': { rol: 'Lenguaje', destinos: [
-    { pagina: '19', accion: 'R' },
-    ...['18', '20', '21', '22', '24', '25'].map(p => ({ pagina: p, accion: 'V' })),
-  ] },
-  '12': { rol: 'Lenguaje', destinos: [{ pagina: '24', accion: 'R' }, { pagina: '18', accion: 'V' }],
-    fuera: ['ADI §11.6 Framework [V]'] },
-  '13': { rol: 'Lenguaje', destinos: [{ pagina: '22', accion: 'R' }, { pagina: '08', accion: 'V' }] },
-  '14': { rol: 'Lenguaje (audio)', destinos: [{ pagina: '23', accion: 'R' }], fuera: ['TDD §10 Audio'] },
-  '15': { rol: 'Lenguaje', destinos: [{ pagina: '25', accion: 'R' }, { pagina: '02', accion: 'V' }] },
-  '16': { rol: 'Lenguaje', destinos: [{ pagina: '21', accion: 'R' }, { pagina: '08', accion: 'V' }] },
+  lighting:           { rol: 'Lenguaje', destinos: [R('environment_sheet'), V('color_system')] },
+  texture_style:      { rol: 'Lenguaje', destinos: [R('prop_sheet')] },
+  readability:        { rol: 'Lenguaje', destinos: [R('environment_sheet'), ...SHEETS_R.filter(p => p !== 'environment_sheet').map(V)] },
+  animation_language: { rol: 'Lenguaje', destinos: [R('animation_sheet'), V('character_sheet')], fuera: ['ADI §11.6 Framework [V]'] },
+  vfx_language:       { rol: 'Lenguaje', destinos: [R('vfx_sheet'), V('color_system')] },
+  audio_language:     { rol: 'Lenguaje (audio)', destinos: [R('audio_sheet')], fuera: ['TDD §10 Audio'] },
+  video_marketing:    { rol: 'Lenguaje', destinos: [R('video_marketing_sheet'), V('visual_dna')] },
+  ui_language:        { rol: 'Lenguaje', destinos: [R('ui_component_sheet'), V('color_system')] },
 
-  // La 17 espeja las ocho hojas: no propaga, se revalida cuando cambia cualquiera de ellas.
-  '17': { rol: 'Divisoria', terminal: true, destinos: [] },
+  asset_sheets: { rol: 'Divisoria', terminal: true, destinos: [] },
 
-  // Las ocho hojas. Terminales dentro de la guía; lo que produjeron queda para revalidar.
   ...Object.fromEntries(HOJAS.map(p => [p, {
     rol: 'Instancia (hoja)', terminal: true,
-    destinos: [{ pagina: '17', accion: 'V' }],
+    destinos: [V('asset_sheets')],
     derivados: 'V',
   }])),
 }
 
-/** El número de página dentro de SU documento, o null si la pieza no es una página del ASG. */
+/**
+ * Qué página del ASG es esta pieza, por su nombre. `null` si no lo es.
+ *
+ * Identidad = DOCUMENTO + nombre. El documento importa: el 3.20 emite tres decks y sus páginas
+ * colisionan en el número —es lo que hizo que el Art Bible citara páginas del GDD—, y el nombre
+ * importa porque el número cambia entre maestros.
+ */
 function paginaDe(asset) {
   const n = String(asset?.name || '')
-  const m = /^\s*(.+?)\s*[—–-]\s*(\d{2})_/.exec(n)
+  const m = /^\s*(.+?)\s*[—–-]\s*(.+?)\s*(?:[—–-]|$)/.exec(n)
   if (!m) return null
   if (m[1].trim().toLowerCase() !== DOCUMENTO.toLowerCase()) return null
-  return m[2]
+  return POR_ALIAS[norm(m[2])] || null
 }
+
+/** El número y el nombre con que se enseña una página. */
+const etiquetaDe = clave => (PAGINAS[clave] ? `${PAGINAS[clave].n} ${PAGINAS[clave].alias[0]}` : clave)
 
 /** Qué dispara tocar esta página, sin tocar nada: es lo que el aviso previo necesita decir. */
 function loQueDispara(pagina) {
   const fila = MATRIZ[pagina]
   if (!fila) return null
   return {
-    pagina, rol: fila.rol, terminal: Boolean(fila.terminal),
-    destinos: fila.destinos || [],
+    pagina, etiqueta: etiquetaDe(pagina), rol: fila.rol, terminal: Boolean(fila.terminal),
+    destinos: (fila.destinos || []).map(d => ({ ...d, etiqueta: etiquetaDe(d.pagina) })),
     condicional: fila.condicional || [],
     derivados: fila.derivados || null,
     fuera: fila.fuera || [],
@@ -126,15 +160,15 @@ async function propagarDesdePagina({ db, project_id, asset_id, motivo = null, me
   const pagina = paginaDe(origen)
   if (!pagina) return { aplica: false }
   const fila = MATRIZ[pagina]
-  if (!fila) return { aplica: false, motivo: `page ${pagina} is not in the trigger matrix` }
+  if (!fila) return { aplica: false, motivo: `“${origen.name}” is not in the trigger matrix` }
 
   const destinos = fila.destinos || []
   if (!destinos.length && !fila.derivados) {
-    return { aplica: true, pagina, marcadas: [], condicional: fila.condicional || [], fuera: fila.fuera || [] }
+    return { aplica: true, pagina, etiqueta: etiquetaDe(pagina), marcadas: [], condicional: fila.condicional || [], fuera: fila.fuera || [] }
   }
 
-  // Las páginas del MISMO documento y proyecto. Se piden todas de una y se resuelven por número
-  // en memoria: una consulta por destino serían veinte viajes para un cambio de la 02.
+  // Las páginas del MISMO documento y proyecto. Se piden todas de una y se resuelven por nombre en
+  // memoria: una consulta por destino serían veinte viajes para un cambio de Visual DNA.
   const { data: hermanas } = await db().from('forge_assets')
     .select('id, name, metadata')
     .eq('project_id', project_id)
@@ -160,7 +194,7 @@ async function propagarDesdePagina({ db, project_id, asset_id, motivo = null, me
       ...(pieza.metadata || {}),
       desactualizado: {
         accion: final, origenes, desde: previa?.desde || sello, marcado_en: sello,
-        por_pagina: pagina, motivo: motivo || previa?.motivo || null, marcado_por: member_id,
+        por_pagina: etiquetaDe(pagina), motivo: motivo || previa?.motivo || null, marcado_por: member_id,
       },
     }
     const { error } = await db().from('forge_assets').update({ metadata }).eq('id', pieza.id)
@@ -171,7 +205,7 @@ async function propagarDesdePagina({ db, project_id, asset_id, motivo = null, me
 
   for (const d of destinos) {
     const pieza = porPagina[d.pagina]
-    if (!pieza) { ausentes.push(d.pagina); continue }
+    if (!pieza) { ausentes.push(etiquetaDe(d.pagina)); continue }
     if (pieza.id === origen.id) continue           // una página no se marca a sí misma
     await marcar(pieza, d.accion, origen.id)
   }
@@ -185,14 +219,14 @@ async function propagarDesdePagina({ db, project_id, asset_id, motivo = null, me
   }
 
   return {
-    aplica: true, pagina, rol: fila.rol,
+    aplica: true, pagina, etiqueta: etiquetaDe(pagina), rol: fila.rol,
     marcadas, ausentes,
     condicional: fila.condicional || [],
     fuera: fila.fuera || [],
   }
 }
 
-/** Lo que está marcado hoy en el proyecto, para el panel y para los badges del lienzo. */
+/** Lo que está marcado hoy en el proyecto, para el panel y para los sellos del lienzo. */
 async function pendientesDelProyecto({ db, project_id }) {
   const { data } = await db().from('forge_assets')
     .select('id, name, storage_url, metadata')
@@ -233,6 +267,6 @@ async function revalidar({ db, project_id, asset_id, member_id = null }) {
 }
 
 module.exports = {
-  MATRIZ, DOCUMENTO, paginaDe, loQueDispara,
+  MATRIZ, PAGINAS, DOCUMENTO, paginaDe, etiquetaDe, loQueDispara,
   propagarDesdePagina, pendientesDelProyecto, revalidar,
 }

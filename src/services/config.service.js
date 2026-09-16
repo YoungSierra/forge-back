@@ -2,6 +2,12 @@ const { db } = require('./supabase.service')
 
 const CACHE_TTL_MS = 60_000
 
+// Los workflows viven más en el caché que los step_configs porque el admin invalida a mano cada
+// vez que se toca uno (ver admin.configs.routes.js). Lo que NO invalida es un cambio hecho por
+// script directo contra la base —los deltas de Pedro—, y por eso el back se reinicia después de
+// aplicarlos: el reinicio vacía el caché igual.
+const WORKFLOWS_TTL_MS = 5 * 60_000
+
 let _stepConfigsCache = null
 let _stepConfigsAt    = 0
 let _workflowsCache   = null
@@ -47,8 +53,44 @@ async function loadWorkflows() {
 }
 
 async function getWorkflows() {
-  if (_workflowsCache && Date.now() - _workflowsAt < CACHE_TTL_MS) return _workflowsCache
+  if (_workflowsCache && Date.now() - _workflowsAt < WORKFLOWS_TTL_MS) return _workflowsCache
   return loadWorkflows()
+}
+
+// ─── Los mismos workflows, pero sin el grafo ─────────────────────────────────
+//
+// `workflow_json` es el 97% de la tabla: 752 KB entre los 28 activos. Quien va a CORRER uno lo
+// necesita; quien solo pregunta «¿está registrado? ¿qué controles tiene?» —el menú radial, cada
+// vez que alguien hace clic derecho— no. Y lo estaba pagando: 1.298 ms en frío para usar 2,8 KB,
+// otra vez cada 60 segundos. Es la latencia que Miguel reportó como «la herramienta a veces no
+// aparece»: el menú se dibujaba antes de que llegara la respuesta.
+//
+// Medido: 24,4 KB y 452 ms. El grafo se sigue leyendo entero, pero solo cuando hay que correrlo.
+let _ligerosCache = null
+let _ligerosAt    = 0
+
+async function loadWorkflowsLite() {
+  const { data, error } = await db()
+    .from('comfyui_workflows')
+    .select('id, name, description, inject_config, is_active')
+    .eq('is_active', true)
+
+  if (error) throw new Error(`[configService] Failed to load comfyui_workflows: ${error.message}`)
+
+  _ligerosCache = Object.fromEntries((data || []).map(r => [r.name, r]))
+  _ligerosAt    = Date.now()
+  return _ligerosCache
+}
+
+async function getWorkflowsLite() {
+  if (_ligerosCache && Date.now() - _ligerosAt < WORKFLOWS_TTL_MS) return _ligerosCache
+  return loadWorkflowsLite()
+}
+
+/** El registro de un workflow SIN su grafo: para saber si existe y qué controles declara. */
+async function getWorkflowLite(name) {
+  const ligeros = await getWorkflowsLite()
+  return ligeros[name] || null
 }
 
 async function getWorkflowByName(name) {
@@ -69,6 +111,8 @@ function invalidateStepConfigs() {
 }
 
 function invalidateWorkflows() {
+  _ligerosCache   = null
+  _ligerosAt      = 0
   _workflowsCache = null
   _workflowsAt    = 0
 }
@@ -134,6 +178,8 @@ module.exports = {
   getWorkflowByName,
   getWorkflowById,
   getWorkflows,
+  getWorkflowLite,
+  getWorkflowsLite,
   invalidateStepConfigs,
   invalidateWorkflows,
   resolveStepModel,
