@@ -192,11 +192,12 @@ const CADENAS = {
         // salieron las veinte partes y sus veinte modelos, lo que toca después es armar el nivel
         // con ellos. Estaba colgado del radial y se pedía en otro sitio que todo lo demás.
         //
-        // No despacha a ComfyUI: junta el grafo del nivel, las medidas y los papeles, y devuelve
-        // el paquete que abre Blender. Por eso va marcado y no lleva workflow.
-        clave: 'montaje', etiqueta: 'Level assembly', montaje: true,
-        que:    'One .zip: the level graph, the kit and the assembly order, ready for the LoopForge add-on.',
-        porque: 'The parts are modelled; this is what turns them into a level somebody can walk.',
+        // No despacha a ComfyUI: reúne lo que el proyecto ya tiene aprobado —el recorte del level
+        // map, los documentos de medida, la referencia visual y los `.glb`— y lo entrega como un
+        // paquete. Por eso va marcado y no lleva workflow.
+        clave: 'montaje', etiqueta: 'Level package', montaje: true,
+        que:    'One .zip with everything this level needs: the level map excerpt, the measurement excerpts, the visual reference and the .glb models.',
+        porque: 'The assembly runs in Blender, with tools that can measure the meshes; Forge hands over the material, it does not compute the layout.',
         entradas: {},
       },
     ],
@@ -516,10 +517,11 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
       let jobId, porRol = {}
 
       if (paso.montaje) {
-        // Sin workflow: lo arma el disparador de montaje, que ya sabe leer el nivel, componer la
-        // gramática desde los papeles y subir el paquete. Acá solo se le dice de qué hoja viene.
-        const { montarNivel } = require('./montaje-nivel.service')
-        const r = await montarNivel({ db, project_id, asset_id: origen.id, member_id, desdeCadena: true })
+        // Sin workflow: este paso EXPORTA el paquete del nivel (`forge_input_package/1.0`). No
+        // monta nada — desde el 16-09 el montaje corre del lado de Claude+Blender, y Forge solo
+        // reúne lo que ya tiene generado y aprobado.
+        const { armarPaquete } = require('./paquete-forge.service')
+        const r = await armarPaquete({ db, project_id, asset_id: origen.id, member_id })
         if (r.necesita_nivel) {
           const e = new Error(`This environment is used by ${r.niveles.length} levels: pick which one to assemble`)
           e.code = 'NECESITA_NIVEL'
@@ -527,7 +529,7 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
           throw e
         }
         creados.push({ id: r.asset?.id, name: r.asset?.name, storage_url: r.url, format: 'zip' })
-        console.log(`[cadena] montaje: nivel ${r.nivel} · ${Math.round((r.bytes || 0) / 1024)} KB`)
+        console.log(`[cadena] paquete: nivel ${r.nivel} · ${r.modelos} modelos · ${r.imagenes} imágenes · ${Math.round((r.bytes || 0) / 1048576)} MB`)
         anterior = origen
         continue
       }

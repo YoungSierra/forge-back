@@ -5900,26 +5900,28 @@ router.put('/assets/:asset_id/montaje/papel', async (req, res, next) => {
   }
 })
 
-// Monta el nivel y devuelve el paquete para Blender. Si el entorno lo usan varios niveles no
-// elige: contesta `necesita_nivel` con la lista, y quien pulsó decide.
+// Exporta el PAQUETE del nivel. Si el entorno lo usan varios niveles no elige: contesta
+// `necesita_nivel` con la lista, y quien pulsó decide.
+//
+// Hasta el 16-09 esta ruta MONTABA el nivel: llamaba a Maps_App, calculaba el orden de colocación
+// y entregaba el bundle `montaje/1.0`. El contrato `forge_input_package/1.0` de JuanK lo cambió —
+// «Forge exporta, no calcula»— y el cálculo pasó a Claude+Blender. La ruta se conserva porque el
+// gesto es el mismo (clic derecho sobre la hoja de entorno) y quien lo usa no tiene por qué
+// aprender otro; lo que cambia es lo que baja.
 router.post('/assets/:asset_id/montaje', async (req, res, next) => {
   try {
     const { id: project_id, asset_id } = req.params
-    const { montarNivel } = require('../services/montaje-nivel.service')
-    const r = await montarNivel({
+    const { armarPaquete } = require('../services/paquete-forge.service')
+    const r = await armarPaquete({
       db, project_id, asset_id,
       nivel: req.body?.nivel || null,
       member_id: req.body?.member_id || null,
-      incluir_referencia: Boolean(req.body?.incluir_referencia),
-      // Quien viene del paso 3 del Run pulsa sobre un modelo, no sobre la imagen que nombra su
-      // entorno: sin decirlo, la comprobación lo rechaza con «esta pieza no dispara un montaje».
-      desdeCadena: Boolean(req.body?.cadena),
     })
     res.json({ success: true, ...r })
   } catch (err) {
     // Lo que falta no es un fallo del servidor: es el estado del proyecto, y el front lo dice con
     // nombre propio para que se pueda ir a resolverlo.
-    if (['FALTA', 'SIN_MURO_EXTERIOR', 'SIN_LEVEL_MAP', 'NIVEL_AJENO', 'NO_APLICA'].includes(err.code)) {
+    if (['FALTA', 'SIN_NIVEL', 'SIN_LEVEL_MAP', 'NIVEL_AJENO', 'NO_APLICA'].includes(err.code)) {
       return res.status(400).json({ success: false, code: err.code, error: err.message, faltantes: err.faltantes || null })
     }
     next(err)

@@ -141,31 +141,12 @@ async function estadoDeMontaje({ db, project_id, asset_id }) {
     faltantes.push({ que: 'nivel', dice: `No level in the level map uses “${entorno}”` })
   }
 
-  // 2 · El kit: modelos con su caja ya leída. Sin eso no hay nada que colocar.
+  // 2 · Los modelos. El paquete los lleva tal cual: no se miden acá (ver comprobarKit).
   const { data: modelos } = await db().from('forge_assets')
     .select('id, name, metadata').eq('project_id', project_id).eq('format', 'glb')
     .not('storage_url', 'is', null)
-  const medidos = (modelos || []).filter(m => m.metadata?.medidas?.dim)
-  if (!medidos.length) {
-    faltantes.push({
-      que: 'kit',
-      dice: (modelos || []).length
-        ? `${modelos.length} model(s) in this project, none of them measured yet`
-        : 'This project has no 3D models to assemble',
-    })
-  }
-
-  // 3 · La gramática: qué pieza juega cada papel estructural. No sale de la geometría —nada en un
-  // bbox dice cuál muro es el exterior— y sin ella el montaje termina «bien» con cero objetos.
-  const conPapel = medidos.filter(m => m.metadata?.montaje?.clase)
-  if (medidos.length && !conPapel.length) {
-    faltantes.push({ que: 'gramatica', dice: 'No model has been assigned its structural role yet' })
-  }
-
-  // 4 · Dónde vive Maps_App. Es configuración del despliegue, no del proyecto, pero se ve igual:
-  // sin esto el botón contestaría un 503 después de haberse dejado pulsar.
-  if (!BASE()) {
-    faltantes.push({ que: 'maps_app', dice: 'The level generator is not configured on this server' })
+  if (!(modelos || []).length) {
+    faltantes.push({ que: 'kit', dice: 'This project has no 3D models to export' })
   }
 
   return {
@@ -177,7 +158,7 @@ async function estadoDeMontaje({ db, project_id, asset_id }) {
     // Los modelos con los que se montaría, y el papel que tiene puesto cada uno. Viaja con el
     // estado porque quien abre el radial es justo quien va a marcarlos: pedirlo aparte obligaría
     // a una segunda vuelta para dibujar la misma ventana.
-    modelos: (medidos || [])
+    modelos: (modelos || [])
       .map(m => ({
         id: m.id, nombre: m.name,
         papel: m.metadata?.montaje?.clase || null,
@@ -359,22 +340,20 @@ async function comprobarKit({ db, project_id }) {
   const { data: todos } = await db().from('forge_assets')
     .select('id, name, metadata').eq('project_id', project_id).eq('format', 'glb')
     .not('storage_url', 'is', null)
-  const medidos = (todos || []).filter(m => m.metadata?.medidas?.dim)
 
-  if (!medidos.length) {
-    faltantes.push({
-      que: 'kit',
-      dice: (todos || []).length
-        ? `${todos.length} model(s) in this project, none of them measured yet`
-        : 'This project has no 3D models to assemble',
-    })
-  }
-  const conPapel = medidos.filter(m => m.metadata?.montaje?.clase)
-  if (medidos.length && !conPapel.length) {
-    faltantes.push({ que: 'gramatica', dice: 'No model has been assigned its structural role yet' })
-  }
-  if (!BASE()) {
-    faltantes.push({ que: 'maps_app', dice: 'The level generator is not configured on this server' })
+  // Lo único que de verdad falta: no haber producido ningún modelo. El paquete lleva los `.glb`
+  // tal cual salieron.
+  //
+  // Antes se exigían tres cosas más —modelos MEDIDOS, papeles puestos y el generador de mapas
+  // configurado— porque Forge armaba el nivel. Con `forge_input_package/1.0` (JuanK, 16-09) ya
+  // no lo arma: exporta, y el cálculo corre del lado de Claude+Blender. Exigirlas ahora sería
+  // bloquear una exportación por cuentas que nadie va a hacer acá — de hecho el botón venía
+  // contestando «The level generator is not configured on this server», que era exactamente eso.
+  //
+  // Los papeles siguen pudiéndose marcar y viajan en el manifiesto como bloque declarado: no
+  // salen de la geometría y perderlos sería una regresión. Pero ya no bloquean.
+  if (!(todos || []).length) {
+    faltantes.push({ que: 'kit', dice: 'This project has no 3D models to export' })
   }
 
   return {
@@ -382,7 +361,8 @@ async function comprobarKit({ db, project_id }) {
     // De qué cadena salió cada modelo. Sin ese dato la ventana los ofrece todos por igual y en la
     // primera prueba una vista FRONTAL de personaje acabó marcada como muro exterior: un gato no
     // es una pared, pero la lista no daba forma de notarlo. Los del entorno van primero.
-    modelos: medidos
+    // Se ofrecen TODOS, medidos o no: medir era para montar, y ya no se monta acá.
+    modelos: (todos || [])
       .map(m => ({
         id: m.id, nombre: m.name,
         papel: m.metadata?.montaje?.clase || null,
@@ -446,14 +426,19 @@ async function grafoDelNivel({ db, project_id, origen, nivel, member_id }) {
 }
 
 /**
- * Monta el nivel: el paquete que abre Blender, a partir del grafo del nivel y de los modelos que
- * el arte marcó.
+ * RETIRADO el 16-09. Nadie lo llama: ni la ruta, ni el paso de la cadena.
  *
- * Es el último paso de Forge en este tramo. De aquí en adelante trabaja el addon de LoopForge, que
- * escala, recentra e instancia; Forge no vuelve a intervenir hasta que el `.glb` del nivel montado
- * entra al moodboard.
+ * Montaba el nivel —grafo desde Maps_App, kit medido, orden de colocación— y entregaba el bundle
+ * `montaje/1.0`. El contrato `forge_input_package/1.0` de JuanK invirtió el reparto: **Forge
+ * exporta, no calcula**, y el montaje corre del lado de Claude+Blender, que sí puede medir las
+ * mallas. Lo que se entrega ahora lo arma `paquete-forge.service`.
  *
- * Nunca monta «el primero»: si el entorno lo usan varios niveles devuelve la lista para que se
+ * Se conserva sin borrar por una razón concreta: la única duda abierta con JuanK es si su proceso
+ * deduce solo el papel estructural de cada modelo. Si la respuesta fuera que no alcanza y hubiera
+ * que volver a montar acá, esto es lo que se volvería a encender. En cuanto conteste, se borra
+ * —junto con `grafoDelNivel`, `bundle-montaje` y la llamada a Maps_App— o se reactiva.
+ *
+ * Nunca montaba «el primero»: si el entorno lo usan varios niveles devuelve la lista para que se
  * elija, que es el guarda que pide la spec —fallar señalando qué falta antes que generar con datos
  * parciales.
  */
