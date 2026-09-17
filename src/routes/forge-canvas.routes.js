@@ -713,10 +713,46 @@ async function executeImageOutput({ project_id, node_id, targetOutputKey, member
       // Se despacha sin esperar y se responde enseguida con la sesión. El avance ya es visible:
       // `output_images` se llena página por página, así que el front consulta esa sesión en vez
       // de colgarse de la respuesta.
+      // ── El ASG nace COMPLETO: sus Sheets de instancia van en la misma corrida ──
+      //
+      // Informe v8, puntos 6 y 7. Hasta hoy el deck emitía UNA `18_CharacterSheet` genérica y
+      // después había que pulsar «Create the sheets» para sacar una por personaje. Eso dejaba las
+      // dos cosas en el lienzo —la genérica y la de «Cartón»— y las de la segunda tanda nacían
+      // fuera del menú del Vertical Slice, porque el menú cuenta instancias y la genérica no lo
+      // es. Un flujo en dos pasos que producía duplicados y desvinculaba lo que producía.
+      //
+      // La solución que pide el informe: una sola corrida. Las páginas que el alcance instancia se
+      // SACAN del deck —no se renderiza la genérica, que es el duplicado— y se despachan después
+      // una vez por ítem, ya con su `metadata.instancia`, que es lo que el menú lee.
+      //
+      // Si el proyecto no declara alcance, no hay plan y todo queda exactamente como estaba.
+      const { DECKS } = require('../services/slide-composer.service')
+      let paginas = Array.isArray(def.pages) && def.pages.length ? def.pages : null
+      let planInst = null
+      try {
+        // El deck se deduce del workflow que declara la DNA, igual que hace `generateDeck`.
+        const wfName = String(def.image_gen_model || '').split(':').slice(1).join(':')
+        const deck = Object.entries(DECKS).find(([, c]) => c.workflow === wfName)?.[0]
+        if (deck) {
+          const { planDeInstancias } = require('../services/instanciar-hojas.service')
+          const p = await planDeInstancias({ db, project_id, deck })
+          if (p.hay && p.paginas.length) {
+            planInst = { deck, ...p }
+            const instanciadas = new Set(p.paginas.map(x => x.indice))
+            if (paginas) paginas = paginas.filter(i => !instanciadas.has(i))
+            console.log(`[asg] ${p.paginas.length} página(s) por instancia (${p.despachos} despachos) se sacan del deck y se despachan aparte`)
+          }
+        }
+      } catch (e) {
+        // Que el alcance no se pueda leer no puede impedir que el ASG se genere: se sigue por el
+        // camino de siempre y se deja dicho por qué no hubo instancias.
+        console.warn('[asg] no se pudo planificar las instancias:', e.message)
+      }
+
       const trabajo = generateDeck({
         db, project_id, node_id, session_id: session.id, node_key: dna.node_key,
         output_key: targetOutputKey, image_gen_model: def.image_gen_model, member_id,
-        fills, outDef: def, solo: Array.isArray(def.pages) && def.pages.length ? def.pages : null,
+        fills, outDef: def, solo: paginas,
       })
 
       // El cierre — mensajes, assets y estado — corre cuando el despacho termina, ya sin nadie
@@ -759,6 +795,39 @@ async function executeImageOutput({ project_id, node_id, targetOutputKey, member
           approved_by: member_id || null, approved_at: new Date().toISOString(),
         }).select('id').single()
         if (!primero) primero = asset?.id || null
+      }
+
+      // ── Y las Sheets de instancia, en la misma corrida ────────────────────
+      // Una hoja por ítem del alcance, cada una con su `metadata.instancia`, que es por donde el
+      // menú del Vertical Slice la reconoce. Van DESPUÉS del deck porque comparten el nodo que
+      // guarda la imagen: dos instancias en un mismo job se pisarían.
+      //
+      // Un fallo acá no invalida el ASG que ya se publicó: se anota y se sigue.
+      if (planInst) {
+        try {
+          const { instanciarHojas } = require('../services/instanciar-hojas.service')
+          const ri = await instanciarHojas({
+            db, project_id, node_id, node_key: dna.node_key, output_key: targetOutputKey,
+            image_gen_model: def.image_gen_model, paginas: planInst.paginas,
+            deck: planInst.deck, documento, member_id,
+          })
+          console.log(`[asg] instancias: ${ri.creados.length} creada(s), ${ri.repetidas.length} ya existían, ${ri.fallos.length} fallo(s)`)
+          if (ri.creados.length || ri.fallos.length) {
+            await db().from('forge_messages').insert({
+              session_id: session.id, role: 'agent', order_index: 2, tool_calls: [],
+              content: [
+                `**${ri.creados.length}** instance sheet(s) created from the Vertical Slice scope, in the same run.`,
+                '',
+                'The generic version of these pages is not rendered: one sheet per scope item is what the',
+                'Vertical Slice menu counts, and having both is what produced duplicates.',
+                ri.repetidas.length ? `\n${ri.repetidas.length} already existed and were not paid for again.` : '',
+                ri.fallos.length ? `\n**Failed:**\n${ri.fallos.map(f => `- ${f.pagina} · ${f.item?.nombre}: ${f.motivo}`).join('\n')}` : '',
+              ].filter(Boolean).join('\n'),
+            })
+          }
+        } catch (e) {
+          console.error('[asg] las instancias fallaron:', e.message)
+        }
       }
 
       await db().from('forge_sessions').update({
@@ -5862,7 +5931,17 @@ router.post('/assets/:asset_id/tool', async (req, res, next) => {
     if (err.publico) {
       return res.status(err.status || 502).json({ success: false, error: err.message, code: err.code || null })
     }
-    next(err)
+    // Y lo que NADIE explicó tampoco se esconde. La causa del punto 9 del informe v8 fue una
+    // variable sin declarar en el último paso del servicio: un `ReferenceError` que llegó al
+    // navegador como «Internal server error» mientras la imagen ya estaba generada y pagada.
+    // Un fallo del que no sabemos el porqué se dice igual, con el nombre de la herramienta: así la
+    // próxima vez se lee en pantalla y no hay que ir al log del servidor.
+    console.error(`[tool] ${req.body?.herramienta} sobre ${req.params.asset_id}:`, err)
+    res.status(500).json({
+      success: false,
+      error: `"${req.body?.herramienta || 'tool'}" failed after dispatching: ${err.message || 'unknown error'}`,
+      code: 'FALLO_NO_PREVISTO',
+    })
   }
 })
 

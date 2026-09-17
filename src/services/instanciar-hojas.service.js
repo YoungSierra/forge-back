@@ -99,9 +99,29 @@ async function instanciarHojas({
     throw e
   }
 
+  // Lo que YA existe no se vuelve a pagar (informe v8, punto 6).
+  //
+  // El duplicado que reportó Miguel —«Cartón se generó dos veces, el mismo Environment Sheet dos
+  // veces»— salía de que instanciar no miraba nada: despachaba lo que le nombraran, viniera de
+  // donde viniera. Ahora la ficha de un ítem que ya tiene la suya se salta, y se dice.
+  //
+  // Se reconoce por `metadata.instancia`, que lo escribe esta misma función: es un dato del motor,
+  // no del nombre, así que renombrar una hoja a mano no engaña a la comprobación.
+  const { data: previas } = await db().from('forge_assets')
+    .select('metadata').eq('project_id', project_id).not('metadata->instancia', 'is', null)
+  const yaHay = new Set()
+  for (const a of previas || []) {
+    const i = a.metadata?.instancia
+    if (i?.pagina && i?.item) yaHay.add(`${i.pagina}::${i.item}`)
+  }
+
   const trabajo = []
+  const repetidas = []
   for (const p of paginas) {
-    for (const item of p.items || []) trabajo.push({ pagina: p.pagina, indice: p.indice, item })
+    for (const item of p.items || []) {
+      if (yaHay.has(`${p.pagina}::${item.nombre}`)) { repetidas.push({ pagina: p.pagina, item: item.nombre }); continue }
+      trabajo.push({ pagina: p.pagina, indice: p.indice, item })
+    }
   }
   const recortado = limite > 0 && trabajo.length > limite ? trabajo.slice(0, limite) : trabajo
   if (recortado.length > TOPE_DESPACHOS) {
@@ -149,7 +169,7 @@ async function instanciarHojas({
     }
   }
 
-  return { creados, fallos, pedidos: recortado.length, de: trabajo.length }
+  return { creados, fallos, repetidas, pedidos: recortado.length, de: trabajo.length }
 }
 
 module.exports = { planDeInstancias, instanciarHojas, pedidoDe, TOPE_DESPACHOS }

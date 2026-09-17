@@ -101,6 +101,33 @@ function herramientasDe(origen) {
  * acá (ver `componerMascara`). El workflow no tiene un segundo puerto de entrada para la máscara,
  * así que viaja en el canal alfa de la propia imagen — pero quien escribe ese alfa es el servidor.
  */
+// ─── Qué paso falló ──────────────────────────────────────────────────────────
+//
+// Informe v8, punto 9 (y v7·3, v6·2, v4·14 antes): «Internal server error» otra vez al correr New
+// Angle. La ruta ya reenvía lo que el proveedor explica, pero solo el propio despacho a ComfyUI se
+// marcaba como explicable. Todo lo demás —subir la lámina, bajar las salidas, guardarlas en R2—
+// caía al manejador genérico, y desde el navegador los cuatro fallos se leen igual.
+//
+// Correr una herramienta son cinco pasos y cada uno falla por su cuenta. Envolviéndolos, el
+// mensaje nombra el paso: «New angle · uploading the source image to ComfyUI: fetch failed» dice a
+// dónde mirar; «Internal server error» obliga a ir al log del servidor, que es lo que pasó tres
+// informes seguidos.
+//
+// No se inventa diagnóstico: se conserva el mensaje original y se le antepone el paso.
+async function paso(nombre, fn) {
+  try {
+    return await fn()
+  } catch (e) {
+    console.error(`[herramienta] falló en «${nombre}»:`, e)
+    const err = new Error(`${nombre}: ${e?.message || 'unknown error'}`)
+    err.publico = true
+    err.status  = e?.status || 502
+    err.code    = e?.code || 'PASO_FALLIDO'
+    err.cause   = e
+    throw err
+  }
+}
+
 async function correrHerramienta({ db, project_id, asset_id, clave, opciones = null, imagen_comfy = null, mascara_base64 = null, member_id = null }) {
   const h = HERRAMIENTAS[clave]
   if (!h) throw new Error(`Unknown tool "${clave}"`)
@@ -130,20 +157,27 @@ async function correrHerramienta({ db, project_id, asset_id, clave, opciones = n
   // La imagen entra por el puerto que declaró el registro. Con trazos se compone acá y se sube el
   // resultado; `imagen_comfy` queda como camino viejo
   // —una imagen ya subida por el llamador— para no romper a quien todavía lo use.
+  const etq = h.etiqueta
   let extras
   if (mascara_base64) {
-    const m = await componerMascara(origen.storage_url, mascara_base64)
+    const m = await paso(`${etq} · composing the mask over the source image`,
+      () => componerMascara(origen.storage_url, mascara_base64))
     console.log(`[herramienta] máscara compuesta en el servidor: ${m.pintados}/${m.total} píxeles marcados`)
-    extras = { [campo]: await uploadBufferToComfyUI(m.buffer) }
+    extras = { [campo]: await paso(`${etq} · uploading the mask to ComfyUI`, () => uploadBufferToComfyUI(m.buffer)) }
   } else {
-    extras = { [campo]: imagen_comfy || await uploadImageToComfyUI(origen.storage_url) }
+    extras = {
+      [campo]: imagen_comfy || await paso(`${etq} · uploading the source image to ComfyUI`,
+        () => uploadImageToComfyUI(origen.storage_url)),
+    }
   }
 
   const t0 = Date.now()
-  const jobId = await submitWorkflow(h.workflow, '', 1024, 1024, extras, opciones)
-  await pollUntilDone(jobId, 300_000)
+  const jobId = await paso(`${etq} · dispatching the workflow`,
+    () => submitWorkflow(h.workflow, '', 1024, 1024, extras, opciones))
+  await paso(`${etq} · waiting for ComfyUI`, () => pollUntilDone(jobId, 300_000))
   const base = `projects/${project_id}/tool/${clave}/${jobId.slice(0, 8)}`
-  const salidas = await downloadOutputsByNode(jobId, base)
+  const salidas = await paso(`${etq} · downloading the results and storing them`,
+    () => downloadOutputsByNode(jobId, base))
 
   // Igual que en la cadena: con mapa declarado manda el mapa. Un workflow publica intermedios
   // —previsualizaciones, comparadores— que no son piezas del moodboard.
@@ -169,6 +203,28 @@ async function correrHerramienta({ db, project_id, asset_id, clave, opciones = n
     triggered_by: member_id,
   }).select('id').single()
 
+  // De qué versión del origen sale esta pieza. ESTA LÍNEA FALTABA, y es la causa del punto 9 del
+  // informe v8 —el «Internal server error» que Miguel reportó por cuarta vez—.
+  //
+  // `versionDelOrigen` se usaba abajo, en la metadata del activo, y no estaba declarada en ninguna
+  // parte: quedó suelta al aplicar el §2.1 de la v2.3. En JavaScript eso no lo ve nadie hasta que
+  // la línea se ejecuta, y esa línea es la ÚLTIMA del recorrido: para entonces ComfyUI ya generó
+  // la imagen, ya se bajó, ya se guardó en R2 y ya se anotó el gasto. El `ReferenceError` caía al
+  // manejador genérico y llegaba como «Internal server error».
+  //
+  // Medido en la base el 17-09: cinco corridas de New Angle ese día, las cinco anotadas con
+  // `salidas: 1` —el registro se escribe DESPUÉS de guardar la imagen—, y cero activos publicados.
+  // Se pagaron cinco imágenes que existen en R2 y que nadie llegó a ver.
+  //
+  // Un fallo leyendo la versión no puede tirar una imagen ya pagada: si no se sabe, va sin marca.
+  let versionDelOrigen = null
+  try {
+    const { versionVigente } = require('./actualizacion.service')
+    versionDelOrigen = await versionVigente(db, origen.id)
+  } catch (e) {
+    console.warn('[herramienta] no se pudo leer la versión del origen:', e.message)
+  }
+
   const creados = []
   const varias = Object.keys(porRol).length > 1
   for (const [rol, sal] of Object.entries(porRol)) {
@@ -192,7 +248,9 @@ async function correrHerramienta({ db, project_id, asset_id, clave, opciones = n
         ...(opciones && Object.keys(opciones).length ? { opciones } : {}),
       },
     }).select('id, name, storage_url, format, metadata').single()
-    if (error) throw error
+    // La imagen YA está generada y pagada: si el registro falla, lo que hay que decir es eso, no
+    // «Internal server error». Se nombra el paso y se conserva la dirección de lo producido.
+    if (error) await paso(`${etq} · publishing "${rol}" (the image is already at ${sal.url})`, () => { throw error })
     creados.push(a)
   }
 
