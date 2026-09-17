@@ -98,13 +98,47 @@ function itemsDesdeSpec(md) {
 
   const anota = (hoja, item) => { (porHoja[hoja] ||= []).push(item) }
 
-  // ── §A7.1 Tier summary: el inventario declarado ────────────────────────────
-  const tier = seccion(md, /^#{2,4}\s*A7\.1/)
-  if (!tier) avisos.push('the spec has no §A7.1 Tier summary: the inventory could not be read')
+  // ── El inventario declarado ────────────────────────────────────────────────
+  //
+  // Se busca primero donde lo sitúa el documento del sistema —§A7.1— y, si ahí no está, POR SU
+  // FORMA: la tabla cuya primera columna es «Asset Class».
+  //
+  // El ancla se mueve entre versiones del 3.13. Medido el 17-09 en test_smack_migue_v.09: su
+  // §A7.1 es «Platform and Build Form» y el inventario vive en «A6 · Quality Tier Per Asset
+  // Class». Atados al número, de 69.000 caracteres salían 2 instancias en vez de quince, y el
+  // panel decía que no había nada que contar. Es la misma lección que con las páginas del ASG: el
+  // número es la posición, no la identidad.
+  const inv = (() => {
+    const porAncla = seccion(md, /^#{2,4}\s*A7\.1/)
+    if (porAncla) {
+      const t = filasDeTabla(porAncla)
+      if (t.filas?.length) return { ...t, de: '§A7.1' }
+    }
+    // Se recorren los bloques del documento —cada encabezado hasta el siguiente— y se toma el que
+    // trae una tabla de clases de asset. Cortar el texto a mano evita armar una expresión regular
+    // a partir de un título, que es frágil con los «·» y los puntos de la numeración.
+    const lineas = md.split('\n')
+    const cortes = []
+    lineas.forEach((l, i) => { if (/^#{2,4}\s+\S/.test(l)) cortes.push(i) })
+    for (let k = 0; k < cortes.length; k++) {
+      const bloque = lineas.slice(cortes[k], cortes[k + 1] ?? lineas.length).join('\n')
+      const t = filasDeTabla(bloque)
+      if (t.filas?.length && (t.cabecera || []).some(c => /asset\s*class/i.test(c))) {
+        const titulo = lineas[cortes[k]].replace(/^#+\s*/, '').trim()
+        return { ...t, de: `§${titulo.split(/[\s·]/)[0]}` }
+      }
+    }
+    return null
+  })()
+
+  if (!inv) avisos.push('the spec has no asset-class inventory table: there is nothing to count from')
   else {
-    const { cabecera, filas } = filasDeTabla(tier)
+    const { cabecera, filas, de } = inv
     const iClase = 0
     const iCuenta = (cabecera || []).findIndex(c => /count/i.test(c))
+    // FINAL o SLICE-ONLY. Es una ETIQUETA de clase de asset, no un estado: la marca dirección de
+    // arte y el menú solo la enseña (spec del menú §7, y v2.3 §11 punto 4).
+    const iTier = (cabecera || []).findIndex(c => /tier|final/i.test(c))
     for (const f of filas) {
       const nombre = limpio(f[iClase])
       if (!nombre) continue
@@ -112,10 +146,14 @@ function itemsDesdeSpec(md) {
       if (n === 0) continue                       // declarado y fuera del slice
       if (NO_ES_LAMINA.test(nombre)) { noSonLaminas.push({ nombre, cuenta: n }); continue }
       const destino = A_LA_HOJA.find(d => d.re.test(nombre))
-      if (!destino) { sinClasificar.push({ nombre, cuenta: n, de: '§A7.1' }); continue }
+      if (!destino) { sinClasificar.push({ nombre, cuenta: n, de }); continue }
       // Los personajes los pone el roster, que los nombra uno por uno.
       if (destino.hoja === '18_CharacterSheet') { avisos.push(`“${nombre}”: counted from the actor roster, not from the inventory`); continue }
-      anota(destino.hoja, { nombre, cuenta: n, de: '§A7.1' })
+      // En el formato viejo la columna «FINAL» lleva una CUENTA, no una etiqueta: ahí un «1» no
+      // significa que el asset sea FINAL. Solo se toma si es texto.
+      const crudo = iTier > 0 ? limpio(f[iTier]) : null
+      const tier = crudo && !/^[\d\s.,–-]+$/.test(crudo) ? crudo : null
+      anota(destino.hoja, { nombre, cuenta: n, de, ...(tier ? { tier } : {}) })
     }
   }
 
@@ -174,7 +212,32 @@ async function itemsDelAlcance({ db, project_id }) {
     .eq('project_id', project_id).in('output_key', CLAVES_DEL_SPEC)
 
   const aprobadas = (ses || []).filter(x => x.status === 'approved' || x.status === 'auto_approved')
+
+  // Y la pieza del MODO NODO ENTERO, que no tiene clave.
+  //
+  // Un nodo puede correr salida por salida —y entonces cada documento lleva la suya— o entero,
+  // y entonces produce UNA pieza con todo dentro, llamada «… — Output» y con `output_key` en
+  // null. Buscar solo por clave la deja invisible: en test_smack_migue_v.09 el spec estaba ahí,
+  // aprobado y con sus 69.000 caracteres, y el panel decía que había que correr el 3.13.
+  //
+  // Se reconoce por el NODO que la produjo, no por su nombre: «Output» lo lleva cualquiera.
+  let deNodoEntero = null
   if (!aprobadas.length) {
+    const { data: nodo } = await db().from('forge_nodes').select('id').eq('node_key', '3.13').maybeSingle()
+    if (nodo) {
+      const { data: piezas } = await db().from('forge_assets').select('content, name, status, created_at')
+        .eq('project_id', project_id).eq('node_id', nodo.id)
+        .in('status', ['approved', 'auto_approved']).not('content', 'is', null)
+        .order('created_at', { ascending: false })
+      // La que de verdad es el spec: la que trae su inventario. Si ninguna lo trae, la más
+      // larga — y el aviso de más abajo dirá que no hay nada que contar.
+      deNodoEntero = (piezas || []).find(p => /A7\.1/.test(p.content))
+        || (piezas || []).sort((a, b) => b.content.length - a.content.length)[0]
+        || null
+    }
+  }
+
+  if (!aprobadas.length && !deNodoEntero) {
     // Que exista sin aprobar y que no exista son dos problemas distintos y se arreglan de
     // formas distintas. Decir lo mismo en los dos casos mandaba a correr un nodo que ya corrió.
     const motivo = (ses || []).length
@@ -186,12 +249,24 @@ async function itemsDelAlcance({ db, project_id }) {
   // En el orden de preferencia, no en el que devuelva la base.
   const orden = CLAVES_DEL_SPEC
     .flatMap(k => aprobadas.filter(x => x.output_key === k))
+  if (!orden.length && deNodoEntero) {
+    const r = itemsDesdeSpec(deNodoEntero.content)
+    const total = Object.values(r.porHoja || {}).reduce((n, l) => n + l.length, 0)
+    if (!total) {
+      return {
+        hay: false,
+        motivo: 'The approved Vertical Slice Specification has no §A7.1 inventory to count from. Re-run node 3.13.',
+        porHoja: {}, sinClasificar: r.sinClasificar || [], avisos: [...avisoManifiesto, ...(r.avisos || [])],
+      }
+    }
+    return { hay: true, ...r, fuente: 'vs_spec', avisos: [...avisoManifiesto, ...(r.avisos || [])] }
+  }
   const { data: docs } = await db().from('forge_assets').select('content, session_id, created_at')
     .in('session_id', orden.map(x => x.id)).not('content', 'is', null)
     .order('created_at', { ascending: false })
   const porSesion = new Map((docs || []).map(d => [d.session_id, d]))
   const elegido = orden.map(x => porSesion.get(x.id)).find(Boolean)
-  const md = elegido?.content
+  const md = elegido?.content || deNodoEntero?.content
   if (!md) return { hay: false, motivo: 'The approved Vertical Slice Specification has no text', porHoja: {}, sinClasificar: [], avisos: avisoManifiesto }
 
   const r = itemsDesdeSpec(md)
