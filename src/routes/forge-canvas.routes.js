@@ -5856,6 +5856,12 @@ router.post('/assets/:asset_id/tool', async (req, res, next) => {
     if (err.code === 'NO_APLICA' || err.code === 'SIN_MASCARA') {
       return res.status(400).json({ success: false, error: err.message, code: err.code })
     }
+    // Y lo que el servicio de imagen ya explicó viaja tal cual. Antes caía al manejador genérico
+    // y llegaba como «Internal server error» — Miguel lo reportó tres veces (v4 #14, v6 #2,
+    // v7 #3) y cada vez hubo que ir al log del servidor para saber qué había pasado.
+    if (err.publico) {
+      return res.status(err.status || 502).json({ success: false, error: err.message, code: err.code || null })
+    }
     next(err)
   }
 })

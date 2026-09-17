@@ -110,8 +110,14 @@ async function submitWorkflow(workflowName, prompt, width, height, extras = {}, 
   if (!res.ok) {
     const body = await res.text()
     const err = new Error(`ComfyUI submit failed: ${res.status} ${body}`)
-    if (res.status === 401) err.code = 'COMFYUI_AUTH'
-    if (res.status === 402) err.code = 'COMFYUI_CREDITS'
+    if (res.status === 401) {
+      err.code = 'COMFYUI_AUTH'; err.publico = true; err.status = 502
+      err.message = 'The image service rejected our credentials. Someone has to renew the ComfyUI key.'
+    }
+    if (res.status === 402) {
+      err.code = 'COMFYUI_CREDITS'; err.publico = true; err.status = 402
+      err.message = 'The ComfyUI account has no credit left. Top it up and run this again — nothing was charged.'
+    }
     throw err
   }
 
@@ -140,12 +146,24 @@ async function pollUntilDone(promptId, timeoutMs = 120000) {
     if (status === 'failed' || status === 'cancelled' || status === 'error') {
       const detail = json.error || json.message || json.error_message || JSON.stringify(json)
       console.error(`[ComfyUI] job ${promptId} failed — ${detail}`)
-      throw new Error(`ComfyUI job failed: ${detail}`)
+      // `publico`: el motivo lo entiende quien pulsó Run y es lo que le deja hacer algo. Sin
+      // esto llegaba como «Internal server error», que no dice ni qué paso fue ni por qué.
+      const e = new Error(detail && detail !== '{}'
+        ? `The image service could not finish this job: ${String(detail).slice(0, 300)}`
+        : 'The image service reported the job as failed, without a reason. Try again; if it repeats, check the ComfyUI account.')
+      e.publico = true
+      e.status = 502
+      e.code = 'COMFYUI_JOB_FAILED'
+      throw e
     }
     console.log(`[ComfyUI] job ${promptId} → ${status}`)
   }
 
-  throw new Error(`ComfyUI job ${promptId} timed out after ${timeoutMs / 1000}s`)
+  const e = new Error(`The image service did not finish within ${Math.round(timeoutMs / 1000)}s. The job may still be running — check before paying for another.`)
+  e.publico = true
+  e.status = 504
+  e.code = 'COMFYUI_TIMEOUT'
+  throw e
 }
 
 async function downloadOutput(promptId, storagePath) {
