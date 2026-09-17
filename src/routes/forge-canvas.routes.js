@@ -5554,12 +5554,53 @@ router.get('/assets/:asset_id/next-step', async (req, res, next) => {
       else clips = []
     }
 
+    // ¿Esta cadena ya avanzó en el proyecto?
+    //
+    // El paso que Run ofrece sale de la pieza sobre la que se pulsó: parado en la hoja del ASG,
+    // es siempre el primero. Pero el proyecto puede tener ya las veinte partes y los veinte
+    // modelos, y entonces lo que la ventana propone —rehacer el paso 1— es justo lo que nadie
+    // quiere. Pasó: JuanK veía «Level package» en la cinta y no tenía cómo llegar.
+    //
+    // Así que se mira qué hay producido de esta misma cadena y se nombra desde dónde seguir. No
+    // se salta solo: se ofrece, y quien mira decide. Saltar por su cuenta sería elegir por él
+    // sobre algo que cuesta.
+    let continuar = null
+    if (paso && paso.indice === 1) {
+      const { data: dela } = await db().from('forge_assets')
+        .select('id, name, metadata, created_at')
+        .eq('project_id', project_id)
+        .eq('metadata->cadena->>nombre', paso.cadena)
+        .not('storage_url', 'is', null)
+
+      // De cada paso, la pieza más reciente. `pasoDe` traduce la clave del paso a su posición.
+      const { pasoDe, proximoPaso } = require('../services/chain.service')
+      let mejor = null
+      for (const a of dela || []) {
+        const i = pasoDe(a)
+        if (i > (mejor ? pasoDe(mejor) : 0)) mejor = a
+      }
+      if (mejor) {
+        const siguiente = proximoPaso(mejor)
+        const hechos = new Set((dela || []).map(a => a.metadata?.cadena?.paso).filter(Boolean))
+        continuar = {
+          asset_id: mejor.id,
+          nombre: mejor.name,
+          piezas: (dela || []).length,
+          pasos_hechos: [...hechos],
+          // `null` cuando la cadena ya llegó al final: entonces no hay nada que ofrecer, pero
+          // sigue valiendo decir que está hecha.
+          paso: siguiente ? { clave: siguiente.clave, etiqueta: siguiente.etiqueta, indice: siguiente.indice, de: siguiente.de } : null,
+        }
+      }
+    }
+
     // Cuáles hay, para cuando no hay ninguna. El aviso del front las nombraba a mano y se quedó
     // diciendo «Character Sheet is the only chain» cuando ya eran cinco: quien lee el aviso se va
     // creyendo que su hoja no tiene workflow, y lo tiene.
     res.json({
       success: true,
       paso: paso ? { ...paso, despachos, ...(clips ? { clips } : {}) } : null,
+      ...(continuar ? { continuar } : {}),
       ...(paso ? {} : { cadenas: etiquetasDeCadenas() }),
     })
   } catch (err) { next(err) }
