@@ -186,6 +186,9 @@ async function correrHerramienta({ db, project_id, asset_id, clave, opciones = n
       metadata: {
         herramienta: { clave, etiqueta: h.etiqueta, rol },
         job: jobId,
+        // De qué versión del origen salió (v2.3 §2.1): una pieza segmentada de la v1 no es la
+        // misma que una de la v4, y la marca tiene que poder decirlo.
+        ...(versionDelOrigen !== null ? { derivado_de_version: versionDelOrigen } : {}),
         ...(opciones && Object.keys(opciones).length ? { opciones } : {}),
       },
     }).select('id, name, storage_url, format, metadata').single()

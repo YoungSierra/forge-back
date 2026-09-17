@@ -16,6 +16,12 @@
 
 // Página del ASG → sección(es) del ADI V6 que la gobiernan. Es la §5 del documento del sistema de
 // actualización, que existe justamente para esto: es el ancla que cada activo lleva de metadato.
+//
+// Las claves llevan número porque así se leen en el documento, pero la BÚSQUEDA es por nombre
+// (ver `seccionDe`): la identidad de una página es su nombre y el número solo dice qué posición
+// ocupa en un maestro — v2.3 §2.0 del sistema de actualización. Los proyectos vivos corren el
+// maestro de 34 páginas, donde Color System es la 09 y no la 08: buscando por la cadena entera,
+// 29 de 35 páginas se quedaban sin su sección.
 const ADI_DE_PAGINA = {
   '01_KeyArt':                '§1.2 Core Fantasy · §2.1 Visual Pillars · §5.1 Approved Style · §6.1 Hero Asset Targets',
   '02_VisualDNA':             '§2.1 Visual Pillars · §2.2 Tone & Mood · §2.3 Visual Keywords · §5.1 Approved Style',
@@ -47,6 +53,30 @@ const ADI_DE_PAGINA = {
 // Las ocho páginas que YA tienen hueco de referencia en el workflow. Las otras diecisiete lo
 // necesitan y es un cambio del `.json` que le toca a dirección de arte (§3 del handoff); hasta que
 // llegue, el destino cae al bloque de identidad en vez de prometer una inyección que no ocurre.
+/** El nombre de una página sin su número, que es lo único estable entre maestros. */
+const soloNombre = s => String(s || '').replace(/^\d+[_\s-]*/, '').toLowerCase().replace(/[^a-z0-9]+/g, '')
+
+/**
+ * Índice nombre → valor, incluyendo las EQUIVALENCIAS entre maestros.
+ *
+ * El maestro de 34 páginas llama «14_VisualHierarchy» y «15_CameraReadability» a lo que el de 25
+ * junta en «11_Readability», y «19_UIStyle» + «20_Iconography» a lo que junta en «16_UILanguage».
+ * Esa tabla ya existe —los alias del sistema de actualización— y se reusa en vez de repetirla:
+ * dos listas de equivalencias son dos listas que un día dicen cosas distintas.
+ */
+function indicePorNombre(obj) {
+  const m = new Map()
+  const { PAGINAS } = require('./actualizacion.service')
+  const alias = Object.values(PAGINAS).map(p => p.alias.map(soloNombre))
+  for (const [clave, valor] of Object.entries(obj)) {
+    const n = soloNombre(clave)
+    m.set(n, valor)
+    // Y con ella, todos los nombres que la v2.3 declara equivalentes.
+    for (const grupo of alias) if (grupo.includes(n)) for (const otro of grupo) if (!m.has(otro)) m.set(otro, valor)
+  }
+  return m
+}
+
 const CON_SLOT_REF = new Set([
   '01_KeyArt', '02_VisualDNA', '03_VisualPillars', '04_ShapeLanguage',
   '05_CharacterDesign', '06_EnvironmentLanguage', '08_ColorSystem', '09_LightingLanguage',
@@ -125,7 +155,7 @@ function resolverDestino({ rol, ambito, cual = null, formato = 'imagen' }) {
     return {
       rol, ambito, estado: def.estado, formato,
       principal: pagina
-        ? { clave: 'adi_pagina', titulo: `ADI section of ${pagina}`, adi: ADI_DE_PAGINA[pagina] || null,
+        ? { clave: 'adi_pagina', titulo: `ADI section of ${pagina}`, adi: seccionDe(pagina),
             pagina, inyeccion: 'indirecta', porque: 'Text feeds the ADI section that governs this page, through node 3.9.' }
         : { ...IDENTIDAD, inyeccion: 'indirecta' },
       alternativas: pagina ? [{ ...IDENTIDAD, inyeccion: 'indirecta' }] : [],
@@ -138,12 +168,12 @@ function resolverDestino({ rol, ambito, cual = null, formato = 'imagen' }) {
     return { rol, ambito, estado: def.estado, formato, principal: { ...IDENTIDAD, inyeccion: 'indirecta' }, alternativas: [], avisos }
   }
 
-  const adi = ADI_DE_PAGINA[cual] || null
+  const adi = seccionDe(cual)
   if (!adi) avisos.push(`“${cual}” is not one of the 25 ASG pages: its §ADI anchor is unknown`)
 
   // El hueco de referencia decide si la inyección es directa o cae al ADI. No prometerla cuando no
   // existe es el fallback declarado en el handoff.
-  const tieneSlot = CON_SLOT_REF.has(cual)
+  const tieneSlot = tieneSlotRef(cual)
   if (!tieneSlot) {
     avisos.push(`“${cual}” has no REF_* slot yet, so the reference cannot be injected into it directly; `
               + 'it lands on the identity block and influences the page through its ADI section')
@@ -233,4 +263,12 @@ async function guardarContexto({
   return { activo, cascada, alimenta_3_9: Boolean(n39?.id) }
 }
 
-module.exports = { resolverDestino, guardarContexto, ROLES, AMBITOS, ADI_DE_PAGINA, CON_SLOT_REF, IDENTIDAD }
+/** La sección del ADI que gobierna una página, venga con el número que venga. */
+const ADI_POR_NOMBRE = indicePorNombre(ADI_DE_PAGINA)
+const seccionDe = pagina => ADI_POR_NOMBRE.get(soloNombre(pagina)) || null
+
+/** Si esa página tiene su hueco `REF_*` declarado. Mismo criterio: por nombre. */
+const SLOT_POR_NOMBRE = new Set([...CON_SLOT_REF].map(soloNombre))
+const tieneSlotRef = pagina => SLOT_POR_NOMBRE.has(soloNombre(pagina))
+
+module.exports = { resolverDestino, guardarContexto, ROLES, AMBITOS, ADI_DE_PAGINA, CON_SLOT_REF, IDENTIDAD, seccionDe, tieneSlotRef, soloNombre }

@@ -41,8 +41,10 @@ const PAGINAS = {
   color_system:         { n: '08', alias: ['ColorSystem'] },
   lighting:             { n: '09', alias: ['LightingLanguage', 'Lighting'] },
   texture_style:        { n: '10', alias: ['TextureStyle', 'Material'] },
-  // Fusión del maestro de 25: dos páginas del de 34 caen acá.
-  readability:          { n: '11', alias: ['Readability', 'VisualHierarchy', 'CameraReadability', 'DetailDensity'] },
+  // Fusión del maestro de 25, tal como la fija la v2.3 §2.0: «Readability = VisualHierarchy +
+  // CameraReadability». DetailDensity NO entra — estaba de más de nuestro lado y Miguel lo sacó
+  // explícitamente al cerrar el punto de las equivalencias.
+  readability:          { n: '11', alias: ['Readability', 'VisualHierarchy', 'CameraReadability'] },
   animation_language:   { n: '12', alias: ['AnimationLanguage', 'AnimationStyle'] },
   vfx_language:         { n: '13', alias: ['VFXLanguage'] },
   audio_language:       { n: '14', alias: ['AudioLanguage'] },
@@ -152,9 +154,20 @@ function loQueDispara(pagina) {
  * cambio, se queda en [R] —la acción más fuerte manda— y se suma el origen. Bajarla a [V] porque
  * llegó después un cambio menor perdería el trabajo que ya se debía.
  */
-async function propagarDesdePagina({ db, project_id, asset_id, motivo = null, member_id = null }) {
+/**
+ * `cambio` dice QUÉ clase de cambio fue, y solo afecta a los derivados (v2.3 §2.1):
+ *
+ *   'sujeto'      cambió lo que se retrata  → los derivados se marcan [R]
+ *   'tratamiento' cambió la luz o la paleta → [V], como hasta ahora
+ *   null          no se sabe               → [V], que es lo que no cuesta ni destruye
+ *
+ * No se deduce del texto del Design Edit. «change the spider for a lion» es fácil, «make it
+ * warmer and add a fireplace» no, y equivocarse manda a alguien a pagar una regeneración que no
+ * hacía falta. Lo elige quien edita, que es el único que lo sabe.
+ */
+async function propagarDesdePagina({ db, project_id, asset_id, motivo = null, member_id = null, cambio = null }) {
   const { data: origen } = await db().from('forge_assets')
-    .select('id, name, project_id').eq('id', asset_id).eq('project_id', project_id).maybeSingle()
+    .select('id, name, project_id, metadata').eq('id', asset_id).eq('project_id', project_id).maybeSingle()
   if (!origen) return { aplica: false, motivo: 'Asset not found' }
 
   const pagina = paginaDe(origen)
@@ -185,6 +198,11 @@ async function propagarDesdePagina({ db, project_id, asset_id, motivo = null, me
   const marcadas = []
   const ausentes = []
 
+  // En qué versión va el padre AHORA. Es la mitad del dato que pide la v2.1: la otra mitad —de
+  // qué versión salió cada hija— la lleva la propia hija desde que se produjo. Con las dos, la
+  // marca puede decir «esta parte viene de la v1 y la hoja va por la v4» sin abrir ninguna.
+  const versionPadre = await versionVigente(db, origen.id)
+
   const marcar = async (pieza, accion, por) => {
     const previa = pieza.metadata?.desactualizado
     // La acción más fuerte manda: [R] no baja a [V] porque llegó un cambio menor después.
@@ -195,6 +213,12 @@ async function propagarDesdePagina({ db, project_id, asset_id, motivo = null, me
       desactualizado: {
         accion: final, origenes, desde: previa?.desde || sello, marcado_en: sello,
         por_pagina: etiquetaDe(pagina), motivo: motivo || previa?.motivo || null, marcado_por: member_id,
+        // De qué versión del padre salió esta pieza, y en cuál va él. `null` en las que se
+        // produjeron antes de que esto existiera: se dice que no se sabe en vez de suponer v1.
+        version_padre: versionPadre,
+        version_origen: pieza.metadata?.derivado_de_version ?? null,
+        // Qué clase de cambio lo provocó, para que la tarjeta pueda explicarse.
+        cambio: cambio || previa?.cambio || null,
       },
     }
     const { error } = await db().from('forge_assets').update({ metadata }).eq('id', pieza.id)
@@ -210,12 +234,17 @@ async function propagarDesdePagina({ db, project_id, asset_id, motivo = null, me
     await marcar(pieza, d.accion, origen.id)
   }
 
-  // Lo que ESTA hoja produjo: las tres vistas, el modelo, el teaser. Se revalida, no se regenera:
-  // es arte pago y puede seguir valiendo.
+  // Lo que ESTA hoja produjo: las tres vistas, el modelo, el teaser.
+  //
+  // Se revalidaba siempre, porque es arte pago y suele seguir valiendo. El caso del león mostró
+  // que eso se queda corto: la hoja pasó de un gato a un león y sus veinte partes seguían siendo
+  // del gato — ahí no hay nada que revalidar, hay que rehacerlas. Por eso la v2.3 distingue: si
+  // cambió QUÉ se retrata, los derivados van a [R]; si cambió la luz o la paleta, [V].
   if (fila.derivados) {
     const { data: hijos } = await db().from('forge_assets')
       .select('id, name, metadata').eq('project_id', project_id).eq('derived_from_id', origen.id)
-    for (const h of hijos || []) await marcar(h, fila.derivados, origen.id)
+    const accionHijos = cambio === 'sujeto' ? 'R' : fila.derivados
+    for (const h of hijos || []) await marcar(h, accionHijos, origen.id)
   }
 
   return {
@@ -238,6 +267,9 @@ async function pendientesDelProyecto({ db, project_id }) {
     desde: a.metadata.desactualizado.desde,
     por_pagina: a.metadata.desactualizado.por_pagina || null,
     origenes: a.metadata.desactualizado.origenes || [],
+    version_padre: a.metadata.desactualizado.version_padre ?? null,
+    version_origen: a.metadata.desactualizado.version_origen ?? null,
+    cambio: a.metadata.desactualizado.cambio ?? null,
   }))
 }
 
@@ -266,7 +298,21 @@ async function revalidar({ db, project_id, asset_id, member_id = null }) {
   return { id: pieza.id, nombre: pieza.name, accion_previa: marca.accion }
 }
 
+/**
+ * En qué versión va una pieza ahora mismo, o `null` si nunca se versionó.
+ *
+ * Vive acá porque es el dato que la marca necesita en los DOS extremos: la versión del padre
+ * cuando se marca, y la del padre cuando se produjo la hija. Leerlo en dos sitios distintos sería
+ * garantizar que un día cuenten cosas distintas.
+ */
+async function versionVigente(db, asset_id) {
+  const { data } = await db().from('forge_asset_versions')
+    .select('version_number').eq('asset_id', asset_id)
+    .order('version_number', { ascending: false }).limit(1)
+  return data?.[0]?.version_number ?? null
+}
+
 module.exports = {
   MATRIZ, PAGINAS, DOCUMENTO, paginaDe, etiquetaDe, loQueDispara,
-  propagarDesdePagina, pendientesDelProyecto, revalidar,
+  propagarDesdePagina, pendientesDelProyecto, revalidar, versionVigente,
 }

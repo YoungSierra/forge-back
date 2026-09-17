@@ -599,6 +599,11 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
         ? (salidasPorPaso[paso.porCadaSalidaDe]?.[cada]?.assetId ?? anterior.id)
         : anterior.id
 
+      // En qué versión iba el padre al producir esto. Se lee UNA vez por lote, no por pieza: en el
+      // escenario son veinte piezas del mismo padre y serían veinte viajes iguales.
+      const { versionVigente } = require('./actualizacion.service')
+      const versionDelPadre = await versionVigente(db, padre).catch(() => null)
+
       for (const [rol, sal] of publicables) {
         // Con instancias, el nombre lleva la parte; sin ellas, el rol solo si hay más de uno.
         const sufijo = cada ? ` — ${cada}` : (publicables.length > 1 ? ` — ${rol}` : '')
@@ -617,6 +622,11 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
           metadata: {
             cadena: { nombre: nombreCadena, paso: paso.clave, rol, parte: cada ?? null },
             job: jobId, prompt: paso.pide_prompt ? prompt : null,
+            // De qué VERSIÓN del padre salió esta pieza (v2.3 §2.1 del sistema de actualización).
+            // Es la mitad del dato que hace útil la marca: sin él, cuando la hoja va por la v4 y
+            // esta parte se hizo con la v1, lo único que se puede decir es «revísala». Con él, la
+            // tarjeta dice de dónde viene y quien mira decide sin abrir las dos.
+            ...(versionDelPadre !== null ? { derivado_de_version: versionDelPadre } : {}),
             ...(opciones && Object.keys(opciones).length ? { opciones } : {}),
           },
         }).select('id, name, storage_url, format, metadata').single()

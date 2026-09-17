@@ -5383,6 +5383,10 @@ router.post('/assets/:asset_id/design-edit', async (req, res, next) => {
     const { id: project_id, asset_id } = req.params
     const member_id = req.body?.member_id || null
     const pedido    = String(req.body?.prompt || '').trim()
+    // Qué clase de cambio es, según quien lo pide (v2.3 §2.1): «sujeto» cambia QUÉ se retrata y
+    // manda los derivados a [R]; «tratamiento» cambia luz o paleta y los deja en [V]. No se
+    // deduce del texto: equivocarse acá hace pagar una regeneración que no hacía falta.
+    const cambio    = ['sujeto', 'tratamiento'].includes(req.body?.cambio) ? req.body.cambio : null
     if (!pedido) return res.status(400).json({ success: false, error: 'Describe the design change' })
 
     const { data: asset } = await db().from('forge_assets')
@@ -5458,6 +5462,9 @@ router.post('/assets/:asset_id/design-edit', async (req, res, next) => {
       created_by: member_id,
       metadata: {
         job: jobId, design_edit: pedido, workflow: 'V57_STUDIO_Moodboard_Iteration',
+        // Qué clase de cambio fue. Se guarda con la VERSIÓN porque la cascada marca al aprobarla,
+        // que puede ser días después y por otra persona.
+        ...(cambio ? { design_edit_cambio: cambio } : {}),
         ...(opciones && Object.keys(opciones).length ? { opciones } : {}),
       },
     }).select('id, version_number').single()
@@ -5482,7 +5489,7 @@ router.post('/assets/:asset_id/design-edit', async (req, res, next) => {
       const { propagarDesdePagina, revalidar } = require('../services/actualizacion.service')
       await revalidar({ db, project_id, asset_id, member_id }).catch(() => {})
       cascada = await propagarDesdePagina({
-        db, project_id, asset_id, member_id,
+        db, project_id, asset_id, member_id, cambio,
         motivo: `design edit: ${String(pedido).slice(0, 80)}`,
       })
     } catch (e) {
@@ -6105,8 +6112,12 @@ router.post('/assets/:asset_id/versions/:version_id/approve', async (req, res, n
       const { propagarDesdePagina, revalidar } = require('../services/actualizacion.service')
       // Esta página acaba de cambiar por decisión de alguien: su propia marca ya no aplica.
       await revalidar({ db, project_id, asset_id, member_id }).catch(() => {})
+      // La clase de cambio se eligió al EDITAR, y la cascada marca al APROBAR: se lee de la
+      // versión que se está aprobando. Una versión que no vino de un Design Edit no la trae, y
+      // entonces los derivados van a [V], que es lo que no cuesta ni destruye.
       cascada = await propagarDesdePagina({
         db, project_id, asset_id, member_id,
+        cambio: ver.metadata?.design_edit_cambio ?? null,
         motivo: `version ${ver.version_number} approved`,
       })
     } catch (e) {
