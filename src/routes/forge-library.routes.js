@@ -79,7 +79,23 @@ router.post('/', (req, res, next) => {
 })
 
 // ─── GET /api/projects/:id/library/:asset_id/file ────────────────────────────
-// Proxy del archivo desde R2 — evita problemas de CORS en el cliente
+//
+// Dice DÓNDE está el archivo; no lo sirve.
+//
+// Antes lo bajaba de R2 y lo volvía a emitir por acá, para esquivar el CORS del bucket. Funciona,
+// y cuesta: cada apertura paga el tamaño entero en el ancho de banda de Render —bajarlo y
+// servirlo—. En esta librería hay 148 MB con dos modelos de 55 y 45 MB: noventa aperturas del
+// grande son los 5 GB del plan. El 17-09 el workspace se suspendió por agotarlos.
+//
+// Ahora contesta un redirect de un par de cientos de bytes y sirve R2, cuya salida no se cobra.
+// Es lo mismo que hace la ruta de miniaturas.
+//
+// Lo que un redirect NO arregla es el CORS que motivó el proxy: quien necesite LEER los bytes
+// —`fetch`, un canvas— seguirá topándose con el bucket, que no manda `Access-Control-Allow-Origin`
+// y contesta 403 al preflight (medido el 16-09). Hoy no le afecta a nadie: el front usa
+// `storage_url` directo para mostrar y descargar, y lo que necesita leer bytes —las miniaturas 3D,
+// el visor— pasa por su propio proxy. Si algún día hace falta de verdad, la solución es ponerle
+// CORS al bucket, no volver a pagar el tráfico dos veces.
 router.get('/:asset_id/file', async (req, res, next) => {
   try {
     const { id: project_id, asset_id } = req.params
@@ -92,16 +108,12 @@ router.get('/:asset_id/file', async (req, res, next) => {
       .single()
 
     if (error || !data) return res.status(404).json({ success: false, error: 'Asset not found' })
+    if (!data.storage_url) return res.status(404).json({ success: false, error: 'Asset has no file' })
 
-    const upstream = await fetch(data.storage_url)
-    if (!upstream.ok) return res.status(502).json({ success: false, error: 'Failed to fetch from storage' })
-
-    res.setHeader('Content-Type', data.mime_type || 'application/octet-stream')
     res.setHeader('Access-Control-Allow-Origin', '*')
-    res.setHeader('Content-Disposition', `inline; filename="${data.file_name}"`)
-
-    const { Readable } = require('stream')
-    Readable.fromWeb(upstream.body).pipe(res)
+    // Una hora: el archivo no cambia de sitio, y el redirect es lo único que se pide a Render.
+    res.setHeader('Cache-Control', 'public, max-age=3600')
+    return res.redirect(302, data.storage_url)
   } catch (err) { next(err) }
 })
 
