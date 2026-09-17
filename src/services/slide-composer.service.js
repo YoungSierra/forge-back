@@ -867,6 +867,33 @@ async function composeDeck({ db, projectId, deck = 'asg', fills = null, solo = n
   // que quien consuma reciba solo páginas reales.
   const vivas = paginas.filter(Boolean)
 
+  // Una página EN BLANCO no se despacha. El guardia de arriba frena la ausencia del documento;
+  // este frena el caso siguiente: el documento está, pero no trae ninguna de las secciones que
+  // una página necesita, y esa página viajaría con todos sus campos en «UPSTREAM GAP». Medido en
+  // test_smack_migue_v.08: la 04 salía sin un solo dato del spec y se habría pagado igual.
+  //
+  // Solo cuentan los campos que se piden AL DOCUMENTO. Lo que Forge sabe de sí mismo (`forge`),
+  // las instrucciones literales del mapa y las etiquetas visuales no prueban que el documento
+  // sirva, así que no salvan a una página. Y la regla es «todos en hueco»: una página con algún
+  // campo resuelto pasa, con sus huecos declarados, como en cualquier otro deck.
+  if (cfg.requerido) {
+    const buscadas = et => {
+      const c = Object.prototype.hasOwnProperty.call(mapa, et) ? mapa[et] : null
+      return Array.isArray(c) ? c.flat().map(x => (typeof x === 'object' ? x.seccion : x)) : [et]
+    }
+    const enBlanco = vivas.filter(p =>
+      p.faltantes.length && !p.llenos.some(l => l.chars != null && l.via !== 'forge'))
+    if (enBlanco.length) {
+      const detalle = enBlanco.map(p =>
+        `${p.nombre}: ${p.faltantes.map(f => `${f} (looked for ${buscadas(f).map(s => `"${s}"`).join(' or ')})`).join(', ')}`).join('; ')
+      const e = new Error(`The ${cfg.documento} deck cannot render ${enBlanco.length} page(s): the ${cfg.asset ? `"${cfg.asset}"` : 'source document'} of node ${cfg.fuente} has none of the sections they need — ${detalle}`)
+      e.publico = true
+      e.status = 422
+      e.code = 'SOURCE_INCOMPLETE'
+      throw e
+    }
+  }
+
   // Verificación de tamaño ANTES de despachar, que es lo que pide la DNA: el límite es de entrada
   // a ComfyUI y una sola página excedida hace fallar el job entero.
   for (const p of vivas) {
