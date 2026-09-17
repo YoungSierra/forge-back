@@ -6256,14 +6256,26 @@ router.post('/alcance/instanciar', async (req, res, next) => {
     const { id: project_id } = req.params
     const { instanciarHojas } = require('../services/instanciar-hojas.service')
 
-    const { data: nodo } = await db().from('forge_nodes').select('id, node_key, dna').eq('node_key', '3.20').maybeSingle()
+    // `outputs`, no `dna`: esa columna no existe en `forge_nodes` y la consulta fallaba ENTERA, así
+    // que `data` volvía null y el botón contestaba «node 3.20 is not registered» con el nodo
+    // perfectamente registrado. Lo reportó Migue Amez el 17-09, con el recuadro ya mostrando sus
+    // 17 hojas: todo listo para producir y un error que señalaba al sitio equivocado.
+    const { data: nodo, error: eNodo } = await db().from('forge_nodes')
+      .select('id, node_key, outputs').eq('node_key', '3.20').maybeSingle()
+    if (eNodo) throw eNodo
     if (!nodo) return res.status(400).json({ success: false, error: 'node 3.20 is not registered' })
-    const def = (nodo.dna?.outputs || []).find(o => (o.key || o.name) === (req.body?.output_key || 'art_style_guide_images'))
+
+    // La clave por defecto es la que el 3.20 declara de verdad. `art_style_guide_images` no existe
+    // entre sus salidas —son `asg_content_images`, `gdd_art_style_images`, `art_bible_images`— y
+    // buscar una que no está dejaba `def` en null: el modelo de imagen caía al de reserva sin que
+    // nada lo dijera.
+    const clave = req.body?.output_key || 'asg_content_images'
+    const def = (nodo.outputs || []).find(o => (o.key || o.name) === clave)
 
     const r = await instanciarHojas({
       db, project_id,
       node_id: nodo.id, node_key: nodo.node_key,
-      output_key: req.body?.output_key || 'art_style_guide_images',
+      output_key: clave,
       image_gen_model: def?.image_gen_model || 'comfyui:V57_STUDIO_ArtStyleGuide_Template_25',
       paginas: req.body?.paginas,
       deck: req.body?.deck || 'asg',
