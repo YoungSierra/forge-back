@@ -354,6 +354,12 @@ router.get('/project-assets', async (req, res, next) => {
       // lo que se reusa al rehacerla. Solo eso del metadata — el resto es interno de la cadena y
       // no tiene por qué viajar a cada tarjeta del moodboard.
       opciones:    a.metadata?.opciones ?? null,
+      // Los renders del nivel montado. Viajan porque el visor los enseña como galería debajo del
+      // modelo —«el visualizador 3D abre el .glb y las imágenes quedan como galería del nivel»,
+      // documento de JuanK del 18-09— y sin esto el front tendría que pedir la pieza otra vez
+      // solo para leer un arreglo de tres URLs. Null en todo lo que no sea un montaje, que es
+      // casi todo: no engorda las tarjetas del moodboard.
+      montaje_renders: a.metadata?.montaje_subido?.renders ?? null,
       created_at:  a.approved_at ?? a.created_at,
       versions:    (forgeVersionsMap[a.id] || []).map(v => ({
         id:             v.id,

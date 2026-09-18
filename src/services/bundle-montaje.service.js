@@ -111,7 +111,16 @@ function kitDesdeMedidas(activos, escala = null, gramaticaClases = {}) {
  * Arma el `.zip` del bundle. Devuelve el buffer, para que quien llame decida si lo sube a R2 o lo
  * manda por la respuesta.
  */
-async function armarZip({ bundle, orden, kit, validacion, modelos, shell = null, planta = null }) {
+async function armarZip({
+  bundle, orden, kit, validacion, modelos, shell = null, planta = null,
+  // Lo que pide el documento de JuanK del 18-09 y no viajaba: la documentación del nivel, la
+  // lámina del Environment Sheet, una imagen de diseño por asset y las medidas del GDD.
+  //
+  // Su razón para las imágenes, literal: «realmente me ayudan a identificar y redimensionar los
+  // modelos». Un `.glb` abierto en Blender es una malla gris sin contexto; la imagen de la que
+  // salió dice qué es y cómo de grande debería ser.
+  documentos = [], laminaSheet = null, imagenes = [], medidas = null,
+}) {
   const zip = archiver('zip', { zlib: { level: 9 } })
   const trozos = []
   zip.on('data', t => trozos.push(t))
@@ -121,7 +130,28 @@ async function armarZip({ bundle, orden, kit, validacion, modelos, shell = null,
   zip.append(JSON.stringify(orden, null, 2), { name: 'montaje/orden_de_montaje.json' })
   zip.append(JSON.stringify(kit, null, 2), { name: 'montaje/kit.json' })
   zip.append(JSON.stringify(validacion, null, 2), { name: 'montaje/validacion.json' })
-  for (const m of modelos) zip.append(m.buffer, { name: `modelos/${m.asset_id}.glb` })
+
+  // Cada asset con su imagen y su modelo BAJO EL MISMO NOMBRE BASE, que es lo que permite
+  // emparejarlos al abrir el `.zip`. El nombre lo trae el modelo; si dos chocaran, el segundo
+  // lleva su id detrás — renombrar en silencio dos cosas igual sería peor que un nombre feo.
+  const usados = new Set()
+  for (const m of modelos) {
+    let base = m.base || m.asset_id
+    if (usados.has(base)) base = `${base}__${String(m.asset_id).slice(0, 8)}`
+    usados.add(base)
+    m.base_final = base
+    zip.append(m.buffer, { name: `assets/modelos/${base}.glb` })
+  }
+  for (const img of imagenes) {
+    const m = modelos.find(x => x.asset_id === img.asset_id)
+    const base = m?.base_final || img.base || img.asset_id
+    zip.append(img.buffer, { name: `assets/imagenes/${base}${img.ext || '.png'}` })
+  }
+
+  for (const d of documentos) zip.append(d.contenido, { name: `level_design/${d.nombre}` })
+  if (laminaSheet) zip.append(laminaSheet.buffer, { name: `environment_sheet/${laminaSheet.nombre}` })
+  if (medidas) zip.append(JSON.stringify(medidas, null, 2), { name: 'medidas.json' })
+
   // La carpeta de referencia no la consume nadie: existe para que un humano entienda el bundle
   // sin abrir Blender.
   if (shell) zip.append(JSON.stringify(shell, null, 2), { name: 'referencia/shell.json' })
@@ -132,6 +162,22 @@ async function armarZip({ bundle, orden, kit, validacion, modelos, shell = null,
   return Buffer.concat(trozos)
 }
 
+/**
+ * El nombre de un asset convertido en nombre de archivo.
+ *
+ * Sin tildes y sin espacios: el `.zip` se abre en Windows, en macOS y en Linux, y una `ó` en una
+ * ruta es un problema de codificación esperando a pasar — lo mismo que ya anotó JuanK para el
+ * `Cartón` de los videos.
+ */
+function nombreDeArchivo(nombre) {
+  return String(nombre || '')
+    .split(/\s+[—–]\s+/).pop()          // solo el nombre propio, no el documento ni la cadena
+    .normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .replace(/[^\w.-]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 60)
+}
+
 /** Baja los `.glb` del inventario y calcula su huella, que es lo que el manifiesto declara. */
 async function traerModelos(inventario) {
   const modelos = []
@@ -139,7 +185,14 @@ async function traerModelos(inventario) {
     const r = await fetch(it.url)
     if (!r.ok) throw new Error(`no se pudo bajar «${it.nombre}»: HTTP ${r.status}`)
     const buffer = Buffer.from(await r.arrayBuffer())
-    modelos.push({ asset_id: it.asset_id, buffer, bytes: buffer.length, sha256: sha256(buffer) })
+    // El nombre LEGIBLE del asset, que es con el que viaja al `.zip`. Antes el archivo se llamaba
+    // como su UUID: emparejar un modelo con su imagen funcionaba, pero quien abre el paquete en
+    // Blender no distingue un muro de una silla — y el documento de JuanK pide justamente poder
+    // identificarlos. El id queda igual en el manifiesto, que es donde hace falta.
+    modelos.push({
+      asset_id: it.asset_id, buffer, bytes: buffer.length, sha256: sha256(buffer),
+      base: nombreDeArchivo(it.nombre) || it.asset_id,
+    })
   }
   return modelos
 }
@@ -163,10 +216,16 @@ function manifiesto({ level_id, modelos, alturaJugador, fuenteAltura, escalaSpec
       validacion: 'montaje/validacion.json',
     },
     modelos: {
-      carpeta: 'modelos',
+      carpeta: 'assets/modelos',
       formato: 'glb',
+      // `archivo` sale del nombre con el que el modelo viajó de verdad, no de una plantilla: dos
+      // assets con el mismo nombre desempatan al empaquetar, y el manifiesto tiene que decir
+      // dónde quedó cada uno. Y va `imagen`, que es lo que empareja el modelo con su lámina.
       inventario: modelos.map(m => ({
-        asset_id: m.asset_id, archivo: `modelos/${m.asset_id}.glb`, sha256: m.sha256, bytes: m.bytes,
+        asset_id: m.asset_id,
+        archivo: `assets/modelos/${m.base_final || m.base || m.asset_id}.glb`,
+        imagen: m.imagen_ext ? `assets/imagenes/${m.base_final || m.base || m.asset_id}${m.imagen_ext}` : null,
+        sha256: m.sha256, bytes: m.bytes,
       })),
     },
     // Trazabilidad: de dónde salió la escala con la que se declararon esas dimensiones.

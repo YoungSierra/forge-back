@@ -109,10 +109,20 @@ const CADENAS = {
     etiqueta: 'Animation Sheet',
     pasos: [
       {
-        clave: 'pose_sheet', workflow: 'V57_STUDIO_2D_Character_Pose_Sheet', etiqueta: 'Pose sheet',
+        // Antes acá había `pose_sheet`, que producía una lámina de poses para Cascadeur. Lo
+        // reemplaza el video de referencia, y la razón la dio JuanK el 18-09: la lámina existía
+        // porque no se podía riggear desde IA, y eso dejó de ser cierto. Con las pruebas de
+        // animación en la mano, un video de referencia es mejor guía de timing e intención que
+        // tres vistas quietas.
+        //
+        // El workflow no lleva ancho ni alto: los calcula su propio `ResolutionSelector` a partir
+        // de un aspect ratio y un presupuesto de megapíxeles. JuanK pidió expresamente no tocarlo
+        // —se reajusta según el tamaño y el skin del personaje—, así que el motor no le inyecta
+        // resolución.
+        clave: 'animation_ref', workflow: 'V57_STUDIO_AnimationRef', etiqueta: 'Motion reference',
         porCadaClip: true,
-        que:    'One pose sheet per animation clip — three views across as many columns as the movement has key poses.',
-        porque: 'Cascadeur builds the real keyframes from these sheets; without them the rig has nothing to pose against.',
+        que:    'One reference video per animation clip, generated from the character’s front view.',
+        porque: 'The rig and the animation are built outside Forge from these clips: they carry the timing and the intent that a still cannot.',
         entradas: { image: 'ancla_personaje' },
       },
     ],
@@ -489,11 +499,41 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
         if (clave.startsWith('seed_')) extras[clave] = Math.floor(Math.random() * 2147483647)
       }
 
-      // Los beats de ESTE clip, y su nombre, que además nombra el archivo que devuelve ComfyUI.
-      // Se componen justo antes de despachar y no todos de una: si uno falla, los anteriores ya
+      // El pedido de ESTE clip, y su nombre, que además nombra el archivo que devuelve ComfyUI.
+      // Se compone justo antes de despachar y no todos de una: si uno falla, los anteriores ya
       // están rendidos y pagados, y componer los ocho para descubrirlo al final no ahorra nada.
       let promptDelDespacho = paso.pide_prompt ? (prompt || '') : ''
-      if (paso.porCadaClip) {
+
+      // ── El video de referencia ────────────────────────────────────────────
+      // Un párrafo que describe al personaje y su movimiento, y la duración en segundos. Las dos
+      // cosas salen de la MISMA caracterización, así que se piden juntas — ver `promptDeVideo`.
+      // La duración viaja como parámetro y no dentro del texto: el workflow la convierte a
+      // fotogramas él solo.
+      if (paso.porCadaClip && paso.clave === 'animation_ref') {
+        const clip = anim.clips.find(c => c.nombre === cada) || { nombre: cada }
+        const anm = require('./animacion.service')
+        // Quién es el personaje. Lo dice la hoja instanciada —el motor le escribió
+        // `metadata.instancia.item` al crearla— y si no la tiene, lo que va después del último
+        // guion largo de su nombre, que es donde el sistema entero guarda el nombre propio.
+        const idPersonaje = origen.metadata?.instancia?.item
+          || String(origen.name || '').split(/\s+[—–]\s+/).pop()
+          || 'Character'
+
+        const v = await anm.promptDeVideo({
+          clip, adi: anim.adi,
+          personaje: idPersonaje,
+          referencia: origen.name || null,
+        })
+        promptDelDespacho = v.texto
+        extras.clip = cada
+        extras.duracion = v.segundos
+        // `<ID_Personaje>/<Movimiento>`, la convención de JuanK, sin tildes en la ruta: el nombre
+        // viaja a un sistema de archivos y `Cartón` da problemas de codificación entre sistemas.
+        // Él mismo lo dejó anotado al elegir `Carton` en el ejemplo del workflow.
+        const sinTilde = s => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^\w.-]+/g, '_')
+        extras.nombre = `${sinTilde(idPersonaje)}/${sinTilde(cada)}`
+        console.log(`[cadena] ${paso.clave}: «${cada}» — ${v.segundos}s${v.estimado ? ' (estimado)' : ' (del documento)'}`)
+      } else if (paso.porCadaClip) {
         const clip = anim.clips.find(c => c.nombre === cada)
         const anm = require('./animacion.service')
 

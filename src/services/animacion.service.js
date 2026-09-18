@@ -149,6 +149,75 @@ async function clipsDelProyecto({ db, project_id, refrescar = false, soloCache =
  * El método es de la skill, no de acá. Se carga registrada y se le manda como sistema: si alguien
  * la mejora en R2, esto mejora sin desplegar, que es la razón por la que las skills viven ahí.
  */
+/**
+ * El prompt de video de UN movimiento, y cuánto dura.
+ *
+ * Es la Fase 2 y la Fase 3 del proceso de JuanK en una sola llamada, y van juntas a propósito:
+ * las dos salen de la MISMA caracterización del personaje —complexión, peso aparente, energía— y
+ * pedirlas por separado significaría deducir esa caracterización dos veces y arriesgar que la
+ * segunda no coincida con la primera. Un personaje grande y pesado se mueve más lento y asienta
+ * más los golpes; uno pequeño y ágil rebota. El mismo razonamiento decide cómo se describe el
+ * movimiento y cuántos segundos dura.
+ *
+ * Las convenciones son las suyas, literales: inglés, un párrafo descriptivo y no una lista, el
+ * personaje descrito AL INICIO —el modelo de video no tiene memoria de otros prompts—, encuadre y
+ * luz consistentes entre movimientos para que los clips sean comparables, y la duración FUERA del
+ * texto, porque es un parámetro aparte del workflow.
+ */
+async function promptDeVideo({ clip, adi, personaje = null, referencia = null }) {
+  const system = [
+    'Escribís el prompt de un modelo de imagen-a-video para UN movimiento de un personaje de juego.',
+    'No escribís prosa alrededor: devolvés JSON.',
+    '',
+    'Devolvé SOLO este objeto, sin texto alrededor y sin cercas de código:',
+    '{ "prompt": "<un párrafo en INGLÉS>", "segundos": <número>, "estimado": true|false }',
+    '',
+    'EL PÁRRAFO:',
+    '- En inglés, UN párrafo descriptivo. No una lista de instrucciones ni viñetas.',
+    '- Empieza SIEMPRE describiendo al personaje —silueta, materiales, escala— y recién después la',
+    '  acción. El modelo no recuerda otros prompts: cada uno se lee solo.',
+    '- Encuadre de cámara, fondo y luz consistentes entre movimientos del mismo personaje, para que',
+    '  los clips queden comparables entre sí.',
+    '- NO escribas la duración en el texto. Es un parámetro aparte.',
+    '- Si el documento fija una regla de deformación para este personaje (p. ej. «cero',
+    '  squash-and-stretch»), repetila explícitamente: el modelo no la infiere sola.',
+    '',
+    'LOS SEGUNDOS:',
+    '- Salen de la complexión y la energía del personaje aplicadas a ESTE movimiento, no de un',
+    '  valor por defecto igual para todos.',
+    '- `estimado: false` solo si el documento da un tiempo para este movimiento. Si lo dedujiste',
+    '  vos, `estimado: true` — hay que poder distinguir el dato duro del criterio aplicado.',
+  ].join('\n')
+
+  const usuario = [
+    personaje ? `Personaje: ${personaje}` : null,
+    referencia ? `Referencia visual de la que sale el video: ${referencia}` : null,
+    `Movimiento: ${clip.etiqueta || clip.nombre}`,
+    clip.loop != null ? `¿Cicla? ${clip.loop ? 'sí' : 'no'}` : null,
+    clip.reglas ? `Lo que el documento dice de este movimiento:\n${clip.reglas}` : null,
+    '',
+    'Documento de dirección de animación:',
+    String(adi || '').slice(0, 24000),
+  ].filter(Boolean).join('\n')
+
+  const res = await callLLM(system, usuario, { model: MODELO, rawText: true, temperature: 0.4, maxOutputTokens: 2000 })
+  const texto = String(res?.data ?? res?.text ?? '').trim()
+    .replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '')
+
+  let p
+  try { p = JSON.parse(texto) } catch {
+    throw new Error(`el prompt de video no volvió como JSON: ${texto.slice(0, 160)}`)
+  }
+  if (!p.prompt || !String(p.prompt).trim()) throw new Error('el prompt de video volvió vacío')
+
+  // Los segundos se acotan: el modelo cobra por duración y un 30 inventado es una corrida cara y
+  // sin sentido. Cinco es el valor con el que viene el workflow, así que es el respaldo honesto.
+  const seg = Number(p.segundos)
+  const segundos = Number.isFinite(seg) && seg >= 1 && seg <= 12 ? Math.round(seg * 10) / 10 : 5
+
+  return { texto: String(p.prompt).trim(), segundos, estimado: p.estimado !== false }
+}
+
 async function beatsDeClip({ clip, adi, personaje = null }) {
   const skill = await getSkill(SKILL_BEATS)
   if (!skill) {
@@ -378,6 +447,6 @@ async function guardarBeats({ db, project_id, node_id = null, clip, json, member
 }
 
 module.exports = {
-  clipsDelProyecto, beatsDeClip, beatsDesdeJson, guardarBeats, lineasDeBeats,
+  clipsDelProyecto, beatsDeClip, beatsDesdeJson, guardarBeats, lineasDeBeats, promptDeVideo,
   adiDeAnimacion, anclaDelPersonaje, TOPE_CLIPS, SKILL_BEATS,
 }

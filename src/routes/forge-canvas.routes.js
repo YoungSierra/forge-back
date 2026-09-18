@@ -5437,6 +5437,123 @@ async function versionActual(asset_id) {
   return data?.version_number || 0
 }
 
+// ─── POST /api/projects/:id/canvas/assets/:asset_id/upload-manual ────────────
+//
+// «Upload manual edits» del radial (informe v9, punto 3). Alguien se llevó el asset a Photoshop,
+// a Blender o a un editor de audio, lo arregló a mano, y quiere que ESA sea la versión vigente.
+//
+// La decisión de fondo: NO se crea una pieza nueva. Se guarda una VERSIÓN de la que ya existe.
+// Eso es lo que hace que herede la arquitectura entera sin copiar ni un campo — mismo `id`, así
+// que conserva su `derived_from_id`, su `output_key`, su `metadata.instancia` del menú del
+// Vertical Slice, su sitio en el lienzo y sus «Must comply with». Publicar un activo nuevo y
+// después reconstruir sus relaciones a mano sería la forma de perder una.
+//
+// El tipo se deduce de la EXTENSIÓN, como pide el informe: nadie tiene que declarar que un `.glb`
+// es un modelo. Y como esto ACTUALIZA la página, dispara la misma cascada que un Design Edit: lo
+// que colgaba de ella queda igual de desactualizado, lo haya hecho una IA o una persona.
+const subidaManual = multer({ storage: multer.memoryStorage(), limits: { fileSize: 200 * 1024 * 1024 } })
+
+// Extensión → qué es y con qué mime se sirve. Un `.mp3` etiquetado `image/png` se descarga y no
+// suena en ningún lado, así que la extensión manda sobre lo que declare el navegador.
+const TIPOS_MANUALES = {
+  png: ['image', 'image/png'],   jpg:  ['image', 'image/jpeg'], jpeg: ['image', 'image/jpeg'],
+  webp: ['image', 'image/webp'], gif:  ['image', 'image/gif'],  tif:  ['image', 'image/tiff'],
+  tiff: ['image', 'image/tiff'],
+  glb: ['model_3d', 'model/gltf-binary'], gltf: ['model_3d', 'model/gltf+json'],
+  fbx: ['model_3d', 'application/octet-stream'], obj: ['model_3d', 'text/plain'],
+  mp4: ['video', 'video/mp4'], webm: ['video', 'video/webm'], mov: ['video', 'video/quicktime'],
+  mp3: ['audio', 'audio/mpeg'], wav: ['audio', 'audio/wav'], ogg: ['audio', 'audio/ogg'],
+  flac: ['audio', 'audio/flac'],
+}
+
+router.post('/assets/:asset_id/upload-manual', subidaManual.single('archivo'), async (req, res, next) => {
+  try {
+    const { id: project_id, asset_id } = req.params
+    const member_id = req.body?.member_id || null
+    const cambio    = req.body?.cambio || null
+    if (!req.file?.buffer?.length) {
+      return res.status(400).json({ success: false, error: 'No file was uploaded', code: 'SIN_ARCHIVO' })
+    }
+
+    const ext = (/\.([a-z0-9]{1,5})$/i.exec(req.file.originalname || '')?.[1] || '').toLowerCase()
+    const tipo = TIPOS_MANUALES[ext]
+    if (!tipo) {
+      return res.status(400).json({
+        success: false, code: 'TIPO_DESCONOCIDO',
+        error: `Forge does not know what a ".${ext || '?'}" is. Accepted: ${Object.keys(TIPOS_MANUALES).join(', ')}`,
+      })
+    }
+    const [formato, mime] = tipo
+
+    const { data: asset, error: eA } = await db().from('forge_assets')
+      .select('id, name, storage_url, format, metadata')
+      .eq('id', asset_id).eq('project_id', project_id).maybeSingle()
+    if (eA) throw eA
+    if (!asset) return res.status(404).json({ success: false, error: 'Asset not found' })
+
+    const { uploadToStorage } = require('../services/storage.service')
+    const destino = `projects/${project_id}/manual/${asset_id}-${Date.now()}.${ext}`
+    const url = await uploadToStorage(req.file.buffer, destino, mime)
+
+    // La v1 se siembra con lo que había, si nadie la había sembrado: sin eso, la imagen original
+    // desaparecería del historial al subir la primera corrección a mano.
+    let ultima = await versionActual(asset_id)
+    if (ultima === 0) {
+      await db().from('forge_asset_versions').insert({
+        asset_id, storage_url: asset.storage_url, version_number: 1, is_current: false,
+        metadata: { origen: 'imagen original' },
+      })
+      ultima = 1
+    }
+    await db().from('forge_asset_versions').update({ is_current: false }).eq('asset_id', asset_id)
+    const { data: ver, error: vErr } = await db().from('forge_asset_versions').insert({
+      asset_id, storage_url: url, version_number: ultima + 1, is_current: true,
+      created_by: member_id,
+      metadata: {
+        subida_manual: {
+          archivo: req.file.originalname, bytes: req.file.size,
+          formato, formato_anterior: asset.format || null,
+        },
+        ...(cambio ? { design_edit_cambio: cambio } : {}),
+      },
+    }).select('id, version_number').single()
+    if (vErr) throw vErr
+
+    // La pieza queda apuntando al archivo nuevo. Se actualiza también el FORMATO: alguien puede
+    // subir un `.glb` sobre una página que era `png` —modelar a mano lo que la cadena dejó en 2D—
+    // y si el formato no cambiara, el moodboard seguiría tratándolo como imagen y la pestaña 3D
+    // no lo vería.
+    const { error: uErr } = await db().from('forge_assets').update({
+      storage_url: url, format: formato, mime_type: mime, file_size_bytes: req.file.size,
+      metadata: {
+        ...(asset.metadata || {}),
+        subida_manual: { en: new Date().toISOString(), archivo: req.file.originalname, por: member_id },
+      },
+    }).eq('id', asset_id)
+    if (uErr) throw uErr
+
+    // Y la cascada, por la misma razón que en Design Edits: la página cambió.
+    let cascada = null
+    try {
+      const { propagarDesdePagina, revalidar } = require('../services/actualizacion.service')
+      await revalidar({ db, project_id, asset_id, member_id }).catch(() => {})
+      cascada = await propagarDesdePagina({
+        db, project_id, asset_id, member_id, cambio,
+        motivo: `manual upload: ${req.file.originalname}`,
+      })
+    } catch (e) {
+      console.warn('[actualizacion] la cascada falló tras la subida manual (no fatal):', e.message)
+    }
+
+    console.log(`[subida-manual] ${asset.name} ← ${req.file.originalname} (${formato}, ${(req.file.size / 1024).toFixed(0)} KB) v${ver.version_number}`)
+    res.json({
+      success: true,
+      version: { id: ver.id, version_number: ver.version_number, storage_url: url },
+      formato, mime, cascada,
+    })
+  } catch (err) { next(err) }
+})
+
 // ─── POST /api/projects/:id/canvas/assets/:asset_id/design-edit ──────────────
 // «Design Edits» del moodboard: el usuario pide un cambio de diseño en palabras y la imagen se
 // vuelve a generar aplicando SOLO eso.
@@ -5447,7 +5564,137 @@ async function versionActual(asset_id) {
 // El prompt del workflow trae un andamiaje alrededor de un token —«mantén la plantilla exacta:
 // mismo layout, cajas, textos, tipografías…»— y ESE andamiaje es la garantía de que la iteración
 // no destruya la página. Por eso se sustituye el token y no se reemplaza el prompt.
-router.post('/assets/:asset_id/design-edit', async (req, res, next) => {
+
+// ─── Recibir el nivel ya montado ─────────────────────────────────────────────
+//
+// La segunda mitad del documento de JuanK del 18-09. El nivel se arma FUERA de Forge —en Blender,
+// con el `.zip` de insumos— y vuelve a mano: un `.glb` y sus tres o cuatro renders.
+//
+// Dos reglas suyas, y las dos son de diseño, no de implementación:
+//
+//   · «Modelo y renders se suben y se reemplazan SIEMPRE JUNTOS». Por eso es UNA petición con
+//     todo: subir el modelo y olvidarse de los renders dejaría un montaje a medias con cara de
+//     completo. O entra el conjunto, o no entra nada.
+//   · «En el moodboard vive un solo montaje por nivel, el último». Así que esto no publica una
+//     pieza nueva cada vez: si el nivel ya tiene su montaje, se le guarda una VERSIÓN, y con eso
+//     el anterior queda en la Asset Library, que es donde se puede volver a mirar.
+const subidaMontaje = multer({ storage: multer.memoryStorage(), limits: { fileSize: 400 * 1024 * 1024, files: 6 } })
+
+router.post('/assets/:asset_id/montaje-subido',
+  subidaMontaje.fields([{ name: 'modelo', maxCount: 1 }, { name: 'renders', maxCount: 4 }]),
+  async (req, res, next) => {
+    try {
+      const { id: project_id, asset_id } = req.params
+      const member_id = req.body?.member_id || null
+      const modelo  = req.files?.modelo?.[0]
+      const renders = req.files?.renders || []
+
+      if (!modelo) return res.status(400).json({ success: false, code: 'SIN_MODELO', error: 'The level model (.glb) is required' })
+      if (!/\.glb$/i.test(modelo.originalname)) {
+        return res.status(400).json({ success: false, code: 'NO_ES_GLB', error: `The level model must be a .glb — got "${modelo.originalname}"` })
+      }
+      if (!renders.length) {
+        return res.status(400).json({ success: false, code: 'SIN_RENDERS', error: 'At least one render is required: the model and its renders are uploaded together' })
+      }
+      const malos = renders.filter(r => !/\.(png|jpe?g)$/i.test(r.originalname))
+      if (malos.length) {
+        return res.status(400).json({ success: false, code: 'RENDER_INVALIDO', error: `Renders must be .png or .jpg — got "${malos[0].originalname}"` })
+      }
+
+      const { data: hoja } = await db().from('forge_assets')
+        .select('id, node_id, name, metadata').eq('id', asset_id).eq('project_id', project_id).maybeSingle()
+      if (!hoja) return res.status(404).json({ success: false, error: 'Asset not found' })
+
+      const { uploadToStorage } = require('../services/storage.service')
+      const base = `projects/${project_id}/montajes/${asset_id}-${Date.now()}`
+      const urlModelo = await uploadToStorage(modelo.buffer, `${base}/nivel.glb`, 'model/gltf-binary')
+
+      const subidos = []
+      for (const r of renders) {
+        const ext = /\.(png|jpe?g)$/i.exec(r.originalname)[1].toLowerCase()
+        const limpio = r.originalname.replace(/[^\w.-]+/g, '_')
+        const u = await uploadToStorage(r.buffer, `${base}/${limpio}`, ext === 'png' ? 'image/png' : 'image/jpeg')
+        subidos.push({ nombre: r.originalname, url: u, bytes: r.size })
+      }
+
+      const nombre = `${String(hoja.name).split(/\s+[—–]\s+/).pop()} — Level assembly`
+      const { data: previo } = await db().from('forge_assets')
+        .select('id, storage_url, metadata').eq('project_id', project_id).eq('derived_from_id', asset_id)
+        .not('metadata->montaje_subido', 'is', null).order('created_at', { ascending: false }).limit(1).maybeSingle()
+
+      const marca = {
+        en: new Date().toISOString(), por: member_id,
+        archivo: modelo.originalname, bytes: modelo.size, renders: subidos,
+      }
+
+      let pieza
+      if (previo) {
+        let ultima = await versionActual(previo.id)
+        if (ultima === 0) {
+          await db().from('forge_asset_versions').insert({
+            asset_id: previo.id, storage_url: previo.storage_url, version_number: 1, is_current: false,
+            metadata: { origen: 'montaje anterior' },
+          })
+          ultima = 1
+        }
+        await db().from('forge_asset_versions').update({ is_current: false }).eq('asset_id', previo.id)
+        await db().from('forge_asset_versions').insert({
+          asset_id: previo.id, storage_url: urlModelo, version_number: ultima + 1, is_current: true,
+          created_by: member_id, metadata: marca,
+        })
+        await db().from('forge_assets').update({
+          storage_url: urlModelo, file_size_bytes: modelo.size,
+          metadata: { ...(previo.metadata || {}), montaje_subido: marca },
+        }).eq('id', previo.id)
+        pieza = { id: previo.id, reemplazado: true }
+      } else {
+        const { data: nuevo, error } = await db().from('forge_assets').insert({
+          project_id, node_id: hoja.node_id, name: nombre,
+          format: 'glb', mime_type: 'model/gltf-binary',
+          status: 'approved', approved_by: member_id, approved_at: new Date().toISOString(),
+          storage_url: urlModelo, file_size_bytes: modelo.size,
+          derived_from_id: asset_id, metadata: { montaje_subido: marca },
+        }).select('id').single()
+        if (error) throw error
+        pieza = { id: nuevo.id, reemplazado: false }
+      }
+
+      console.log(`[montaje-subido] ${hoja.name} ← ${modelo.originalname} + ${subidos.length} render(s)${pieza.reemplazado ? ' (reemplaza al anterior)' : ''}`)
+      res.json({ success: true, ...pieza, modelo: urlModelo, renders: subidos })
+    } catch (err) { next(err) }
+  })
+
+// ── Dos editores, un solo camino ─────────────────────────────────────────────
+//
+// «New Art Style» (informe v9, punto 2) hace lo mismo que un Design Edit desde el punto de vista
+// del motor: toma la imagen que existe, sustituye un token dentro de un prompt que protege la
+// plantilla, y reemplaza la página EN SU SITIO dejando la anterior en la Asset Library. Lo único
+// distinto es qué workflow corre y qué token lleva.
+//
+// Por eso no se duplica el manejador: se parametriza. Duplicar 120 líneas habría dejado dos
+// caminos que arreglar cada vez, y ya sabemos cómo termina eso — el nombre de un deck vivía en
+// tres sitios y una entrega mató el ASG y el Art Bible el mismo día.
+const EDITORES = {
+  design: {
+    workflow: 'V57_STUDIO_Moodboard_Iteration',
+    etiqueta: 'design edit',
+    // Lo declara quien pide el cambio: el texto no lo dice y equivocarse hace pagar de más.
+    cambioFijo: null,
+    soloASG: false,
+  },
+  estilo: {
+    workflow: 'V57_STUDIO_New_Art_Style',
+    etiqueta: 'new art style',
+    // Acá NO se pregunta: re-estilizar es, por definición, cambiar cómo se ve y no qué se retrata.
+    // El prompt fijo del workflow bloquea el cambio de sujeto, así que los derivados van a [V].
+    cambioFijo: 'tratamiento',
+    // Solo sobre las 25 páginas del ASG, como pide el §7 del documento de Miguel.
+    soloASG: true,
+  },
+}
+
+const manejarEdicion = clave => async (req, res, next) => {
+  const editor = EDITORES[clave]
   try {
     const { id: project_id, asset_id } = req.params
     const member_id = req.body?.member_id || null
@@ -5455,8 +5702,14 @@ router.post('/assets/:asset_id/design-edit', async (req, res, next) => {
     // Qué clase de cambio es, según quien lo pide (v2.3 §2.1): «sujeto» cambia QUÉ se retrata y
     // manda los derivados a [R]; «tratamiento» cambia luz o paleta y los deja en [V]. No se
     // deduce del texto: equivocarse acá hace pagar una regeneración que no hacía falta.
-    const cambio    = ['sujeto', 'tratamiento'].includes(req.body?.cambio) ? req.body.cambio : null
-    if (!pedido) return res.status(400).json({ success: false, error: 'Describe the design change' })
+    const cambio = editor.cambioFijo
+      ?? (['sujeto', 'tratamiento'].includes(req.body?.cambio) ? req.body.cambio : null)
+    if (!pedido) {
+      return res.status(400).json({
+        success: false,
+        error: clave === 'estilo' ? 'Describe the art style you want' : 'Describe the design change',
+      })
+    }
 
     const { data: asset } = await db().from('forge_assets')
       .select('id, node_id, project_id, name, storage_url, format')
@@ -5464,9 +5717,21 @@ router.post('/assets/:asset_id/design-edit', async (req, res, next) => {
     if (!asset)             return res.status(404).json({ success: false, error: 'Asset not found' })
     if (!asset.storage_url) return res.status(400).json({ success: false, error: 'This asset has no image to edit' })
 
+    // Quién puede recibir este editor. New Art Style re-estiliza la PÁGINA entera del ASG, así que
+    // fuera de ellas no tiene sentido — y se dice por qué, en vez de generar algo que nadie pidió.
+    if (editor.soloASG) {
+      const { paginaDe } = require('../services/actualizacion.service')
+      if (!paginaDe(asset)) {
+        return res.status(400).json({
+          success: false, code: 'NO_ES_PAGINA_ASG',
+          error: `"${asset.name}" is not an Art Style Guide page — New Art Style re-styles ASG pages`,
+        })
+      }
+    }
+
     const { getWorkflowByName } = require('../services/config.service')
-    const entry = await getWorkflowByName('V57_STUDIO_Moodboard_Iteration')
-    if (!entry) return res.status(500).json({ success: false, error: 'Moodboard iteration workflow is not registered' })
+    const entry = await getWorkflowByName(editor.workflow)
+    if (!entry) return res.status(500).json({ success: false, error: `Workflow "${editor.workflow}" is not registered` })
 
     const cfg = entry.inject_config || {}
     const wf  = JSON.parse(JSON.stringify(entry.workflow_json))
@@ -5530,7 +5795,11 @@ router.post('/assets/:asset_id/design-edit', async (req, res, next) => {
       asset_id, storage_url: salida.url, version_number: ultima + 1, is_current: true,
       created_by: member_id,
       metadata: {
-        job: jobId, design_edit: pedido, workflow: 'V57_STUDIO_Moodboard_Iteration',
+        // Qué se pidió y QUÉ WORKFLOW lo produjo. El nombre sale del editor y no escrito a fuego:
+        // con dos editores compartiendo camino, una constante acá etiquetaría de «Moodboard
+        // Iteration» una versión que en realidad la hizo New Art Style, y la pieza dejaría de ser
+        // auditable — que es para lo que existe esta metadata.
+        job: jobId, design_edit: pedido, workflow: editor.workflow, editor: clave,
         // Qué clase de cambio fue. Se guarda con la VERSIÓN porque la cascada marca al aprobarla,
         // que puede ser días después y por otra persona.
         ...(cambio ? { design_edit_cambio: cambio } : {}),
@@ -5559,10 +5828,10 @@ router.post('/assets/:asset_id/design-edit', async (req, res, next) => {
       await revalidar({ db, project_id, asset_id, member_id }).catch(() => {})
       cascada = await propagarDesdePagina({
         db, project_id, asset_id, member_id, cambio,
-        motivo: `design edit: ${String(pedido).slice(0, 80)}`,
+        motivo: `${editor.etiqueta}: ${String(pedido).slice(0, 80)}`,
       })
     } catch (e) {
-      console.warn('[actualizacion] la cascada falló tras el design edit (no fatal):', e.message)
+      console.warn(`[actualizacion] la cascada falló tras el ${editor.etiqueta} (no fatal):`, e.message)
     }
 
     res.json({
@@ -5572,7 +5841,12 @@ router.post('/assets/:asset_id/design-edit', async (req, res, next) => {
       cascada,
     })
   } catch (err) { next(err) }
-})
+}
+
+router.post('/assets/:asset_id/design-edit',   manejarEdicion('design'))
+// «New Art Style»: re-estiliza la página del ASG conservando el template. Mismo camino, otro
+// workflow y otro token — ver EDITORES arriba.
+router.post('/assets/:asset_id/new-art-style', manejarEdicion('estilo'))
 
 // ─── Qué paso viene, sin correr nada (§8) ────────────────────────────────────
 // Lo consulta el recuadro previo de Run: tiene que decir QUÉ se va a generar y POR QUÉ antes de
@@ -5610,7 +5884,10 @@ router.get('/assets/:asset_id/next-step', async (req, res, next) => {
     // JuanK, punto 1). Salen del caché: leerlas del ADI cuesta una llamada al modelo y abrir un
     // recuadro no puede gastar. Si todavía no se leyeron nunca, se dice y el Run las lee al correr.
     let clips = null
-    if (paso?.clave === 'pose_sheet') {
+    // Por si el paso enumera clips, no por su nombre: el paso pasó de 'pose_sheet' a
+    // 'animation_ref' cuando los videos reemplazaron a las láminas, y atarlo al nombre viejo
+    // dejaba el recuadro sin lista que elegir, en silencio.
+    if (paso?.porCadaClip) {
       // Del caché, para que abrir el recuadro no cueste. Pero la primera vez no hay caché —se
       // escribe al correr— y sin lista no hay nada que elegir, que es justo lo que JuanK pidió
       // poder hacer ANTES de correr. Con `leer_clips=1` se lee del ADI y queda cacheada: es una

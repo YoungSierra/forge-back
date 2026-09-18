@@ -703,6 +703,46 @@ async function imagenDelProyecto(projectId, nodeId) {
 //
 // El emparejamiento va por NÚMERO. Los nombres no coinciden entre los dos lados («05 Character
 // Design Language» contra `05_CharacterDesign`) y el número sí es el mismo en ambos.
+/**
+ * La referencia que Add Context inyectó en el slot `REF_*` de una página.
+ *
+ * Nota de Miguel del 18-09: Add Context guardaba la referencia y marcaba las páginas dependientes,
+ * pero al regenerar la página el arte no la tomaba. Medido: las dos mitades existían y nadie las
+ * unía. La referencia vive como pieza con `metadata.contexto.pagina_destino`, las ocho páginas
+ * declaran su slot en el registro (`image_input`), y `generateDeck` resolvía referencias solo por
+ * el NOMBRE que declara el prompt — jamás miraba `metadata.contexto`. Una página con `image_input`
+ * y sin `source` caía en «el prompt no dice de dónde sale su referencia» y se renderizaba con el
+ * relleno del workflow. Su prueba con Key Art fue la correcta: una referencia roja, cero rojo.
+ *
+ * Manda la marcada `primary`, que es lo que el documento del sistema de actualización llama
+ * «Primary si procede»; entre varias sin marcar, la más reciente. Las `rejected` no entran: son el
+ * ejemplo a evitar y se conservan justamente para no repetirlo.
+ */
+async function referenciaDeContexto(db, projectId, nombrePagina) {
+  const { data: refs } = await db().from('forge_assets')
+    .select('id, name, storage_url, status, metadata, created_at')
+    .eq('project_id', projectId)
+    .not('metadata->contexto', 'is', null)
+    .not('storage_url', 'is', null)
+    .order('created_at', { ascending: false })
+  if (!(refs || []).length) return null
+
+  const norm = s => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '')
+  const quiero = norm(String(nombrePagina).replace(/^\d+[_\s-]*/, ''))
+
+  const suyas = (refs || []).filter(r => {
+    const c = r.metadata?.contexto
+    if (!c || c.estado === 'rejected' || r.status === 'rejected') return false
+    const destino = norm(String(c.pagina_destino || '').replace(/^\d+[_\s-]*/, ''))
+    return destino && destino === quiero
+  })
+  if (!suyas.length) return null
+
+  // La `primary` manda. Sin ninguna marcada, la más reciente — que es lo que alguien acaba de
+  // subir, y lo que espera ver influyendo.
+  return suyas.find(r => r.metadata.contexto.primary) || suyas[0]
+}
+
 async function paginaDelASG(db, projectId, numero, nombre = null, frase = false) {
   const { data: n } = await db().from('forge_nodes').select('id').eq('node_key', '3.20').maybeSingle()
   if (!n) return null
@@ -1157,9 +1197,28 @@ ${cola}`
 
         for (const h of huecos) {
           if (wf[h.node]?.class_type !== 'LoadImage') continue
+
+          // ── Primero, lo que alguien puso a mano con Add Context ───────────
+          // Una referencia elegida para ESTA página gana sobre cualquier fuente declarada: es una
+          // decisión de dirección de arte tomada hace un momento, y el propósito entero de Add
+          // Context es que sesgue la generación. Hasta hoy se guardaba y no la leía nadie.
+          const ctx = await referenciaDeContexto(db, project_id, p.nombre)
+          if (ctx?.storage_url) {
+            try {
+              if (!subidas.has(ctx.storage_url)) subidas.set(ctx.storage_url, await uploadImageToComfyUI(ctx.storage_url))
+              wf[h.node].inputs.image = subidas.get(ctx.storage_url)
+              avisosRef.push(`${p.nombre}: referencia de Add Context «${ctx.name}»${ctx.metadata?.contexto?.primary ? ' (primary)' : ''}`)
+              continue
+            } catch (e) {
+              avisosRef.push(`${p.nombre}: no se pudo subir la referencia de Add Context (${e.message})`)
+            }
+          }
+
           const fuente = String(h.source || '').trim()
           if (!fuente) {
-            avisosRef.push(`${p.nombre}: el prompt no dice de dónde sale su referencia`)
+            // Sin `source` Y sin Add Context no hay de dónde sacarla. Se dice lo segundo, que es
+            // lo accionable: quien mire este aviso puede subir una referencia y volver a correr.
+            avisosRef.push(`${p.nombre}: no tiene referencia — súbele una con Add Context`)
             sinRef.add(p.nombre); continue
           }
           // Puede ser un nodo del canvas («Pitch Document») o una página del ASG nombrada dentro
@@ -1397,4 +1456,4 @@ function nombreDeImagen ({ tituloNodo, etiqueta, ids, idx, total }) {
   return total > 1 ? `${base} ${idx + 1}` : base
 }
 
-module.exports = { imageOutputsOf, parseOutputItems, idsDeclarados, nombreDeImagen, sobreDeLaSeccion, tieneEntidades, cleanItemText, generateOneImage, generateDeck, esDeck, paginaDelASG, imagenDeNodoPorTitulo }
+module.exports = { imageOutputsOf, parseOutputItems, idsDeclarados, nombreDeImagen, sobreDeLaSeccion, tieneEntidades, cleanItemText, generateOneImage, generateDeck, esDeck, paginaDelASG, imagenDeNodoPorTitulo, referenciaDeContexto }

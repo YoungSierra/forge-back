@@ -209,6 +209,31 @@ async function guardarContexto({
 }) {
   if (!url && !texto) { const e = new Error('Nothing to store: neither a file nor text'); e.code = 'VACIO'; throw e }
 
+  // ── Primary cuando es la primera ──────────────────────────────────────────
+  //
+  // Punto (c) de la nota de Miguel del 18-09: «confirmar que Add Context marca la referencia como
+  // Primary al inyectarla». Hoy se marcaba SOLO si quien sube lo pedía, y medido en la base viva
+  // ninguna de las ocho referencias que existen está marcada. Su imagen roja tampoco lo estaba, y
+  // por eso su «cabo por descartar» era real.
+  //
+  // La regla: si es la PRIMERA referencia con imagen para esa página, es primary — no hay nada con
+  // qué competir y obligar a marcar una casilla para lo único que hay es una trampa. Si ya había
+  // otra, se respeta lo que pidió quien sube: elegir cuál manda entre dos es una decisión de arte
+  // y no se toma sola.
+  let esPrimary = Boolean(primary)
+  const paginaDestino = destino?.pagina || destino?.pagina_pedida || null
+  if (!esPrimary && url && paginaDestino) {
+    const { data: previas } = await db().from('forge_assets')
+      .select('id, metadata').eq('project_id', project_id)
+      .not('metadata->contexto', 'is', null).not('storage_url', 'is', null)
+    const norm = s => String(s || '').replace(/^\d+[_\s-]*/, '').toLowerCase().replace(/[^a-z0-9]+/g, '')
+    const mismas = (previas || []).filter(r => {
+      const c = r.metadata?.contexto
+      return c && c.estado !== 'rejected' && norm(c.pagina_destino) === norm(paginaDestino)
+    })
+    if (!mismas.length) esPrimary = true
+  }
+
   const { data: n39 } = await db().from('forge_nodes').select('id').eq('node_key', '3.9').maybeSingle()
 
   const { data: ses } = await db().from('forge_sessions').insert({
@@ -231,7 +256,7 @@ async function guardarContexto({
     metadata: {
       contexto: {
         rol, ambito, estado,
-        primary: Boolean(primary),
+        primary: esPrimary,
         pagina_destino: destino?.pagina || destino?.pagina_pedida || null,
         ancla_adi: destino?.adi || destino?.adi_de_la_pagina || null,
         inyeccion: destino?.inyeccion || 'indirecta',

@@ -8,7 +8,7 @@
 // La evidencia es lo que las cadenas dejaron escrito en cada pieza —`metadata.cadena.nombre` y
 // `.paso`—, que es un dato que nadie teclea: lo pone el motor al publicar. Medido contra la base
 // viva el 15-09, hoy existen piezas de character_sheet (concept_art · 3d), environment_sheet
-// (concept_art · 3d), prop_sheet (concept_art · 3d), animation_sheet (pose_sheet), audio_sheet
+// (concept_art · 3d), prop_sheet (concept_art · 3d), animation_sheet (animation_ref), audio_sheet
 // (audio) y marketing (key_art · video).
 //
 // Lo que NO se puede medir se dice y se deja a mano. Forge no produce rigs, ni cuenta encuentros,
@@ -19,7 +19,7 @@
 const REGLAS = {
   'character.personajes':            { cadena: 'character_sheet',   paso: 'concept_art' },
   'character.modelos':               { cadena: 'character_sheet',   paso: '3d' },
-  'animation.clips':                 { cadena: 'animation_sheet',   paso: 'pose_sheet' },
+  'animation.clips':                 { cadena: 'animation_sheet',   paso: 'animation_ref' },
   'environment.entornos':            { cadena: 'environment_sheet', paso: 'concept_art' },
   'prop.props':                      { cadena: 'prop_sheet',        paso: 'concept_art' },
   'vfx.vfx':                         { cadena: 'vfx_sheet',         paso: 'flipbook' },

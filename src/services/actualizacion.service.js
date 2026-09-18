@@ -247,12 +247,89 @@ async function propagarDesdePagina({ db, project_id, asset_id, motivo = null, me
     for (const h of hijos || []) await marcar(h, accionHijos, origen.id)
   }
 
+  // ── Aguas AFUERA: el Art Bible ────────────────────────────────────────────
+  //
+  // Informe v9, punto 6. Hasta acá la cascada vive dentro del Art Style Guide: `hermanas` se
+  // busca con `like('${DOCUMENTO} — %')`, así que el Art Bible —que es otro documento— nunca se
+  // enteraba de nada.
+  //
+  // Y sí depende: cada página del Art Bible se PINTA a partir de una página ya renderizada del
+  // ASG, y lo dice ella misma en su prompt —«Art Style Guide (ASG · 05 Character Design
+  // Language)»—. Medido el 18-09 contra el registro: las 20 páginas declaran la suya, 20 de 20.
+  // Si la página del ASG cambió, la del bible se pintó desde una imagen que ya no existe.
+  //
+  // Va a [R] y no a [V] a propósito: no es una hoja que «probablemente siga valiendo», es una
+  // obra derivada de UNA imagen concreta que cambió. Nada se regenera solo — como todo el resto
+  // del sistema, esto marca y decide una persona.
+  try {
+    const delBible = await paginasDelBibleQueCitan(db, project_id, pagina)
+    for (const b of delBible) await marcar(b, 'R', origen.id)
+    if (delBible.length) console.log(`[actualizacion] aguas afuera: ${delBible.length} página(s) del Art Bible marcadas por «${etiquetaDe(pagina)}»`)
+  } catch (e) {
+    // Que el registro del bible no se pueda leer no puede tumbar la cascada del ASG, que es la
+    // que de verdad importa. Se dice y se sigue.
+    console.warn('[actualizacion] no se pudo propagar al Art Bible:', e.message)
+  }
+
   return {
     aplica: true, pagina, etiqueta: etiquetaDe(pagina), rol: fila.rol,
     marcadas, ausentes,
     condicional: fila.condicional || [],
     fuera: fila.fuera || [],
   }
+}
+
+/**
+ * Las páginas del Art Bible de ESTE proyecto que se pintan desde una página dada del ASG.
+ *
+ * El vínculo no se escribe acá: se lee del registro del workflow, donde cada página del bible cita
+ * la del ASG que toma como canon. Copiarlo a una tabla en el código sería una segunda verdad que
+ * envejece sola — y ya pasó con los nombres de los decks.
+ *
+ * Se empareja por NOMBRE y no por número: el maestro del ASG pasó de 34 páginas a 25 y los números
+ * se movieron, los nombres no. Es la misma lección de `bug_artbible_paginas_del_gdd`.
+ */
+async function paginasDelBibleQueCitan(db, project_id, paginaASG) {
+  const { getWorkflowByName } = require('./config.service')
+  const entry = await getWorkflowByName('V57_STUDIO_ArtBible_Template_20')
+  if (!entry?.workflow_json) return []
+
+  const norm = s => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '')
+  const buscada = norm(etiquetaDe(paginaASG))          // «19 EnvironmentSheet» → «19environmentsheet»
+  const soloNombre = norm(String(etiquetaDe(paginaASG)).replace(/^\d+\s*/, ''))
+
+  const citas = []
+  for (const p of entry.inject_config?.pages || []) {
+    const prompt = entry.workflow_json[p.prompt_node]?.inputs?.prompt || ''
+    const cita = prompt.match(/Art Style Guide \(ASG\s*[·.\-]?\s*(\d{1,2})\s*([^)]*)\)/i)
+    if (!cita) continue
+    citas.push({ bible: p.nombre || p.name, num: String(cita[1]).padStart(2, '0'), nombre: norm((cita[2] || '').trim()) })
+  }
+
+  // EXACTO primero, y contención solo si deja UNA. Aflojar a «uno contiene al otro» sin exigir
+  // unicidad empareja «Video Marketing» con la lámina «Video Marketing Sheet», que es otra página
+  // — medido: con la regla laxa, esas dos se reclamaban mutuamente y un cambio en cualquiera
+  // marcaba las dos del bible. Es la misma trampa que ya documenta `paginaDelASG`.
+  let quiere = citas.filter(c => c.nombre && c.nombre === soloNombre).map(c => c.bible)
+  if (!quiere.length) {
+    const laxas = citas.filter(c => c.nombre && (c.nombre.includes(soloNombre) || soloNombre.includes(c.nombre)))
+    if (laxas.length === 1) quiere = [laxas[0].bible]
+    else if (laxas.length > 1) {
+      console.warn(`[actualizacion] «${etiquetaDe(paginaASG)}» encaja con ${laxas.length} páginas del Art Bible (${laxas.map(c => c.bible).join(', ')}) — no se marca ninguna`)
+    }
+  }
+  // Y el número, solo para las citas que no traen nombre: ahí es el mejor dato que existe.
+  if (!quiere.length) {
+    quiere = citas.filter(c => !c.nombre && buscada.startsWith(c.num)).map(c => c.bible)
+  }
+  if (!quiere.length) return []
+
+  // Y ahora, cuáles de esas existen publicadas en este proyecto.
+  const { data: hojas } = await db().from('forge_assets')
+    .select('id, name, metadata')
+    .eq('project_id', project_id).like('name', 'Art Bible — %')
+  const cola = n => norm(String(n || '').split(/\s+[—–-]\s+/).pop())
+  return (hojas || []).filter(h => quiere.some(q => cola(h.name) === norm(q)))
 }
 
 /** Lo que está marcado hoy en el proyecto, para el panel y para los sellos del lienzo. */
@@ -314,5 +391,5 @@ async function versionVigente(db, asset_id) {
 
 module.exports = {
   MATRIZ, PAGINAS, DOCUMENTO, paginaDe, etiquetaDe, loQueDispara,
-  propagarDesdePagina, pendientesDelProyecto, revalidar, versionVigente,
+  propagarDesdePagina, pendientesDelProyecto, revalidar, versionVigente, paginasDelBibleQueCitan,
 }

@@ -442,6 +442,74 @@ async function grafoDelNivel({ db, project_id, origen, nivel, member_id }) {
  * elija, que es el guarda que pide la spec —fallar señalando qué falta antes que generar con datos
  * parciales.
  */
+/**
+ * Los insumos que el `.zip` lleva además de los modelos (documento de JuanK, 18-09).
+ *
+ * Todos existen ya en el proyecto: esto los junta, no los produce. Y ninguno es obligatorio — un
+ * paquete al que le falta la foto de una silla se arma igual, uno que no sale no sirve de nada.
+ * Lo que falte se devuelve en `avisos` para que se diga en vez de desaparecer.
+ */
+async function reunirInsumos({ db, project_id, origen, inventarioUsado, modelosBin }) {
+  const avisos = []
+  const bajar = async (url, que) => {
+    try {
+      const r = await fetch(url)
+      if (!r.ok) throw new Error(`HTTP ${r.status}`)
+      return Buffer.from(await r.arrayBuffer())
+    } catch (e) { avisos.push(`${que} (${e.message})`); return null }
+  }
+
+  // 1 · La documentación de level design. Sale del 3.11, que es quien la escribe.
+  const documentos = []
+  try {
+    const { data: n } = await db().from('forge_nodes').select('id').eq('node_key', '3.11').maybeSingle()
+    if (n) {
+      const { data: docs } = await db().from('forge_assets')
+        .select('name, content, output_key').eq('project_id', project_id).eq('node_id', n.id)
+        .in('status', ['approved', 'auto_approved']).not('content', 'is', null)
+      for (const d of docs || []) {
+        documentos.push({ nombre: `${(d.output_key || d.name).replace(/[^\w.-]+/g, '_')}.md`, contenido: d.content })
+      }
+    }
+    if (!documentos.length) avisos.push('la documentación de level design (el 3.11 no publicó ninguna)')
+  } catch (e) { avisos.push(`la documentación de level design (${e.message})`) }
+
+  // 2 · La lámina del Environment Sheet: es la hoja desde la que se disparó el montaje.
+  let laminaSheet = null
+  if (origen?.storage_url) {
+    const buf = await bajar(origen.storage_url, 'la lámina del Environment Sheet')
+    if (buf) laminaSheet = { nombre: `${String(origen.name || 'environment_sheet').split(/\s+[—–]\s+/).pop().replace(/[^\w.-]+/g, '_')}.png`, buffer: buf }
+  }
+
+  // 3 · Una imagen de diseño por asset: la pieza DE LA QUE SALIÓ cada modelo. El `.glb` cuelga de
+  //     su concept art por `derived_from_id`, así que el vínculo ya está escrito y no hay que
+  //     adivinarlo por el nombre.
+  const imagenes = []
+  const ids = inventarioUsado.map(i => i.asset_id)
+  if (ids.length) {
+    const { data: modelos } = await db().from('forge_assets')
+      .select('id, derived_from_id').in('id', ids)
+    const padres = [...new Set((modelos || []).map(m => m.derived_from_id).filter(Boolean))]
+    const { data: fuentes } = padres.length
+      ? await db().from('forge_assets').select('id, name, storage_url, format').in('id', padres)
+      : { data: [] }
+    const porId = new Map((fuentes || []).map(f => [f.id, f]))
+    for (const m of modelos || []) {
+      const f = porId.get(m.derived_from_id)
+      if (!f?.storage_url || !['png', 'jpg', 'jpeg', 'image', 'webp'].includes(String(f.format))) continue
+      const buf = await bajar(f.storage_url, `la imagen de «${f.name}»`)
+      if (!buf) continue
+      const ext = /\.(jpe?g|webp)(?:[?#]|$)/i.exec(f.storage_url) ? `.${RegExp.$1.toLowerCase()}` : '.png'
+      imagenes.push({ asset_id: m.id, buffer: buf, ext })
+      const mb = modelosBin.find(x => x.asset_id === m.id)
+      if (mb) mb.imagen_ext = ext
+    }
+    if (!imagenes.length) avisos.push('las imágenes de diseño (ningún modelo cuelga de una lámina)')
+  }
+
+  return { documentos, laminaSheet, imagenes, avisos }
+}
+
 async function montarNivel({ db, project_id, asset_id, nivel = null, member_id = null, incluir_referencia = false, desdeCadena = false, estrategia = null }) {
   // Llamado desde la CADENA, el origen es la hoja del ASG —«Art Style Guide — 29_EnvironmentSheet»—
   // y esa no nombra su entorno: el nombre vive en la imagen de `world_visuals`. Hasta que el
@@ -511,18 +579,46 @@ async function montarNivel({ db, project_id, asset_id, nivel = null, member_id =
   })
 
   const modelosBin = await bm.traerModelos(inventarioUsado)
+
+  // ── Lo que pide el documento de JuanK del 18-09 ───────────────────────────
+  // Documentación del nivel, la lámina del Environment Sheet, una imagen por asset y las medidas
+  // del GDD. Todo existe ya dentro de Forge: exportar es juntarlo, no producirlo.
+  //
+  // Nada de esto puede tumbar el paquete: si una imagen no se deja bajar, el `.zip` sale sin ella
+  // y se dice. Un montaje sin la foto de una silla se arma; un montaje que no sale no sirve.
+  const extras = await reunirInsumos({ db, project_id, origen, inventarioUsado, modelosBin })
+
+  const { medidasDelGDD } = require('./medidas-gdd.service')
+  let medidas = null
+  try { medidas = await medidasDelGDD({ db, project_id }) } catch (e) {
+    console.warn('[montaje] no se pudieron leer las medidas del GDD:', e.message)
+  }
+  // La altura del personaje, si el GDD la declara. Es la que manda para la escala, y hasta hoy
+  // siempre viajaba el valor por defecto con la nota «el 3.6 no publica una medida real» — que ya
+  // no es cierto: medido el 18-09, los GDD sí traen dimensiones con su cita.
+  const alturaGDD = medidas?.medidas?.altura_personaje?.valor_m
+    || medidas?.medidas?.altura_camara_personaje?.valor_m
+    || null
+
   const manifiesto = bm.manifiesto({
     level_id: level_graph.level_id || String(elegido),
     modelos: modelosBin,
-    alturaJugador: ALTURA_POR_DEFECTO,
-    fuenteAltura: 'valor por defecto (el 3.6 no publica una medida real)',
+    alturaJugador: alturaGDD || ALTURA_POR_DEFECTO,
+    fuenteAltura: alturaGDD
+      ? (medidas.medidas.altura_personaje?.fuente || medidas.medidas.altura_camara_personaje?.fuente)
+      : 'valor por defecto — el GDD de este proyecto no declara la altura del personaje',
     escalaSpec: null,
   })
   const zip = await bm.armarZip({
     bundle: manifiesto, orden: orden.order, kit: { assets },
     validacion: orden.validation || {}, modelos: modelosBin,
     shell: incluir_referencia ? orden.shell : null,
+    documentos: extras.documentos,
+    laminaSheet: extras.laminaSheet,
+    imagenes: extras.imagenes,
+    medidas: medidas ? { medidas: medidas.medidas, de_respaldo: medidas.de_respaldo, fuente: medidas.fuente } : null,
   })
+  if (extras.avisos.length) console.warn(`[montaje] el paquete sale sin: ${extras.avisos.join(' · ')}`)
 
   const { uploadToStorage } = require('./storage.service')
   const url = await uploadToStorage(zip, `projects/${project_id}/bundles/${manifiesto.bundle_id}.zip`, 'application/zip')
