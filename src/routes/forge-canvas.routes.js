@@ -5693,11 +5693,23 @@ router.post('/assets/:asset_id/advance', async (req, res, next) => {
     // corrida. No se validan acá: el catálogo vive por workflow y cada paso de la cadena usa el
     // suyo, así que la validación pasa donde se arma el grafo.
     const opciones  = req.body?.opciones && typeof req.body.opciones === 'object' ? req.body.opciones : null
+    // Qué páginas de un paso de DECK correr. Vacío = todas, que es como venía funcionando.
+    //
+    // Sirve para probar UNA página sin pagar las ocho: el deck de UI son $0.32 la corrida y hasta
+    // hoy no había forma de mirar una sola —`solo` llegaba a `generateDeck` por `/iterate`, que
+    // pide un output de imagen de la DNA, y por el instanciador de hojas, pero no por acá—.
+    // Lo pidió Pedro el 18-09 para verificar la referencia del juego antes de gastar el deck.
+    //
+    // Se acota a enteros: una página se nombra por su índice, y colar cualquier cosa del cuerpo
+    // en el compositor es abrirle la puerta a un despacho con basura.
+    const solo = Array.isArray(req.body?.solo)
+      ? req.body.solo.map(Number).filter(n => Number.isInteger(n) && n >= 0)
+      : null
 
     const { avanzar } = require('../services/chain.service')
     const progreso = require('../services/progreso.service')
     try {
-      const r = await avanzar({ db, project_id, asset_id, pasos, prompt, member_id, limitePorCada: limite, opciones, clips })
+      const r = await avanzar({ db, project_id, asset_id, pasos, prompt, member_id, limitePorCada: limite, opciones, clips, solo })
       res.json({ success: true, ...r })
     } finally {
       // Pase lo que pase deja de figurar como corriendo. El servicio caduca solo a los diez

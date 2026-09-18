@@ -290,7 +290,7 @@ function proximoPaso(asset) {
 // 12). Valen para TODA la corrida —así lo confirmó Miguel—; regenerar una pieza suelta las pide
 // aparte. Se guardan además en el metadata de cada activo producido: es lo que deja mostrarlas
 // bajo la imagen y reusarlas al rehacerla.
-async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, member_id = null, limitePorCada = 0, opciones = null, clips = null }) {
+async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, member_id = null, limitePorCada = 0, opciones = null, clips = null, solo = null }) {
   const { data: origen, error: e0 } = await db().from('forge_assets')
     .select('id, project_id, node_id, session_id, name, storage_url, metadata')
     .eq('id', asset_id).single()
@@ -559,6 +559,13 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
           db, project_id, node_id: origen.node_id, node_key: paso.deck,
           output_key: paso.clave, image_gen_model: `comfyui:${paso.workflow}`,
           deck: paso.deck, member_id,
+          // Probar UNA página sin pagar el deck entero. `generateDeck` ya sabe hacerlo —es como se
+          // instancian las hojas del ASG— pero desde la cadena no había forma de pedírselo: un
+          // paso de deck eran siempre sus ocho páginas y $0.32, aunque solo quisieras ver si la
+          // referencia del juego llega. Lo pidió Pedro el 18-09.
+          //
+          // Null = todas, que es como venía funcionando.
+          solo: Array.isArray(solo) && solo.length ? solo : null,
         })
         jobId = r.jobId
         if (!r.paginas?.length) {

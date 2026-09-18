@@ -1037,6 +1037,11 @@ ${cola}`
         // inválido. Se reconecta el nodo del modelo directo a la plantilla y el batch queda
         // huérfano; la poda posterior lo descarta.
         const sinAncla = motivo => {
+          // La página se queda sin referencia SIEMPRE que se entre acá, se haya podido puentear el
+          // batch o no. Antes solo se contaba el caso en que ni siquiera se pudo puentear, así que
+          // el parte decía «referencias de estilo: 1/1» mientras el modelo recibía una sola imagen
+          // — un contador que tapaba justo lo que tenía que denunciar.
+          sinRef.add(p.nombre)
           const plantillaId = Object.values(batch.inputs).map(v => v?.[0])[0]
           const puerto = Object.entries(gpt.inputs).find(([, v]) => Array.isArray(v))?.[0]
           if (plantillaId && puerto) {
@@ -1044,16 +1049,46 @@ ${cola}`
             avisosRef.push(`${p.nombre}: ${motivo} — se renderiza solo con la plantilla`)
           } else {
             avisosRef.push(`${p.nombre}: ${motivo}`)
-            sinRef.add(p.nombre)
           }
         }
 
-        const fuente = (gpt.inputs.prompt || '').match(/IMAGE 2 = [^\n]*coming from ([^.]+)\./)?.[1] || ''
-        const url    = await imagenDeNodoPorTitulo(db, project_id, fuente)
-        if (!url) { sinAncla(`sin imagen de «${fuente.trim()}» en el proyecto`); continue }
+        // ── De dónde sale la referencia ────────────────────────────────────
+        //
+        // Manda lo que el REGISTRO declara (`image_inputs`), y el prompt queda de reserva.
+        //
+        // Hasta hoy era solo el prompt: se sacaba «coming from X» de una frase en inglés con una
+        // expresión regular. Las ocho páginas del deck de UI dicen «IMAGE 2» sin ese «coming
+        // from», así que `fuente` salía vacía, el batch se puenteaba y el modelo recibía UNA
+        // imagen mientras su prompt le hablaba de dos. Lo encontró Pedro el 18-09, y el dato que
+        // faltaba llevaba ahí todo el tiempo: el registro declara nodo Y fuente en las ocho
+        // —`{"node":"171","slot":"2","source":"the game's KEY ART page"}`—, pero esta rama no lo
+        // miraba y la otra (`directas`) excluye a propósito las páginas con batch.
+        //
+        // Consecuencia: todo render de UI hecho hasta hoy salió sin la referencia del juego.
+        const declarado = (p.image_inputs || []).find(h => String(h.node) === String(refId))
+          || (p.image_inputs || [])[0]
+          || (p.image_input ? { node: p.image_input, source: null } : null)
+
+        // El nodo también se respeta si el registro lo nombra: deducirlo como «la segunda entrada
+        // del batch» funciona hoy y deja de funcionar en cuanto un grafo las ordene distinto.
+        const destino = declarado && wf[declarado.node]?.class_type === 'LoadImage'
+          ? String(declarado.node)
+          : refId
+
+        const fuente = String(declarado?.source || '').trim()
+          || (gpt.inputs.prompt || '').match(/IMAGE 2 = [^\n]*coming from ([^.]+)\./)?.[1] || ''
+        if (!fuente) { sinAncla('ni el registro ni el prompt dicen de dónde sale su referencia'); continue }
+
+        // Puede ser un nodo del canvas («Pitch Document») o una página del ASG nombrada dentro de
+        // una frase («the game's KEY ART page»). Se prueban las dos, en ese orden — igual que en
+        // la rama `directas`. Probar solo la primera era la otra mitad del fallo: la fuente del
+        // deck de UI es una página del ASG, así que jamás habría resuelto.
+        const url = await imagenDeNodoPorTitulo(db, project_id, fuente)
+                 || await paginaDelASG(db, project_id, null, fuente, true)
+        if (!url) { sinAncla(`sin imagen de «${fuente}» en el proyecto`); continue }
         try {
           if (!subidas.has(url)) subidas.set(url, await uploadImageToComfyUI(url))
-          wf[refId].inputs.image = subidas.get(url)
+          wf[destino].inputs.image = subidas.get(url)
         } catch (e) {
           sinAncla(`no se pudo subir la referencia (${e.message})`)
         }
