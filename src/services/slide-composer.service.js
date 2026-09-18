@@ -919,6 +919,10 @@ async function composeDeck({ db, projectId, deck = 'asg', fills = null, solo = n
 
 module.exports = {
   composeDeck, parsearIntake, parsearFills, seccionPorNombre,
+  // `seccionDeOutput` se exporta porque el problema que resuelve no es del compositor: leer una
+  // salida dentro del documento de una corrida entera le hace falta a cualquiera que busque algo
+  // por `output_key`. El Laboratory es el segundo que lo necesita.
+  seccionDeOutput,
   DECKS, MAPA_ASG, MAPA_GDD, LIMITE_DIGEST, LIMITE_LINEA, LIMITE,
 }
 

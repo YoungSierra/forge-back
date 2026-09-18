@@ -40,6 +40,11 @@ function exigirBase() {
  *
  * Se busca por `output_key`, que es el contrato — `tdd_complete` es la salida del nodo 3.12 que
  * junta las nueve secciones. Las secciones sueltas no sirven: el Laboratory lee UN documento.
+ *
+ * Y si el nodo se corrió ENTERO, donde no hay clave que buscar, se lee su sección del documento
+ * único. El 3.12 puede correrse de las dos formas y su contrato lo permite; buscar solo la clave
+ * dejaba a `test_pinball_migue_v.10` con su TDD de 170.843 caracteres aprobado en el lienzo y el
+ * botón diciendo «this project has no assembled TDD yet — run node 3.12 first». Medido el 18-09.
  */
 async function tddDelProyecto(db, project_id) {
   const { data } = await db().from('forge_assets')
@@ -48,7 +53,92 @@ async function tddDelProyecto(db, project_id) {
     .not('content', 'is', null)
     .order('created_at', { ascending: false })
   const doc = (data || [])[0]
-  return doc?.content ? doc : null
+  if (doc?.content) return doc
+
+  return await tddDeCorridaEntera(db, project_id)
+}
+
+/**
+ * El TDD dentro del documento de una corrida de nodo entero.
+ *
+ * Una corrida entera aprueba UNA pieza sin `output_key` con las nueve salidas dentro, cada una
+ * bajo su encabezado `## <nombre de la salida>`.
+ *
+ * El corte NO puede ser por nivel de encabezado: el propio TDD usa nivel 2 para sus secciones
+ * —`## 0.0 · Fill-policy legend`, `## Mechanic: FlipperController`— así que cortar en el próximo
+ * `##` devolvería un muñón. El límite es la SIGUIENTE SALIDA del nodo, que es justo lo que hace
+ * `seccionDeOutput`; se reutiliza esa en vez de escribir otra que se equivoque igual.
+ */
+async function tddDeCorridaEntera(db, project_id) {
+  const { seccionDeOutput } = require('./slide-composer.service')
+
+  const { data: n } = await db().from('forge_nodes')
+    .select('id, outputs').eq('node_key', '3.12').maybeSingle()
+  if (!n) return null
+  const salidas = Array.isArray(n.outputs) ? n.outputs : []
+  const claves = salidas.map(o => o.key || o.name).filter(Boolean)
+  // La etiqueta la declara la DNA —`tdd_complete` → «TDD Complete»—; no se escribe a mano acá.
+  const etiqueta = salidas.find(o => (o.key || o.name) === 'tdd_complete')?.label || 'TDD Complete'
+
+  // Solo DOCUMENTOS: una sesión única también deja piezas sueltas sin clave que no son el TDD.
+  const { data: enteros } = await db().from('forge_assets')
+    .select('id, name, content, created_at')
+    .eq('project_id', project_id).eq('node_id', n.id)
+    .in('status', ['approved', 'auto_approved'])
+    .is('output_key', null).not('content', 'is', null)
+    .order('created_at', { ascending: false })
+
+  // 1 · La pieza que lleva la sección dentro. Es el caso de una corrida REALMENTE entera: un solo
+  //     documento con las nueve salidas, cada una bajo su `## <clave>`.
+  for (const a of enteros || []) {
+    const s = seccionDeOutput(a.content, 'tdd_complete', claves)
+    if (!s) continue
+    console.log(`[lab] 3.12 corrido entero: sección «tdd_complete» de «${a.name}» (${s.length} chars)`)
+    return { ...a, content: s, de_corrida_entera: true }
+  }
+
+  // 2 · Y la pieza cuyo NOMBRE es la salida. Medido el 18-09: hay proyectos con las nueve piezas
+  //     publicadas por separado y ninguna con clave —el nombre lleva la etiqueta de la DNA,
+  //     «Technical Design Document — TDD Complete»— porque cada output se aprobó en su propia
+  //     sesión sin que nadie escribiera `output_key`. Es el bug de fondo de buscar por clave un
+  //     dato que el motor deja en el nombre.
+  const norm = s => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '')
+  const buscada = norm(etiqueta)
+  for (const a of enteros || []) {
+    const cola = String(a.name || '').split(/\s+[—–-]\s+/).pop()
+    if (norm(cola) !== buscada) continue
+    console.log(`[lab] 3.12 sin clave: se reconoce «${a.name}» por su etiqueta (${a.content.length} chars)`)
+    return { ...a, por_etiqueta: true }
+  }
+
+  // 3 · Y por ELIMINACIÓN, que tampoco es adivinar: de las nueve salidas del 3.12, ocho son de
+  //     tipo `connection` y la ÚNICA que es un documento es `tdd_complete`. Así que un documento
+  //     sin clave de este nodo que no sea ninguna de las otras ocho, es el TDD.
+  //
+  //     Hace falta porque hay una tercera forma en la base, medida el 18-09 en
+  //     `smack_test_pedrito_v0.4`: las ocho conexiones publicadas CON su clave, y el TDD suelto
+  //     sin clave, llamado «Technical Design Document — Output» y sin ninguna marca dentro. Son
+  //     143.809 caracteres con su Fill-policy legend y sus secciones 1 a 6: decir que ese proyecto
+  //     no tiene TDD era falso.
+  //
+  //     Solo se acepta si queda UNO. Con varios candidatos no hay forma de elegir y se prefiere
+  //     decir que no hay a mandar el documento equivocado al Laboratory.
+  const etiquetasDeConexion = salidas
+    .filter(o => o.type === 'connection')
+    .map(o => norm(o.label || o.key || o.name))
+    .filter(Boolean)
+  const sobran = (enteros || []).filter(a => {
+    const cola = norm(String(a.name || '').split(/\s+[—–-]\s+/).pop())
+    return !etiquetasDeConexion.includes(cola)
+  })
+  if (sobran.length === 1) {
+    console.log(`[lab] 3.12 sin clave: «${sobran[0].name}» es el único documento que no es una conexión (${sobran[0].content.length} chars)`)
+    return { ...sobran[0], por_eliminacion: true }
+  }
+  if (sobran.length > 1) {
+    console.warn(`[lab] 3.12 deja ${sobran.length} documentos sin clave que podrían ser el TDD (${sobran.map(a => a.name).join(', ')}) — no se elige ninguno`)
+  }
+  return null
 }
 
 /**
