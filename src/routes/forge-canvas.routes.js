@@ -5706,10 +5706,29 @@ router.post('/assets/:asset_id/advance', async (req, res, next) => {
       progreso.terminar(project_id, asset_id)
     }
   } catch (err) {
-    // «Esta página todavía no tiene cadena» no es una falla del servidor: es el estado real de
-    // casi todas hasta que el equipo defina sus workflows.
-    if (err.code === 'SIN_CADENA') return res.status(400).json({ success: false, error: err.message, code: err.code })
-    next(err)
+    // Nada de esto es una falla del servidor: es el estado real del proyecto, y cada uno ya trae
+    // escrito qué hacer. Hasta hoy solo salía `SIN_CADENA` y el resto caía al manejador genérico,
+    // así que «este proyecto tiene dos personajes con vista frontal, corré la animación desde el
+    // que querés animar» llegaba al navegador como «Internal server error» — con el mensaje que
+    // resuelve el problema ya redactado y a dos líneas de la pantalla.
+    //
+    // Lo reportó Migue Amez el 18-09 sobre la Animation Sheet de test_smack_migue_v.09.
+    const DEL_PROYECTO = ['SIN_CADENA', 'SIN_ANCLA', 'ANCLA_AMBIGUA', 'SIN_ADI', 'SIN_CLIPS']
+    if (DEL_PROYECTO.includes(err.code)) {
+      return res.status(400).json({ success: false, error: err.message, code: err.code })
+    }
+    // Y lo que el proveedor de imagen ya explicó viaja tal cual, como en la ruta de herramientas.
+    if (err.publico) {
+      return res.status(err.status || 502).json({ success: false, error: err.message, code: err.code || null })
+    }
+    // Lo que nadie explicó tampoco se esconde: el mensaje real, aunque sea feo, ubica el problema.
+    // Un genérico obliga a ir al log del servidor, y eso ya costó cuatro informes.
+    console.error(`[advance] ${req.params.asset_id}:`, err)
+    res.status(500).json({
+      success: false,
+      error: `The step failed: ${err.message || 'unknown error'}`,
+      code: 'FALLO_NO_PREVISTO',
+    })
   }
 })
 

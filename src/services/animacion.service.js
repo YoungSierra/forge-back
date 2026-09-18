@@ -257,9 +257,9 @@ function beatsDesdeJson(crudo, clip = {}) {
  * nombra el conflicto y se para, que es lo mismo que hace el resto del sistema cuando una
  * referencia es ambigua.
  */
-async function anclaDelPersonaje({ db, project_id }) {
+async function anclaDelPersonaje({ db, project_id, desde = null }) {
   const { data: frentes } = await db().from('forge_assets')
-    .select('id, name, storage_url, metadata, created_at')
+    .select('id, name, storage_url, metadata, derived_from_id, created_at')
     .eq('project_id', project_id)
     .eq('metadata->cadena->>rol', 'front')
     .not('storage_url', 'is', null)
@@ -272,17 +272,69 @@ async function anclaDelPersonaje({ db, project_id }) {
     throw err
   }
 
+  // ── Acotar por la instancia de la que se corre ──────────────────────────────
+  //
+  // Corriendo desde «Art Style Guide — 24_AnimationSheet — Cartón rig + all animations», el
+  // personaje está DICHO: es Cartón. No hace falta que nadie lo elija, y preguntarlo cuando el
+  // dato está escrito es exactamente lo que hace que una prueba se detenga.
+  //
+  // Se ACOTA, nunca se adivina: se filtra por el nombre de la instancia y solo se usa el resultado
+  // si queda uno. Con cero o con varios se sigue al conflicto de abajo, que ahora sí se lee en
+  // pantalla. Cada clip es una lámina pagada y animar al personaje equivocado cuesta ocho.
+  //
+  // Es la misma regla de nombres del menú de alcance: la cadena arrastra el nombre de su hoja de
+  // origen, así que la pieza del personaje lo lleva dentro. La genérica —«Character Sheet —
+  // 18_CharacterSheet — Concept art — front»— no nombra a nadie y queda fuera sola, que es
+  // justo lo que deshace el empate del proyecto de Migue.
+  let candidatos = vivos
+  const k = String(desde || '').toLowerCase().replace(/[^a-z0-9]+/g, '')
+  if (k.length >= 3) {
+    // De qué personaje es cada vista frontal. NO se lee de su propio nombre: se sube un salto por
+    // `derived_from_id` hasta la hoja del ASG de la que salió, que es la que lleva escrito el ítem
+    // del alcance. Medido el 18-09 en test_smack_migue_v.09:
+    //
+    //   «Character Sheet — 18_CharacterSheet — Moon Jelly × 6 — Concept art — front»
+    //     ↑ «Art Style Guide — 18_CharacterSheet — Moon Jelly × 6»   instancia: Moon Jelly × 6
+    //   «Character Sheet — 18_CharacterSheet — Concept art — front»
+    //     ↑ «Art Style Guide — 18_CharacterSheet»                    instancia: —
+    //
+    // La genérica no nombra a nadie y queda fuera sola, que es lo que deshace el empate. Por el
+    // nombre de la pieza no salía: «Moon Jelly × 6 (mesh + shader + animation)» es el ítem de la
+    // hoja de ANIMACIÓN y no encaja con el de la de personaje, que es «Moon Jelly × 6» a secas.
+    const madres = [...new Set(vivos.map(f => f.derived_from_id).filter(Boolean))]
+    const item = new Map()
+    if (madres.length) {
+      const { data: hojas } = await db().from('forge_assets')
+        .select('id, metadata').in('id', madres)
+      for (const h of hojas || []) {
+        const i = h.metadata?.instancia?.item
+        if (i) item.set(h.id, String(i).toLowerCase().replace(/[^a-z0-9]+/g, ''))
+      }
+    }
+    // El personaje está DENTRO de la pista: «Cartón» dentro de «Cartón rig + all animations».
+    const suyos = vivos.filter(f => {
+      const i = item.get(f.derived_from_id)
+      return i && i.length >= 3 && k.includes(i)
+    })
+    if (suyos.length === 1) {
+      return { url: suyos[0].storage_url, nombre: suyos[0].name, id: suyos[0].id, por: 'instancia' }
+    }
+    // Con varios se sigue acotado; con ninguno se deja la lista entera, para que el conflicto que
+    // se nombre abajo sea el real y no uno recortado por una pista que no sirvió.
+    if (suyos.length > 1) candidatos = suyos
+  }
+
   // Del mismo job son las tres vistas de UN personaje; jobs distintos son personajes distintos.
-  const jobs = [...new Set(vivos.map(f => f.metadata?.job).filter(Boolean))]
+  const jobs = [...new Set(candidatos.map(f => f.metadata?.job).filter(Boolean))]
   if (jobs.length > 1) {
     const err = new Error(
-      `This project has ${jobs.length} characters with a front view (${vivos.map(f => f.name).slice(0, 4).join(', ')}). ` +
+      `This project has ${jobs.length} characters with a front view (${candidatos.map(f => f.name).slice(0, 4).join(', ')}). ` +
       'Animation needs one anchor: run it from the character you want to animate.')
     err.code = 'ANCLA_AMBIGUA'
     throw err
   }
 
-  return { url: vivos[0].storage_url, nombre: vivos[0].name, id: vivos[0].id }
+  return { url: candidatos[0].storage_url, nombre: candidatos[0].name, id: candidatos[0].id, por: 'único' }
 }
 
 /**

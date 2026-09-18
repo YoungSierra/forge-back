@@ -390,7 +390,14 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
       if (Array.isArray(clips) && clips.length) {
         const pedidos = new Set(clips)
         const ajenos = clips.filter(c => !instancias.includes(c))
-        if (ajenos.length) throw new Error(`These are not clips of this project: ${ajenos.join(', ')}`)
+        if (ajenos.length) {
+          // Con código, para que la ruta lo devuelva como estado del proyecto y no como fallo del
+          // servidor. Pasa si el ADI cambió entre abrir el recuadro y pulsar Run: la lista se
+          // relee y el modelo puede nombrar los movimientos distinto.
+          const err = new Error(`These are not clips of this project: ${ajenos.join(', ')}`)
+          err.code = 'SIN_CLIPS'
+          throw err
+        }
         instancias = instancias.filter(c => pedidos.has(c))
       }
       if (anim.descartados?.length) {
@@ -451,9 +458,17 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
         // el personaje: su vista frontal, que produjo la cadena de Character Sheet. Es el hueco
         // que el propio paquete marcaba: «nadie ató automáticamente la vista Frontal al nodo 17».
         else if (ref === 'ancla_personaje') {
-          const ancla = await require('./animacion.service').anclaDelPersonaje({ db, project_id })
+          // De qué personaje es esta hoja. Una hoja instanciada lo lleva escrito —el motor le puso
+          // `metadata.instancia.item` al crearla— y si no, se toma lo que vaya después del último
+          // guion largo del nombre, que es donde el sistema entero guarda el nombre propio.
+          // Es una PISTA para acotar: si no alcanza para dejar un solo personaje, el servicio para
+          // y lo dice, como hacía antes.
+          const desde = origen.metadata?.instancia?.item
+            || String(origen.name || '').split(/\s+[—–]\s+/).pop()?.trim()
+            || null
+          const ancla = await require('./animacion.service').anclaDelPersonaje({ db, project_id, desde })
           url = ancla.url
-          if (instancias.indexOf(cada) === 0) console.log(`[cadena] ${paso.clave}: ancla «${ancla.nombre}»`)
+          if (instancias.indexOf(cada) === 0) console.log(`[cadena] ${paso.clave}: ancla «${ancla.nombre}» (por ${ancla.por})`)
         }
         else if (ref === '<cada>') url = salidasPorPaso[paso.porCadaSalidaDe]?.[cada]?.url
         else {
