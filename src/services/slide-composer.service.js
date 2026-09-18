@@ -309,6 +309,28 @@ function seccionPorNumero(contenido, numero) {
   return out.join('\n').trim()
 }
 
+// La sección `## <clave>` de un documento de NODO ENTERO.
+//
+// Un nodo puede correr salida por salida —cada documento lleva su `output_key`— o entero, y
+// entonces aprueba UNA pieza sin clave con todas las salidas dentro, cada una bajo el encabezado
+// exacto `## <output_name>` que el motor le exige (canvas-chat.service, «Output format»).
+//
+// No sirven ni `seccionPorNombre` ni el `seccion` de alcance-vs: los dos cortan por NIVEL de
+// encabezado, y lo primero que escribe el modelo bajo `## ux_ui_spec` es el `# Título` del propio
+// documento, seguido de sus `## HUD Layout`, `## Menu Tree`… Medido en test_smack_migue_v.08 y
+// v.09: devolvían 0 y 13 caracteres. Acá el límite no es un nivel sino la SIGUIENTE SALIDA: se
+// corta en el próximo `## <otra clave de la DNA>`, y todo lo de en medio es el documento.
+function seccionDeOutput(contenido, clave, claves) {
+  const L = String(contenido || '').split('\n')
+  const rx = k => new RegExp(`^##\\s+${String(k).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*$`)
+  const i = L.findIndex(l => rx(clave).test(l))
+  if (i < 0) return null
+  const otras = (claves || []).filter(k => k !== clave).map(rx)
+  let fin = L.length
+  for (let j = i + 1; j < L.length; j++) if (otras.some(r => r.test(L[j]))) { fin = j; break }
+  return L.slice(i + 1, fin).join('\n').trim() || null
+}
+
 // ── Parser del bloque de intake ──────────────────────────────────────────────
 // Un solo parser para los tres delimitadores. Devuelve null cuando el workflow no tiene
 // bloque (el Art Bible), que NO es un error: significa que se llena con imágenes.
@@ -621,7 +643,7 @@ async function composeDeck({ db, projectId, deck = 'asg', fills = null, solo = n
   // Documento fuente. El Art Bible no tiene: se llena con imágenes.
   let assets = []
   if (cfg.fuente) {
-    const { data: n } = await db().from('forge_nodes').select('id').eq('node_key', cfg.fuente).single()
+    const { data: n } = await db().from('forge_nodes').select('id,outputs').eq('node_key', cfg.fuente).single()
     if (!n) throw new Error(`no existe el nodo fuente ${cfg.fuente}`)
     let q = db().from('forge_assets').select('name,content')
       .eq('project_id', projectId).eq('node_id', n.id).in('status', ['approved', 'auto_approved'])
@@ -630,6 +652,33 @@ async function composeDeck({ db, projectId, deck = 'asg', fills = null, solo = n
     if (cfg.asset) q = q.eq('output_key', cfg.asset)
     const { data } = await q
     assets = data || []
+
+    // Y la pieza del MODO NODO ENTERO, que no tiene clave. Mismo criterio que alcance-vs con el
+    // 3.13: se reconoce por el NODO que la produjo, no por su nombre. Medido en dos proyectos de
+    // Migue: el 3.7 corrido en una sola sesión («execute summarized manner») aprueba UN documento
+    // sin `output_key` con las siete salidas dentro, y el filtro de arriba no lo ve.
+    //
+    // De esa pieza se usa SOLO la sección del spec, no el documento entero: `## hud_layout` y
+    // `## HUD Layout` se normalizan igual, y con todo dentro el mapa resolvía contra la salida de
+    // conexión en vez de contra el spec.
+    //
+    // Solo DOCUMENTOS: una sesión única también deja png sueltos sin clave (el schematic del HUD).
+    // Se filtra por formato y no por `content`: medido en la base, hay png con `content`.
+    if (!assets.length && cfg.asset) {
+      const claves = (Array.isArray(n.outputs) ? n.outputs : []).map(o => o.key || o.name).filter(Boolean)
+      const { data: enteros } = await db().from('forge_assets').select('name,content')
+        .eq('project_id', projectId).eq('node_id', n.id).in('status', ['approved', 'auto_approved'])
+        .is('output_key', null).in('format', ['docx', 'markdown', 'md', 'document'])
+        .order('created_at', { ascending: false })
+      for (const a of enteros || []) {
+        const s = seccionDeOutput(a.content, cfg.asset, claves)
+        if (!s) continue
+        assets = [{ name: a.name, content: s }]
+        avisos.push(`node ${cfg.fuente} was run as a whole node: reading the "${cfg.asset}" section of "${a.name}"`)
+        break
+      }
+    }
+
     if (!assets.length) {
       // `publico` + 422: el handler global devuelve el mensaje tal cual en vez de «Internal
       // server error», y el despacho en segundo plano ya lo escribe en el chat del nodo.
@@ -817,6 +866,33 @@ async function composeDeck({ db, projectId, deck = 'asg', fills = null, solo = n
   // `solo` deja huecos en el arreglo (una pasada compone su subconjunto); se descartan acá para
   // que quien consuma reciba solo páginas reales.
   const vivas = paginas.filter(Boolean)
+
+  // Una página EN BLANCO no se despacha. El guardia de arriba frena la ausencia del documento;
+  // este frena el caso siguiente: el documento está, pero no trae ninguna de las secciones que
+  // una página necesita, y esa página viajaría con todos sus campos en «UPSTREAM GAP». Medido en
+  // test_smack_migue_v.08: la 04 salía sin un solo dato del spec y se habría pagado igual.
+  //
+  // Solo cuentan los campos que se piden AL DOCUMENTO. Lo que Forge sabe de sí mismo (`forge`),
+  // las instrucciones literales del mapa y las etiquetas visuales no prueban que el documento
+  // sirva, así que no salvan a una página. Y la regla es «todos en hueco»: una página con algún
+  // campo resuelto pasa, con sus huecos declarados, como en cualquier otro deck.
+  if (cfg.requerido) {
+    const buscadas = et => {
+      const c = Object.prototype.hasOwnProperty.call(mapa, et) ? mapa[et] : null
+      return Array.isArray(c) ? c.flat().map(x => (typeof x === 'object' ? x.seccion : x)) : [et]
+    }
+    const enBlanco = vivas.filter(p =>
+      p.faltantes.length && !p.llenos.some(l => l.chars != null && l.via !== 'forge'))
+    if (enBlanco.length) {
+      const detalle = enBlanco.map(p =>
+        `${p.nombre}: ${p.faltantes.map(f => `${f} (looked for ${buscadas(f).map(s => `"${s}"`).join(' or ')})`).join(', ')}`).join('; ')
+      const e = new Error(`The ${cfg.documento} deck cannot render ${enBlanco.length} page(s): the ${cfg.asset ? `"${cfg.asset}"` : 'source document'} of node ${cfg.fuente} has none of the sections they need — ${detalle}`)
+      e.publico = true
+      e.status = 422
+      e.code = 'SOURCE_INCOMPLETE'
+      throw e
+    }
+  }
 
   // Verificación de tamaño ANTES de despachar, que es lo que pide la DNA: el límite es de entrada
   // a ComfyUI y una sola página excedida hace fallar el job entero.
