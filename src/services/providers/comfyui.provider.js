@@ -99,7 +99,13 @@ async function submitWorkflow(workflowName, prompt, width, height, extras = {}, 
   const extra_data = {}
   if (process.env.COMFYUI_API_KEY) extra_data.api_key_comfy_org = process.env.COMFYUI_API_KEY
 
-  console.log(`[ComfyUI] Payload for /api/prompt (workflow: ${workflowName}):\n${JSON.stringify({ prompt: workflow, ...(Object.keys(extra_data).length ? { extra_data } : {}) }, null, 2)}`)
+  // El payload se sigue imprimiendo —hace falta para auditar qué grafo se despachó— pero la clave
+  // NO. Esta línea volcaba `extra_data.api_key_comfy_org` en claro, así que la credencial de
+  // ComfyUI quedaba escrita en los logs de Render en cada despacho. Lo encontró Pedro el 18-09.
+  //
+  // Se redacta sobre una COPIA: tocar `extra_data` dejaría sin clave la petición de abajo.
+  const paraElLog = { prompt: workflow, ...(Object.keys(extra_data).length ? { extra_data: { ...extra_data, api_key_comfy_org: '<redacted>' } } : {}) }
+  console.log(`[ComfyUI] Payload for /api/prompt (workflow: ${workflowName}):\n${JSON.stringify(paraElLog, null, 2)}`)
 
   const res = await fetch(`${BASE_URL()}/api/prompt`, {
     method: 'POST',
