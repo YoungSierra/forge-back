@@ -5892,9 +5892,12 @@ router.get('/assets/:asset_id/next-step', async (req, res, next) => {
       // escribe al correr— y sin lista no hay nada que elegir, que es justo lo que JuanK pidió
       // poder hacer ANTES de correr. Con `leer_clips=1` se lee del ADI y queda cacheada: es una
       // llamada al modelo, así que la pide quien mira el recuadro, no se hace a sus espaldas.
+      // El mismo `desde` que usa la corrida: el recuadro tiene que enseñar los clips de ESTE
+      // personaje, no los del proyecto. Si enseñara otros, elegir desde acá sería elegir mal.
       const leer = req.query.leer_clips === '1'
+      const desdeClips = asset.metadata?.instancia?.item || asset.name || null
       const r = await require('../services/animacion.service')
-        .clipsDelProyecto({ db, project_id, soloCache: !leer })
+        .clipsDelPersonaje({ db, project_id, desde: desdeClips, soloCache: !leer })
         .catch(() => null)
       if (r?.clips?.length) { clips = r.clips.map(c => ({ nombre: c.nombre, etiqueta: c.etiqueta || c.nombre })); despachos = clips.length }
       else clips = []

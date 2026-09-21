@@ -395,8 +395,16 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
     // una lámina distinta, y cada lámina se paga.
     let anim = null
     if (paso.porCadaClip) {
-      anim = await require('./animacion.service').clipsDelProyecto({ db, project_id })
+      // `desde` es la PÁGINA DEL RUN, y es lo que decide de qué personaje son los clips: sin ella
+      // la lista salía del ADI a nivel de proyecto y animando Moon Jelly se producía el set de
+      // Cartón (punto 1 del informe de JuanK, 21-09). El nombre de la pieza es el mismo dato que
+      // ya se usa más abajo para resolver la imagen ancla.
+      const desdeClips = origen.metadata?.instancia?.item || origen.name || null
+      anim = await require('./animacion.service').clipsDelPersonaje({ db, project_id, desde: desdeClips })
       instancias = anim.clips.map(c => c.nombre)
+      if (anim.fuente === 'vertical_slice') {
+        console.log(`[cadena] ${paso.clave}: ${anim.clips.length} clips de «${anim.personaje}» (Vertical Slice · B4)`)
+      }
       // Elegir QUÉ animaciones correr, en vez de producir siempre el set entero. Es el punto 1 del
       // informe de JuanK: cada lámina es un despacho pago y el ADI nombra hasta ocho movimientos.
       // Lo que no se elige no se pierde — sigue disponible para otra corrida.
@@ -622,7 +630,16 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
         await enPaso(`${paso.etiqueta} · waiting for ComfyUI to finish job ${jobId.slice(0, 8)}`,
           () => pollUntilDone(jobId, 300_000))   // Tripo y gpt-image-2 tardan bastante más que un render local
         progreso.marcar(project_id, origen.id, { estado: 'publicando' })
-        const base = `projects/${project_id}/chain/${nombreCadena}/${paso.clave}/${cada ? cada + '-' : ''}${jobId.slice(0, 8)}`
+        // La convención de JuanK (Fase 4, punto 4): `<ID_Personaje>/<Movimiento>`. Lo que salía era
+        // «Moon_Jelly_6_mesh_shader_animation__idle_00001_.mp4» — el nombre que le puso el nodo de
+        // guardado de ComfyUI, con su sufijo técnico. El personaje solo se antepone cuando hay uno
+        // resuelto: en el resto de las cadenas no existe y la ruta se queda como estaba.
+        const idPersonaje = anim?.personaje
+          ? String(anim.personaje).trim().replace(/\s+/g, '_').replace(/[^\w.-]+/g, '')
+          : null
+        const base = `projects/${project_id}/chain/${nombreCadena}/${paso.clave}/`
+          + (idPersonaje ? `${idPersonaje}/` : '')
+          + `${cada ? cada + '-' : ''}${jobId.slice(0, 8)}`
         const salidas = await enPaso(`${paso.etiqueta} · downloading the results and saving them`,
           () => downloadOutputsByNode(jobId, base))
 

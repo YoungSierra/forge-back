@@ -277,10 +277,17 @@ async function downloadOutputsByNode(promptId, basePath) {
       if (vistos.has(f.filename)) continue
       vistos.add(f.filename)
 
+      // La extensión y el tipo salen de lo que ComfyUI DEVOLVIÓ, no de lo que se supone que
+      // devuelve. Antes eran dos casos —`.glb` o, si no, `.png`— y el workflow de animación emite
+      // vídeo: un `.mp4` se guardaba en R2 con nombre `.png` y tipo `image/png`, así que ningún
+      // visor lo reconocía. Es el mismo fallo de forma que el resto del informe de JuanK.
       const nombre = f.filename.toLowerCase()
       const es3D   = nombre.endsWith('.glb') || nombre.endsWith('.gltf')
-      const ext    = es3D ? '.glb' : '.png'
-      const mime   = es3D ? 'model/gltf-binary' : 'image/png'
+      const esVideo = /\.(mp4|webm|mov)$/.test(nombre)
+      const ext    = es3D ? '.glb' : esVideo ? nombre.slice(nombre.lastIndexOf('.')) : '.png'
+      const mime   = es3D ? 'model/gltf-binary'
+                   : esVideo ? (nombre.endsWith('.webm') ? 'video/webm' : nombre.endsWith('.mov') ? 'video/quicktime' : 'video/mp4')
+                   : 'image/png'
 
       const viewUrl = `${BASE_URL()}/api/view?filename=${encodeURIComponent(f.filename)}`
                     + `&subfolder=${encodeURIComponent(f.subfolder || '')}&type=${f.type || 'output'}`
@@ -290,10 +297,10 @@ async function downloadOutputsByNode(promptId, basePath) {
       const buffer = Buffer.from(await res.arrayBuffer())
       // Un PNG de menos de 1 KB es un placeholder, no un render — el mismo umbral que ya usaba
       // downloadOutput. Un GLB chico sí puede ser válido, así que el piso es solo para imágenes.
-      if (!es3D && buffer.length < 1000) continue
+      if (!es3D && !esVideo && buffer.length < 1000) continue
 
       const url = await uploadToStorage(buffer, `${basePath}_${nodo}${ext}`, mime)
-      porNodo[nodo] = { url, kind: es3D ? 'model' : 'image', size_bytes: buffer.length }
+      porNodo[nodo] = { url, kind: es3D ? 'model' : esVideo ? 'video' : 'image', size_bytes: buffer.length }
       console.log(`[ComfyUI] salida ${nodo} → ${url} (${Math.round(buffer.length / 1024)}kb) job:${promptId}`)
       break
     }
