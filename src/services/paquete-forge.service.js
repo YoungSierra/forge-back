@@ -256,10 +256,22 @@ async function armarPaquete({ db, project_id, asset_id, nivel = null, member_id 
   // Todo el proyecto de una vez: el paquete toca ocho carpetas y consultarlas por separado son
   // ocho viajes a la base para armar un archivo que ya tarda por las descargas.
   const { data: piezas } = await db().from('forge_assets')
-    .select('id, name, format, output_key, storage_url, content, metadata, created_at')
+    .select('id, name, format, output_key, storage_url, content, metadata, created_at, forge_sessions!session_id(output_key)')
     .eq('project_id', project_id)
   const todas = piezas || []
-  const texto = clave => (todas.find(a => a.output_key === clave && a.content)?.content) || ''
+
+  // La clave de salida vive en DOS sitios: en la pieza (desde la migración 054) y en su sesión
+  // (las filas anteriores). Mirar solo la de la pieza dejaba al exportador ciego ante proyectos
+  // enteros: medido el 21-09 en test_smack_migue_v.09, siete claves —level_map, encounter_design,
+  // gdd_complete, gdd_ref, visual_targets, scene_manifest, asset_briefs— estaban declaradas en la
+  // sesión y ninguna en la pieza.
+  //
+  // Eso es lo que JuanK reportó como «Level Design has not produced its level map yet»: el mapa
+  // existe, son 17.173 caracteres aprobados, y el exportador no lo veía. No era un prerrequisito
+  // que faltara, era una lectura que miraba un solo sitio. El resolvedor de entradas de un nodo
+  // ya consultaba los dos desde hace tiempo; acá no se había aplicado.
+  const claveDe = a => a?.output_key ?? a?.forge_sessions?.output_key ?? null
+  const texto = clave => (todas.find(a => claveDe(a) === clave && a.content)?.content) || ''
 
   // 1 · El nivel. Sale de la tabla del level_map, que es quien declara qué nivel usa qué entorno.
   const levelMap = texto('level_map')
@@ -311,11 +323,11 @@ async function armarPaquete({ db, project_id, asset_id, nivel = null, member_id 
     // van todas las páginas de Environment Sheet. Elegir un subconjunto «parecido» sería adivinar
     // cuál retrata este nivel, y el contrato prohíbe exactamente eso.
     'environment_sheet': todas.filter(a => esImagen(a) && (
-      a.output_key === 'world_visuals'
+      claveDe(a) === 'world_visuals'
         || (entorno ? nombra(a, entorno) : false)
         || /environmentsheet/i.test(norm(a.name)))),
     'character_sheet': todas.filter(a => esImagen(a) &&
-      (a.output_key === 'visual_targets' || /charactersheet/i.test(norm(a.name)))),
+      (claveDe(a) === 'visual_targets' || /charactersheet/i.test(norm(a.name)))),
     'art_bible_level_design': todas.filter(a => esImagen(a) &&
       /artbible/i.test(norm(a.name)) && /leveldesign/i.test(norm(a.name))),
     'art_style_guide': todas.filter(a => esImagen(a) && /artstyleguide/i.test(norm(a.name))
@@ -334,7 +346,7 @@ async function armarPaquete({ db, project_id, asset_id, nivel = null, member_id 
   }
   // `world_visuals` es su propia fuente y su ausencia importa: el contrato la nombra explícitamente
   // como parte de environment_sheet.
-  if (!todas.some(a => a.output_key === 'world_visuals')) {
+  if (!todas.some(a => claveDe(a) === 'world_visuals')) {
     ausentes.push('world_visuals: no node produced them in this project')
   }
   if (!carpetas.art_bible_level_design.length) {
