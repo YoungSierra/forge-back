@@ -1,4 +1,5 @@
 const express = require('express')
+const { normalizarLayout } = require('../utils/canvas-layout')
 const path = require('path')
 const fs = require('fs')
 const archiver = require('archiver')
@@ -152,6 +153,9 @@ router.get('/pending-reviews', async (req, res, next) => {
 })
 
 // PUT /api/projects/:id/canvas — save canvas layout
+// El recorte del acomodo vive en un solo sitio -src/utils/canvas-layout.js-: lo usan este
+// escritor, el del moodboard y el fan-out. Tres podas distintas serian tres verdades.
+
 router.put('/:id/canvas', async (req, res, next) => {
   try {
     const { id } = req.params
@@ -166,8 +170,21 @@ router.put('/:id/canvas', async (req, res, next) => {
     // tenía acomodo guardado.
     //
     // Se conserva lo que este PUT no trae. Cada dueño pisa solo sus claves.
-    const { data: previo } = await db().from('projects').select('canvas_layout').eq('id', id).maybeSingle()
-    const fusion = { ...(previo?.canvas_layout ?? {}), ...canvas_layout }
+    //
+    // Y si la LECTURA falla, no se escribe. Ese `?? {}` era una bomba: una mezcla sobre nada
+    // escribe solo lo que trae este PUT y borra la mitad del otro dueño. El 21-09 pasó de verdad
+    // —`test_smack_migue_v.09` perdió el acomodo de sus 29 nodos— porque leer 2,4 MB de JSONB
+    // expiraba por tiempo en Postgres y el error se ignoraba. Un guardado que falla se reintenta;
+    // uno que destruye lo que no tocó, no se deshace.
+    const { data: previo, error: eLeer } = await db().from('projects')
+      .select('canvas_layout').eq('id', id).maybeSingle()
+    if (eLeer) {
+      return res.status(503).json({
+        success: false, code: 'NO_SE_PUDO_LEER',
+        error: `The current layout could not be read, so nothing was saved (it would have wiped what this save does not carry): ${eLeer.message}`,
+      })
+    }
+    const fusion = { ...(previo?.canvas_layout ?? {}), ...normalizarLayout(canvas_layout) }
 
     const { error } = await db().from('projects').update({ canvas_layout: fusion }).eq('id', id)
     if (error) return res.status(500).json({ success: false, error: error.message })
@@ -196,7 +213,18 @@ router.put('/:id/moodboard-layout', async (req, res, next) => {
     if (!layout || typeof layout !== 'object') {
       return res.status(400).json({ success: false, error: 'layout is required' })
     }
-    const { data } = await db().from('projects').select('canvas_layout').eq('id', req.params.id).maybeSingle()
+    // Si no se puede leer lo que hay, NO se escribe. Este guardado mezcla sobre lo anterior para
+    // no pisar la mitad del lienzo; con la lectura fallada la mezcla se hace sobre nada y la
+    // borra. Es exactamente lo que le pasó a `test_smack_migue_v.09` el 21-09: perdió el acomodo
+    // de sus 29 nodos porque leer una columna de 2,4 MB expiraba y el error se ignoraba.
+    const { data, error: eLeer } = await db().from('projects')
+      .select('canvas_layout').eq('id', req.params.id).maybeSingle()
+    if (eLeer) {
+      return res.status(503).json({
+        success: false, code: 'NO_SE_PUDO_LEER',
+        error: `The current layout could not be read, so nothing was saved (it would have wiped the canvas layout): ${eLeer.message}`,
+      })
+    }
     const previo = data?.canvas_layout?.moodboard ?? {}
 
     // MEZCLA, no reemplazo. El acomodo se guardaba entero en cada escritura, así que dos personas
@@ -228,7 +256,11 @@ router.put('/:id/moodboard-layout', async (req, res, next) => {
     const ocultos = { ...(previo.ocultos ?? {}), ...(layout.ocultos ?? {}) }
     for (const k of Object.keys(ocultos)) if (!ocultos[k]) delete ocultos[k]
 
-    const nuevo = { ...(data?.canvas_layout ?? {}), moodboard: { pos, marcos, ocultos } }
+    // La mitad del canvas se arrastra tal cual —no es de este dueño— pero se pasa por el mismo
+    // recorte: si algo la volviera a engordar, guardar una nota del moodboard reescribiría esos
+    // megabytes y volvería a expirar. Recortar en los dos escritores deja la columna magra
+    // gobierne quien gobierne la escritura. Es idempotente: sobre algo ya magro no cambia nada.
+    const nuevo = { ...normalizarLayout(data?.canvas_layout), moodboard: { pos, marcos, ocultos } }
     const { error } = await db().from('projects').update({ canvas_layout: nuevo }).eq('id', req.params.id)
     if (error) throw error
     res.json({ success: true })

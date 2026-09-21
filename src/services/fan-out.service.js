@@ -2,6 +2,8 @@
 // Regla (Instancing Brief v1.2): list<T> → single<T> dispara fan-out (una instancia por ítem).
 // Fan-in: primer nodo downstream con cardinality one_or_more.
 
+const { normalizarLayout } = require('../utils/canvas-layout')
+
 const LANE_COLORS  = ['#60a5fa', '#a78bfa', '#34d399', '#f59e0b', '#fb923c']
 const LANE_KEYS    = ['A', 'B', 'C', 'D', 'E']
 
@@ -371,11 +373,17 @@ async function fanOut({ project_id, gate_project_node_id, gate_output_key, nextB
   if (lanesErr) throw lanesErr
 
   // 2. Canvas layout para posicionar relativo al gate
-  const { data: projectRow } = await db()
+  // El error de esta lectura NO se puede descartar. Si expira —y con la columna gorda expiraba—,
+  // `projectRow` queda en null, y el paso 6 más abajo reescribe la columna partiendo de un acomodo
+  // VACÍO: se llevaría por delante las posiciones de todos los nodos, las aristas Y el moodboard,
+  // que comparte columna. Mejor no abrir el fan-out que abrirlo borrando el proyecto.
+  const { data: projectRow, error: eLayout } = await db()
     .from('projects')
     .select('canvas_layout')
     .eq('id', project_id)
     .single()
+  if (eLayout) throw new Error(`No se pudo leer el acomodo del proyecto, así que no se abrió el ` +
+    `fan-out (habría borrado las posiciones y el moodboard): ${eLayout.message}`)
 
   const savedNodes = projectRow?.canvas_layout?.nodes ?? []
 
@@ -489,7 +497,9 @@ async function fanOut({ project_id, gate_project_node_id, gate_output_key, nextB
   }
 
   // 6. Persistir posiciones en canvas_layout
-  const currentLayout = projectRow?.canvas_layout ?? { templateId: null, nodes: [], edges: [] }
+  // Por el mismo recorte que los otros dos escritores: este camino arrastraba los nodos enteros
+  // hacia adelante y volvía a engordar la columna aunque el lienzo ya no lo haga.
+  const currentLayout = normalizarLayout(projectRow?.canvas_layout)
   const layoutNodeMap = {}
   for (const n of (currentLayout.nodes ?? [])) layoutNodeMap[n.id] = n
   for (const [pnId, pos] of Object.entries(newPositions)) {
