@@ -157,11 +157,24 @@ async function estadoDelLaboratorio({ db, project_id }) {
 
   // `ready` es del SERVICIO, no del proyecto: el laboratorio guarda un solo taller para todos.
   // Sin preguntarlo, Publish se ofrecía siempre y el error llegaba del otro lado.
+  // ── El TDD no espera al laboratorio ───────────────────────────────────────
+  //
+  // Antes esta pregunta aguardaba hasta 90 segundos a que el Laboratory contestara, y recién
+  // entonces devolvía TODO — incluido `tiene_tdd`, que sale de la base y ya estaba resuelto en la
+  // primera línea. El resultado: el botón se quedaba en «Checking…» esperando a un servicio
+  // externo para decir algo que no depende de él. Lo reportó David el 21-09 sobre
+  // test_pinball_migue_v.10, cuyo TDD está perfectamente ahí.
+  //
+  // Ahora se espera poco. El despertar del laboratorio NO necesita que nadie lo aguarde: la
+  // petición ya salió y el servicio arranca igual, así que si no contesta a tiempo se devuelve lo
+  // que sí se sabe y `jugable_listo` queda en falso hasta la próxima consulta. Un Publish que
+  // tarda un ciclo en aparecer es mucho mejor que un botón que no dice nada en minuto y medio.
+  const ESPERA_MS = 6000
   let jugable = null
   if (base) {
     const t0 = Date.now()
     try {
-      const r = await fetch(`${base}/api/gameplay/status`, { signal: AbortSignal.timeout(90000) })
+      const r = await fetch(`${base}/api/gameplay/status`, { signal: AbortSignal.timeout(ESPERA_MS) })
       if (r.ok) jugable = await r.json()
     } catch (e) {
       // Que no conteste no es un fallo del proyecto: es el servicio arrancando o caído, y el
@@ -180,6 +193,25 @@ async function estadoDelLaboratorio({ db, project_id }) {
     ...(jugable?.motivo ? { lab_motivo: jugable.motivo } : {}),
     ...(doc ? { documento: doc.name, chars: doc.content.length } : {}),
   }
+}
+
+/**
+ * Despertar el Laboratory, sin esperarlo.
+ *
+ * Corre en una instancia que se duerme: la primera petición tarda ~22 s y la siguiente 0,28. Si
+ * ese arranque empieza cuando alguien ya abrió el panel, se lo come esperando. Empezándolo en el
+ * LOGIN —mientras la persona escribe su contraseña— llega despierto a la primera pantalla.
+ *
+ * No devuelve el resultado a propósito: lo único que hace falta es que el proceso de allá
+ * arranque. Quien de verdad necesite saber si hay build, lo pregunta con `estadoDelLaboratorio`.
+ */
+function despertarLaboratorio() {
+  const base = BASE()
+  if (!base) return { configurado: false }
+  fetch(`${base}/api/gameplay/status`, { signal: AbortSignal.timeout(90000) })
+    .then(() => console.log('[lab] despierto'))
+    .catch(() => { /* silencio: corre de fondo y su fallo no es de nadie que esté mirando */ })
+  return { configurado: true }
 }
 
 /**
@@ -244,4 +276,4 @@ async function abrirLaboratorio({ db, project_id, nombreProyecto }) {
   }
 }
 
-module.exports = { abrirLaboratorio, estadoDelLaboratorio, tddDelProyecto, slugDe, BASE }
+module.exports = { abrirLaboratorio, estadoDelLaboratorio, despertarLaboratorio, tddDelProyecto, slugDe, BASE }
