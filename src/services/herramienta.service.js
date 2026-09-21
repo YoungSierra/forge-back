@@ -114,20 +114,9 @@ function herramientasDe(origen) {
 // informes seguidos.
 //
 // No se inventa diagnóstico: se conserva el mensaje original y se le antepone el paso.
-async function paso(nombre, fn) {
-  try {
-    return await fn()
-  } catch (e) {
-    console.error(`[herramienta] falló en «${nombre}»:`, e)
-    const err = new Error(`${nombre}: ${e?.message || 'unknown error'}`)
-    err.publico = true
-    err.status  = e?.status || 502
-    err.code    = e?.code || 'PASO_FALLIDO'
-    err.cause   = e
-    throw err
-  }
-}
-
+// La implementación vive en ../utils/paso.js: la comparte con chain.service, que la necesitaba
+// para el punto 4 del informe v11. Dos copias del mismo envoltorio serían dos verdades.
+const paso = require('../utils/paso').crearPaso('herramienta')
 async function correrHerramienta({ db, project_id, asset_id, clave, opciones = null, imagen_comfy = null, mascara_base64 = null, member_id = null }) {
   const h = HERRAMIENTAS[clave]
   if (!h) throw new Error(`Unknown tool "${clave}"`)
@@ -240,6 +229,22 @@ async function correrHerramienta({ db, project_id, asset_id, clave, opciones = n
       // Las opciones quedan pegadas a la pieza: es lo que se lee debajo de la imagen y lo que se
       // reusa al rehacerla. En Nuevo Ángulo son el ángulo y el zoom con que se generó.
       metadata: {
+        // ── El sello de cadena se HEREDA ────────────────────────────────────
+        //
+        // Una pieza sacada de un concept art sigue siendo concept art: pertenece a la misma
+        // cadena y está en el mismo paso. Sin este sello la cadena no la reconoce, y la ventana
+        // de Run —que pregunta `proximoPaso(asset)`— la trata como si estuviera fuera: solo
+        // puede ofrecer rehacer el paso 1, o saltar al último paso ya producido.
+        //
+        // Eso es el punto 6 del informe v11 de Miguel: «al lanzar un nuevo output de concept art
+        // no deja avanzar al workflow de generación 3D». Medido en test_smack_migue_v.09: de 20
+        // piezas derivadas de una pieza sellada, 6 habían perdido el sello — y las 6 eran New
+        // angle. El dato estaba a mano: `origen.metadata` ya se lee más arriba.
+        //
+        // Se copia TAL CUAL, `rol` incluido: cambiarlo haría que el paso siguiente —que despacha
+        // uno por cada rol distinto— creyera que hay un rol más y despachara un trabajo de más,
+        // que es pago y no se repite.
+        ...(origen.metadata?.cadena ? { cadena: origen.metadata.cadena } : {}),
         herramienta: { clave, etiqueta: h.etiqueta, rol },
         job: jobId,
         // De qué versión del origen salió (v2.3 §2.1): una pieza segmentada de la v1 no es la

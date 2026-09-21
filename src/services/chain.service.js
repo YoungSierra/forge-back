@@ -11,6 +11,9 @@
 // «la primera que aparezca»: el concept art emite cuatro y el 3D pide tres de ellas POR ROL.
 
 const { submitWorkflow, pollUntilDone, downloadOutputsByNode, uploadImageToComfyUI } = require('./providers/comfyui.provider')
+// Nombrar cuál de las llamadas a ComfyUI falló (punto 4 del informe v11). Se llama `enPaso` y no
+// `paso` porque en este archivo `paso` ya es el objeto del paso de la cadena.
+const enPaso = require('../utils/paso').crearPaso('chain')
 const { getWorkflowByName } = require('./config.service')
 const { logExecution } = require('./execution-log.service')
 const progreso = require('./progreso.service')
@@ -490,7 +493,7 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
           if (!url) throw new Error(`Step "${paso.clave}" needs "${rol}" from "${pasoRef}" and it is not there`)
         }
         if (!url) throw new Error(`Step "${paso.clave}" has no image for "${campo}"`)
-        extras[campo] = await uploadImageToComfyUI(url)
+        extras[campo] = await enPaso(`${paso.etiqueta} · uploading the "${campo}" image to ComfyUI`, () => uploadImageToComfyUI(url))
       }
 
       // Las semillas de las vistas van aparte: comparten workflow pero no nodo, y con la misma
@@ -613,12 +616,15 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
         }
         for (const pg of r.paginas) porRol[pg.name] = { url: pg.url, kind: pg.kind || 'image' }
       } else {
-        jobId = await submitWorkflow(paso.workflow, promptDelDespacho, 1024, 1024, extras, opciones)
+        jobId = await enPaso(`${paso.etiqueta} · dispatching "${paso.workflow}" to ComfyUI`,
+          () => submitWorkflow(paso.workflow, promptDelDespacho, 1024, 1024, extras, opciones))
         progreso.marcar(project_id, origen.id, { estado: 'generando' })
-        await pollUntilDone(jobId, 300_000)   // Tripo y gpt-image-2 tardan bastante más que un render local
+        await enPaso(`${paso.etiqueta} · waiting for ComfyUI to finish job ${jobId.slice(0, 8)}`,
+          () => pollUntilDone(jobId, 300_000))   // Tripo y gpt-image-2 tardan bastante más que un render local
         progreso.marcar(project_id, origen.id, { estado: 'publicando' })
         const base = `projects/${project_id}/chain/${nombreCadena}/${paso.clave}/${cada ? cada + '-' : ''}${jobId.slice(0, 8)}`
-        const salidas = await downloadOutputsByNode(jobId, base)
+        const salidas = await enPaso(`${paso.etiqueta} · downloading the results and saving them`,
+          () => downloadOutputsByNode(jobId, base))
 
         // Del nodo al rol. Con mapa declarado manda el mapa Y NADA MÁS: un workflow publica más de
         // lo que interesa guardar —el de 3D tiene un `Preview3D` que emite el MISMO .glb que el

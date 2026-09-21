@@ -53,6 +53,66 @@ const ANCHOR_CAP = 2000
 // `visualRefs` es una bolsa de salida: acá se anotan las referencias que el modelo tiene que
 // VER, no solo leer. Va aparte del texto porque los strings resueltos alimentan el prompt y
 // estas van como bloques de imagen. El llamador que no la pase sigue funcionando igual.
+/**
+ * El activo de NODO ENTERO entre los de un nodo: el que trae todas las secciones juntas.
+ *
+ * Cuando un nodo corre entero deja UN solo activo, sin clave de salida, con cada salida adentro
+ * bajo su propio «## clave». Ese es el que hay que abrir cuando no aparece la pieza suelta.
+ *
+ * Se elegía con `find(a => a.content)` —«el más reciente que tenga algo de texto»— y eso es lo que
+ * rompía el Art Style Guide en Pinball (punto 2 del informe v11 de Miguel). Medido el 21-09 sobre
+ * el 3.9 de ese proyecto: de 8 candidatos, los 5 más recientes eran pies de foto de Reference
+ * Images de 102 a 151 caracteres, y el documento real —43.420 caracteres— era el sexto. El código
+ * abría el pie de foto: 0 de 22 secciones. Abriendo el documento salen 22 de 22. El contexto nunca
+ * se perdió; se estaba leyendo el papel equivocado.
+ *
+ * Se reconoce por lo que DEFINE a un activo de nodo entero —no declara clave de salida, ni la
+ * suya ni la de su sesión—, no por ser el más nuevo ni por pesar más. Entre varios, el más largo:
+ * si un nodo corrió entero dos veces, la corrida completa es la que trae todas las secciones.
+ */
+/**
+ * La sección que se pidió dentro de un activo de nodo entero — o el documento entero.
+ *
+ * Un nodo corrido entero deja UN activo, y lo deja en una de DOS formas:
+ *
+ *   a) varias salidas juntas, cada una bajo su «## clave». Así corre el 3.9: dentro están
+ *      style_guide, color_palette, visual_targets… y `extractSection` las abre una por una.
+ *   b) UNA sola salida, escrita directamente. Así corre el 3.8: el activo ES el GDD, y sus
+ *      encabezados son los capítulos del documento —«## §0 · Executive Summary», «## §1 · Game
+ *      Identity»— no las claves del nodo. Buscar «## gdd_complete» ahí no encuentra nada, porque
+ *      el documento entero es gdd_complete.
+ *
+ * El código solo conocía la forma (a), y en la (b) devolvía nada. Eso es el punto 2 del informe
+ * v11 de Miguel: «en Pinball el Art Style Guide pierde el contexto». Medido el 21-09: el 3.9 de
+ * Pinball resolvía 22 de 22 y el 3.8 resolvía 0 de 3, teniendo el GDD de 70 KB aprobado al lado.
+ *
+ * La distinción es limpia y no adivina: si el activo no contiene NINGUNA de las claves del nodo,
+ * no es un contenedor de secciones, es el documento de una sola salida. Entonces se entrega
+ * entero. Si contiene alguna, se respeta el reparto por secciones y una clave ausente sigue
+ * ausente — entregar el documento completo ahí duplicaría lo que ya viajó por su propia sección.
+ */
+function seccionOEntero(entero, clave, hermanas) {
+  if (!entero?.content) return null
+  const seccion = extractSection(entero.content, clave, hermanas)
+  if (seccion) return seccion
+  const tieneAlguna = (hermanas || []).some(k => extractSection(entero.content, k, hermanas))
+  return tieneAlguna ? null : entero.content
+}
+
+function assetDeNodoEntero(candidatos) {
+  const sinClave = (candidatos || []).filter(a =>
+    a?.content && !a.output_key && !a.forge_sessions?.output_key)
+  if (sinClave.length) {
+    return sinClave.reduce((mejor, a) => a.content.length > mejor.content.length ? a : mejor)
+  }
+  // Ninguno se declara de nodo entero. Antes de rendirse, el más largo de los que tienen texto:
+  // quedan filas viejas —anteriores a la migración 054— que no declaran la clave en ninguno de
+  // los dos sitios. Aun así, el más largo nunca es un pie de foto.
+  const conTexto = (candidatos || []).filter(a => a?.content)
+  if (!conTexto.length) return null
+  return conTexto.reduce((mejor, a) => a.content.length > mejor.content.length ? a : mejor)
+}
+
 async function resolveNodeInputs(db, { projectId, currentPNodeId, targetOutput, visualRefs = [] }) {
   const resolvedInputs    = []
   const injectedPngUrls   = new Set()  // dedup PNG cuando hay múltiples edges del mismo nodo
@@ -1205,9 +1265,9 @@ async function resolveAssemblyPools(db, { projectId, currentPNodeId, node, outpu
     // proyecto del 3.8: 0 de 18 inputs resueltos, y las 18 secciones estaban ahí dentro bajo su
     // propio "## clave". El contenido existe y está aprobado; solo había que abrirlo.
     if (!inputs[portKey]) {
-      const entero   = (cand || []).find(a => a.content)
+      const entero   = assetDeNodoEntero(cand)
       const hermanas = defs.map(o => o.key || o.name).filter(Boolean)
-      const seccion  = entero?.content ? extractSection(entero.content, outKey, hermanas) : null
+      const seccion  = seccionOEntero(entero, outKey, hermanas)
       if (seccion) inputs[portKey] = seccion
     }
   }
@@ -1231,9 +1291,9 @@ async function resolveAssemblyPools(db, { projectId, currentPNodeId, node, outpu
     if (hit?.content) { siblings[k] = hit.content; continue }
 
     // Mismo respaldo para los hermanos: el nodo pudo haber corrido entero también.
-    const entero   = (own || []).find(a => a.content)
+    const entero   = assetDeNodoEntero(own)
     const hermanas = (outputDefs || []).map(o => o.key || o.name).filter(Boolean)
-    const seccion  = entero?.content ? extractSection(entero.content, k, hermanas) : null
+    const seccion  = seccionOEntero(entero, k, hermanas)
     if (seccion) siblings[k] = seccion
   }
 
