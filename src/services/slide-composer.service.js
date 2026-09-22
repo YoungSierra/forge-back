@@ -722,11 +722,41 @@ async function composeDeck({ db, projectId, deck = 'asg', fills = null, solo = n
   // líneas de la portada salían con «TBD». Dos de esos datos no estaban perdidos: el título es el
   // nombre del proyecto y la fecha es hoy. Los otros dos no los sabe nadie todavía, y se dicen
   // así, en vez de inventar una versión 1.0 que nadie aprobó.
-  const { data: proyecto } = await db().from('projects').select('name').eq('id', projectId).maybeSingle()
+  const { data: proyecto } = await db().from('projects')
+    .select('name, studio_name').eq('id', projectId).maybeSingle()
   const hoy = new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })
+
+  // El título del JUEGO, no el del proyecto.
+  //
+  // La portada del GDD de pinball salía con «test_pinball_migue_v.10», que es como se llama la
+  // carpeta de pruebas, no el juego: su GDD se titula «Happy Habitat». El documento lo declara en
+  // su primer encabezado —«## Happy Habitat — Game Design Document»— y lo hace igual en 7 de los
+  // 10 proyectos que tienen documento del 3.8. Cuando no lo declara se sigue usando el nombre del
+  // proyecto, que es lo que había.
+  const tituloDelJuego = (() => {
+    for (const a of assets || []) {
+      const m = /^#{1,3}\s*(.+?)\s*[—–-]\s*Game Design Document\s*$/im.exec(a.content || '')
+      if (m && m[1].trim().length >= 2) return m[1].trim()
+    }
+    return proyecto?.name || null
+  })()
+
   const PROPIOS = [
-    [/GAME TITLE/i, () => proyecto?.name || null],
+    [/GAME TITLE/i, () => tituloDelJuego],
     [/VERSION\s*\/\s*DATE\s*\/\s*ART DIRECTOR/i, () => `Version: not set · Date: ${hoy} · Art Director: not set`],
+
+    // La portada del GDD pide estos tres POR SEPARADO, y el mapa los resolvía con una frase —
+    // «Fill from the project record — do not invent a name.»— que viajaba al modelo de imagen como
+    // si fuera el valor. El modelo la leyó, no tiene ningún project record, y escribió «Studio
+    // GDD»; la fecha salió «May 20, 2025» y la versión «1.0.0». Ninguno de los tres estaba en el
+    // documento: los tres los inventó porque se le pidió que los rellenara.
+    //
+    // La fecha sí la sabe Forge. El autor, solo si el proyecto declara estudio —hoy ninguno de los
+    // 14 lo hace—. La versión no la sabe nadie. Lo que no se sabe se dice «TBD», que es además lo
+    // que el propio prompt exige en sus reglas duras: «If a value is unknown write "TBD"».
+    [/^\s*Author\s*$/i,  () => proyecto?.studio_name || 'TBD'],
+    [/^\s*Date\s*$/i,    () => hoy],
+    [/^\s*Version\s*$/i, () => 'TBD'],
   ]
   const propioDe = etiqueta => {
     for (const [rx, fn] of PROPIOS) if (rx.test(etiqueta)) return fn()
@@ -844,8 +874,15 @@ async function composeDeck({ db, projectId, deck = 'asg', fills = null, solo = n
       }
       if (r?.noAplica) {
         // No es un gap del proyecto: nadie debe producirlo aguas arriba.
+        //
+        // Pero una instrucción NO puede viajar desnuda. Lo que se manda acá es el valor del campo,
+        // y quien lo recibe es un modelo de IMAGEN que no distingue una orden de un dato: con
+        // «Fill from the project record — do not invent a name.» escrito como valor, escribió un
+        // nombre de estudio inventado en la portada del GDD de pinball. Entre corchetes lo lee
+        // como marcador y no lo copia, que es como se comporta el resto de los huecos del deck.
+        const inst = r.instruccion || 'derive from the other slides of this deck and V57 studio standards'
         pag.llenos.push({ etiqueta: c.etiqueta, via: 'no aplica' })
-        return { fijo: r.instruccion || '[derive from the other slides of this deck and V57 studio standards]' }
+        return { fijo: /^\s*\[/.test(inst) ? inst : `[${String(inst).replace(/\s*[.·]\s*$/, '')}]` }
       }
       // Solo en el GDD: ahí los paneles de imagen conviven con campos de datos y se distinguen
       // por el nombre. En el ASG toda página es una obra y la etiqueta nombra su TEMA, así que
