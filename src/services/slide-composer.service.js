@@ -204,11 +204,43 @@ const MAPA_GDD = {
   'Environment 3':      [{ seccion: 'Environments', fila: 3 }],
   'Environment 4':      [{ seccion: 'Environments', fila: 4 }],
   'Economy source -> sink': ['Economy'],
-  // Se resuelve dentro del ámbito de la línea (PROTAGONIST / ANTAGONIST / NPC-MENTOR).
+  // Las tres fichas de personaje se resuelven dentro del ÁMBITO de su línea (PROTAGONIST /
+  // ANTAGONIST / NPC-MENTOR): el prefijo lo fija `RE_ENTIDAD_LINEA` en el dialecto `insert` y
+  // el ámbito localiza la ficha por PREFIJO de encabezado —«PROTAGONIST — The Keeper (Player)»,
+  // «NPC / Mentor 1 — Dr. Yael Orin»—, porque el título lleva el nombre del personaje detrás.
   'Name/Age/Visual':    [['Name', 'Age', 'Visual description']],
   // OJO: el campo se llama «Abilities / actions». Sin esto la búsqueda se iba a la §8.3
   // Character Abilities y los tres personajes salían con el mismo texto.
   'Abilities':          ['Abilities / actions'],
+  'Mechanical role':    ['Mechanical role'],
+
+  // ── Paneles de imagen: el SUJETO de la lámina, sacado del propio GDD ─────────
+  // Estas etiquetas casan con RE_VISUAL y sin entrada caían en «draw this from the data already on
+  // this slide». En la portada «los datos de la página» son seis campos, y el modelo inventaba el
+  // hook, cuatro features y el autor. Medido el 22-09 en test_pinball_migue_v.10 y SMACK: los
+  // encabezados son los de Forge_GDD_Template_v2.4.0 y los dos documentos traen todos.
+  // «Turnaround + expression sheets» se queda en RE_VISUAL a propósito: su fuente son las tres
+  // fichas de arriba, que ya viajan en la misma página.
+  'Cover key art - subject / scene': ['Elevator pitch', 'Logline'],
+  'hero / cover':                    ['Elevator pitch', 'Logline'],
+  'Final key art - subject':         ['Feel statement', 'Elevator pitch'],
+  'Pillar visuals':                  [['Pillar 1 — definition', 'Pillar 2 — definition', 'Pillar 3 — definition', 'Pillar 4 — definition']],
+  'Core loop diagram':               ['Core Loop'],
+  'Mechanics / systems diagram':     ['Mechanics'],
+  'Difficulty curve':                ['Difficulty Curve', 'Scaling rule'],
+  'Stats & progression diagram':     ['Player Stats', 'Progression'],
+  'Item icon sheet':                 ['Item Catalog'],
+  'World / mood key art':            [['Setting', 'Environments']],
+  'Act key frames':                  ['Narrative Arc'],
+  'Level flow map':                  ['Level Table', 'Level design philosophy'],
+  'HUD / screen mockup':             ['HUD'],
+  'Mood board / audio reference':    [['Sonic mood', 'Audio reference 1', 'Audio reference 2', 'Audio reference 3']],
+  'Systems architecture diagram':    [['Simulation systems', 'Dynamic systems', 'Technical constraints (design-side)']],
+  'Prototype greybox':               ['Minimum feature set'],
+  'Roadmap / milestone timeline':    [['Vertical Slice goals', 'Launch scope — v1.0', 'Post-launch scope']],
+  // El «Revenue model» solo son tres palabras («Premium (pay-once)»); el pitch da el sujeto.
+  'Store page / pricing mockup':     [['Elevator pitch', 'Revenue model']],
+  'Thumbnails':                      ['External Document References'],
   'Fail consequence':   ['Fail state consequence', 'Fail-state consequence'],
   'Partial success (optional)': ['Partial success state'],
   'Zone 1 baseline':    ['Zone 1 baseline (lives 1–2)', 'Zone 1 baseline'],
@@ -282,6 +314,23 @@ function seccionPorNombre(contenido, nombre) {
   const L = String(contenido || '').split('\n')
   const busca = normalizar(nombre)
   const i = L.findIndex(l => /^#{1,5} /.test(l) && normalizar(l) === busca)
+  if (i < 0) return null
+  const nivel = (L[i].match(/^#+/) || ['#'])[0].length
+  const out = [L[i]]
+  for (let j = i + 1; j < L.length; j++) {
+    const m = L[j].match(/^(#+) /)
+    if (m && m[1].length <= nivel) break
+    out.push(L[j])
+  }
+  return out.join('\n').trim()
+}
+
+// La sección cuyo encabezado EMPIEZA por el nombre. Solo para los ámbitos de entidad de las fichas
+// de personaje; todo lo demás sigue buscando por igualdad con `seccionPorNombre`.
+function seccionPorPrefijo(contenido, prefijo) {
+  const L = String(contenido || '').split('\n')
+  const busca = normalizar(prefijo)
+  const i = L.findIndex(l => /^#{1,5} /.test(l) && normalizar(l).startsWith(busca))
   if (i < 0) return null
   const nivel = (L[i].match(/^#+/) || ['#'])[0].length
   const out = [L[i]]
@@ -374,6 +423,15 @@ const seccionDeOutput = (contenido, clave, claves) =>
 //
 // Cada dialecto trae su forma de campo y cómo se escribe una vez lleno, porque el viejo sustituye
 // un marcador `[INSERT …]` y el nuevo escribe detrás de la flecha.
+// Prefijo de ENTIDAD al principio de la línea: `PROTAGONIST - Name/Age/Visual: [...] |
+// Mechanical role: [...]`. Sin él, las tres fichas de personaje piden los mismos nombres de
+// campo («Mechanical role», «Abilities») y las tres se resolvían a la PRIMERA aparición del
+// documento — protagonista, antagonista y NPC salían con el texto idéntico, en silencio.
+// El ámbito se fija al empezar la línea y lo heredan los campos que vienen detrás en ella.
+// Solo lo usa el dialecto `insert`: en el de flecha «CORE PALETTE - hex + roles (§2.5)» se leería
+// como ámbito «CORE PALETTE» y la etiqueta quedaría en «hex + roles».
+const RE_ENTIDAD_LINEA = /^([A-Z][A-Z0-9 /&'-]{2,30}?)\s*[-—–]\s+(?=[^\s])/
+
 const DIALECTOS = [
   {
     // El ASG viejo abre con `━━━` y el GDD con `----`; el resto del dialecto es el mismo, así que
@@ -382,6 +440,7 @@ const DIALECTOS = [
     nombre: 'insert',
     delimitador: /((?:━━━|-{4})[^\n]*(?:INTAKE|SOURCE DATA)[^\n]*(?:━+|-{4}))\n([\s\S]*?)\n(?:(━{4,})|(-{4,}))/,
     campo: /([^:\[\]\n]+?):[ \t]*(\[(?:INSERT|OPTIONAL)\b[^\]]*\])/g,
+    entidad: RE_ENTIDAD_LINEA,
     // «This slide — Color System» es la línea propia de la página; el resto es común al deck.
     propia: /^This slide\b/i,
     quitarPrefijo: /^This slide\s*(?:image)?\s*[—–-]?\s*/i,
@@ -411,13 +470,6 @@ const DIALECTOS = [
 // etiqueta no puede llegar hasta el fin de línea — se corta en el placeholder anterior. Por eso
 // la clase excluye corchetes y la sustitución se hace EN EL SITIO, no rearmando líneas.
 const RE_CAMPO = /([^:\[\]\n]+?):[ \t]*(\[(?:INSERT|OPTIONAL)\b[^\]]*\])/g
-
-// Prefijo de ENTIDAD al principio de la línea: `PROTAGONIST - Name/Age/Visual: [...] |
-// Mechanical role: [...]`. Sin él, las tres fichas de personaje piden los mismos nombres de
-// campo («Mechanical role», «Abilities») y las tres se resolvían a la PRIMERA aparición del
-// documento — protagonista, antagonista y NPC salían con el texto idéntico, en silencio.
-// El ámbito se fija al empezar la línea y lo heredan los campos que vienen detrás en ella.
-const RE_ENTIDAD_LINEA = /^([A-Z][A-Z0-9 /&'-]{2,30}?)\s*[-—–]\s+(?=[^\s])/
 
 function parsearIntake(prompt) {
   for (const d of DIALECTOS) {
@@ -547,8 +599,13 @@ function resolverEtiqueta(etiqueta, mapa, assets, ambito = null) {
 
   // Con ámbito se busca SOLO dentro de esa sección. Si la sección no existe no se cae de vuelta
   // al documento entero: eso es lo que devolvía el personaje equivocado. Mejor un gap visible.
+  //
+  // El ámbito se localiza por PREFIJO y no por igualdad: la ficha se titula con el rol y el
+  // nombre del personaje detrás («PROTAGONIST — The Keeper (Player)», «NPC / Mentor 1 — Dr. Yael
+  // Orin»), y el nombre cambia con cada juego. Gana la primera ficha que empieza por el ámbito —
+  // con dos mentores es el Mentor 1. La búsqueda exacta de las demás etiquetas no cambia.
   const cuerpos = ambito
-    ? assets.map(a => seccionPorNombre(a.content, ambito)).filter(Boolean)
+    ? assets.map(a => seccionPorPrefijo(a.content, ambito)).filter(Boolean)
     : assets.map(a => a.content)
   if (ambito && !cuerpos.length) return null
 
