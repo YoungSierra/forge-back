@@ -117,6 +117,34 @@ function herramientasDe(origen) {
 // La implementación vive en ../utils/paso.js: la comparte con chain.service, que la necesitaba
 // para el punto 4 del informe v11. Dos copias del mismo envoltorio serían dos verdades.
 const paso = require('../utils/paso').crearPaso('herramienta')
+
+/**
+ * El sello de cadena que le corresponde a una pieza sacada de `origen`.
+ *
+ * Dos casos, y el segundo es el que faltaba:
+ *
+ *   · El origen es una pieza DE la cadena —ya lleva su sello—: se hereda tal cual. Una vista nueva
+ *     de un concept art sigue siendo concept art del mismo paso.
+ *   · El origen es una PÁGINA DEL ASG, que no lleva sello porque no la produjo la cadena: entonces
+ *     la pieza es lo que produce el PRIMER paso de la cadena de esa hoja. Segmentar una Environment
+ *     Sheet devuelve un asset aislado sobre blanco, que es exactamente lo que entrega su
+ *     `concept_art`.
+ *
+ * Sin el segundo caso la pieza quedaba huérfana: la cadena la reconocía por el nombre pero no sabía
+ * en qué paso estaba, así que la ventana de Run solo ofrecía rehacer el paso 1. Es el tiburón
+ * segmentado del punto 5 del informe v12 de Miguel.
+ *
+ * El `rol` se toma del que la herramienta acaba de producir. No se inventa nada más: si el nombre
+ * no resuelve a ninguna cadena, la pieza se queda sin sello, como antes.
+ */
+function selloDeCadena(origen, rol) {
+  if (origen?.metadata?.cadena) return { cadena: origen.metadata.cadena }
+  const { CADENAS, cadenaDe } = require('./chain.service')
+  const nombre = cadenaDe(origen)
+  const primero = nombre && CADENAS[nombre]?.pasos?.[0]
+  if (!primero) return {}
+  return { cadena: { nombre, paso: primero.clave, ...(rol ? { rol } : {}) } }
+}
 async function correrHerramienta({ db, project_id, asset_id, clave, opciones = null, imagen_comfy = null, mascara_base64 = null, member_id = null }) {
   const h = HERRAMIENTAS[clave]
   if (!h) throw new Error(`Unknown tool "${clave}"`)
@@ -244,7 +272,7 @@ async function correrHerramienta({ db, project_id, asset_id, clave, opciones = n
         // Se copia TAL CUAL, `rol` incluido: cambiarlo haría que el paso siguiente —que despacha
         // uno por cada rol distinto— creyera que hay un rol más y despachara un trabajo de más,
         // que es pago y no se repite.
-        ...(origen.metadata?.cadena ? { cadena: origen.metadata.cadena } : {}),
+        ...selloDeCadena(origen, rol),
         herramienta: { clave, etiqueta: h.etiqueta, rol },
         job: jobId,
         // De qué versión del origen salió (v2.3 §2.1): una pieza segmentada de la v1 no es la
