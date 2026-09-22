@@ -1260,11 +1260,19 @@ ${cola}`
     }
   }
 
-  // Con subconjunto hay que PODAR el grafo: si se manda entero, ComfyUI renderiza las 34 páginas
-  // aunque solo queramos 31. Se conservan los nodos alcanzables desde los SaveImage elegidos,
-  // caminando hacia atrás por los inputs — así sirve igual para el Art Bible, cuyas páginas
-  // cuelgan de un ImageBatch con dos LoadImage.
-  if (solo) {
+  // Se PODA el grafo SIEMPRE a las páginas que quedaron en `armado.paginas`: son las que el motor
+  // autorizó, ya sea porque `solo` pidió un subconjunto o porque el filtro de arriba descartó las
+  // que no tienen referencia. Se conservan los nodos alcanzables desde sus SaveImage, caminando
+  // hacia atrás por los inputs — así sirve igual para el Art Bible, cuyas páginas cuelgan de un
+  // ImageBatch con dos LoadImage.
+  //
+  // Antes solo se podaba con `solo`. Sin él, el grafo viajaba ENTERO aunque el filtro hubiera
+  // dejado fuera páginas: ComfyUI ejecutaba los 21 SaveImage, y las páginas excluidas se
+  // renderizaban contra la imagen de muestra del autor —lo que el filtro existe para impedir—, se
+  // descargaban con el nombre de archivo de ComfyUI por título, se aprobaban y se cobraban. Medido
+  // en test_pinball_migue_v.10 el 22-09, job a92d0011: 21 renderizadas / 7 esperadas, sesión que
+  // queda `active` para siempre porque el conteo nunca cuadra.
+  {
     const vivos = new Set()
     const pendientes = armado.paginas.map(p => p.save_node)
     while (pendientes.length) {

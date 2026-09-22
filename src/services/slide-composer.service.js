@@ -24,6 +24,8 @@
 //   node src/services/slide-composer.service.js --workflow asg --page 9
 //   node src/services/slide-composer.service.js --workflow asg --dump <dir>
 
+const { extractSection } = require('../utils/extract-section')
+
 const LIMITE = 32000   // límite duro del modelo de imagen
 // El tope de ComfyUI para el grafo entero. Se recorta antes de llegar.
 const MARGEN = 31000
@@ -50,7 +52,16 @@ const TOPE_DE_NODO = { audio_base: 3000 }
 // dejaron de funcionar en el acto, con un 500 sin explicación —es el «Internal server error» del
 // punto 14 del informe v4—. `scripts/preflight-decks.js` comprueba que los tres coincidan.
 const DECKS = {
-  asg:      { workflow: 'V57_STUDIO_ArtStyleGuide_Template_25',   fuente: '3.9', paginas: 25, documento: 'Art Style Guide' },
+  // `requerido` en el ASG no frena un deck con huecos, que es su estado normal: un ASG sano sale
+  // con ~69 campos sin fuente —audio, UI, video, las fichas por asset— y se renderiza igual. Lo
+  // que frena es un 3.9 DEGRADADO. Las 25 páginas llevan el mismo bloque de identidad (core
+  // fantasy, keywords, shape, palette, style) y en un ADI sano ese bloque resuelve SIEMPRE, así
+  // que ninguna página queda con todos sus campos de documento en hueco. Medido el 21-09 sobre la
+  // base viva: SMACK_DEVELOP_TEST y 13_lives 0/25 páginas en blanco, y los otros cinco proyectos
+  // con ADI útil también 0/25. test_pinball_migue_v.10, con el 3.9 corrido como nodo entero —22
+  // salidas resumidas en un documento sin un solo encabezado §—, 25/25: ahí el deck se habría
+  // despachado entero, 25 páginas de plantilla con «UPSTREAM GAP», y se habría cobrado.
+  asg:      { workflow: 'V57_STUDIO_ArtStyleGuide_Template_25',   fuente: '3.9', requerido: true, paginas: 25, documento: 'Art Style Guide' },
   gdd:      { workflow: 'V57_STUDIO_Vertical_Slice_GDD_Template', fuente: '3.8', paginas: 21, documento: 'GDD Art Style' },
   // El Art Bible no se llena desde un documento: cada página recibe su página YA APROBADA del ASG
   // y pinta la obra final de ese tema. Por eso no tiene `fuente` — su insumo es una imagen, no
@@ -108,11 +119,19 @@ const MAPA_ASG = {
   //   §2.4 del template (forma)  → el documento la publica como «§0.3 Shape Language»
   //   §2.5 del template (color)  → el documento la publica como «§0.4 Color Language»
   //
-  // Lo negativo no tiene sección propia en el documento: el ANTI-FANTASY vive dentro del §1.2 y
-  // las ANTI-KEYWORDS dentro del §2.3 —el intake 11.0 las pide en la misma línea, «Visual
-  // Keywords set with anti-keywords»—, así que apuntan a la sección que las contiene.
+  // Las ANTI-KEYWORDS viven dentro del §2.3 —el intake 11.0 las pide en la misma línea, «Visual
+  // Keywords set with anti-keywords», y el documento las publica ahí como la lista «Reject:»—,
+  // así que apuntan a la sección que las contiene.
+  //
+  // El ANTI-FANTASY NO vive dentro del §1.2, aunque el template lo cite así. Medido el 21-09 sobre
+  // los 21 documentos del 3.9 de 13_lives: la expresión no aparece ni una vez, y el §1.2 es una
+  // sola frase AFIRMATIVA. Con «Core Fantasy Statement» primero —que existe siempre, así que el
+  // segundo candidato no se alcanzaba nunca— las 25 páginas recibían en el campo «what the art
+  // must never do» el mismo texto que en CORE FANTASY: se le pedía al modelo lo prohibido y se le
+  // entregaba lo deseado. Lo negativo del documento está en «§3.2 Negative References», una tabla
+  // de referencias rechazadas con su porqué; el §1.2 queda de respaldo para un ADI sin §3.2.
   'CORE FANTASY':             ['Core Fantasy Statement', 'Core Fantasy'],
-  'ANTI-FANTASY':             ['Core Fantasy Statement', 'Negative References'],
+  'ANTI-FANTASY':             ['Negative References', 'Core Fantasy Statement'],
   'VISUAL KEYWORDS 8-12':     ['Visual Keywords'],
   'ANTI-KEYWORDS':            ['Visual Keywords', 'Negative References'],
   'APPROVED STYLE DIRECTION': ['Approved Style', 'Art Style Definition'],
@@ -318,18 +337,20 @@ function seccionPorNumero(contenido, numero) {
 // No sirven ni `seccionPorNombre` ni el `seccion` de alcance-vs: los dos cortan por NIVEL de
 // encabezado, y lo primero que escribe el modelo bajo `## ux_ui_spec` es el `# Título` del propio
 // documento, seguido de sus `## HUD Layout`, `## Menu Tree`… Medido en test_smack_migue_v.08 y
-// v.09: devolvían 0 y 13 caracteres. Acá el límite no es un nivel sino la SIGUIENTE SALIDA: se
-// corta en el próximo `## <otra clave de la DNA>`, y todo lo de en medio es el documento.
-function seccionDeOutput(contenido, clave, claves) {
-  const L = String(contenido || '').split('\n')
-  const rx = k => new RegExp(`^##\\s+${String(k).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*$`)
-  const i = L.findIndex(l => rx(clave).test(l))
-  if (i < 0) return null
-  const otras = (claves || []).filter(k => k !== clave).map(rx)
-  let fin = L.length
-  for (let j = i + 1; j < L.length; j++) if (otras.some(r => r.test(L[j]))) { fin = j; break }
-  return L.slice(i + 1, fin).join('\n').trim() || null
-}
+// v.09: devolvían 0 y 13 caracteres. El límite no es un nivel sino la SIGUIENTE SALIDA.
+//
+// Ese corte ya lo tenía el motor: `utils/extract-section`, que es con lo que `resolveNodeInputs`
+// reparte una corrida entera entre los inputs de aguas abajo. Acá había una segunda copia, escrita
+// sin haber visto la primera. Medido sobre los 237 documentos sin clave de la base, 1.598 pares
+// documento × salida: 588 idénticos, y los 2 que difieren los acierta la del motor —corta en
+// `### concept_data` y en `## char_abilities (Protagonist Summary)`, salidas hermanas escritas
+// con otra forma que la copia se tragaba—. Se usa esa.
+//
+// El nombre se conserva porque el Laboratory lo importa de acá. `claves || []` y `|| null`
+// mantienen el contrato de la copia: sin hermanas la sección llega hasta el final, y una sección
+// vacía es «no está».
+const seccionDeOutput = (contenido, clave, claves) =>
+  extractSection(String(contenido || ''), clave, claves || []) || null
 
 // ── Parser del bloque de intake ──────────────────────────────────────────────
 // Un solo parser para los tres delimitadores. Devuelve null cuando el workflow no tiene
@@ -922,15 +943,34 @@ async function composeDeck({ db, projectId, deck = 'asg', fills = null, solo = n
   // sirva, así que no salvan a una página. Y la regla es «todos en hueco»: una página con algún
   // campo resuelto pasa, con sus huecos declarados, como en cualquier otro deck.
   if (cfg.requerido) {
+    // Qué se buscó, dicho como lo busca `resolverEtiqueta`: por la entrada del mapa —que casa por
+    // la forma normalizada de la etiqueta, no por la literal— y, sin entrada, por la § que el
+    // propio rótulo cita. Buscar solo la clave literal hacía que en el ASG el «looked for»
+    // repitiera la etiqueta: sus rótulos son «CORE FANTASY (§1.2)» y el mapa dice «CORE FANTASY».
     const buscadas = et => {
-      const c = Object.prototype.hasOwnProperty.call(mapa, et) ? mapa[et] : null
-      return Array.isArray(c) ? c.flat().map(x => (typeof x === 'object' ? x.seccion : x)) : [et]
+      let c = Object.prototype.hasOwnProperty.call(mapa, et) ? mapa[et] : undefined
+      if (c === undefined) {
+        const hit = Object.keys(mapa).find(x => claveDeEtiqueta(x) === claveDeEtiqueta(et))
+        if (hit !== undefined) c = mapa[hit]
+      }
+      if (Array.isArray(c) && c.length) return c.flat().map(x => (typeof x === 'object' ? x.seccion : x))
+      const ref = /\(§\s*([\d.]+)/.exec(et)?.[1]
+      return ref ? [`§${ref}`] : [et]
     }
     const enBlanco = vivas.filter(p =>
       p.faltantes.length && !p.llenos.some(l => l.chars != null && l.via !== 'forge'))
     if (enBlanco.length) {
-      const detalle = enBlanco.map(p =>
-        `${p.nombre}: ${p.faltantes.map(f => `${f} (looked for ${buscadas(f).map(s => `"${s}"`).join(' or ')})`).join(', ')}`).join('; ')
+      // El detalle va ACOTADO. Con el deck de UI son una o dos páginas y tres etiquetas; con el
+      // ASG degradado son 25 páginas y 341 etiquetas, y el mensaje medía 27.772 caracteres —esto
+      // viaja en un error HTTP y se escribe en el chat del nodo—. Se nombran todas las páginas,
+      // que es lo que dice el alcance del problema, y se detallan las primeras: en un documento
+      // que no resuelve nada, las demás fallan por lo mismo.
+      const PAGINAS = 3, ETIQUETAS = 5
+      const dePagina = p => `${p.nombre}: ` +
+        p.faltantes.slice(0, ETIQUETAS).map(f => `${f} (looked for ${buscadas(f).map(s => `"${s}"`).join(' or ')})`).join(', ') +
+        (p.faltantes.length > ETIQUETAS ? `, and ${p.faltantes.length - ETIQUETAS} more` : '')
+      const detalle = enBlanco.slice(0, PAGINAS).map(dePagina).join('; ') +
+        (enBlanco.length > PAGINAS ? `; and ${enBlanco.length - PAGINAS} more page(s) in the same state: ${enBlanco.slice(PAGINAS).map(p => p.nombre).join(', ')}` : '')
       const e = new Error(`The ${cfg.documento} deck cannot render ${enBlanco.length} page(s): the ${cfg.asset ? `"${cfg.asset}"` : 'source document'} of node ${cfg.fuente} has none of the sections they need — ${detalle}`)
       e.publico = true
       e.status = 422
