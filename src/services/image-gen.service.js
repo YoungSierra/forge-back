@@ -1187,8 +1187,28 @@ ${cola}`
     //
     // Acá no se puentea nada: si la referencia falta, la página NO se manda. Renderizarla igual
     // significa entregar la imagen de muestra del autor como si fuera el arte del juego.
+    // Una página con UN solo hueco de imagen y sin `source` declarado no está pidiendo una
+    // referencia: ese hueco ES su propia plantilla.
+    //
+    // En el deck del GDD, `image_input` apunta al `LoadImage` de la lámina de cada página —el 1
+    // para la portada, el 4 para ReadFirst, el 13 para CoreLoop—. Las nueve páginas que sí quieren
+    // referencia la reciben por un `ImageBatch` que junta plantilla + referencia, y ésas son
+    // exactamente las que `conBatch` recoge. Las otras doce llevan un `LoadImage` y nada más: por
+    // construcción no tienen segunda imagen.
+    //
+    // El motor las metía igual en este camino, no les encontraba fuente —porque no la piden— y las
+    // descartaba. De 21 páginas del GDD se despachaban 7. Lo vio Pedro mirando el grafo, y se
+    // confirma en el registro: de las 21, nueve cuelgan de un ImageBatch y doce no.
+    //
+    // La condición es `source`, no el número de huecos: el deck de audio también lleva un único
+    // LoadImage sin ImageBatch, pero DECLARA de dónde sale su imagen (`ASG_AudioSheet`), y ése sí
+    // tiene que resolverse o la pieza sale contra la maqueta del estudio.
+    const pideReferencia = p =>
+      (p.image_inputs || []).some(h => String(h?.source || '').trim()) || conBatch.includes(p)
+
     const directas = armado.paginas.filter(p =>
-      (p.image_inputs?.length || p.image_input) && !conBatch.includes(p) && !desdeASG.includes(p))
+      (p.image_inputs?.length || p.image_input) && pideReferencia(p)
+      && !conBatch.includes(p) && !desdeASG.includes(p))
 
     if (directas.length) {
       const { uploadImageToComfyUI } = require('./providers/comfyui.provider')
