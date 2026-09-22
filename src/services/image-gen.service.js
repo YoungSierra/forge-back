@@ -958,6 +958,10 @@ async function generateDeck({
   db, project_id, node_id, session_id, node_key, output_key,
   image_gen_model, deck, member_id, onPage, fills = null, solo = null, outDef = null,
   extraPrompt = null,
+  // De qué paso de qué cadena viene este deck, cuando lo despacha una cadena. Viaja al log para
+  // que esa fila —la que tiene el `jobId`, o sea la del despacho de verdad— no necesite una
+  // segunda fila al lado contándolo otra vez. Ver el comentario del log más abajo.
+  contexto = null,
 }) {
   const { composeDeck, DECKS } = require('./slide-composer.service')
   const { getWorkflowByName } = require('./config.service')
@@ -1396,7 +1400,7 @@ ${cola}`
       is_estimated: true, duration_ms: Date.now() - t0,
       started_at: new Date(t0).toISOString(),
       status: paginas.length === total ? 'success' : 'partial',
-      metadata: { output_key, node_key, deck, jobId, paginas: paginas.length, esperadas: total },
+      metadata: { output_key, node_key, deck, jobId, paginas: paginas.length, esperadas: total, ...(contexto || {}) },
     })
   } catch (e) { console.error('[deck] logExec falló (no fatal):', e.message) }
 

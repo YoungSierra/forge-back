@@ -284,6 +284,19 @@ function proximoPaso(asset) {
     // veinte, y eso no puede quedar detrás de un botón que no lo dice.
     por_cada_salida_de: p.porCadaSalidaDe ?? null,
 
+    // Y si corre una vez por CLIP, que es el otro modo de despachar varias veces.
+    //
+    // Faltaba. Esta función devuelve una lista blanca de campos y éste no estaba, así que la
+    // condición que lee la lista de movimientos —`if (paso?.porCadaClip)` en la ruta— nunca se
+    // cumplía: el recuadro del Run salía sin lista, sin casillas para elegir y diciendo «1 image ·
+    // $0.04» cuando en realidad iba a despachar uno por clip.
+    //
+    // Las dos mitades estaban construidas —la ruta sabe leer los clips y la interfaz sabe
+    // dibujar el selector con su contador— y las unía un campo que nadie copiaba. Es el punto 6
+    // del informe v4 de JuanK, que yo había dado por resuelto mirando los dos extremos y no el
+    // puente. Lo cazó él.
+    por_cada_clip: !!p.porCadaClip,
+
     // La cadena entera, para poder DIBUJARLA antes de correr (informe v6 #7, opción a de Miguel).
     // Solo los pasos de producción y con sus nombres llanos —«Concept art → 3D production»—; las
     // herramientas de edición no entran acá porque no son pasos de la cadena, son otra cosa que se
@@ -617,6 +630,9 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
           //
           // Null = todas, que es como venía funcionando.
           solo: Array.isArray(solo) && solo.length ? solo : null,
+          // El paso de la cadena viaja con el log del despacho, para que no haga falta una
+          // segunda fila que lo repita. Ver el `logExecution` de más abajo.
+          contexto: { cadena: nombreCadena, paso: paso.clave, parte: cada },
         })
         jobId = r.jobId
         if (!r.paginas?.length) {
@@ -656,12 +672,24 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
         throw new Error(`Step "${paso.clave}" produced output, but none from the declared nodes (${Object.keys(roles || {}).join(', ')})`)
       }
 
-      logExecution({
-        project_id, node_id: origen.node_id, triggered_by: member_id,
-        trigger_type: 'chain', executor_type: 'comfyui', provider: 'comfyui', model: paso.workflow,
-        is_estimated: true, duration_ms: Date.now() - t0, started_at: new Date(t0).toISOString(),
-        metadata: { cadena: nombreCadena, paso: paso.clave, parte: cada, salidas: Object.keys(porRol).length },
-      })
+      // El despacho se registra UNA vez.
+      //
+      // Un paso de deck no lo despacha esta función: lo hace `generateDeck`, que ya escribe su
+      // propia fila —y es la buena, porque lleva el `jobId` de ComfyUI—. Esta de acá la escribía
+      // igual, así que la misma corrida quedaba contada dos veces y el costo del proyecto salía
+      // inflado: medido el 22-09, 10 corridas duplicadas y $0,40 de más.
+      //
+      // Lo que esta fila aportaba —de qué cadena y qué paso— ahora viaja en `contexto` dentro de
+      // la fila del deck, así que no se pierde nada al no escribirla. Los pasos que NO son deck sí
+      // despachan acá, y para ésos ésta sigue siendo la única fila.
+      if (!paso.deck) {
+        logExecution({
+          project_id, node_id: origen.node_id, triggered_by: member_id,
+          trigger_type: 'chain', executor_type: 'comfyui', provider: 'comfyui', model: paso.workflow,
+          is_estimated: true, duration_ms: Date.now() - t0, started_at: new Date(t0).toISOString(),
+          metadata: { cadena: nombreCadena, paso: paso.clave, parte: cada, salidas: Object.keys(porRol).length },
+        })
+      }
 
       // Una sesión por despacho: el asset la exige y además deja el paso trazado en el log.
       const { data: ses } = await db().from('forge_sessions').insert({

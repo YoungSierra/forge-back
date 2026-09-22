@@ -764,7 +764,9 @@ async function composeDeck({ db, projectId, deck = 'asg', fills = null, solo = n
     // les daba a los tres la misma matriz: decirle al modelo que los tonos prohibidos son los
     // mismos que los primarios es peor que no decirle nada. El primero se la lleva y los demás se
     // declaran huecos — el documento no los responde por separado.
-    const seccionesUsadas = new Set()
+    // Texto ya pegado → el rótulo del campo que lo pegó. Es un mapa y no un conjunto para poder
+    // decir DE DÓNDE tomarlo cuando se repite.
+    const seccionesUsadas = new Map()
     const topeChico = (TOPE_DE_NODO[deck] ?? Infinity) < 8000
     const valores = intake.campos.map(c => {
       // Los fills mandan cuando estan: son lo que el LLM escribio para ESTE deck. Sin ellos se
@@ -788,10 +790,30 @@ async function composeDeck({ db, projectId, deck = 'asg', fills = null, solo = n
       // documento no lo produjo» es mentira —la página 24 pedía sus cuatro campos a la misma
       // §7.9.1 y salía con tres huecos teniendo el ADI la sección entera— y encima invita al
       // modelo a escribir «TBD» sobre información que tiene delante.
+      // Se compara por el CONTENIDO, no por el rótulo de la vía. La misma sección se alcanza por
+      // su número («§2.3») y por su nombre («Visual Keywords»), y comparando rótulos las dos rutas
+      // parecían fuentes distintas: en el deck de audio, ANTI-KEYWORDS volvía a pegar los 322
+      // caracteres que VISUAL KEYWORDS acababa de pegar. Sobre un presupuesto de 552, más de la
+      // mitad gastada dos veces en lo mismo.
+      //
+      // `forge` y `fills` quedan fuera: son valores escritos PARA ese campo, no secciones
+      // compartidas, y dos campos pueden coincidir sin que ninguno sobre.
+      //
+      // SOLO con el tope chico. En el ASG —32.000 de presupuesto— repetir una sección no hace
+      // daño y el deck funciona hoy: medido, extender esto allí le cambiaba ocho páginas y le
+      // quitaba mil caracteres. No se toca lo que sirve para arreglar lo que no.
       let repetida = null
       if (r?.via?.startsWith?.('§')) {
-        if (seccionesUsadas.has(r.via)) { repetida = r.via; r = null }
-        else seccionesUsadas.add(r.via)
+        if (seccionesUsadas.has(r.via)) { repetida = seccionesUsadas.get(r.via); r = null }
+        else {
+          seccionesUsadas.set(r.via, r.via)
+          // Con el tope chico se indexa TAMBIÉN por el texto, para que el campo que llegue después
+          // por el NOMBRE de la misma sección la reconozca.
+          if (topeChico && r.texto) seccionesUsadas.set(r.texto, r.via)
+        }
+      } else if (topeChico && r?.texto && r.via !== 'forge' && r.via !== 'fills') {
+        if (seccionesUsadas.has(r.texto)) { repetida = seccionesUsadas.get(r.texto); r = null }
+        else seccionesUsadas.set(r.texto, r.via)
       }
       if (repetida) {
         pag.llenos.push({ etiqueta: c.etiqueta, via: `${repetida} (arriba)` })
@@ -823,7 +845,14 @@ async function composeDeck({ db, projectId, deck = 'asg', fills = null, solo = n
           : `[UPSTREAM GAP: "${c.etiqueta}" — el documento del nodo ${cfg.fuente} no lo produjo. NO lo inventes: escribe «TBD».]` }
       }
       pag.llenos.push({ etiqueta: c.etiqueta, via: r.via, chars: r.texto.length })
-      return { texto: r.texto }
+      // Con el tope chico, el encabezado de la sección sobra. Lo que se extrae del documento
+      // empieza por su propio título markdown —«## §1.2 Core Fantasy Statement»— y eso son treinta
+      // caracteres de un presupuesto de cuarenta y cinco: al modelo le llegaba el título del
+      // apartado y casi nada de su contenido. La etiqueta del campo ya dice de qué va
+      // («CORE FANTASY / what the player should feel (§1.2) →»), así que repetirlo cuesta el
+      // dato. Donde hay sitio se conserva, porque ahí ayuda a leer el prompt compuesto.
+      const texto = topeChico ? r.texto.replace(/^\s*#{1,6}\s*[^\n]*\n+/, '') : r.texto
+      return { texto }
     })
 
     // Recorte por CAMPO, no por línea: la sección más gorda puede ser cientos de líneas cortas
@@ -855,8 +884,24 @@ async function composeDeck({ db, projectId, deck = 'asg', fills = null, solo = n
       pag.recortado = true
       // Se quita la marca anterior antes de volver a cortar: si no, cada vuelta rebana la marca
       // por la mitad y deja basura a medias dentro del texto.
-      const limpio = max.texto.replace(/\n\[…recortado[^\]]*\]$/, '')
-      max.texto = limpio.slice(0, Math.floor(limpio.length * 0.85)).trimEnd() + '\n[…recortado por el límite de 32.000 caracteres]'
+      const limpio = max.texto.replace(/\n\[…recortado[^\]]*\]$/, '').replace(/\s*…$/, '')
+
+      // La marca del corte, y CUÁNTO ocupa, importan cuando el tope es chico.
+      //
+      // Era siempre la misma frase de 46 caracteres —en español, dentro de un prompt en inglés, y
+      // nombrando un límite de 32.000 que no es el que se está aplicando—. En un deck de 32.000
+      // no se nota; en el de audio, que tope a 3.000, sí: la plantilla vacía ya ocupa 2.448, así
+      // que a los datos del juego les quedan 552 caracteres y esa frase aparecía CINCO veces,
+      // 235 caracteres, el 43% de todo el presupuesto.
+      //
+      // El modelo recibía entonces trozos cortados a media palabra más cinco avisos en español
+      // sobre un límite, en vez de la fantasía, el tono y las palabras clave del juego. Es el
+      // punto 4 del informe v12 de Miguel: «los audios no corresponden al estilo del videojuego».
+      //
+      // Con el tope chico se marca con un solo carácter. La frase se conserva donde no estorba,
+      // que es donde hoy funciona.
+      const marca = tope < 8000 ? ' …' : `\n[…recortado por el límite de ${tope.toLocaleString('es')} caracteres]`
+      max.texto = limpio.slice(0, Math.floor(limpio.length * 0.85)).trimEnd() + marca
     }
     pag.prompt = armar()
     if (pag.prompt.length > LIMITE) avisos.push(`página ${i + 1} ${p.name}: ${pag.prompt.length} chars > ${LIMITE}`)

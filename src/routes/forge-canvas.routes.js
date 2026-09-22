@@ -5887,7 +5887,10 @@ router.get('/assets/:asset_id/next-step', async (req, res, next) => {
     // Por si el paso enumera clips, no por su nombre: el paso pasó de 'pose_sheet' a
     // 'animation_ref' cuando los videos reemplazaron a las láminas, y atarlo al nombre viejo
     // dejaba el recuadro sin lista que elegir, en silencio.
-    if (paso?.porCadaClip) {
+    // `por_cada_clip`, como lo devuelve `proximoPaso`. Estaba escrito `porCadaClip` —el nombre que
+    // usa la tabla de cadenas, no el que viaja— así que era siempre `undefined` y este bloque
+    // entero no corría nunca.
+    if (paso?.por_cada_clip) {
       // Del caché, para que abrir el recuadro no cueste. Pero la primera vez no hay caché —se
       // escribe al correr— y sin lista no hay nada que elegir, que es justo lo que JuanK pidió
       // poder hacer ANTES de correr. Con `leer_clips=1` se lee del ADI y queda cacheada: es una
