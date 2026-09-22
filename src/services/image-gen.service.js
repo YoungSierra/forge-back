@@ -1109,9 +1109,25 @@ ${cola}`
         // miraba y la otra (`directas`) excluye a propósito las páginas con batch.
         //
         // Consecuencia: todo render de UI hecho hasta hoy salió sin la referencia del juego.
+        // OJO: aquí NO vale `p.image_input`.
+        //
+        // En una página con batch, la referencia es por definición la segunda entrada del batch.
+        // `image_input` es otra cosa: en el deck del GDD nombra el `LoadImage` de la LÁMINA de la
+        // página —el 1 para la portada, el 7 para Game Identity—, y con él como destino el arte
+        // del proyecto se escribía encima de la plantilla mientras la referencia de estilo
+        // conservaba el relleno de fábrica del workflow: un caballero de fantasía.
+        //
+        // Comprobado el 22-09 contra el grafo despachado: el nodo 1 salía con la imagen subida y
+        // el 64 —la referencia que el prompt llama IMAGE 2— seguía con `2ec9d7df…`, el mismo
+        // relleno en las tres páginas que citan el Pitch Document. Por eso el caballero aparecía
+        // en la portada de un pinball cozy aunque la referencia del proyecto fuera la correcta: se
+        // le entregaba en la ranura equivocada y se le decía que el estilo era la otra.
+        //
+        // Se respeta `image_inputs` porque ahí el registro nombra ranuras de REFERENCIA con su
+        // fuente; a falta de eso, la segunda entrada del batch, que es la definición.
         const declarado = (p.image_inputs || []).find(h => String(h.node) === String(refId))
           || (p.image_inputs || [])[0]
-          || (p.image_input ? { node: p.image_input, source: null } : null)
+          || null
 
         // El nodo también se respeta si el registro lo nombra: deducirlo como «la segunda entrada
         // del batch» funciona hoy y deja de funcionar en cuanto un grafo las ordene distinto.
