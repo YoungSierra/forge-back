@@ -539,9 +539,13 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
         // Quién es el personaje. Lo dice la hoja instanciada —el motor le escribió
         // `metadata.instancia.item` al crearla— y si no la tiene, lo que va después del último
         // guion largo de su nombre, que es donde el sistema entero guarda el nombre propio.
-        const idPersonaje = origen.metadata?.instancia?.item
+        // Limpio: el ítem del alcance es una línea de producción —«Moon Jelly × 6 (mesh + shader +
+        // animation)»— y viajaba tal cual al modelo que escribe el prompt, que leía el «× 6» y
+        // dibujaba seis medusas. Punto 3 del informe v4 de JuanK.
+        const idPersonaje = anm.nombreDePersonaje(
+          origen.metadata?.instancia?.item
           || String(origen.name || '').split(/\s+[—–]\s+/).pop()
-          || 'Character'
+          || 'Character')
 
         const v = await anm.promptDeVideo({
           clip, adi: anim.adi,
@@ -650,8 +654,11 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
         // «Moon_Jelly_6_mesh_shader_animation__idle_00001_.mp4» — el nombre que le puso el nodo de
         // guardado de ComfyUI, con su sufijo técnico. El personaje solo se antepone cuando hay uno
         // resuelto: en el resto de las cadenas no existe y la ruta se queda como estaba.
+        // Por el mismo limpiador: si no, la carpeta se llamaría «Moon_Jelly__6_mesh_shader_animation».
         const idPersonaje = anim?.personaje
-          ? String(anim.personaje).trim().replace(/\s+/g, '_').replace(/[^\w.-]+/g, '')
+          ? require('./animacion.service').nombreDePersonaje(anim.personaje)
+              .normalize('NFD').replace(/[̀-ͯ]/g, '')   // «Cartón» → «Carton», no «Cartn»
+              .trim().replace(/\s+/g, '_').replace(/[^\w.-]+/g, '')
           : null
         const base = `projects/${project_id}/chain/${nombreCadena}/${paso.clave}/`
           + (idPersonaje ? `${idPersonaje}/` : '')

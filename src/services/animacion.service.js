@@ -84,6 +84,41 @@ async function filaDelAdi(db, project_id) {
 
 const norma = s => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '')
 
+// Palabras que describen QUÉ HAY QUE PRODUCIR, no cómo es el personaje.
+const PRODUCCION = /\b(mesh|shader|shaders|animation|animations|rig|rigs|rigging|skinning|texture|textures|material|materials|prefab|prefabs|lod|variant|sheet|clips?)\b/i
+// Un código de alcance: UI-01, VFX-15, ITEM-05, ENV-01.
+const CODIGO = /^[A-Z]{2,5}-\d{1,3}$/
+
+/**
+ * El nombre del personaje, sacado del ítem del alcance.
+ *
+ * El ítem es una línea de producción, no un nombre: «Moon Jelly × 6 (mesh + shader + animation)».
+ * Viajaba TAL CUAL al modelo que escribe el prompt del video —`Personaje: …`— y el modelo leía el
+ * «× 6» y dibujaba seis medusas en cuadro. Es el punto 3 del informe v4 de JuanK.
+ *
+ * Se quitan dos cosas y solo dos:
+ *   · el multiplicador `× N`, que cuenta cuántas van en el nivel y nunca es parte de un nombre;
+ *   · un paréntesis final que solo hable de producción o sea un código de alcance.
+ *
+ * El paréntesis NO se quita a ciegas: en la base hay «Koala (Elder)» y «Luma (Axolotl)», donde es
+ * parte de la identidad del personaje. Por eso se mira lo que dice dentro, no que exista.
+ */
+function nombreDePersonaje(item) {
+  let s = String(item || '').trim()
+  s = s.replace(/\s*[×x]\s*\d+/gi, '')
+  s = s.replace(/\s*\(([^()]*)\)\s*$/, (todo, dentro) => {
+    const d = String(dentro).trim()
+    if (CODIGO.test(d)) return ''
+    // Solo si TODO lo de dentro es vocabulario de producción: «mesh + shader + animation» sí,
+    // «Elder» no, «VFX-01, VFX-03» sí por los códigos.
+    const partes = d.split(/[+,/·]/).map(x => x.trim()).filter(Boolean)
+    const todasProduccion = partes.length > 0 &&
+      partes.every(x => PRODUCCION.test(x) || CODIGO.test(x))
+    return todasProduccion ? '' : todo
+  })
+  return s.replace(/\s{2,}/g, ' ').trim() || String(item || '').trim()
+}
+
 /** Los personajes del proyecto, por el ítem de instancia de sus hojas de Character Sheet. */
 async function personajesDelProyecto(db, project_id) {
   const { data: hojas } = await db().from('forge_assets')
@@ -501,7 +536,20 @@ async function anclaDelPersonaje({ db, project_id, desde = null }) {
     .not('storage_url', 'is', null)
     .order('created_at', { ascending: false })
 
-  const vivos = (frentes || []).filter(f => f.metadata?.cadena?.nombre === 'character_sheet')
+  // Una pieza hecha con una HERRAMIENTA no es otro personaje.
+  //
+  // New angle sobre una vista frontal devuelve OTRA VISTA del mismo personaje, y Segmentation
+  // devuelve ese mismo personaje recortado. Desde el 22-09 esas piezas heredan el sello de su
+  // madre —`rol: 'front'` incluido, que es lo correcto para que la cadena las reconozca— y de
+  // golpe el proyecto de Migue pasó a declarar OCHO vistas frontales donde hay dos: seis eran
+  // ángulos nuevos del mismo Cartón. Con ocho «personajes» la desambiguación no puede elegir y
+  // para, que es el aviso que JuanK reporta en el v3·2, el v4·1 y el v5·4.
+  //
+  // Se cuentan solo las que produjo la CADENA. Si no quedara ninguna se vuelve a la lista entera:
+  // más vale un ancla derivada que ninguna.
+  const todas = (frentes || []).filter(f => f.metadata?.cadena?.nombre === 'character_sheet')
+  const deLaCadena = todas.filter(f => !f.metadata?.herramienta)
+  const vivos = deLaCadena.length ? deLaCadena : todas
   if (!vivos.length) {
     const err = new Error('No character front view in this project yet: run the Character Sheet chain first')
     err.code = 'SIN_ANCLA'
@@ -560,6 +608,32 @@ async function anclaDelPersonaje({ db, project_id, desde = null }) {
         url: suyos[0].storage_url, nombre: suyos[0].name, id: suyos[0].id, por: 'instancia',
         item: item.get(suyos[0].derived_from_id)?.item ?? null,
       }
+    }
+
+    // Y si ninguna lleva el nombre: por ELIMINACIÓN.
+    //
+    // No todas las vistas frontales dicen de quién son. En el proyecto de Migue, la de Moon Jelly
+    // sale de una hoja instanciada y lo declara; la de Cartón sale de la hoja genérica
+    // —«Character Sheet — 18_CharacterSheet — Concept art — front»— y no declara nada. Corriendo
+    // desde «Cartón rig + all animations» no había ninguna que dijera «Cartón», así que se paraba
+    // por ambigüedad teniendo delante una sola candidata posible.
+    //
+    // Se descartan las que se sabe que son de OTRO —su ítem está declarado y no es el de la
+    // página— y si queda exactamente una, ésa es. Es eliminar, no adivinar: si quedan dos o más
+    // se sigue al conflicto de abajo, como antes.
+    if (!suyos.length) {
+      const deOtro = new Set(vivos.filter(f => {
+        const i = item.get(f.derived_from_id)
+        return i && i.k.length >= 3 && !k.includes(i.k)
+      }))
+      const resto = vivos.filter(f => !deOtro.has(f))
+      if (resto.length === 1) {
+        return {
+          url: resto[0].storage_url, nombre: resto[0].name, id: resto[0].id, por: 'eliminación',
+          item: item.get(resto[0].derived_from_id)?.item ?? null,
+        }
+      }
+      if (resto.length) candidatos = resto
     }
     // Con varios se sigue acotado; con ninguno se deja la lista entera, para que el conflicto que
     // se nombre abajo sea el real y no uno recortado por una pista que no sirvió.
@@ -632,6 +706,6 @@ async function guardarBeats({ db, project_id, node_id = null, clip, json, member
 }
 
 module.exports = {
-  clipsDelProyecto, clipsDelPersonaje, personajesDelProyecto, beatsDeClip, beatsDesdeJson, guardarBeats, lineasDeBeats, promptDeVideo,
+  nombreDePersonaje, clipsDelProyecto, clipsDelPersonaje, personajesDelProyecto, beatsDeClip, beatsDesdeJson, guardarBeats, lineasDeBeats, promptDeVideo,
   adiDeAnimacion, anclaDelPersonaje, TOPE_CLIPS, SKILL_BEATS,
 }
