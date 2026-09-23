@@ -408,7 +408,14 @@ async function promptDeVideo({ clip, adi, personaje = null, referencia = null })
 
   let p
   try { p = JSON.parse(texto) } catch {
-    throw new Error(`el prompt de video no volvió como JSON: ${texto.slice(0, 160)}`)
+    // El modelo a veces razona en voz alta antes del JSON —«Aquí está el análisis antes del
+    // JSON: · Velocidad: 6.0 m/s…»— y entonces el texto entero no parsea aunque el objeto esté
+    // completo y bien formado unas líneas más abajo. Se rescata el bloque `{…}` en vez de tirar
+    // el clip: perderlo obliga a re-pedirlo, y re-pedir es otra llamada por un envoltorio.
+    // Medido el 23-09 probando la revisión de prompts: de dos clips, uno vino así.
+    const i = texto.indexOf('{'), j = texto.lastIndexOf('}')
+    if (i >= 0 && j > i) { try { p = JSON.parse(texto.slice(i, j + 1)) } catch { /* abajo */ } }
+    if (!p) throw new Error(`el prompt de video no volvió como JSON: ${texto.slice(0, 160)}`)
   }
   if (!p.prompt || !String(p.prompt).trim()) throw new Error('el prompt de video volvió vacío')
 

@@ -5965,6 +5965,83 @@ router.get('/assets/:asset_id/next-step', async (req, res, next) => {
   } catch (err) { next(err) }
 })
 
+// ─── Los prompts de los clips, ANTES de generar los vídeos ──────────────────
+//
+// Punto 5 del informe v4 de JuanK: «el Run genera directamente los videos sin mostrar antes los
+// prompts que se van a usar, lo que impide validar que la generación corresponderá a lo esperado
+// antes de gastar créditos».
+//
+// Su razón de fondo es más fuerte que la comodidad: dos clips le salieron iguales —«el pulse y el
+// activation están iguales, debería haber cambios entre ellas»— y el documento no los distingue.
+// Si la fuente no lleva la diferencia, el único sitio donde se puede meter es el prompt.
+//
+// Esto NO despacha nada a ComfyUI. Escribe los prompts, que es una llamada de texto por clip, y
+// los devuelve para que se miren y se corrijan. Lo caro es el vídeo, no el párrafo que lo pide.
+router.post('/assets/:asset_id/prompts-de-clips', async (req, res, next) => {
+  try {
+    const { id: project_id, asset_id } = req.params
+    const pedidos = Array.isArray(req.body?.clips) && req.body.clips.length ? req.body.clips : null
+
+    const { data: asset } = await db().from('forge_assets')
+      .select('id, name, metadata').eq('id', asset_id).eq('project_id', project_id).single()
+    if (!asset) return res.status(404).json({ success: false, error: 'Asset not found' })
+
+    const { proximoPaso } = require('../services/chain.service')
+    const paso = proximoPaso(asset)
+    if (!paso?.por_cada_clip) {
+      return res.status(400).json({
+        success: false, code: 'NO_ES_POR_CLIP',
+        error: 'This step does not run once per clip, so it has no per-clip prompts to review.',
+      })
+    }
+
+    const anm = require('../services/animacion.service')
+    const desde = asset.metadata?.instancia?.item || asset.name || null
+    const r = await anm.clipsDelPersonaje({ db, project_id, desde, soloCache: false })
+    if (!r.clips?.length) {
+      return res.status(400).json({
+        success: false, code: 'SIN_CLIPS',
+        error: 'No movement list for this character yet.',
+      })
+    }
+
+    // Solo los elegidos. Sin selección, todos — y se dice cuántos son, porque cada uno es una
+    // llamada al modelo.
+    const clips = pedidos ? r.clips.filter(c => pedidos.includes(c.nombre)) : r.clips
+    const ajenos = (pedidos || []).filter(n => !r.clips.some(c => c.nombre === n))
+    if (ajenos.length) {
+      return res.status(400).json({
+        success: false, code: 'SIN_CLIPS',
+        error: `These are not clips of this character: ${ajenos.join(', ')}`,
+      })
+    }
+
+    // El mismo nombre limpio que usa la cadena: el prompt que se revisa tiene que ser el que se
+    // va a despachar, no uno parecido.
+    const personaje = anm.nombreDePersonaje(
+      asset.metadata?.instancia?.item
+      || String(asset.name || '').split(/\s+[—–]\s+/).pop()
+      || 'Character')
+
+    const salida = []
+    for (const clip of clips) {
+      try {
+        const v = await anm.promptDeVideo({ clip, adi: r.adi, personaje, referencia: asset.name || null })
+        salida.push({
+          nombre: clip.nombre, etiqueta: clip.etiqueta || clip.nombre,
+          prompt: v.texto, segundos: v.segundos, estimado: v.estimado, es_prop: !!clip.es_prop,
+        })
+      } catch (e) {
+        // Que falle el párrafo de UN clip no puede tumbar la revisión de los otros: se dice cuál y
+        // se sigue, que es lo que deja corregirlo a mano en vez de volver a pedir todo.
+        salida.push({ nombre: clip.nombre, etiqueta: clip.etiqueta || clip.nombre, error: e.message })
+      }
+    }
+
+    res.json({ success: true, personaje, fuente: r.fuente || 'adi', clips: salida })
+  } catch (err) { next(err) }
+})
+
 // ─── Avanzar la pieza por su cadena (§8 con pasos=1, §10 con pasos=3) ────────
 router.post('/assets/:asset_id/advance', async (req, res, next) => {
   try {
@@ -5996,10 +6073,31 @@ router.post('/assets/:asset_id/advance', async (req, res, next) => {
       ? req.body.solo.map(Number).filter(n => Number.isInteger(n) && n >= 0)
       : null
 
+    // Los prompts que el usuario revisó y corrigió, por clip (punto 5 del v4 de JuanK). Si vienen,
+    // mandan: no se le vuelve a pedir el párrafo al modelo, porque entonces la revisión no habría
+    // servido de nada — saldría otro texto distinto del que se aprobó.
+    //
+    // Se acepta `{ clip: "texto" }` o `{ clip: { prompt, segundos } }`. Con los segundos —que los
+    // devuelve la misma revisión— el despacho no vuelve a llamar al modelo. Lo que llegue con otra
+    // forma se descarta y ese clip se escribe como siempre: un cuerpo raro no puede convertirse en
+    // un prompt vacío que igual se paga.
+    const promptsClips = (() => {
+      const v = req.body?.prompts_clips
+      if (!v || typeof v !== 'object' || Array.isArray(v)) return null
+      const out = {}
+      for (const [k, t] of Object.entries(v)) {
+        const texto = typeof t === 'string' ? t : (t && typeof t.prompt === 'string' ? t.prompt : null)
+        if (!texto || !texto.trim()) continue
+        const seg = Number(t?.segundos)
+        out[k] = { prompt: texto.trim(), ...(Number.isFinite(seg) && seg > 0 ? { segundos: seg } : {}) }
+      }
+      return Object.keys(out).length ? out : null
+    })()
+
     const { avanzar } = require('../services/chain.service')
     const progreso = require('../services/progreso.service')
     try {
-      const r = await avanzar({ db, project_id, asset_id, pasos, prompt, member_id, limitePorCada: limite, opciones, clips, solo })
+      const r = await avanzar({ db, project_id, asset_id, pasos, prompt, member_id, limitePorCada: limite, opciones, clips, solo, promptsClips })
       res.json({ success: true, ...r })
     } finally {
       // Pase lo que pase deja de figurar como corriendo. El servicio caduca solo a los diez

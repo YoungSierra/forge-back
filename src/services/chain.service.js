@@ -316,7 +316,7 @@ function proximoPaso(asset) {
 // 12). Valen para TODA la corrida —así lo confirmó Miguel—; regenerar una pieza suelta las pide
 // aparte. Se guardan además en el metadata de cada activo producido: es lo que deja mostrarlas
 // bajo la imagen y reusarlas al rehacerla.
-async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, member_id = null, limitePorCada = 0, opciones = null, clips = null, solo = null }) {
+async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, member_id = null, limitePorCada = 0, opciones = null, clips = null, solo = null, promptsClips = null }) {
   const { data: origen, error: e0 } = await db().from('forge_assets')
     .select('id, project_id, node_id, session_id, name, storage_url, metadata')
     .eq('id', asset_id).single()
@@ -547,11 +547,29 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
           || String(origen.name || '').split(/\s+[—–]\s+/).pop()
           || 'Character')
 
-        const v = await anm.promptDeVideo({
-          clip, adi: anim.adi,
-          personaje: idPersonaje,
-          referencia: origen.name || null,
-        })
+        // El prompt REVISADO manda sobre el que escribiría el modelo (punto 5 del v4 de JuanK).
+        // Volver a pedírselo daría un texto distinto del que el usuario aprobó, y la revisión no
+        // habría servido de nada.
+        //
+        // Viene con sus segundos —los devolvió la misma llamada que escribió el párrafo al
+        // revisarlo— así que con prompt Y duración no se llama al modelo en absoluto. Si solo hay
+        // texto, se pide la duración: es un parámetro del despacho, no parte del párrafo.
+        const revisado = promptsClips?.[cada] || null
+        let v
+        if (revisado?.prompt && Number(revisado.segundos) > 0) {
+          v = { texto: revisado.prompt, segundos: Number(revisado.segundos), estimado: true }
+          console.log(`[cadena] ${paso.clave}: «${cada}» usa el prompt revisado por el usuario`)
+        } else {
+          v = await anm.promptDeVideo({
+            clip, adi: anim.adi,
+            personaje: idPersonaje,
+            referencia: origen.name || null,
+          })
+          if (revisado?.prompt) {
+            v = { ...v, texto: revisado.prompt }
+            console.log(`[cadena] ${paso.clave}: «${cada}» usa el prompt revisado (duración calculada)`)
+          }
+        }
         promptDelDespacho = v.texto
         extras.clip = cada
         extras.duracion = v.segundos
