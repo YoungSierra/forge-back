@@ -85,7 +85,8 @@ async function componerMascara(urlOrigen, mascaraBase64) {
   }
   if (!pintados) throw new Error('la máscara llegó vacía: no hay nada marcado para aislar')
 
-  return { buffer: PNG.sync.write(lamina), pintados, total: lamina.data.length / 4 }
+  return { buffer: PNG.sync.write(lamina), pintados, total: lamina.data.length / 4,
+           ancho: lamina.width, alto: lamina.height }
 }
 
 function herramientasDe(origen) {
@@ -176,10 +177,21 @@ async function correrHerramienta({ db, project_id, asset_id, clave, opciones = n
   // —una imagen ya subida por el llamador— para no romper a quien todavía lo use.
   const etq = h.etiqueta
   let extras
+  // El tamaño REAL de la lámina, para que el lienzo del workflow se adapte a ella.
+  //
+  // Sin esto el lienzo se queda en el 1024×1024 que trae el export, y la lámina se pega encima
+  // en (0,0) sin redimensionar: en una hoja de 1536 de ancho, TODO lo que se pinte a partir de
+  // x=1024 se cae fuera y llega en blanco. GPT recibe una imagen vacía y rellena el hueco con lo
+  // que quiera. Medido el 23-09 en test_pinball_migue_v.10: Migue pintó el zorro del panel 5
+  // —x 1064..1266— y volvió un escudo medieval; el cangrejo de otra lámina, en x 689..839, salió
+  // perfecto. Dos jobs, los dos con la entrada a GPT en blanco puro (255/255, varianza cero).
+  // Afectaba al tercio derecho de toda lámina apaisada, en silencio y pagando.
+  let ancho = 1024, alto = 1024
   if (mascara_base64) {
     const m = await paso(`${etq} · composing the mask over the source image`,
       () => componerMascara(origen.storage_url, mascara_base64))
-    console.log(`[herramienta] máscara compuesta en el servidor: ${m.pintados}/${m.total} píxeles marcados`)
+    ancho = m.ancho; alto = m.alto
+    console.log(`[herramienta] máscara compuesta en el servidor: ${m.pintados}/${m.total} píxeles marcados · lámina ${ancho}×${alto}`)
     extras = { [campo]: await paso(`${etq} · uploading the mask to ComfyUI`, () => uploadBufferToComfyUI(m.buffer)) }
   } else {
     extras = {
@@ -190,7 +202,7 @@ async function correrHerramienta({ db, project_id, asset_id, clave, opciones = n
 
   const t0 = Date.now()
   const jobId = await paso(`${etq} · dispatching the workflow`,
-    () => submitWorkflow(h.workflow, '', 1024, 1024, extras, opciones))
+    () => submitWorkflow(h.workflow, '', ancho, alto, extras, opciones))
   await paso(`${etq} · waiting for ComfyUI`, () => pollUntilDone(jobId, 300_000))
   const base = `projects/${project_id}/tool/${clave}/${jobId.slice(0, 8)}`
   const salidas = await paso(`${etq} · downloading the results and storing them`,

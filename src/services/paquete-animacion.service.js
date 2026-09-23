@@ -90,6 +90,18 @@ async function armarPackDeAnimacion({ db, project_id, asset_id, member_id = null
   if (origen.metadata?.cadena) throw falta('This is a piece produced from a sheet, not the sheet', 'NO_APLICA')
   if (!/^(png|jpg|jpeg|image)$/i.test(origen.format || '')) throw falta('This is not an animation sheet', 'NO_APLICA')
 
+  // Y tiene que ser la hoja de ANIMACIÓN, no cualquier hoja que nombre a un personaje.
+  //
+  // Faltaba, y el sector salía sobre las Character Sheet: también son imagen y también nombran a
+  // su criatura, así que pasaban las dos comprobaciones de arriba. Lo reportó Miguel el 23-09
+  // sobre «Character Sheet — Cactus». La página la dice la propia instancia —`18_CharacterSheet`,
+  // `24_AnimationSheet`—, que es el dato que las separa sin depender de cómo se llame el activo.
+  const pagina = origen.metadata?.instancia?.pagina || ''
+  const esHojaDeAnimacion = pagina
+    ? /animationsheet/i.test(String(pagina).replace(/[^a-z]/gi, ''))
+    : /animation\s*sheet/i.test(String(origen.name || ''))
+  if (!esHojaDeAnimacion) throw falta('This is not an animation sheet', 'NO_APLICA')
+
   const desde = origen.metadata?.instancia?.item || origen.name || null
   const personaje = anm.nombreDePersonaje(desde)
   if (!personaje || norma(personaje).length < 2) throw falta('This sheet does not name a character', 'NO_APLICA')
@@ -156,8 +168,14 @@ async function armarPackDeAnimacion({ db, project_id, asset_id, member_id = null
   const lamina = origen.storage_url && /^(png|jpg|jpeg|image)$/i.test(origen.format || '') ? origen : null
   if (!lamina) faltantes.push({ que: 'sheet', dice: 'This sheet has no rendered image' })
 
-  const clips = await anm.clipsDelPersonaje({ db, project_id, desde, soloCache: true })
-    .then(r => r.clips || []).catch(() => [])
+  // La lista de clips solo sirve para NOMBRAR los archivos y poner sus tiempos, y eso únicamente
+  // hace falta al armar el zip. Pidiéndola también para el estado, abrir el radial leía el
+  // Vertical Slice entero —112.000 caracteres en pinball— cada vez, y el sector tardaba en
+  // aparecer. Miguel lo reportó el 23-09. El estado no la usa: cuenta vídeos y dice qué falta.
+  const clips = soloEstado
+    ? []
+    : await anm.clipsDelPersonaje({ db, project_id, desde, soloCache: true })
+        .then(r => r.clips || []).catch(() => [])
 
   // El nombre del archivo de cada vídeo: el del clip, que es como el otro lado sabe qué animar.
   // Se toma la etiqueta del listado —«Idle_Sleepy»— y, si el clip no está en la lista, la clave
