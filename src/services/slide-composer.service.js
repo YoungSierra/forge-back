@@ -968,7 +968,7 @@ async function composeDeck({ db, projectId, deck = 'asg', fills = null, solo = n
 
   // `solo` deja huecos en el arreglo (una pasada compone su subconjunto); se descartan acá para
   // que quien consuma reciba solo páginas reales.
-  const vivas = paginas.filter(Boolean)
+  let vivas = paginas.filter(Boolean)
 
   // Una página EN BLANCO no se despacha. El guardia de arriba frena la ausencia del documento;
   // este frena el caso siguiente: el documento está, pero no trae ninguna de las secciones que
@@ -1013,6 +1013,35 @@ async function composeDeck({ db, projectId, deck = 'asg', fills = null, solo = n
       e.status = 422
       e.code = 'SOURCE_INCOMPLETE'
       throw e
+    }
+  }
+
+  // ── Una página sin UN SOLO dato del documento no se despacha ────────────────
+  //
+  // El guardia de arriba solo corre en los decks `requerido` y frena el deck ENTERO; y además
+  // exige que la página declare huecos. Una página cuyas etiquetas no están en el mapa no declara
+  // huecos: no busca nada, así que no le falta nada. Viaja vacía.
+  //
+  // Y vacía no significa que salga en blanco: significa que el modelo la rellena. Medido el 22-09
+  // en el GDD de pinball, `04_Mechanics` viajó con CERO campos con dato y cero huecos, y volvió
+  // describiendo otro juego —«Sanity System», «Entity AI», radio de aggro—, palabras que no
+  // aparecen en ninguno de los 70 documentos del proyecto. `17_Monetization` volvió anunciando un
+  // juego llamado «Balls of Ardor». Cada una costó su despacho.
+  //
+  // Se descarta la página, no el deck: las demás sí tienen datos y hay que renderizarlas. Y solo
+  // en decks que se alimentan de un documento — el Art Bible no tiene `fuente`, su insumo es una
+  // imagen, y todas sus páginas tienen cero campos de documento por diseño.
+  //
+  // «Con dato» es lo mismo que ya define el guardia de arriba: lo que Forge sabe de sí mismo, los
+  // marcadores de panel y las instrucciones del mapa no prueban que el documento sirva.
+  if (cfg.fuente) {
+    const conDato = p => (p.llenos || []).some(l => l.chars != null && l.via !== 'forge')
+    const vacias = vivas.filter(p => !conDato(p))
+    if (vacias.length) {
+      for (const p of vacias) {
+        avisos.push(`page ${p.indice} ${p.nombre}: not dispatched — no field of this page came from the source document`)
+      }
+      vivas = vivas.filter(conDato)
     }
   }
 
