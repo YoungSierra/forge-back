@@ -5997,6 +5997,21 @@ router.post('/assets/:asset_id/prompts-de-clips', async (req, res, next) => {
 
     const anm = require('../services/animacion.service')
     const desde = asset.metadata?.instancia?.item || asset.name || null
+
+    // El MISMO ancla que exige la corrida, y ANTES de llamar al modelo.
+    //
+    // Faltaba: el Run comprobaba el ancla y este panel no, así que sobre una hoja que agrupa a
+    // varios personajes escribía los prompts igual —una llamada de texto por clip, pagadas— y los
+    // enseñaba como buenos. Medido el 23-09 en test_pinball_migue_v.10: el prompt de un clip
+    // describía «six small terrarium creatures» en vez de un personaje, porque el sujeto que
+    // viajaba era la línea de producción entera. Sin sujeto claro no hay prompt que revisar, y
+    // cobrar por escribirlo es lo peor de las dos opciones.
+    try {
+      await anm.anclaDelPersonaje({ db, project_id, desde })
+    } catch (e) {
+      return res.status(400).json({ success: false, code: 'SIN_ANCLA', error: e.message })
+    }
+
     const r = await anm.clipsDelPersonaje({ db, project_id, desde, soloCache: false })
     if (!r.clips?.length) {
       return res.status(400).json({

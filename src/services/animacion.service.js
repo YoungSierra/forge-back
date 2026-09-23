@@ -156,7 +156,18 @@ async function vsSpecDelProyecto(db, project_id) {
 function clipsDeLaTabla(vs, personaje, personajes) {
   if (!vs) return null
   const L = vs.split('\n')
-  const i = L.findIndex(l => /^#{1,4}\s*B4\b.*animation/i.test(l))
+  // La sección se busca por NOMBRE, no por número.
+  //
+  // Antes se pedía `B4` literal. El número de la sección no es estable entre proyectos: en
+  // test_smack_migue_v.09 la animación es la B4, y en test_pinball_migue_v.10 es la B3 —ahí la B4
+  // es VFX—. En pinball no se encontraba, se caía al ADI, y de ahí salía una lista de clips
+  // mezclados de varias criaturas y sin personaje: ni se podía elegir el ancla ni eran los clips
+  // que el documento enumera. Es el mismo fallo por el que el Art Bible cargaba páginas del GDD.
+  const ES_ANIMACION = /^#{1,4}\s*B\d+\s*[·•.\-–—]?\s*animation\s*$/i
+  let i = L.findIndex(l => ES_ANIMACION.test(l))
+  // Respaldo por si el encabezado lleva algo detrás («B3 · Animation & FX»): se exige igual que
+  // empiece por B<n> y nombre la animación, para no capturar «B2 · Rigging & Skinning».
+  if (i < 0) i = L.findIndex(l => /^#{1,4}\s*B\d+\b[^\n]*\banimation\b/i.test(l))
   if (i < 0) return null
   const j = L.findIndex((l, k) => k > i && /^#{1,4}\s/.test(l))
   const bloque = L.slice(i + 1, j < 0 ? L.length : j)
@@ -165,28 +176,22 @@ function clipsDeLaTabla(vs, personaje, personajes) {
   const otros = (personajes || []).map(norma).filter(p => p.length >= 3 && p !== kAncla)
 
   const clips = []
-  for (const linea of bloque) {
-    if (!/^\s*\|/.test(linea)) continue
-    const celdas = linea.split('|').map(c => c.trim()).filter(Boolean)
-    // Cabecera y separador de la tabla markdown.
-    if (!celdas.length || /^-+$/.test(celdas[0])) continue
-    // La celda que trae «Sujeto — Movimiento». Se busca el guión largo, que es lo que los separa.
-    const celda = celdas.find(c => /—|–/.test(c))
-    if (!celda) continue
-    const [sujetoCrudo, ...resto] = celda.split(/—|–/)
-    const movimiento = resto.join(' — ').trim()
-    if (!movimiento) continue
+
+  // El criterio de a quién pertenece un clip y cómo se nombra, compartido por las dos formas en
+  // que los proyectos escriben esta sección. Estaba escrito una sola vez dentro del bucle de la
+  // tabla; se saca acá para que la lista agrupada lo herede tal cual y no se bifurque la regla.
+  const agregar = (sujetoCrudo, movimiento) => {
     const s = norma(sujetoCrudo)
-    if (s.length < 2) continue
+    if (s.length < 2 || !movimiento) return
 
     // Del personaje del ancla: el nombre de uno contiene al del otro en cualquier dirección — el
     // ítem es «Moon Jelly × 6» y la tabla dice «Moon Jelly».
     const esDelAncla = kAncla.length >= 3 && (s.includes(kAncla) || kAncla.includes(s))
     // De OTRO personaje: fuera. Es exactamente lo que evita el walk en la medusa.
     const esDeOtro = otros.some(o => s.includes(o) || o.includes(s))
-    if (!esDelAncla && esDeOtro) continue
+    if (!esDelAncla && esDeOtro) return
     // Ni del ancla ni de otro personaje ⇒ es un prop, y esos también se animan.
-    if (!esDelAncla && !esDeOtro && kAncla.length < 3) continue
+    if (!esDelAncla && !esDeOtro && kAncla.length < 3) return
 
     // El movimiento a veces trae su descripción entre paréntesis: el nombre es lo de fuera, la
     // descripción son las reglas que después definen las poses.
@@ -198,8 +203,8 @@ function clipsDeLaTabla(vs, personaje, personajes) {
     // props con «Activate» colisionarían en una sola clave. El personaje no lo necesita: todos sus
     // clips son suyos y el nombre del personaje ya va en la ruta del archivo.
     const nombre = (esDelAncla ? norma(etiqueta) : `${norma(sujetoCrudo)}_${norma(etiqueta)}`).slice(0, 40)
-    if (!nombre) continue
-    if (clips.some(c => c.nombre === nombre)) continue
+    if (!nombre) return
+    if (clips.some(c => c.nombre === nombre)) return
 
     clips.push({
       nombre,
@@ -209,6 +214,67 @@ function clipsDeLaTabla(vs, personaje, personajes) {
       sujeto: sujetoCrudo.trim(),
       es_prop: !esDelAncla,
     })
+  }
+
+  // Forma 2: lista numerada agrupada por personaje. El sujeto no está en cada línea sino en el
+  // encabezado del grupo que las precede, y el nombre del clip lo repite pegado:
+  //
+  //     *Luma (Axolotl) — 7 clips:*
+  //     1. ANIM_Luma_Idle_Sleepy (gill plumes drooped, no motion, 2.0 s loop)
+  //     *Chef Crab — 7 clips:*
+  //     8. ANIM_ChefCrab_Idle_Sleepy (folded claws, askew toque, 2.0 s loop)
+  //
+  // Así lo escribe test_pinball_migue_v.10: 6 grupos, 42 clips, cero filas de tabla. Con solo el
+  // lector de tablas la sección se leía como vacía aunque enumere las 42 por personaje.
+  const GRUPO = /^\s*\*\*?\s*([^*|]+?)\s*[—–]\s*\d+\s*clips?\s*:?\s*\*?\*\s*$/i
+  const ITEM  = /^\s*\d+\.\s+(.+)$/
+
+  // `ANIM_Luma_Idle_Sleepy` con sujeto «Luma (Axolotl)» ⇒ «Idle_Sleepy». Se consumen los tramos
+  // iniciales mientras sigan siendo prefijo del sujeto normalizado: así vale igual «Luma» (que es
+  // solo la primera palabra) que «ChefCrab» (que son las dos pegadas).
+  const sinPrefijoDeSujeto = (crudo, sujeto) => {
+    const partes = String(crudo).replace(/^ANIM[_-]/i, '').split('_')
+    const meta = norma(sujeto)
+    let acum = ''
+    let corte = 0
+    for (let k = 0; k < partes.length - 1; k++) {
+      acum += norma(partes[k])
+      if (!acum.length || !meta.startsWith(acum)) break
+      corte = k + 1
+      if (acum === meta) break
+    }
+    return partes.slice(corte).join('_') || partes.join('_')
+  }
+
+  let sujetoGrupo = null
+  for (const linea of bloque) {
+    const g = linea.match(GRUPO)
+    if (g) { sujetoGrupo = g[1].trim(); continue }
+
+    // Forma 1: la tabla markdown. Intacta.
+    if (/^\s*\|/.test(linea)) {
+      const celdas = linea.split('|').map(c => c.trim()).filter(Boolean)
+      // Cabecera y separador de la tabla markdown.
+      if (!celdas.length || /^-+$/.test(celdas[0])) continue
+      // La celda que trae «Sujeto — Movimiento». Se busca el guión largo, que es lo que los separa.
+      const celda = celdas.find(c => /—|–/.test(c))
+      if (!celda) continue
+      const [sujetoCrudo, ...resto] = celda.split(/—|–/)
+      agregar(sujetoCrudo, resto.join(' — ').trim())
+      continue
+    }
+
+    if (!sujetoGrupo) continue
+    const it = linea.match(ITEM)
+    if (!it) continue
+    // El nombre va antes del paréntesis; las reglas, dentro. Se le quita el prefijo del sujeto y se
+    // vuelve a montar para que `agregar` lo parta igual que en la tabla.
+    const crudo = it[1].trim()
+    const m = crudo.match(/^([^(]+)(?:\((.*)\))?/)
+    const nombreCrudo = (m?.[1] || crudo).trim()
+    const dentro = (m?.[2] || '').trim()
+    const movimiento = sinPrefijoDeSujeto(nombreCrudo, sujetoGrupo) + (dentro ? ` (${dentro})` : '')
+    agregar(sujetoGrupo, movimiento)
   }
   return clips
 }

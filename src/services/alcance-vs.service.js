@@ -179,6 +179,51 @@ function itemsDesdeSpec(md) {
     }
   }
 
+  // ── La hoja de animación, una por personaje ────────────────────────────────
+  //
+  // Sus instancias salen del inventario de CLASES de activo, y una clase no tiene por qué nombrar
+  // a un personaje. En test_smack_migue_v.09 lo hace por casualidad —«Cartón rig + all
+  // animations», «Moon Jelly × 6»— y todo funciona. En test_pinball_migue_v.10 las filas son «6
+  // creature rigs and skinning» y «42 creature animation clips (7 per creature × 6)»: dos hojas
+  // para seis criaturas, y ninguna dice a cuál animar. El paso no encuentra ancla y no corre.
+  //
+  // La sección de animación del propio spec SÍ enumera por personaje, así que de ahí salen. Pero
+  // solo se recurre a ella cuando hace falta: si alguna clase ya nombra a un actor del roster, se
+  // deja como está — cambiarlo renombraría instancias vivas y dejaría huérfanas las hojas ya
+  // generadas y pagadas.
+  const HOJA_ANIM = '24_AnimationSheet'
+  const actores = (porHoja['18_CharacterSheet'] || []).map(x => x.nombre)
+  if (actores.length) {
+    const k = s => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '')
+    const nombraActor = (porHoja[HOJA_ANIM] || []).some(it =>
+      actores.some(a => k(it.nombre).includes(k(a)) || k(a).includes(k(it.nombre))))
+    if (!nombraActor) {
+      // Los grupos de la sección de animación: «*Luma (Axolotl) — 7 clips:*».
+      const anim = (() => {
+        const L = md.split('\n')
+        let i = L.findIndex(l => /^#{1,4}\s*B\d+\s*[·•.\-–—]?\s*animation\s*$/i.test(l))
+        if (i < 0) i = L.findIndex(l => /^#{1,4}\s*B\d+\b[^\n]*\banimation\b/i.test(l))
+        if (i < 0) return []
+        const j = L.findIndex((l, n) => n > i && /^#{1,4}\s/.test(l))
+        const grupos = []
+        for (const l of L.slice(i + 1, j < 0 ? L.length : j)) {
+          const g = l.match(/^\s*\*\*?\s*([^*|]+?)\s*[—–]\s*\d+\s*clips?\s*:?\s*\*?\*\s*$/i)
+          if (g) grupos.push(g[1].trim())
+        }
+        // Solo los que el roster reconoce como actores: la sección también menciona props, y esos
+        // se animan dentro de la hoja de su personaje, no en una hoja propia.
+        return grupos
+          .map(g => actores.find(a => k(a).includes(k(g)) || k(g).includes(k(a))) || null)
+          .filter((v, n, arr) => v && arr.indexOf(v) === n)
+      })()
+      if (anim.length > 1) {
+        avisos.push(`${HOJA_ANIM}: instanced per character from the animation section `
+          + `(${anim.length}), because no asset class names an actor`)
+        porHoja[HOJA_ANIM] = anim.map(nombre => ({ nombre, cuenta: 1, de: '§B · Animation' }))
+      }
+    }
+  }
+
   return { porHoja, sinClasificar, noSonLaminas, avisos }
 }
 
