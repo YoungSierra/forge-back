@@ -4135,6 +4135,24 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
     }
     cancelacionesPedidas.delete(session.id)
 
+    // Un output de imagen que vuelve del chat SIN haber despachado nada NO está hecho, por muy
+    // convencido que suene la respuesta.
+    //
+    // Medido el 23-09 en test_pinball_migue_v.10, output `art_bible_images`: el modelo escribió
+    // 24.486 caracteres de plan, puso «DISPATCHED» veinte veces y cerró con «COUNT: 20/20 ✅
+    // STATUS: ✅ COMPLETE». En la base: `tool_calls: []`, `output_images: {}`, ni un bloque de
+    // máquina, cero imágenes. Se guardó como si hubiera corrido y nadie se enteró hasta abrir el
+    // modal. Es el mismo engaño que el docx con código alucinado.
+    //
+    // El chat NO despacha: llama al modelo. Quien despacha es ▶ RENDER. Así que cuando el output
+    // enfocado produce imágenes y no salió ninguna, se dice — y se dice a dónde ir.
+    if (targetOutput?.image_gen && !imagenesDespachadas.length) {
+      const clave = targetOutput.key || targetOutput.name || target_output_key
+      docWarnings.push(`"${clave}" produces images and none were dispatched — the chat writes the plan, `
+        + `it does not render. A reply that says it dispatched did not. Use ▶ RENDER on this output.`)
+      console.warn(`[forge-chat] ${clave}: image_gen sin despacho — respuesta de ${replyText.length} chars`)
+    }
+
     res.json({
       success:    true,
       reply:      replyText,
