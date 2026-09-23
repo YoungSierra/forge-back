@@ -6495,6 +6495,42 @@ router.post('/assets/:asset_id/montaje', async (req, res, next) => {
   }
 })
 
+// Exporta el PACK DE ANIMACIÓN del personaje de esta hoja: el `.glb`, un `.mp4` por movimiento
+// nombrado con el movimiento, la lámina y el listado de tiempos. Es la Fase 5 de JuanK y la
+// entrada que espera su skill `blender-loopforge-character-pipeline`.
+//
+// `GET` contesta el estado sin bajar ni escribir nada —lo que alimenta el sector del radial, que
+// tiene que poder decir qué falta antes de que nadie pulse—; `POST` arma el zip.
+router.get('/assets/:asset_id/pack-de-animacion', async (req, res, next) => {
+  try {
+    const { id: project_id, asset_id } = req.params
+    const { armarPackDeAnimacion } = require('../services/paquete-animacion.service')
+    const estado = await armarPackDeAnimacion({ db, project_id, asset_id, soloEstado: true })
+    res.json({ success: true, aplica: true, ...estado })
+  } catch (err) {
+    // «No aplica» no es un error que el usuario deba leer: es que esta pieza no es una hoja de
+    // animación, y el sector simplemente no se dibuja.
+    if (err.code === 'NO_APLICA') return res.json({ success: true, aplica: false, motivo: err.message })
+    next(err)
+  }
+})
+
+router.post('/assets/:asset_id/pack-de-animacion', async (req, res, next) => {
+  try {
+    const { id: project_id, asset_id } = req.params
+    const { armarPackDeAnimacion } = require('../services/paquete-animacion.service')
+    const r = await armarPackDeAnimacion({ db, project_id, asset_id, member_id: req.body?.member_id || null })
+    res.json({ success: true, ...r })
+  } catch (err) {
+    // Lo que falta es el estado del proyecto, no un fallo del servidor: se dice con nombre propio
+    // para poder ir a resolverlo, igual que en el paquete de nivel.
+    if (['FALTA', 'NO_APLICA'].includes(err.code)) {
+      return res.status(400).json({ success: false, code: err.code, error: err.message, faltantes: err.faltantes || null })
+    }
+    next(err)
+  }
+})
+
 router.post('/assets/:asset_id/iterate', async (req, res, next) => {
   try {
     const { id: project_id, asset_id } = req.params
