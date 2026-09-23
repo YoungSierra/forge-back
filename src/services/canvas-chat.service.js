@@ -263,15 +263,43 @@ async function resolveNodeInputs(db, { projectId, currentPNodeId, targetOutput, 
           .neq('format', 'png')
           .order('created_at', { ascending: false })
         // Mismo criterio de lane que arriba: el respaldo no puede traer el documento del vecino.
-        const recent = (recientes || []).find(a => {
+        const delLaneR = a => {
           const pn = a.forge_sessions?.project_node_id
           return !pn || pn === edge.source_node_id
-        })
+        }
+        const candidatos = (recientes || []).filter(delLaneR)
+        const sectionKey = outputDef ? (outputDef.key || outputDef.name) : null
+        const hermanas   = outputs.map(o => o.key || o.name).filter(Boolean)
+
+        // Si el cable pide un OUTPUT, gana el documento más reciente que de verdad TRAIGA esa
+        // sección, no el más reciente a secas.
+        //
+        // Antes se cogía el primero y, si la extracción fallaba, se entregaba el documento
+        // ENTERO por ese puerto. Basta con que el nodo produzca después un documento de una sola
+        // salida —correr un output enfocado, que es lo normal— para que ese documento se vuelva
+        // el más reciente y se cuele por los puertos de todas las demás. Medido en
+        // test_pinball_migue_v.10: con un `ux_ui_spec` enfocado encima, los cuatro cables del 3.7
+        // hacia 3.8/3.9/3.12/3.13 recibían el spec de UX en vez de su propia salida, en silencio.
+        //
+        // Sin `sectionKey` —el cable apunta al nodo, no a un output— no hay nada que comprobar y
+        // se conserva el criterio de siempre: el más reciente.
+        let recent = null, extracted = null
+        if (sectionKey) {
+          for (const a of candidatos) {
+            if (!a?.content) continue
+            const s = extractSection(a.content, sectionKey, hermanas)
+            if (s) { recent = a; extracted = s; break }
+          }
+          // Ningún documento trae esa sección. Se entrega el más reciente igual que antes: puede
+          // ser un documento de una sola salida sin encabezados, que es justo lo que el puerto
+          // pide. Lo que ya no pasa es que uno CON secciones, pero sin la suya, se cuele.
+          if (!recent) recent = candidatos.find(a => a?.content && !hermanas.some(k => extractSection(a.content, k, hermanas))) || null
+        } else {
+          recent = candidatos.find(a => a?.content) || null
+        }
+
         if (recent?.content) {
           content = recent.content
-          const sectionKey = outputDef ? (outputDef.key || outputDef.name) : null
-          const hermanas   = outputs.map(o => o.key || o.name).filter(Boolean)
-          const extracted  = sectionKey ? extractSection(content, sectionKey, hermanas) : null
           if (extracted) {
             content   = extracted
             slotLabel = `${nodeTitle} → ${outputLabel || sectionKey}`
