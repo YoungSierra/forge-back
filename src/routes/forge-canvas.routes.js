@@ -2255,6 +2255,13 @@ router.post('/nodes/:node_id/accept', async (req, res, next) => {
         node_id,
         project_id,
         session_id,
+        // La clave de la salida, que ya se leyó de la sesión unas líneas más arriba para nombrar
+        // el activo. Se escribía en el NOMBRE y no en la columna, así que el documento nacía sin
+        // clave y solo la sesión sabía de qué salida era. Todo lo que busca por `output_key`
+        // —el compositor de decks, entre otros— no lo encontraba y se caía a otro documento.
+        // Medido el 23-09 en test_pinball_migue_v.10: el `ux_ui_spec` recién aceptado quedó con
+        // `output_key` nulo y el deck de UI siguió leyendo el documento de la corrida vieja.
+        output_key:     outputKey,
         name:           assetName,
         format:         docUrlFinal ? (docFormatFinal === 'pptx' ? 'pptx' : 'docx') : 'markdown',
         status:         'approved',

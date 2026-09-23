@@ -666,13 +666,24 @@ async function composeDeck({ db, projectId, deck = 'asg', fills = null, solo = n
   if (cfg.fuente) {
     const { data: n } = await db().from('forge_nodes').select('id,outputs').eq('node_key', cfg.fuente).single()
     if (!n) throw new Error(`no existe el nodo fuente ${cfg.fuente}`)
-    let q = db().from('forge_assets').select('name,content')
+    let q = db().from('forge_assets')
+      .select('name,content,output_key,forge_sessions!session_id(output_key)')
       .eq('project_id', projectId).eq('node_id', n.id).in('status', ['approved', 'auto_approved'])
+      .order('created_at', { ascending: false })
+    const { data } = await q
     // Si el deck acota a un asset, se ignora el resto: evita que un asset parcial le gane al
     // documento consolidado por orden de llegada.
-    if (cfg.asset) q = q.eq('output_key', cfg.asset)
-    const { data } = await q
-    assets = data || []
+    //
+    // La clave vive en DOS sitios y hay que mirar los dos. El activo la tiene desde que existe la
+    // columna, pero la ruta de Accept no la escribía: el documento nacía con `output_key` nulo y
+    // solo su SESIÓN sabía de qué salida era. Filtrando solo por la columna, un documento recién
+    // aceptado era invisible y el deck se caía al anterior. Medido el 23-09 en
+    // test_pinball_migue_v.10: el `ux_ui_spec` aceptado —con las cinco secciones— no se veía, y el
+    // deck seguía leyendo el documento de la corrida entera. Es la misma lectura que ya hace
+    // `canvas-chat` para los puertos, que sí miraba las dos.
+    assets = cfg.asset
+      ? (data || []).filter(a => (a.output_key ?? a.forge_sessions?.output_key) === cfg.asset)
+      : (data || [])
 
     // Y la pieza del MODO NODO ENTERO, que no tiene clave. Mismo criterio que alcance-vs con el
     // 3.13: se reconoce por el NODO que la produjo, no por su nombre. Medido en dos proyectos de
@@ -805,7 +816,10 @@ async function composeDeck({ db, projectId, deck = 'asg', fills = null, solo = n
     }
 
     // Sin bloque: el prompt viaja tal cual (Art Bible, portadas sin campos).
-    if (!intake) return pag
+    //
+    // Queda MARCADO, porque no es lo mismo que un bloque que no resolvió nada y el descarte de
+    // más abajo tiene que distinguirlos: los dos casos llegan con `llenos` y `faltantes` vacíos.
+    if (!intake) return { ...pag, sin_bloque: true }
 
     // Un valor por placeholder, EN EL MISMO ORDEN en que aparecen en el bloque: la sustitución
     // los consume en secuencia, así el template conserva su formato y las líneas con varios
@@ -1034,14 +1048,22 @@ async function composeDeck({ db, projectId, deck = 'asg', fills = null, solo = n
   //
   // «Con dato» es lo mismo que ya define el guardia de arriba: lo que Forge sabe de sí mismo, los
   // marcadores de panel y las instrucciones del mapa no prueban que el documento sirva.
+  //
+  // Y NO entra la página que no tiene bloque de datos. Eso no es una página que se quedó sin
+  // resolver: es una página que no pide nada del documento por diseño —su entrada es la maqueta
+  // de la pantalla, como en el Art Bible—. Sin esta excepción el deck de UI perdía sus cuatro
+  // sprite sheets en todos los proyectos (medido el 23-09: 13_lives, fighting_slime y
+  // test_smack_migue_v.09, 4 de 8 páginas cada uno) y el GDD perdía la 00b. Lo cazó Pedro
+  // revisando la v1.3; los dos casos llegan acá con `llenos` y `faltantes` vacíos y solo los
+  // separa `sin_bloque`.
   if (cfg.fuente) {
     const conDato = p => (p.llenos || []).some(l => l.chars != null && l.via !== 'forge')
-    const vacias = vivas.filter(p => !conDato(p))
+    const vacias = vivas.filter(p => !p.sin_bloque && !conDato(p))
     if (vacias.length) {
       for (const p of vacias) {
         avisos.push(`page ${p.indice} ${p.nombre}: not dispatched — no field of this page came from the source document`)
       }
-      vivas = vivas.filter(conDato)
+      vivas = vivas.filter(p => p.sin_bloque || conDato(p))
     }
   }
 
