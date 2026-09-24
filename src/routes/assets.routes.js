@@ -354,6 +354,17 @@ router.get('/project-assets', async (req, res, next) => {
       // lo que se reusa al rehacerla. Solo eso del metadata — el resto es interno de la cadena y
       // no tiene por qué viajar a cada tarjeta del moodboard.
       opciones:    a.metadata?.opciones ?? null,
+      // De qué PÁGINA del deck es esta hoja, cuando está instanciada. Viaja porque el nombre no
+      // sirve para deducirlo: una hoja instanciada termina con el personaje —«… —
+      // 18_CharacterSheet — Luma (Axolotl)»— y quien lea el último tramo busca «Luma (Axolotl)»
+      // entre las páginas y no la encuentra. Es lo que dejaba New Iteration en gris sobre las
+      // hojas Sheet (informe v13 de Miguel, punto 1). Solo la página: el resto de la instancia
+      // es interno.
+      instancia_pagina: a.metadata?.instancia?.pagina ?? null,
+      // Y si la pieza la produjo una CADENA. Una parte de un entorno también cuelga del 3.20 y
+      // también es imagen, así que sin esto no hay forma de distinguir una hoja del deck de algo
+      // que salió de un paso de producción — y son cosas distintas para iterar.
+      de_cadena:   a.metadata?.cadena ? true : false,
       // Los renders del nivel montado. Viajan porque el visor los enseña como galería debajo del
       // modelo —«el visualizador 3D abre el .glb y las imágenes quedan como galería del nivel»,
       // documento de JuanK del 18-09— y sin esto el front tendría que pedir la pieza otra vez

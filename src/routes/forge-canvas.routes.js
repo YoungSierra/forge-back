@@ -3595,7 +3595,8 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
     })()
 
     if (esPromptSetDeDeck) {
-      const { composeDeck, DECKS } = require('../services/slide-composer.service')
+      const { pedidoDe: pedidoDeInstancia } = require('../services/instanciar-hojas.service')
+    const { composeDeck, DECKS } = require('../services/slide-composer.service')
       const img = allOutputDefs.find(o => o.image_gen && (o.uses?.siblings_if_present || []).includes(asmKey))
       const wfName = String(img.image_gen_model).replace(/^comfyui:/, '')
       const deck = Object.entries(DECKS).find(([, c]) => c.workflow === wfName)?.[0]
@@ -6555,9 +6556,78 @@ router.post('/assets/:asset_id/iterate', async (req, res, next) => {
     const member_id = req.body?.member_id || null
 
     const { data: asset } = await db().from('forge_assets')
-      .select('id, node_id, project_id, session_id, name, storage_url, format')
+      .select('id, node_id, project_id, session_id, name, storage_url, format, metadata')
       .eq('id', asset_id).eq('project_id', project_id).single()
     if (!asset) return res.status(404).json({ success: false, error: 'Asset not found' })
+
+    // ── Una PARTE de cadena se re-rollea con su propio workflow ───────────────
+    //
+    // Punto 2 del informe v13 de Miguel. Una parte de un entorno —`part_13`— no es una página de
+    // deck: la produjo `Concept Art_Environments`, que saca las veinte de un solo despacho, así
+    // que no había forma de rehacer una sin rehacer las otras diecinueve.
+    //
+    // Él construyó la variante: toma la pieza como referencia y devuelve otra instancia del mismo
+    // asset —mismo estilo, misma paleta, mismo encuadre, el detalle redistribuido—. La coherencia
+    // con el set sale de que la referencia ES la pieza, que ya lleva el estilo del entorno.
+    //
+    // Se guarda como VERSIÓN de la misma pieza, no como una pieza nueva: es lo mismo que hace
+    // iterar una página, y es lo que Miguel pidió — «la anterior al historial».
+    if (asset.metadata?.cadena && asset.storage_url) {
+      const WF = 'V57_STUDIO_2D_regenerar'
+      const { getWorkflowByName } = require('../services/config.service')
+      const entry = await getWorkflowByName(WF)
+      if (!entry) {
+        return res.status(400).json({
+          success: false, code: 'SIN_WORKFLOW',
+          error: `"${WF}" is not registered: a chain part cannot be re-rolled yet.`,
+        })
+      }
+      const { submitWorkflow, pollUntilDone, downloadOutputsByNode, uploadImageToComfyUI } =
+        require('../services/providers/comfyui.provider')
+      const campo = Object.keys(entry.inject_config?.extra || {})[0] || 'image'
+      const roles = entry.inject_config?.salidas || null
+
+      // `paso` nombra cuál de los cuatro tramos falló: sin esto, subir, despachar, esperar y bajar
+      // se leen los cuatro como «Internal server error» desde el navegador.
+      const tramo = require('../utils/paso').crearPaso('regenerar')
+      const t0 = Date.now()
+      const subida = await tramo('Re-generate · uploading the piece to ComfyUI',
+        () => uploadImageToComfyUI(asset.storage_url))
+      const jobId = await tramo('Re-generate · dispatching the workflow',
+        () => submitWorkflow(WF, '', 1024, 1024, { [campo]: subida }, null))
+      await tramo('Re-generate · waiting for ComfyUI', () => pollUntilDone(jobId, 300_000))
+      const salidas = await tramo('Re-generate · downloading the result',
+        () => downloadOutputsByNode(jobId, `projects/${project_id}/regenerar/${jobId.slice(0, 8)}`))
+
+      const elegida = Object.entries(salidas).find(([n]) => !roles || roles[n])?.[1]
+      const url = Array.isArray(elegida) ? elegida[0]?.url : elegida?.url
+      if (!url) return res.status(502).json({ success: false, error: 'The workflow returned no image' })
+
+      let ultima = await versionActual(asset_id)
+      if (ultima === 0) {
+        await db().from('forge_asset_versions').insert({
+          asset_id, storage_url: asset.storage_url, version_number: 1, is_current: false,
+          metadata: { origen: 'la pieza que produjo la cadena' },
+        })
+        ultima = 1
+      }
+      await db().from('forge_asset_versions').update({ is_current: false }).eq('asset_id', asset_id)
+      const { data: v } = await db().from('forge_asset_versions').insert({
+        asset_id, storage_url: url, version_number: ultima + 1, is_current: true,
+        created_by: member_id,
+        metadata: { job: jobId, workflow: WF, regenerado: true, duracion_ms: Date.now() - t0 },
+      }).select('id, version_number').single()
+      await db().from('forge_assets').update({ storage_url: url }).eq('id', asset_id)
+
+      require('../services/execution-log.service').logExecution({
+        project_id, node_id: asset.node_id, triggered_by: member_id,
+        trigger_type: 'tool', executor_type: 'comfyui', provider: 'comfyui', model: WF,
+        is_estimated: true, duration_ms: Date.now() - t0, started_at: new Date(t0).toISOString(),
+        metadata: { regenerar: true, asset: asset_id, parte: asset.metadata?.cadena?.rol || null },
+      })
+
+      return res.json({ success: true, url, version: v?.version_number ?? ultima + 1, job: jobId })
+    }
 
     const { data: ses } = await db().from('forge_sessions')
       .select('output_key, project_node_id').eq('id', asset.session_id).maybeSingle()
@@ -6566,7 +6636,15 @@ router.post('/assets/:asset_id/iterate', async (req, res, next) => {
     const outs = Array.isArray(dna?.outputs) ? dna.outputs : []
 
     // La página que es este asset: su nombre termina con el de la página («… — 09_ColorSystem»).
-    const sufijo = String(asset.name).split('—').pop().trim()
+    //
+    // Salvo cuando la página está INSTANCIADA. Entonces el nombre sigue creciendo por la derecha
+    // —«Art Style Guide — 18_CharacterSheet — Luma (Axolotl)»— y el último tramo es el personaje,
+    // no la página: se buscaba «Luma (Axolotl)» entre las páginas del deck y no aparecía, así que
+    // iterar contestaba «Not available yet» sobre una hoja que SÍ es una página del ASG. Es el
+    // punto 1 del informe v13 de Miguel. La instancia lleva escrita su página, que es el dato que
+    // no hay que deducir del nombre.
+    const instancia = asset.metadata?.instancia || null
+    const sufijo = instancia?.pagina || String(asset.name).split('—').pop().trim()
 
     // Primero por la clave de la sesión. Si no aparece, se resuelve por NOMBRE DE PÁGINA: los
     // outputs se renombran —v2.9.7 partió `art_style_guide_images` en contenido y síntesis— y los
@@ -6627,7 +6705,15 @@ router.post('/assets/:asset_id/iterate', async (req, res, next) => {
       db, project_id, node_id: asset.node_id, session_id: null,
       node_key: dna.node_key, output_key: ses.output_key,
       image_gen_model: def.image_gen_model, member_id, solo: [pag.indice],
-      extraPrompt: ultimoPedido,
+      // Una hoja instanciada se vuelve a producir CON SU ÍTEM. Sin esto, iterar la ficha de Luma
+      // re-renderizaría la página 18 a secas y devolvería una Character Sheet genérica: la hoja
+      // perdería al personaje que la define, en una acción que el usuario entiende como «lo mismo,
+      // otra vez». La línea es la misma que usa el instanciador, para que las dos digan igual de
+      // cuál ítem se trata. El pedido del usuario, si lo hay, va detrás y manda sobre el resto.
+      extraPrompt: [
+        instancia?.item ? pedidoDeInstancia(instancia.pagina || sufijo, { nombre: instancia.item }) : null,
+        ultimoPedido,
+      ].filter(Boolean).join('\n\n') || null,
     })
     const nueva = r.paginas[0]
     if (!nueva) return res.status(502).json({ success: false, error: 'The workflow returned no image' })
