@@ -3595,8 +3595,7 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
     })()
 
     if (esPromptSetDeDeck) {
-      const { pedidoDe: pedidoDeInstancia } = require('../services/instanciar-hojas.service')
-    const { composeDeck, DECKS } = require('../services/slide-composer.service')
+      const { composeDeck, DECKS } = require('../services/slide-composer.service')
       const img = allOutputDefs.find(o => o.image_gen && (o.uses?.siblings_if_present || []).includes(asmKey))
       const wfName = String(img.image_gen_model).replace(/^comfyui:/, '')
       const deck = Object.entries(DECKS).find(([, c]) => c.workflow === wfName)?.[0]
@@ -6710,10 +6709,16 @@ router.post('/assets/:asset_id/iterate', async (req, res, next) => {
       // perdería al personaje que la define, en una acción que el usuario entiende como «lo mismo,
       // otra vez». La línea es la misma que usa el instanciador, para que las dos digan igual de
       // cuál ítem se trata. El pedido del usuario, si lo hay, va detrás y manda sobre el resto.
-      extraPrompt: [
-        instancia?.item ? pedidoDeInstancia(instancia.pagina || sufijo, { nombre: instancia.item }) : null,
-        ultimoPedido,
-      ].filter(Boolean).join('\n\n') || null,
+      // `pedidoDe` se trae ACÁ, donde se usa. Puesto arriba del archivo cayó dentro de otra
+      // función y la ruta lo llamaba sin tenerlo: «pedidoDeInstancia is not defined» en cuanto
+      // alguien iteraba una hoja. Lo reportó Miguel minutos después de publicar.
+      extraPrompt: (() => {
+        const { pedidoDe } = require('../services/instanciar-hojas.service')
+        return [
+          instancia?.item ? pedidoDe(instancia.pagina || sufijo, { nombre: instancia.item }) : null,
+          ultimoPedido,
+        ].filter(Boolean).join('\n\n') || null
+      })(),
     })
     const nueva = r.paginas[0]
     if (!nueva) return res.status(502).json({ success: false, error: 'The workflow returned no image' })
