@@ -427,10 +427,15 @@ async function clipsDelProyecto({ db, project_id, refrescar = false, soloCache =
  * más los golpes; uno pequeño y ágil rebota. El mismo razonamiento decide cómo se describe el
  * movimiento y cuántos segundos dura.
  *
- * Las convenciones son las suyas, literales: inglés, un párrafo descriptivo y no una lista, el
- * personaje descrito AL INICIO —el modelo de video no tiene memoria de otros prompts—, encuadre y
- * luz consistentes entre movimientos para que los clips sean comparables, y la duración FUERA del
- * texto, porque es un parámetro aparte del workflow.
+ * Las convenciones son las suyas, literales: inglés, un párrafo descriptivo y no una lista, y la
+ * duración FUERA del texto, porque es un parámetro aparte del workflow.
+ *
+ * **Cambió una, y él mismo la cambió.** Hasta el informe v7 el párrafo abría SIEMPRE describiendo
+ * al personaje —silueta, materiales, escala—, también decisión suya. Ahí reportó que eso rompía
+ * las generaciones: con la imagen de referencia delante, una descripción física le dice al modelo
+ * que dibuje un personaje nuevo a partir del texto, y pisa la referencia. Ahora el párrafo lleva
+ * SOLO el movimiento; el encuadre, la luz y las reglas de no-deformación viven dentro del
+ * workflow (`V57_STUDIO_AnimationRef` v2, nodos 148 y 154), no en lo que escribimos.
  */
 async function promptDeVideo({ clip, adi, personaje = null, referencia = null }) {
   const system = [
@@ -442,10 +447,15 @@ async function promptDeVideo({ clip, adi, personaje = null, referencia = null })
     '',
     'EL PÁRRAFO:',
     '- En inglés, UN párrafo descriptivo. No una lista de instrucciones ni viñetas.',
-    '- Empieza SIEMPRE describiendo al personaje —silueta, materiales, escala— y recién después la',
-    '  acción. El modelo no recuerda otros prompts: cada uno se lee solo.',
-    '- Encuadre de cámara, fondo y luz consistentes entre movimientos del mismo personaje, para que',
-    '  los clips queden comparables entre sí.',
+    '- SOLO EL MOVIMIENTO. Nunca describas al personaje: ni ropa, ni rasgos, ni accesorios, ni',
+    '  colores, ni materiales, ni de qué está hecho. El modelo ya tiene su imagen delante; si',
+    '  además lee una descripción física, entiende que debe dibujar un personaje nuevo A PARTIR DE',
+    '  ESE TEXTO y pisa la referencia. Es el punto 1 del informe v7 de JuanK, y revierte la',
+    '  convención anterior —que era suya— de abrir siempre describiendo al personaje.',
+    '- Escribí qué HACE el cuerpo: la acción, su ritmo, su peso, cómo empieza y cómo termina.',
+    '  «Performs a fast sword slash to the right, stepping forward», no «a warrior with red armor…».',
+    '- Nombralo como «the character», nunca por su nombre ni por su especie.',
+    '- NO escribas encuadre, fondo ni luz: el workflow ya los fija por dentro.',
     '- NO escribas la duración en el texto. Es un parámetro aparte.',
     '- Si el documento fija una regla de deformación para este personaje (p. ej. «cero',
     '  squash-and-stretch»), repetila explícitamente: el modelo no la infiere sola.',
