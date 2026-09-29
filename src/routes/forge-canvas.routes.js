@@ -6414,9 +6414,11 @@ router.post('/laboratory/abrir', async (req, res, next) => {
     const r = await abrirLaboratorio({ db, project_id: req.params.id, nombreProyecto: pr?.name })
     res.json({ success: true, ...r })
   } catch (err) {
-    // Ninguno de los dos es una falla del servidor: uno es el estado del proyecto y el otro el
-    // del despliegue.
-    if (err.code === 'SIN_TDD' || err.code === 'SIN_LAB') {
+    // Ninguno es una falla del servidor: uno es el estado del proyecto, otro el del despliegue y
+    // el tercero un servicio que se está levantando. `LAB_DORMIDO` faltaba, así que un laboratorio
+    // arrancando salía como «Internal server error» y había que ir a encenderlo a mano por su
+    // enlace directo. El servicio ya redactaba el mensaje útil; la ruta no lo dejaba pasar.
+    if (err.code === 'SIN_TDD' || err.code === 'SIN_LAB' || err.code === 'LAB_DORMIDO') {
       return res.status(400).json({ success: false, error: err.message, code: err.code })
     }
     next(err)

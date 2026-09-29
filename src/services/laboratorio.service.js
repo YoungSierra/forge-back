@@ -205,6 +205,34 @@ async function estadoDelLaboratorio({ db, project_id }) {
  * No devuelve el resultado a propósito: lo único que hace falta es que el proceso de allá
  * arranque. Quien de verdad necesite saber si hay build, lo pregunta con `estadoDelLaboratorio`.
  */
+/**
+ * Preguntar por el laboratorio hasta que conteste, o rendirse.
+ *
+ * Preguntar ES despertarlo: la misma petición que informa del estado levanta el proceso. Por eso
+ * se insiste en vez de fallar a la primera — la primera siempre la pierde un servicio dormido.
+ *
+ * Tres intentos de 10 s cubren los ~22 s que tarda en arrancar y se quedan lejos del corte de
+ * Render. Contesta al primer OK: con el servicio despierto son 0,3 s y no se nota.
+ */
+async function esperarAlLaboratorio(base, intentos = 3, esperaMs = 10000) {
+  for (let i = 1; i <= intentos; i++) {
+    const t0 = Date.now()
+    try {
+      const r = await fetch(`${base}/api/gameplay/status`, { signal: AbortSignal.timeout(esperaMs) })
+      if (r.ok) {
+        if (i > 1) console.log(`[lab] despertó en el intento ${i} (${Math.round((Date.now() - t0) / 1000)}s)`)
+        return true
+      }
+      // Contestó algo que no es OK: está en pie y el push dirá qué pasa. No es un arranque.
+      console.warn(`[lab] responde HTTP ${r.status} — se sigue igual`)
+      return true
+    } catch (e) {
+      console.warn(`[lab] intento ${i}/${intentos} sin respuesta (${e.name}) tras ${Math.round((Date.now() - t0) / 1000)}s`)
+    }
+  }
+  return false
+}
+
 function despertarLaboratorio() {
   const base = BASE()
   if (!base) return { configurado: false }
@@ -233,6 +261,25 @@ async function abrirLaboratorio({ db, project_id, nombreProyecto }) {
   const slug = slugDe(nombreProyecto || project_id)
   const texto = `project_name: ${nombreProyecto || slug}\n\n${doc.content}`
 
+  // ── Esperar a que el laboratorio esté en pie, ANTES de empujarle nada ──────
+  //
+  // Se duerme por inactividad y tarda ~22 s en arrancar. Hasta ahora solo se le despertaba en el
+  // login; quien lleva un rato dentro de Forge y pulsa el botón es el primero en tocarlo, y esta
+  // función iba derecha al push contra un servicio que se estaba levantando. El fetch se quedaba
+  // colgado hasta que Render cortaba el request, y lo que veía el usuario era «Internal server
+  // error». David lo reportó el 29-09 en test_smack_migue_v.09, y el apaño era abrir el enlace
+  // directo para encenderlo a mano.
+  //
+  // La petición de estado es la misma que lo despierta, así que preguntar ES encender. Se
+  // pregunta hasta que conteste, y solo si no lo hace se para — diciendo por qué.
+  const listo = await esperarAlLaboratorio(base)
+  if (!listo) {
+    const err = new Error('The Laboratory is waking up and did not answer in time. '
+      + 'It takes about 22 seconds to start: try again in a moment.')
+    err.code = 'LAB_DORMIDO'
+    throw err
+  }
+
   // El taller del laboratorio es UNO para todo el servicio: el jugable vive siempre en
   // `public/gameplay`. Abrir dos proyectos seguidos hacía que el segundo viera el prototipo del
   // primero — lo reportó Miguel. Antes de empujar nada se le pide al laboratorio que aparte el
@@ -253,11 +300,24 @@ async function abrirLaboratorio({ db, project_id, nombreProyecto }) {
     console.warn('[lab] no se pudo cambiar de taller:', e.message)
   }
 
-  const r = await fetch(`${base}/api/tdds/push`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ slug, text: texto }),
-  })
+  // Con timeout: sin él, un laboratorio a medio levantar deja la petición colgada hasta que Render
+  // corta el request, y entonces lo que llega al navegador es un 502 sin explicación. Un minuto es
+  // de sobra — el TDD son ~112.000 caracteres y el push tarda unos 2 s con el servicio en pie.
+  let r
+  try {
+    r = await fetch(`${base}/api/tdds/push`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ slug, text: texto }),
+      signal: AbortSignal.timeout(60000),
+    })
+  } catch (e) {
+    const err = new Error(e.name === 'TimeoutError'
+      ? 'The Laboratory took too long to accept the TDD. It may still be starting: try again in a moment.'
+      : `The Laboratory could not be reached: ${e.message}`)
+    err.code = 'LAB_DORMIDO'
+    throw err
+  }
   const cuerpo = await r.text()
   if (!r.ok) throw new Error(`The Laboratory refused the TDD (${r.status}): ${cuerpo.slice(0, 200)}`)
 
