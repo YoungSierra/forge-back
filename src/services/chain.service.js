@@ -67,31 +67,17 @@ const CADENAS = {
         porque: 'This is the asset the vertical slice actually ships.',
         entradas: { image: 'concept_art:concept' },
       },
-      // Punto 2 del informe v7 de JuanK (25-09): las animaciones de un prop van «únicamente dentro
-      // del Animation Sheet asignado a dicho prop». Hasta hoy ese destino no existía —la cadena
-      // terminaba en el .glb— y sus filas viajaban de polizón en la hoja de algún personaje. Este
-      // paso es el destino; sin él, filtrarlas allá las dejaba sin producirse en ninguna parte.
+      // La cadena de un prop TERMINA en su modelo, a propósito.
       //
-      // Es el MISMO paso que la hoja de personaje, con una diferencia: el ancla. Un personaje
-      // tiene vista frontal de su Character Sheet; un prop no tiene vistas, así que se ancla en su
-      // concept art, igual que hace el paso de 3D justo encima.
+      // El 30-09 llegó a tener un paso de animación: el punto 2 del informe v7 de JuanK pedía que
+      // las animaciones de un prop vivieran en la hoja del propio prop en vez de colarse en la de
+      // un personaje. Ese mismo día, tras validarlo con David, cambió el criterio de raíz: **las
+      // animaciones de props se resuelven en el motor** —puertas, shaders, props de interacción—,
+      // así que no se producen en Forge y no deben aparecer en ningún listado de animación.
       //
-      // Va último a propósito. El concept art es su entrada, así que no puede ir antes; y detrás
-      // del 3D el artista ya vio la pieza montada cuando decide pagar los clips.
-      {
-        clave: 'animation_ref', workflow: 'V57_STUDIO_AnimationRef', etiqueta: 'Motion reference',
-        porCadaClip: true,
-        // Y exige saber DE QUÉ PROP. Si no se identifica el sujeto, `clipsDelPersonaje` cae al ADI
-        // y devuelve el set genérico de ocho movimientos —idle, walk, run, jump…— que no son de
-        // este prop y que una puerta no hace. Cada uno es un despacho pago: ocho vídeos de nada.
-        // Le pasa a la hoja `20_PropSheet` sin instanciar, que representa a todos los props y a
-        // ninguno. Con personajes el respaldo del ADI es el comportamiento de siempre y se deja
-        // como está; acá es un error caro y se para.
-        exigeSujeto: true,
-        que:    'One reference video per animation clip of this prop.',
-        porque: 'A prop that moves is animated outside Forge from these clips, the same as a character.',
-        entradas: { image: 'concept_art:concept' },
-      },
+      // Lo que sí quedó de aquello es el filtro de `clipsDeLaTabla`, que ya no deja pasar a la
+      // hoja de un personaje las filas que no son suyas. Con los props fuera del flujo, ese filtro
+      // es justo lo que hace falta y no deja nada sin producir.
     ],
   },
 
@@ -452,11 +438,15 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
         err.code = 'SIN_CLIPS'
         throw err
       }
-      // El sujeto tiene que venir de la tabla del Vertical Slice, no del respaldo del ADI.
+      // El sujeto tiene que venir de la tabla del Vertical Slice, no del respaldo del ADI: sin
+      // saber de quién es la hoja, el respaldo devuelve el set genérico del proyecto y cada uno de
+      // esos movimientos es un despacho pago que no es de esta pieza. Hoy ningún paso lo exige
+      // —lo pedía el de props, que ya no existe—, y se deja porque la trampa sigue ahí para el
+      // próximo paso que se apoye en `porCadaClip`.
       if (paso.exigeSujeto && anim.fuente !== 'vertical_slice') {
         const err = new Error(
-          `This sheet does not say which piece it is, so the clips would be the project's generic set `
-          + `instead of this piece's own. Instance the sheet per item first — one sheet per prop — and run it from there.`)
+          'This sheet does not say which piece it is, so the clips would be the project\'s generic set '
+          + 'instead of this piece\'s own. Instance the sheet per item first and run it from there.')
         err.code = 'SIN_SUJETO'
         throw err
       }

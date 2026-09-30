@@ -224,48 +224,16 @@ function itemsDesdeSpec(md) {
     }
   }
 
-  // ── Los props que solo aparecen en la tabla de animación ─────────────────────────────────────
+  // Los props que solo aparecen en la tabla de animación NO se derivan como hoja.
   //
-  // Punto 2 del informe v7 de JuanK (25-09): un prop que se mueve tiene que animarse en SU hoja,
-  // no colgado de la de un personaje. Para eso necesita ser una hoja, y para ser una hoja tiene
-  // que ser un ítem del alcance.
+  // El 30-09 llegaron a derivarse: el alcance no declara un solo prop en ningún proyecto y sin
+  // embargo el Vertical Slice de v.09 pide animar «Exit Door — Open», así que se les daba hoja
+  // propia para tener dónde animarlos. Ese mismo día JuanK cambió el criterio tras validarlo con
+  // David: **las animaciones de props se resuelven en el motor** y salen del flujo de Forge.
   //
-  // Medido el 30-09 contra los cinco proyectos con alcance: **ninguno declara un solo prop**. Y sin
-  // embargo el Vertical Slice de v.09 pide animar «Exit Door — Open» y «Standard Lever — Activate».
-  // Ese sujeto existe en la tabla de animación y en ningún otro sitio: la clasificación de arriba
-  // mira el roster y el inventario, y ahí no está. Por eso el prop no tenía hoja, y sin hoja no
-  // tenía dónde animarse.
-  //
-  // Se deriva solo cuando la hoja de props está VACÍA. Si el alcance ya nombra props, mandan esos:
-  // añadir los de la tabla duplicaría ítems y renombraría instancias ya generadas y pagadas, que es
-  // exactamente lo que evita la regla de arriba para los personajes.
-  if (!(porHoja['20_PropSheet'] || []).length) {
-    const k = s => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '')
-    const esActor = s => actores.some(a => k(a).length >= 3 && (k(a).includes(k(s)) || k(s).includes(k(a))))
-
-    const L = md.split('\n')
-    let i = L.findIndex(l => /^#{1,4}\s*B\d+\s*[·•.\-–—]?\s*animation\s*$/i.test(l))
-    if (i < 0) i = L.findIndex(l => /^#{1,4}\s*B\d+\b[^\n]*\banimation\b/i.test(l))
-    if (i >= 0) {
-      const j = L.findIndex((l, n) => n > i && /^#{1,4}\s/.test(l))
-      const sujetos = []
-      for (const l of L.slice(i + 1, j < 0 ? L.length : j)) {
-        // Una fila de la tabla: `| 17 | Exit Door — Open (theatrical swing…) | FINAL |`. El sujeto
-        // es lo que va ANTES del guion largo; el movimiento y sus reglas, lo de después.
-        const f = l.match(/^\s*\|[^|]*\|\s*([^|]+?)\s*[—–]\s*[^|]+\|/)
-        const s = f?.[1]?.trim()
-        // Se descartan los encabezados de la tabla y las celdas de relleno.
-        if (!s || s.length < 3 || /^(subject|clip|animation|movement|-+)$/i.test(s)) continue
-        if (esActor(s)) continue
-        if (!sujetos.some(x => k(x) === k(s))) sujetos.push(s)
-      }
-      if (sujetos.length) {
-        avisos.push(`20_PropSheet: derived from the animation table (${sujetos.length}), `
-          + 'because no asset class lists a prop and these have movements to produce')
-        porHoja['20_PropSheet'] = sujetos.map(nombre => ({ nombre, cuenta: 1, de: '§B · Animation' }))
-      }
-    }
-  }
+  // Sin animación que producir, darles hoja sería crear instancias —y despachos pagos— que nadie
+  // pidió. Se quedan fuera, que es lo que él pide: «no deben aparecer en ningún listado». Si
+  // algún día el alcance nombra props de verdad, entran por la clasificación normal de arriba.
 
   return { porHoja, sinClasificar, noSonLaminas, avisos }
 }

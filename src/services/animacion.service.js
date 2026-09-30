@@ -74,13 +74,14 @@ async function filaDelAdi(db, project_id) {
 //     | 13 | Moon Jelly — Idle Pulse (slow rhythmic bell contraction, 60 BPM) | FINAL |
 //     | 17 | Exit Door — Open (theatrical swing, 1.5 s sequential panel opening) | FINAL |
 //
-// El sujeto de cada fila es un personaje O un prop, y **en la hoja de un sujeto solo salen las
-// filas de ESE sujeto**. Es el punto 2 de su informe v7 (25-09), y revierte su decisión del
-// 21-09, que dejaba colarse en la hoja del personaje las filas que no eran de ningún personaje.
+// El sujeto de cada fila es un personaje O un prop, y **en la hoja de un personaje solo salen las
+// filas de ESE personaje**. Es el punto 2 de su informe v7 (25-09), que revierte su decisión del
+// 21-09 de dejar pasar las filas que no eran de ningún personaje.
 //
-// El cambio se pudo hacer porque los props ya tienen dónde animarse: la cadena `prop_sheet` lleva
-// ahora su propio paso `animation_ref`. Antes no lo tenían, y filtrar sin más habría dejado
-// «Exit Door — Open» sin producirse en ningún sitio. Por eso este punto estuvo parado.
+// Los props no se quedan sin sitio: **sus animaciones se resuelven en el motor** —decisión suya
+// del 30-09, validada con David, y aplica a puertas, shaders y props de interacción—. O sea que
+// `Exit Door — Open` no es que se pierda: es que nunca fue de Forge. Por eso este filtro basta y
+// no hizo falta darles hoja propia, que es por donde se intentó primero.
 //
 // Lo que NO puede pasar sigue siendo lo mismo: que salga un `walk` en la medusa.
 //
@@ -180,15 +181,6 @@ function clipsDeLaTabla(vs, personaje, personajes, anclaEsProp = null) {
   const kAncla = norma(personaje)
   const otros = (personajes || []).map(norma).filter(p => p.length >= 3 && p !== kAncla)
 
-  // ¿El sujeto de ESTA hoja es un prop? Desde que los props tienen hoja propia, la pregunta ya no
-  // es por fila —todas son del ancla— sino por el ancla entera, y quien la responde es el ALCANCE,
-  // que separa los ítems de `18_CharacterSheet` de los de `20_PropSheet`.
-  //
-  // No sirve mirar `personajes`: esa lista son las hojas instanciadas, y desde que los props se
-  // instancian también, el prop aparece ahí y se contestaría a sí mismo que no lo es.
-  //
-  // Si el alcance no se puede leer queda `null`, no `false`: el pack leería un `false` inventado
-  // como «esto es un personaje».
 
   const clips = []
 
@@ -333,23 +325,11 @@ async function clipsDelPersonaje({ db, project_id, desde = null, refrescar = fal
       ?? await anclaDelPersonaje({ db, project_id, desde }).then(a => a?.item).catch(() => null)
 
     if (personaje) {
-      // ¿Este sujeto es un prop? Lo dice el alcance, que separa las dos clases de ítem. Si no se
-      // puede leer, viaja `null` y nadie inventa una respuesta.
-      let esProp = null
-      try {
-        const { itemsDelAlcance } = require('./alcance-vs.service')
-        const a = await itemsDelAlcance({ db, project_id })
-        if (a?.hay) {
-          const dice = (hoja) => (a.porHoja?.[hoja] || []).some(it => {
-            const k = norma(it.nombre)
-            return k.length >= 3 && (k.includes(norma(personaje)) || norma(personaje).includes(k))
-          })
-          if (dice('20_PropSheet')) esProp = true
-          else if (dice('18_CharacterSheet')) esProp = false
-        }
-      } catch { /* sin alcance legible: queda null */ }
-
-      const clips = clipsDeLaTabla(vs, personaje, personajes, esProp)
+      // `es_prop` sale siempre `false`: desde que las animaciones de props se resuelven en el motor
+      // (JuanK, 30-09, validado con David), un prop no ancla ninguna hoja de animación, así que
+      // todo lo que llega acá es de un personaje. El campo se conserva porque lo leen el recuadro
+      // de prompts y el pack, y quitarlo obligaría a tocar los dos sin que nadie gane nada.
+      const clips = clipsDeLaTabla(vs, personaje, personajes, false)
       if (clips?.length) {
         const descartados = clips.length > TOPE_CLIPS ? clips.slice(TOPE_CLIPS).map(c => c.nombre) : []
         return {
