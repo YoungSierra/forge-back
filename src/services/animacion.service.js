@@ -74,10 +74,15 @@ async function filaDelAdi(db, project_id) {
 //     | 13 | Moon Jelly — Idle Pulse (slow rhythmic bell contraction, 60 BPM) | FINAL |
 //     | 17 | Exit Door — Open (theatrical swing, 1.5 s sequential panel opening) | FINAL |
 //
-// El sujeto de cada fila es un personaje O un prop. Se quedan las del personaje del ancla **y las
-// que no son de ningún personaje** — también decisión suya: los props se animan, se montan fuera
-// como animaciones de props y sus componentes van en el pack. Lo que NO puede pasar es que salga
-// un `walk` en la medusa, que es su requisito de fondo.
+// El sujeto de cada fila es un personaje O un prop, y **en la hoja de un sujeto solo salen las
+// filas de ESE sujeto**. Es el punto 2 de su informe v7 (25-09), y revierte su decisión del
+// 21-09, que dejaba colarse en la hoja del personaje las filas que no eran de ningún personaje.
+//
+// El cambio se pudo hacer porque los props ya tienen dónde animarse: la cadena `prop_sheet` lleva
+// ahora su propio paso `animation_ref`. Antes no lo tenían, y filtrar sin más habría dejado
+// «Exit Door — Open» sin producirse en ningún sitio. Por eso este punto estuvo parado.
+//
+// Lo que NO puede pasar sigue siendo lo mismo: que salga un `walk` en la medusa.
 //
 // Esto NO llama al modelo: la tabla ya está escrita. El camino viejo del ADI queda como respaldo
 // para los proyectos cuyo Vertical Slice no tenga la sección.
@@ -153,7 +158,7 @@ async function vsSpecDelProyecto(db, project_id) {
  * no usa el Vertical Slice para esto» de «este personaje no tiene animaciones», y solo lo primero
  * justifica caer al ADI.
  */
-function clipsDeLaTabla(vs, personaje, personajes) {
+function clipsDeLaTabla(vs, personaje, personajes, anclaEsProp = null) {
   if (!vs) return null
   const L = vs.split('\n')
   // La sección se busca por NOMBRE, no por número.
@@ -175,6 +180,16 @@ function clipsDeLaTabla(vs, personaje, personajes) {
   const kAncla = norma(personaje)
   const otros = (personajes || []).map(norma).filter(p => p.length >= 3 && p !== kAncla)
 
+  // ¿El sujeto de ESTA hoja es un prop? Desde que los props tienen hoja propia, la pregunta ya no
+  // es por fila —todas son del ancla— sino por el ancla entera, y quien la responde es el ALCANCE,
+  // que separa los ítems de `18_CharacterSheet` de los de `20_PropSheet`.
+  //
+  // No sirve mirar `personajes`: esa lista son las hojas instanciadas, y desde que los props se
+  // instancian también, el prop aparece ahí y se contestaría a sí mismo que no lo es.
+  //
+  // Si el alcance no se puede leer queda `null`, no `false`: el pack leería un `false` inventado
+  // como «esto es un personaje».
+
   const clips = []
 
   // El criterio de a quién pertenece un clip y cómo se nombra, compartido por las dos formas en
@@ -190,19 +205,25 @@ function clipsDeLaTabla(vs, personaje, personajes) {
     // De OTRO personaje: fuera. Es exactamente lo que evita el walk en la medusa.
     const esDeOtro = otros.some(o => s.includes(o) || o.includes(s))
     if (!esDelAncla && esDeOtro) return
-    // Ni del ancla ni de otro personaje ⇒ es un prop, y esos también se animan.
-    if (!esDelAncla && !esDeOtro && kAncla.length < 3) return
+    // Y lo que no es del ancla tampoco entra, aunque no sea de ningún otro personaje: es un prop,
+    // y los props se animan en SU PROPIA hoja desde que `prop_sheet` tiene paso de animación.
+    // Antes se quedaban acá porque no existía ese destino (punto 2 del v7 de JuanK).
+    //
+    // Con el ancla sin identificar (`kAncla` corto) no se devuelve nada: sin saber de quién es la
+    // hoja, soltar la tabla entera es justo lo que producía movimientos ajenos.
+    if (!esDelAncla) return
 
     // El movimiento a veces trae su descripción entre paréntesis: el nombre es lo de fuera, la
     // descripción son las reglas que después definen las poses.
     const m = movimiento.match(/^([^(]+)(?:\((.*)\))?/)
     const etiqueta = (m?.[1] || movimiento).trim()
     const reglas = (m?.[2] || '').trim()
-    // El prop lleva su sujeto DENTRO del nombre: la tabla tiene «Exit Door — Open» y «Standard
-    // Lever — Activate», y con solo el movimiento los dos se llamarían igual de genérico y dos
-    // props con «Activate» colisionarían en una sola clave. El personaje no lo necesita: todos sus
-    // clips son suyos y el nombre del personaje ya va en la ruta del archivo.
-    const nombre = (esDelAncla ? norma(etiqueta) : `${norma(sujetoCrudo)}_${norma(etiqueta)}`).slice(0, 40)
+    // El nombre es solo el movimiento. Antes el prop llevaba su sujeto dentro —«exitdoor_open»—
+    // porque sus filas viajaban en la hoja de un personaje y dos props con «Activate» habrían
+    // colisionado en una sola clave. Ya no: cada sujeto tiene su hoja, todos los clips de esta
+    // son suyos, y quién es va en la ruta del archivo. Es además lo que pide la skill de JuanK,
+    // donde el nombre del `.mp4` ES el nombre del clip.
+    const nombre = norma(etiqueta).slice(0, 40)
     if (!nombre) return
     if (clips.some(c => c.nombre === nombre)) return
 
@@ -212,7 +233,7 @@ function clipsDeLaTabla(vs, personaje, personajes) {
       loop: /idle|loop|pulse/i.test(etiqueta),
       reglas: reglas || movimiento,
       sujeto: sujetoCrudo.trim(),
-      es_prop: !esDelAncla,
+      es_prop: anclaEsProp,
     })
   }
 
@@ -312,7 +333,23 @@ async function clipsDelPersonaje({ db, project_id, desde = null, refrescar = fal
       ?? await anclaDelPersonaje({ db, project_id, desde }).then(a => a?.item).catch(() => null)
 
     if (personaje) {
-      const clips = clipsDeLaTabla(vs, personaje, personajes)
+      // ¿Este sujeto es un prop? Lo dice el alcance, que separa las dos clases de ítem. Si no se
+      // puede leer, viaja `null` y nadie inventa una respuesta.
+      let esProp = null
+      try {
+        const { itemsDelAlcance } = require('./alcance-vs.service')
+        const a = await itemsDelAlcance({ db, project_id })
+        if (a?.hay) {
+          const dice = (hoja) => (a.porHoja?.[hoja] || []).some(it => {
+            const k = norma(it.nombre)
+            return k.length >= 3 && (k.includes(norma(personaje)) || norma(personaje).includes(k))
+          })
+          if (dice('20_PropSheet')) esProp = true
+          else if (dice('18_CharacterSheet')) esProp = false
+        }
+      } catch { /* sin alcance legible: queda null */ }
+
+      const clips = clipsDeLaTabla(vs, personaje, personajes, esProp)
       if (clips?.length) {
         const descartados = clips.length > TOPE_CLIPS ? clips.slice(TOPE_CLIPS).map(c => c.nombre) : []
         return {

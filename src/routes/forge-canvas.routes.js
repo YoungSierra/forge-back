@@ -6504,6 +6504,39 @@ router.put('/assets/:asset_id/montaje/papel', async (req, res, next) => {
   }
 })
 
+// Los elementos que pueden entrar al montaje, cada uno con su imagen 2D, su modelo si ya existe y
+// su check. Es la pantalla que pide el punto 1 del informe v2 de Level Design de JuanK.
+//
+// No cuesta nada y no decide nada: solo lee. Se consulta al abrir la pantalla del pack.
+router.get('/montaje/elementos', async (req, res, next) => {
+  try {
+    const { id: project_id } = req.params
+    const { elementosDelNivel } = require('../services/montaje-nivel.service')
+    res.json({ success: true, ...await elementosDelNivel({ db, project_id }) })
+  } catch (err) { next(err) }
+})
+
+// Marcar o desmarcar un elemento. `incluir: null` borra la decisión y lo devuelve al valor por
+// omisión —que entra—, distinto de marcarlo incluido: una es «nadie lo decidió» y la otra
+// «alguien lo decidió». La marca va sobre la pieza 2D siempre que exista, porque es lo que el
+// paso de 3D lee ANTES de generar, que es el punto 2 del mismo informe.
+router.put('/assets/:asset_id/montaje/incluir', async (req, res, next) => {
+  try {
+    const { id: project_id, asset_id } = req.params
+    const { marcarInclusion } = require('../services/montaje-nivel.service')
+    const v = req.body?.incluir
+    const r = await marcarInclusion({
+      db, project_id, asset_id,
+      incluir: v === null || v === undefined ? null : Boolean(v),
+      member_id: req.body?.member_id || null,
+    })
+    res.json({ success: true, ...r })
+  } catch (err) {
+    if (err.code === 'NO_ASSET') return res.status(404).json({ success: false, error: err.message })
+    next(err)
+  }
+})
+
 // Exporta el PAQUETE del nivel. Si el entorno lo usan varios niveles no elige: contesta
 // `necesita_nivel` con la lista, y quien pulsó decide.
 //

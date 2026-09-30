@@ -231,6 +231,124 @@ async function marcarPapel({ db, project_id, asset_id, papel, member_id = null }
   return { id: asset.id, nombre: asset.name, papel: papel || null }
 }
 
+// ─── Qué entra al montaje, y qué ni siquiera se genera ───────────────────────
+//
+// Puntos 1 y 2 del informe v2 de Level Design de JuanK (30-09). Al montar sobran piezas: las
+// simétricas —basta una y se espeja—, las bases de estructuras que se arman con piezas más
+// pequeñas, y los props que el flujo trató como personajes. Medido contra la base viva: de 30
+// modelos de pinball, la mayoría son `Character Sheet`. Van todos al pack de nivel.
+//
+// La marca vive en la pieza **2D**, no en el modelo, y eso es lo que hace posible su punto 2: la
+// decisión se toma mirando la imagen, ANTES de pagar la generación 3D. Puesta en el modelo solo
+// habría servido para limpiar el pack, con el 3D ya pagado.
+//
+// Por omisión todo entra. Es la regla vieja del exportador —«dejar uno fuera es peor que mandar
+// uno de más»— y sigue siendo la correcta para lo que nadie ha mirado: excluir es un acto
+// deliberado, nunca un descuido de quien no abrió la pantalla.
+const ENTRA_POR_OMISION = true
+
+/** ¿Esta pieza entra al montaje? Lee la marca donde esté: en la propia pieza o en su origen 2D. */
+const entraAlMontaje = asset => asset?.metadata?.montaje?.incluir ?? ENTRA_POR_OMISION
+
+/**
+ * Marca si una pieza entra al montaje. `incluir: null` borra la marca y la devuelve al valor por
+ * omisión, que no es lo mismo que marcarla incluida: una es «nadie lo ha decidido» y la otra
+ * «alguien lo decidió». El pack necesita poder contar las dos cosas.
+ *
+ * Acepta piezas 2D y modelos: se marca lo que el usuario esté mirando. Lo que manda para el 3D es
+ * la marca de la pieza 2D, porque el modelo todavía no existe cuando se decide.
+ */
+async function marcarInclusion({ db, project_id, asset_id, incluir, member_id = null }) {
+  const { data: asset } = await db().from('forge_assets')
+    .select('id, name, format, metadata').eq('id', asset_id).eq('project_id', project_id).maybeSingle()
+  if (!asset) { const e = new Error('Asset not found'); e.code = 'NO_ASSET'; throw e }
+
+  const montaje = { ...(asset.metadata?.montaje || {}) }
+  if (incluir === null) { delete montaje.incluir; delete montaje.decidido_en; delete montaje.decidido_por }
+  else Object.assign(montaje, {
+    incluir: Boolean(incluir), decidido_en: new Date().toISOString(), decidido_por: member_id,
+  })
+
+  const metadata = { ...(asset.metadata || {}), montaje }
+  const { error } = await db().from('forge_assets').update({ metadata }).eq('id', asset_id)
+  if (error) throw error
+  return { id: asset.id, nombre: asset.name, incluir: incluir === null ? null : Boolean(incluir) }
+}
+
+/**
+ * Los elementos del proyecto que pueden entrar a un montaje, cada uno con su imagen 2D y su modelo.
+ *
+ * Es lo que pide su punto 1: «cada elemento se muestra junto a su imagen 2D correspondiente con un
+ * check de inclusión». El par se arma por `derived_from_id` —comprobado contra la base viva: los 54
+ * modelos que existen hoy alcanzan su origen 2D, sin una sola excepción—, así que la pantalla nunca
+ * tiene que enseñar un modelo huérfano del que nadie sepa qué es.
+ *
+ * Entran también las piezas 2D SIN modelo: son precisamente las que todavía se pueden desmarcar a
+ * tiempo de no pagar su 3D, que es el punto 2.
+ */
+async function elementosDelNivel({ db, project_id }) {
+  // Sin `node_key`: esa columna no existe en `forge_assets` —la clave vive en la pieza como
+  // `output_key` y en su sesión—. Pedirla devuelve `data: null` con el error en el otro campo, y
+  // la lista salía vacía sin que nada se quejara. Por eso el error se comprueba, siempre.
+  const { data: todas, error } = await db().from('forge_assets')
+    .select('id, name, format, storage_url, metadata, derived_from_id')
+    .eq('project_id', project_id).not('storage_url', 'is', null)
+  if (error) throw error
+
+  const esModelo = a => /^(glb|model_3d)$/i.test(a.format || '')
+  const esImagen = a => /^(png|jpg|jpeg|webp)$/i.test(a.format || '')
+  const porId = new Map((todas || []).map(a => [a.id, a]))
+
+  const elementos = []
+  const yaUsada = new Set()
+
+  // Primero los que YA tienen modelo: el par imagen→modelo es el que el usuario reconoce.
+  for (const m of (todas || []).filter(esModelo)) {
+    const dosD = m.derived_from_id ? porId.get(m.derived_from_id) : null
+    if (dosD) yaUsada.add(dosD.id)
+    elementos.push({
+      id: dosD?.id ?? m.id,           // se marca sobre la pieza 2D cuando existe
+      nombre: m.name,
+      imagen_url: dosD?.storage_url ?? null,
+      imagen_nombre: dosD?.name ?? null,
+      modelo_id: m.id,
+      modelo_url: m.storage_url,
+      papel: m.metadata?.montaje?.clase ?? null,
+      // La decisión puede estar tomada en cualquiera de los dos. Manda la de la pieza 2D, que es
+      // donde se decide antes de generar; el modelo solo aporta si nadie decidió en la 2D.
+      incluir: dosD?.metadata?.montaje?.incluir ?? m.metadata?.montaje?.incluir ?? null,
+      tiene_3d: true,
+    })
+  }
+
+  // Y las imágenes de pieza que todavía no tienen modelo: las que se pueden dejar sin generar.
+  for (const a of (todas || []).filter(esImagen)) {
+    if (yaUsada.has(a.id)) continue
+    // Solo lo que sale de una cadena de producción de pieza. Una página del Art Style Guide no es
+    // un elemento del nivel, y meterla convertiría la pantalla en la librería entera.
+    if (!/^(Prop|Environment|Character) Sheet\b/i.test(a.name || '')) continue
+    elementos.push({
+      id: a.id,
+      nombre: a.name,
+      imagen_url: a.storage_url,
+      imagen_nombre: a.name,
+      modelo_id: null, modelo_url: null, papel: null,
+      incluir: a.metadata?.montaje?.incluir ?? null,
+      tiene_3d: false,
+    })
+  }
+
+  elementos.sort((a, b) => String(a.nombre).localeCompare(String(b.nombre)))
+  const excluidos = elementos.filter(e => e.incluir === false).length
+  return {
+    elementos,
+    total: elementos.length,
+    excluidos,
+    sin_decidir: elementos.filter(e => e.incluir === null).length,
+    entra_por_omision: ENTRA_POR_OMISION,
+  }
+}
+
 /**
  * De los papeles marcados a la gramática que consume Maps_App.
  *
@@ -659,4 +777,5 @@ module.exports = {
   estadoDeMontaje, estadoDesdeLevelMap, comprobarKit, entornoDe, nivelesDelEntorno, PREFIJO_ENTORNO,
   PAPELES, catalogoDePapeles, marcarPapel, gramaticaDesdePapeles,
   grafoDelNivel, montarNivel,
+  marcarInclusion, elementosDelNivel, entraAlMontaje, ENTRA_POR_OMISION,
 }

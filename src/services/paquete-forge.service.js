@@ -256,7 +256,9 @@ async function armarPaquete({ db, project_id, asset_id, nivel = null, member_id 
   // Todo el proyecto de una vez: el paquete toca ocho carpetas y consultarlas por separado son
   // ocho viajes a la base para armar un archivo que ya tarda por las descargas.
   const { data: piezas } = await db().from('forge_assets')
-    .select('id, name, format, output_key, storage_url, content, metadata, created_at, forge_sessions!session_id(output_key)')
+    // `derived_from_id` viaja porque la decisión de si un modelo entra al pack vive en la pieza 2D
+    // de la que salió, no en el modelo — ver el filtro de los modelos más abajo.
+    .select('id, name, format, output_key, storage_url, content, metadata, derived_from_id, created_at, forge_sessions!session_id(output_key)')
     .eq('project_id', project_id)
   const todas = piezas || []
 
@@ -362,9 +364,30 @@ async function armarPaquete({ db, project_id, asset_id, nivel = null, member_id 
   })
   if (!gddAssembly.disponible) ausentes.push(`GDD Assembly: ${gddAssembly.motivo}`)
 
-  // 5 · Los modelos. TODOS los del proyecto, igual que el montaje: un prop pertenece a su entorno
-  // por decisión de arte, no por su nombre, y dejar uno fuera es peor que mandar uno de más.
-  const modelos = todas.filter(a => /^(glb|model_3d)$/i.test(a.format || '') && a.storage_url)
+  // 5 · Los modelos. Todos los del proyecto —un prop pertenece a su entorno por decisión de arte,
+  // no por su nombre— MENOS los que alguien desmarcó a propósito.
+  //
+  // Punto 1 del informe v2 de Level Design de JuanK (30-09): al montar sobran piezas y no había
+  // forma de excluirlas. Medido contra la base viva: el pack de pinball lleva 30 modelos y la
+  // mayoría son `Character Sheet` — personajes, dentro del pack del nivel.
+  //
+  // La regla de omisión no cambia: lo que nadie ha mirado entra. Excluir es un acto deliberado.
+  // Y se respeta la marca de la pieza 2D de la que salió el modelo, porque ahí es donde se decide
+  // —antes de generar— y sería absurdo no generar el 3D y aun así listarlo en el pack.
+  const { entraAlMontaje } = require('./montaje-nivel.service')
+  const porId = new Map(todas.map(a => [a.id, a]))
+  const fueraDelPack = []
+  const modelos = todas.filter(a => {
+    if (!/^(glb|model_3d)$/i.test(a.format || '') || !a.storage_url) return false
+    const dosD = a.derived_from_id ? porId.get(a.derived_from_id) : null
+    // Manda la marca de la pieza 2D; la del modelo solo decide si en la 2D nadie decidió.
+    const entra = dosD?.metadata?.montaje?.incluir != null ? entraAlMontaje(dosD) : entraAlMontaje(a)
+    if (!entra) fueraDelPack.push(a.name)
+    return entra
+  })
+  if (fueraDelPack.length) {
+    console.log(`[paquete] ${fueraDelPack.length} modelo(s) fuera del pack por decisión del usuario`)
+  }
   const inventario = []
   const binarios = []
   const fallos = []

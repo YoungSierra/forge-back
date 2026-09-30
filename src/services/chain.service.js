@@ -67,6 +67,31 @@ const CADENAS = {
         porque: 'This is the asset the vertical slice actually ships.',
         entradas: { image: 'concept_art:concept' },
       },
+      // Punto 2 del informe v7 de JuanK (25-09): las animaciones de un prop van «únicamente dentro
+      // del Animation Sheet asignado a dicho prop». Hasta hoy ese destino no existía —la cadena
+      // terminaba en el .glb— y sus filas viajaban de polizón en la hoja de algún personaje. Este
+      // paso es el destino; sin él, filtrarlas allá las dejaba sin producirse en ninguna parte.
+      //
+      // Es el MISMO paso que la hoja de personaje, con una diferencia: el ancla. Un personaje
+      // tiene vista frontal de su Character Sheet; un prop no tiene vistas, así que se ancla en su
+      // concept art, igual que hace el paso de 3D justo encima.
+      //
+      // Va último a propósito. El concept art es su entrada, así que no puede ir antes; y detrás
+      // del 3D el artista ya vio la pieza montada cuando decide pagar los clips.
+      {
+        clave: 'animation_ref', workflow: 'V57_STUDIO_AnimationRef', etiqueta: 'Motion reference',
+        porCadaClip: true,
+        // Y exige saber DE QUÉ PROP. Si no se identifica el sujeto, `clipsDelPersonaje` cae al ADI
+        // y devuelve el set genérico de ocho movimientos —idle, walk, run, jump…— que no son de
+        // este prop y que una puerta no hace. Cada uno es un despacho pago: ocho vídeos de nada.
+        // Le pasa a la hoja `20_PropSheet` sin instanciar, que representa a todos los props y a
+        // ninguno. Con personajes el respaldo del ADI es el comportamiento de siempre y se deja
+        // como está; acá es un error caro y se para.
+        exigeSujeto: true,
+        que:    'One reference video per animation clip of this prop.',
+        porque: 'A prop that moves is animated outside Forge from these clips, the same as a character.',
+        entradas: { image: 'concept_art:concept' },
+      },
     ],
   },
 
@@ -415,6 +440,26 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
       const desdeClips = origen.metadata?.instancia?.item || origen.name || null
       anim = await require('./animacion.service').clipsDelPersonaje({ db, project_id, desde: desdeClips })
       instancias = anim.clips.map(c => c.nombre)
+      // Sin clips no hay nada que despachar, y el bucle de abajo daría la vuelta sin hacer nada:
+      // el paso quedaría «terminado» sin producir un solo vídeo. Pasa de verdad en la cadena de
+      // props, donde la mayoría de los props no se mueven —de los del slice, solo dos— y el paso
+      // existe para los que sí. Decirlo es la diferencia entre «este prop no se anima» y «el Run
+      // no hizo nada y no sé por qué».
+      if (!instancias.length) {
+        const err = new Error(
+          `"${anim.personaje || desdeClips}" has no animation clips listed in the Vertical Slice, `
+          + 'so there is nothing to animate. Only the pieces with movements in the animation table run this step.')
+        err.code = 'SIN_CLIPS'
+        throw err
+      }
+      // El sujeto tiene que venir de la tabla del Vertical Slice, no del respaldo del ADI.
+      if (paso.exigeSujeto && anim.fuente !== 'vertical_slice') {
+        const err = new Error(
+          `This sheet does not say which piece it is, so the clips would be the project's generic set `
+          + `instead of this piece's own. Instance the sheet per item first — one sheet per prop — and run it from there.`)
+        err.code = 'SIN_SUJETO'
+        throw err
+      }
       if (anim.fuente === 'vertical_slice') {
         console.log(`[cadena] ${paso.clave}: ${anim.clips.length} clips de «${anim.personaje}» (Vertical Slice · B4)`)
       }
@@ -455,6 +500,37 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
     if (paso.porCadaSalidaDe && rolOrigen && instancias.includes(rolOrigen)) {
       console.log(`[cadena] ${paso.clave}: Run sobre «${rolOrigen}» — se corre solo esa parte, no las ${instancias.length}`)
       instancias = [rolOrigen]
+    }
+
+    // ── Lo desmarcado no se genera ───────────────────────────────────────────
+    //
+    // Punto 2 del informe v2 de Level Design de JuanK (30-09): hoy se produce el 3D de todos los
+    // elementos, incluso de los que después sobran en el montaje —las piezas simétricas, las bases
+    // que se arman con piezas menores, los props que el flujo trató como personajes—. Cada uno de
+    // esos es un despacho pago que nadie usa.
+    //
+    // La decisión se toma sobre la imagen 2D, en la pantalla del pack, y se lee acá: si la pieza de
+    // la que saldría el modelo está desmarcada, ese modelo no se genera. Solo afecta al paso de 3D:
+    // desmarcar no borra nada de lo que ya existe ni impide volver a marcarla y generarlo después,
+    // que es lo que él pide explícitamente.
+    if (paso.clave === '3d' && instancias.length) {
+      const { entraAlMontaje } = require('./montaje-nivel.service')
+      const idDe = cada => (cada != null ? salidasPorPaso[paso.porCadaSalidaDe]?.[cada]?.assetId : null) ?? origen.id
+      const ids = [...new Set(instancias.map(idDe).filter(Boolean))]
+      const { data: piezas } = await db().from('forge_assets').select('id, name, metadata').in('id', ids)
+      const fuera = new Set((piezas || []).filter(a => !entraAlMontaje(a)).map(a => a.id))
+      if (fuera.size) {
+        const antes = instancias.length
+        instancias = instancias.filter(c => !fuera.has(idDe(c)))
+        console.log(`[cadena] ${paso.clave}: ${antes - instancias.length} de ${antes} no se generan — desmarcadas para el montaje`)
+        if (!instancias.length) {
+          const err = new Error(
+            'Every piece this step would model is unchecked for the assembly, so there is nothing to generate. '
+            + 'Check it back in the level package screen if you want its 3D.')
+          err.code = 'TODO_DESMARCADO'
+          throw err
+        }
+      }
     }
 
     // `limitePorCada` corre solo las primeras N partes. Sirve para mirar una antes de
