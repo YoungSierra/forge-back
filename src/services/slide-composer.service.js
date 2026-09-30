@@ -911,6 +911,10 @@ async function composeDeck({ db, projectId, deck = 'asg', fills = null, solo = n
       prompt_node: p.prompt_node,
       prompt_field: campo,
       kind: p.kind || 'image',
+      // Una página SIN prompt por diseño —el Audio Base escribe su caption con un nodo de Claude
+      // dentro del propio grafo—. Viaja al despachador para que no la confunda con una página mal
+      // cableada, que es lo que la ausencia de `prompt_node` significa en todas las demás.
+      sin_prompt: p.sin_prompt === true,
       save_node: p.save_node,
       image_input: p.image_input,
       image_inputs: p.image_inputs,
@@ -1192,11 +1196,25 @@ async function composeDeck({ db, projectId, deck = 'asg', fills = null, solo = n
     }
   })() : null
 
-  return { deck, workflow: cfg.workflow, fuente: cfg.fuente, documento: cfg.documento, paginas: vivas, avisos, fills: medida }
+  // `heredado_de` viaja al despachador: es cómo sabe que el maestro elegido NO es el que nombra la
+  // DNA, y por tanto que el número de páginas declarado allí está desfasado a propósito.
+  return { deck, workflow: cfg.workflow, heredado_de: cfg.heredado_de ?? null,
+    fuente: cfg.fuente, documento: cfg.documento, paginas: vivas, avisos, fills: medida }
+}
+
+// Cuántas páginas le tocan a ESTE proyecto en ESTE deck. No es siempre lo que declara la DNA: con
+// dos maestros conviviendo, un proyecto nuevo trae 31 donde la DNA dice 25. Lo necesita la ruta
+// para decirle al front cuántas esperar — si dice 25 y llegan 31, la barra de avance se da por
+// terminada a mitad. Es una consulta de fechas, no compone nada.
+async function paginasDelMaestro({ db, projectId, deck }) {
+  const base = DECKS[deck]
+  if (!base) return null
+  const cfg = await maestroDelProyecto({ db, projectId, deck, cfg: base })
+  return cfg?.paginas ?? null
 }
 
 module.exports = {
-  composeDeck, parsearIntake, parsearFills, seccionPorNombre,
+  composeDeck, parsearIntake, parsearFills, seccionPorNombre, paginasDelMaestro,
   // `seccionDeOutput` se exporta porque el problema que resuelve no es del compositor: leer una
   // salida dentro del documento de una corrida entera le hace falta a cualquiera que busque algo
   // por `output_key`. El Laboratory es el segundo que lo necesita.

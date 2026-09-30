@@ -729,10 +729,12 @@ async function executeImageOutput({ project_id, node_id, targetOutputKey, member
       const { DECKS } = require('../services/slide-composer.service')
       let paginas = Array.isArray(def.pages) && def.pages.length ? def.pages : null
       let planInst = null
+      let deckDelOutput = null
       try {
         // El deck se deduce del workflow que declara la DNA, igual que hace `generateDeck`.
         const wfName = String(def.image_gen_model || '').split(':').slice(1).join(':')
         const deck = Object.entries(DECKS).find(([, c]) => c.workflow === wfName)?.[0]
+        deckDelOutput = deck || null
         if (deck) {
           const { planDeInstancias } = require('../services/instanciar-hojas.service')
           const p = await planDeInstancias({ db, project_id, deck })
@@ -896,11 +898,26 @@ async function executeImageOutput({ project_id, node_id, targetOutputKey, member
         }
       })
 
+      // Cuántas páginas esperar. El orden importa: si la DNA acota un subconjunto (`def.pages`)
+      // manda ese; si no, el maestro que le toca a ESTE proyecto, que con dos maestros
+      // conviviendo no es el que declara la DNA. El techo de la DNA queda de último recurso.
+      let esperadas = (Array.isArray(def.pages) && def.pages.length) || null
+      if (!esperadas && deckDelOutput) {
+        try {
+          const { paginasDelMaestro } = require('../services/slide-composer.service')
+          esperadas = await paginasDelMaestro({ db, projectId: project_id, deck: deckDelOutput })
+        } catch (e) {
+          // Es solo el número que ve la barra de avance: que falle no puede tumbar el despacho.
+          console.warn('[deck] no se pudo resolver el maestro para el conteo:', e.message)
+        }
+      }
+      if (!esperadas) esperadas = require('../services/image-count').techoDeclarado(def)
+
       // Se responde YA. El trabajo sigue solo y su avance se lee en la sesión.
       return {
         output_key: targetOutputKey, session_id: session.id, asset_id: null,
         dispatched: true,
-        expected: (Array.isArray(def.pages) && def.pages.length) || require('../services/image-count').techoDeclarado(def),
+        expected: esperadas,
       }
     }
   }

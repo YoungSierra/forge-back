@@ -978,10 +978,22 @@ async function generateDeck({
   deck = deck || Object.entries(DECKS).find(([, c]) => c.workflow === wfName)?.[0]
   if (!deck) throw new Error(`No hay deck registrado para el workflow "${wfName}"`)
 
-  const entry = await getWorkflowByName(wfName)
-  if (!entry) throw new Error(`Workflow no registrado: "${wfName}"`)
+  // 1. Poblar. Va ANTES de traer el grafo a propósito: un deck puede tener dos maestros
+  // conviviendo —el ASG de 25 y el de 31— y quien decide cuál le toca a ESTE proyecto es el
+  // compositor, no la DNA. La DNA nombra el maestro viejo para siempre, porque renombrarla
+  // migraría también los proyectos ya generados y pagados.
+  //
+  // Si se traía el grafo por el nombre de la DNA, el compositor componía 31 páginas y el motor
+  // despachaba el grafo de 25: medido, 0 de los 31 `prompt_node` existen en el otro grafo, así
+  // que no se habría escrito ni un prompt y se habrían pagado 25 páginas con el texto de muestra
+  // del autor. Las dos mitades existían y nadie las unía.
+  const armado = await composeDeck({ db, projectId: project_id, deck, fills, solo })
+  const maestro = armado.workflow || wfName
+
+  const entry = await getWorkflowByName(maestro)
+  if (!entry) throw new Error(`Workflow no registrado: "${maestro}"`)
   if (entry.inject_config?.mode !== 'per_page') {
-    throw new Error(`El workflow "${wfName}" no está marcado per_page; no es un deck`)
+    throw new Error(`El workflow "${maestro}" no está marcado per_page; no es un deck`)
   }
 
   // ¿Qué páginas del workflow le tocan a este output? El ASG se parte en 31 de contenido + 3 de
@@ -994,17 +1006,36 @@ async function generateDeck({
   // `26_OnePageSummary`). Adivinar acá cuesta renderizar 34 páginas cuando querías 3.
   // Un deck declara un número exacto de páginas. Si lo declarara como rango no habría un
   // subconjunto que buscar, así que se compara contra el techo: para un entero son el mismo.
+  // Con un maestro heredado la cuenta de la DNA está desfasada por diseño —dice 25 y el maestro
+  // nuevo tiene 31—, así que compararlas haría saltar la guarda en todo proyecto nuevo. Ahí el
+  // número correcto lo garantiza `preflight-decks`, que compara el sucesor de DECKS contra su
+  // propio registro. La guarda sigue viva para el caso normal, que es el que puede equivocarse.
   const techoDeck = require('./image-count').techoDeclarado(outDef)
-  if (!solo && techoDeck && techoDeck !== entry.inject_config.pages.length) {
+  if (!solo && !armado.heredado_de && techoDeck && techoDeck !== entry.inject_config.pages.length) {
     throw new Error(
       `El output "${output_key}" declara ${require('./image-count').textoDeCuenta(outDef)} de las ` +
       `${entry.inject_config.pages.length} páginas del workflow, pero no dice CUÁLES. ` +
       'Hace falta el campo `pages` en la DNA del output.')
   }
 
-  // 1. Poblar: se clona el grafo y se le escribe a cada página su prompt.
-  const armado = await composeDeck({ db, projectId: project_id, deck, fills, solo })
+  // Se clona el grafo del maestro elegido y se le escribe a cada página su prompt.
   let wf = JSON.parse(JSON.stringify(entry.workflow_json))
+  // Ninguna página compuesta puede apuntar a un nodo que no existe en el grafo que se va a
+  // despachar. El bucle de abajo salta en silencio la que no encuentre (`continue`), así que sin
+  // esto un desajuste de maestro se pagaría como páginas en blanco en vez de fallar acá.
+  {
+    // Una página puede no tener prompt LEGÍTIMAMENTE: el Audio Base escribe su caption con un
+    // nodo de Claude dentro del propio grafo, así que no hay campo que rellenar. Eso se declara
+    // (`sin_prompt`), no se adivina por la ausencia del campo — que es justo lo que no distingue
+    // «no lleva» de «se olvidó».
+    const huerfanas = armado.paginas.filter(p => !p.sin_prompt && !wf[p.prompt_node]?.inputs)
+    if (huerfanas.length) {
+      throw new Error(
+        `El deck "${deck}" compuso ${armado.paginas.length} páginas para «${maestro}», pero ` +
+        `${huerfanas.length} apuntan a nodos que ese grafo no tiene ` +
+        `(${huerfanas.slice(0, 3).map(p => p.name).join(', ')}). No se despacha.`)
+    }
+  }
   // `extraPrompt` es lo que el usuario ya le pidió a ESTA página y quiere conservar al rehacerla.
   // Va DESPUÉS del prompt compuesto y anunciado: el prompt de la plantilla es el que garantiza que
   // la página siga siendo la página —mismo layout, mismas cajas, misma tipografía— y anteponerle
@@ -1338,7 +1369,10 @@ ${cola}`
   const jobId = JSON.parse(txt).prompt_id
   // Sin esto el despacho es invisible en la consola: cuatro minutos sin una línea se ven igual
   // que un proceso muerto, y eso llevó a disparar el mismo render tres veces.
-  console.log(`[deck] ${output_key} · ${armado.paginas.length} páginas · job ${jobId} · workflow ${wfName}`)
+  // El nombre que se anuncia es el del maestro DESPACHADO, no el que nombra la DNA: con dos
+  // maestros conviviendo son distintos, y decir el de la DNA mandaría a mirar el grafo que no fue.
+  console.log(`[deck] ${output_key} · ${armado.paginas.length} páginas · job ${jobId} · workflow ${maestro}`
+    + (armado.heredado_de ? ` (sucesor de ${armado.heredado_de})` : ''))
 
   // 2. Poll con descarga PROGRESIVA: cada página se sube apenas llega, así una caída a mitad
   //    de camino no pierde lo ya rendido.
@@ -1440,7 +1474,8 @@ ${cola}`
     logExecution({
       project_id, node_id, session_id,
       triggered_by: member_id || null,
-      trigger_type: 'image_gen', executor_type: 'comfyui', provider: 'comfyui', model: wfName,
+      // El maestro despachado, no el de la DNA: el log es la única prueba de qué grafo se pagó.
+      trigger_type: 'image_gen', executor_type: 'comfyui', provider: 'comfyui', model: maestro,
       is_estimated: true, duration_ms: Date.now() - t0,
       started_at: new Date(t0).toISOString(),
       status: paginas.length === total ? 'success' : 'partial',
