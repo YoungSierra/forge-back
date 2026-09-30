@@ -61,7 +61,12 @@ const DECKS = {
   // con ADI útil también 0/25. test_pinball_migue_v.10, con el 3.9 corrido como nodo entero —22
   // salidas resumidas en un documento sin un solo encabezado §—, 25/25: ahí el deck se habría
   // despachado entero, 25 páginas de plantilla con «UPSTREAM GAP», y se habría cobrado.
-  asg:      { workflow: 'V57_STUDIO_ArtStyleGuide_Template_25',   fuente: '3.9', requerido: true, paginas: 25, documento: 'Art Style Guide' },
+  // `sucesor`: el maestro para proyectos que todavía no generaron ninguna página de este deck.
+  // Los dos conviven por decisión de Miguel (29-09) — ver `maestroDelProyecto`. Las 25 páginas
+  // siguen todas en el de 31; las 6 nuevas son `04_StyleBoundaryTest`, `05_HeroAssetTargets`,
+  // `10_TechnologyRules`, `11_ItemCollectible`, `15_MaterialSurface` y `26_MaterialSurfaceSheet`.
+  asg:      { workflow: 'V57_STUDIO_ArtStyleGuide_Template_25',   fuente: '3.9', requerido: true, paginas: 25, documento: 'Art Style Guide',
+              sucesor: { workflow: 'V57_STUDIO_ArtStyleGuide_Template_31', paginas: 31 } },
   gdd:      { workflow: 'V57_STUDIO_Vertical_Slice_GDD_Template', fuente: '3.8', paginas: 21, documento: 'GDD Art Style' },
   // El Art Bible no se llena desde un documento: cada página recibe su página YA APROBADA del ASG
   // y pinta la obra final de ese tema. Por eso no tiene `fuente` — su insumo es una imagen, no
@@ -88,6 +93,46 @@ const DECKS = {
   // arma desde esta misma entrada (documento, fuente, asset) a propósito: es genérico para que
   // cualquier deck que declare `requerido` lo herede sin escribir un texto nuevo en el motor.
   uiux: { workflow: 'V57_STUDIO_2D_uiux', fuente: '3.7', asset: 'ux_ui_spec', requerido: true, paginas: 8, documento: 'UI Screens' },
+}
+
+/**
+ * El maestro que le toca a un proyecto, cuando el deck tiene dos.
+ *
+ * Miguel rehízo el ASG: de 25 páginas a 31, con 6 nuevas y ninguna menos. Su decisión (29-09) fue
+ * que los dos CONVIVAN — «los proyectos existentes se quedan en el de 25, son tests de QA; el de
+ * 31 es canónico solo para proyectos nuevos»— porque lo ya generado está pagado y no se regenera.
+ *
+ * Hasta ahora eso no se podía: el nombre del workflow es un campo fijo de `DECKS`, así que todos
+ * los proyectos usaban el mismo. Registrar el maestro nuevo no bastaba; había que poder elegirlo.
+ *
+ * **El corte es la fecha en que se registró el maestro nuevo, y el proyecto nace con el que
+ * existía.** Un proyecto creado antes se queda donde está para siempre; uno creado después nace
+ * con el nuevo. No hay migración ni a medias: los números de página se mueven entre los dos —22
+ * de ellos, `08_ColorSystem` pasa a ser `12_ColorSystem`— así que cambiarle el maestro a un
+ * proyecto en marcha le rompería las citas.
+ *
+ * Se probó antes con «si ya generó alguna página» y estaba MAL: dejaba pasar al maestro nuevo a
+ * `13_lives_kitten_TEST` y `SMACK_DEVELOP_TEST`, que son existentes, y Miguel fue explícito —
+ * «los proyectos existentes se quedan en el de 25, son tests de QA, no se migran». Existente no
+ * es lo mismo que sin generar.
+ *
+ * La fecha no se escribe a mano: se lee del propio registro del sucesor. Así no hay número mágico
+ * que envejezca, y el día que llegue un tercer maestro la regla sigue valiendo sola. Medido el
+ * 30-09: 15 proyectos se quedan en el de 25 y 2 nacen con el de 31.
+ */
+async function maestroDelProyecto({ db, projectId, deck, cfg }) {
+  if (!cfg.sucesor || !projectId) return cfg
+
+  const { data: p } = await db().from('projects').select('created_at').eq('id', projectId).maybeSingle()
+  if (!p?.created_at) return cfg
+
+  const { data: nuevo } = await db().from('comfyui_workflows')
+    .select('created_at').eq('name', cfg.sucesor.workflow).maybeSingle()
+  // Sin el sucesor registrado no hay nada que elegir: se sigue con el de siempre.
+  if (!nuevo?.created_at) return cfg
+
+  if (new Date(p.created_at) <= new Date(nuevo.created_at)) return cfg
+  return { ...cfg, ...cfg.sucesor, heredado_de: cfg.workflow }
 }
 
 // ── Mapa etiqueta de página → sección del documento fuente ───────────────────
@@ -703,8 +748,11 @@ function fillDe(fills, etiqueta) {
  * @returns {Promise<{deck, workflow, paginas, avisos}>}
  */
 async function composeDeck({ db, projectId, deck = 'asg', fills = null, solo = null }) {
-  const cfg = DECKS[deck]
-  if (!cfg) throw new Error(`deck desconocido: ${deck}`)
+  const base = DECKS[deck]
+  if (!base) throw new Error(`deck desconocido: ${deck}`)
+
+  // Qué MAESTRO le toca a este proyecto. Dos pueden convivir (ver `sucesor` en DECKS).
+  const cfg = await maestroDelProyecto({ db, projectId, deck, cfg: base })
 
   const { data: wfRow, error: e1 } = await db().from('comfyui_workflows')
     .select('name,workflow_json,inject_config').eq('name', cfg.workflow).single()

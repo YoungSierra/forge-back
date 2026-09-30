@@ -35,6 +35,25 @@ const { techoDeclarado, textoDeCuenta } = require('../src/services/image-count')
       const { data: n } = await db().from('forge_nodes').select('node_key').eq('node_key', c.fuente).maybeSingle()
       if (!n) problemas.push(`DECKS.${k}: el nodo fuente ${c.fuente} no existe`)
     }
+
+    // Y el SUCESOR, cuando el deck tiene dos maestros conviviendo. Sin esto quedaba fuera del
+    // preflight justo el que usan los proyectos nuevos: podía desincronizarse en silencio y no
+    // saltar hasta que alguien creara un proyecto y corriera el deck.
+    if (c.sucesor) {
+      const { data: ws } = await db().from('comfyui_workflows')
+        .select('inject_config,is_active,created_at').eq('name', c.sucesor.workflow).maybeSingle()
+      if (!ws) {
+        problemas.push(`DECKS.${k}.sucesor apunta a «${c.sucesor.workflow}», que no está registrado`)
+        console.log(`  ✗ ${''.padEnd(9)} ${c.sucesor.workflow} — NO registrado (sucesor)`)
+      } else {
+        const cs = typeof ws.inject_config === 'string' ? JSON.parse(ws.inject_config) : ws.inject_config
+        const ps = cs?.pages?.length ?? 0
+        const oks = ps === c.sucesor.paginas
+        if (!oks) problemas.push(`DECKS.${k}.sucesor declara ${c.sucesor.paginas} páginas y «${c.sucesor.workflow}» tiene ${ps}`)
+        console.log(`  ${oks ? '✓' : '✗'} ${''.padEnd(9)} ${c.sucesor.workflow.padEnd(40)} código ${String(c.sucesor.paginas).padStart(2)} · registro ${String(ps).padStart(2)}`
+          + `  ← sucesor, desde ${String(ws.created_at).slice(0, 10)}` + (ws.is_active ? '' : '  ⚠ inactivo'))
+      }
+    }
   }
 
   console.log('\nDNA → DECKS:\n')
