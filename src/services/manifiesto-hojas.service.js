@@ -53,13 +53,20 @@ const sinNumero = s => String(s || '').replace(/^\d+[_\s-]*/, '').toLowerCase().
  * nunca se estime el corte, y dejar fuera lo dudoso sería estimarlo al revés.
  */
 async function itemsDelManifiesto({ db, project_id }) {
-  const { data } = await db().from('forge_assets')
-    .select('id, name, content, created_at')
-    .eq('project_id', project_id).eq('output_key', 'sheet_instance_manifest')
+  // La clave vive en DOS sitios: en la pieza desde la migración 054, y en su sesión desde siempre.
+  // Exigirla solo en la pieza dejaba esto ciego del todo — medido el 30-09 contra la base viva:
+  // CERO piezas la llevan y tres sesiones sí, así que el planificador nunca encontró un manifiesto
+  // y siempre cayó al VS Spec. Lo reportó Pedro; es la misma familia de bug que ya mordió seis
+  // veces, y el mismo arreglo que `b6e8536` le hizo al empaquetador.
+  const { data, error } = await db().from('forge_assets')
+    .select('id, name, content, created_at, output_key, forge_sessions!session_id(output_key)')
+    .eq('project_id', project_id)
     .not('content', 'is', null)
-    .order('created_at', { ascending: false }).limit(1)
+    .order('created_at', { ascending: false })
+  if (error) throw error
 
-  const doc = (data || [])[0]
+  const doc = (data || []).find(a =>
+    (a.output_key ?? a.forge_sessions?.output_key) === 'sheet_instance_manifest')
   if (!doc) return { hay: false, motivo: 'This project has no sheet instance manifest yet', porHoja: {}, avisos: [] }
 
   const bloque = bloqueYaml(doc.content)
@@ -136,6 +143,23 @@ async function itemsDelManifiesto({ db, project_id }) {
       motivo: pendientes.length
         ? `The sheet instance manifest has no instances yet: ${pendientes.join(', ')} are still PENDING_SPEC`
         : 'The sheet instance manifest lists no instances',
+      porHoja: {}, avisos,
+    }
+  }
+
+  // Un manifiesto que nombra sus hojas SOLO con el número —«19», «20»— no se puede usar: las hojas
+  // se resuelven por nombre, precisamente porque el número cambia entre maestros. Lo escribían así
+  // los manifiestos viejos, de antes de que la convención se fijara.
+  //
+  // Se devuelve como «no hay», no como un manifiesto vacío, para que el respaldo del VS Spec entre
+  // solo y quede el aviso de que existe y no se está usando. Sin esto, arreglar la búsqueda del
+  // manifiesto —que llevaba sin encontrar ninguno— hacía que uno viejo tapara al spec y dejara al
+  // proyecto sin plan: se cambiaba un fallo silencioso por otro.
+  const conNombre = Object.keys(porHoja).filter(k => /[a-z]/i.test(k))
+  if (!conNombre.length) {
+    return {
+      hay: false,
+      motivo: `its sheets are named by number only (${Object.keys(porHoja).join(', ')}), and sheets resolve by name`,
       porHoja: {}, avisos,
     }
   }

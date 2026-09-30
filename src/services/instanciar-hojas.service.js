@@ -38,7 +38,11 @@ async function planDeInstancias({ db, project_id, deck = 'asg' }) {
   // Por NOMBRE y no por número. El manifiesto y el lector del alcance hablan del maestro de 25
   // páginas —«19_EnvironmentSheet»— y un proyecto puede correr otro, donde la misma hoja es la
   // 29. Es la trampa que ya rompió la cascada de actualización: el número cambia, el nombre no.
-  const sinNumero = n => String(n || '').replace(/^d+[_s-]*/, '').toLowerCase().replace(/[^a-z0-9]+/g, '')
+  // Las barras invertidas importan: escrito `^d+[_s-]*` no quita el número, quita una «d» literal.
+  // O sea que la regla que este comentario describe no se estaba aplicando, y `19_EnvironmentSheet`
+  // y `29_EnvironmentSheet` NO casaban — justo lo que debía evitar. Lo cazó Pedro (30-09), y desde
+  // que conviven dos maestros de ASG con la misma hoja en distinto número, ya no es teórico.
+  const sinNumero = n => String(n || '').replace(/^\d+[_\s-]*/, '').toLowerCase().replace(/[^a-z0-9]+/g, '')
   const porNombre = new Map(armado.paginas.map(p => [p.nombre, p]))
   for (const p of armado.paginas) {
     const k = sinNumero(p.nombre)
