@@ -253,16 +253,58 @@ const CLAVES_DEL_SPEC = ['vs_spec_doc', 'vs_spec']
  *  El spec sigue de respaldo y no es temporal: un proyecto que no haya vuelto a correr el 3.20
  *  no puede quedarse sin poder instanciar. `fuente` dice de dónde salió la cuenta, porque al
  *  mirar un número que se paga hay que poder saber quién lo dijo. */
+/**
+ * El spec como base y el manifiesto por encima, PÁGINA A PÁGINA.
+ *
+ * `fuente` deja de ser una palabra para todo el resultado y pasa a ser un mapa: qué dijo cada
+ * página y quién lo dijo. Es lo que hay que poder mirar cuando un número no cuadra, porque las dos
+ * fuentes cuentan distinto y saber cuál habló es la mitad de la respuesta.
+ */
+function conManifiesto(r, manifiesto, avisoManifiesto) {
+  const base = { hay: true, ...r, fuente: 'vs_spec', avisos: [...avisoManifiesto, ...(r.avisos || [])] }
+  if (!manifiesto?.hay) return base
+
+  const porHoja = { ...(r.porHoja || {}) }
+  const fuentePorHoja = Object.fromEntries(Object.keys(porHoja).map(h => [h, 'vs_spec']))
+  const tomadas = []
+  for (const [hoja, items] of Object.entries(manifiesto.porHoja || {})) {
+    if (!items?.length) continue          // una hoja que el manifiesto nombra vacía no manda
+    porHoja[hoja] = items
+    fuentePorHoja[hoja] = 'manifest'
+    tomadas.push(hoja)
+  }
+
+  return {
+    ...base,
+    porHoja,
+    fuente: tomadas.length ? 'mixta' : 'vs_spec',
+    fuente_por_hoja: fuentePorHoja,
+    avisos: [
+      ...base.avisos,
+      ...(tomadas.length ? [`sheet instance manifest used for: ${tomadas.join(', ')}`] : []),
+      ...(manifiesto.avisos || []),
+    ],
+  }
+}
+
 async function itemsDelAlcance({ db, project_id }) {
   const { itemsDelManifiesto } = require('./manifiesto-hojas.service')
   const manifiesto = await itemsDelManifiesto({ db, project_id })
-  if (manifiesto.hay) return { ...manifiesto, fuente: 'manifest' }
 
-  // Que el manifiesto exista PERO no sirva no se calla: si alguien lo produjo y no se está
-  // usando, hay que poder verlo sin abrir la base.
+  // UNA FUENTE POR PÁGINA, no una fuente para todo el deck.
+  //
+  // El manifiesto manda en las páginas que declara, y el spec cubre el resto. Tomarlo entero era
+  // todo-o-nada y se comió cinco hojas: medido en pinball el 01-10, su manifiesto solo especifica
+  // Environment y Prop —deja Character, UI, VFX, Audio y Animation en PENDING_SPEC— y al usarlo
+  // para el deck completo el plan pasaba de 6 hojas y 20 ítems a 2 hojas y 14. Desaparecían
+  // ocho personajes y seis animaciones sin que nada lo dijera. Lo vio venir Pedro.
+  //
+  // El manifiesto NO se descarta por eso: donde declara instancias es más preciso que el spec,
+  // porque lo escribió el nodo que de verdad las produjo. Lo que no puede es hablar por las
+  // páginas sobre las que calla.
   const avisoManifiesto = /has no sheet instance manifest/.test(manifiesto.motivo || '')
     ? []
-    : [`sheet instance manifest not used — ${manifiesto.motivo}`]
+    : manifiesto.hay ? [] : [`sheet instance manifest not used — ${manifiesto.motivo}`]
 
   const { data: ses } = await db().from('forge_sessions').select('id, output_key, status')
     .eq('project_id', project_id).in('output_key', CLAVES_DEL_SPEC)
@@ -315,7 +357,7 @@ async function itemsDelAlcance({ db, project_id }) {
         porHoja: {}, sinClasificar: r.sinClasificar || [], avisos: [...avisoManifiesto, ...(r.avisos || [])],
       }
     }
-    return { hay: true, ...r, fuente: 'vs_spec', avisos: [...avisoManifiesto, ...(r.avisos || [])] }
+    return conManifiesto(r, manifiesto, avisoManifiesto)
   }
   const { data: docs } = await db().from('forge_assets').select('content, session_id, created_at')
     .in('session_id', orden.map(x => x.id)).not('content', 'is', null)
@@ -339,7 +381,7 @@ async function itemsDelAlcance({ db, project_id }) {
       porHoja: {}, sinClasificar: r.sinClasificar || [], avisos: [...avisoManifiesto, ...(r.avisos || [])],
     }
   }
-  return { hay: true, ...r, fuente: 'vs_spec', avisos: [...avisoManifiesto, ...(r.avisos || [])] }
+  return conManifiesto(r, manifiesto, avisoManifiesto)
 }
 
 module.exports = { itemsDelAlcance, itemsDesdeSpec, A_LA_HOJA, seccion, filasDeTabla }
