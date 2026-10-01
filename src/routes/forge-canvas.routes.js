@@ -5902,8 +5902,11 @@ router.get('/assets/:asset_id/next-step', async (req, res, next) => {
       .eq('id', asset_id).eq('project_id', project_id).single()
     if (!asset) return res.status(404).json({ success: false, error: 'Asset not found' })
 
-    const { proximoPaso, etiquetasDeCadenas } = require('../services/chain.service')
-    const paso = proximoPaso(asset)
+    const { proximoPaso, etiquetasDeCadenas, workflowDelProyecto } = require('../services/chain.service')
+    // El recuadro tiene que nombrar el workflow que se va a despachar DE VERDAD. Con dos versiones
+    // conviviendo —Tripo P1 y P2— el del paso y el del proyecto pueden ser distintos, y anunciar el
+    // que no es manda a mirar el grafo equivocado cuando algo sale raro.
+    const paso = await workflowDelProyecto({ db, project_id, paso: proximoPaso(asset) })
 
     // Cuántos despachos son. Un paso normal es uno; uno que corre por cada salida del anterior son
     // tantos como partes haya producido — veinte, en el escenario. El recuadro tiene que poder

@@ -27,8 +27,23 @@ const KEY  = () => process.env.COMFYUI_API_KEY
 
 // Lo que el informe pide exponer, y nada más. La lista es corta a propósito: `face_limit`,
 // `orientation` o `texture_alignment` también son editables y nadie los pidió.
+// Ampliada el 01-10 a pedido de Migue: «mapeen el schema completo del nodo a ese cuadro, sin
+// recortar». Antes decía aquí que la lista era corta a propósito porque nadie había pedido el
+// resto; ahora lo pidió.
+//
+// Dos cosas que NO entran, y conviene que esté dicho para que nadie las añada creyendo que faltan:
+//   · `model_seed` y `texture_seed` — la semilla la inyecta el motor en cada corrida
+//     (`inject_config.seed`), así que ofrecerlas sería dar un control que el sistema pisa.
+//   · los cables. Se filtran por TIPO más abajo, no por nombre.
+//
+// `texture` es de la serie P de Tripo y absorbe a los dos de P1: `output_mode` (Geometry only /
+// Textured) y `texture_quality`. Los tres conviven en la lista porque los workflows de P1 siguen
+// vivos; cada grafo expone solo los que de verdad tiene.
 const EXPUESTAS = new Set([
-  'output_mode', 'pbr', 'texture_quality',   // 3D (Tripo)
+  'output_mode', 'pbr', 'texture_quality',   // 3D — Tripo P1
+  'texture', 'quad',                         // 3D — Tripo serie P
+  'face_limit', 'texture_alignment', 'orientation',
+  'enable_image_autofix', 'auto_size', 'export_uv', 'compress_geometry',
   'quality', 'model', 'size',                // imagen
   'custom_width', 'custom_height',           // resolución, cuando `size` = Custom
 ])
@@ -44,7 +59,10 @@ const ENCARECE = {
   quality:         v => v === 'medium' || v === 'high',
   output_mode:     v => v === 'Textured',
   pbr:             v => v === true,
-  texture_quality: v => v === 'detailed',
+  texture_quality: v => v === 'detailed' || v === 'extreme',
+  // En la serie P, `texture` es el desplegable que reemplaza a los dos de arriba: `none` devuelve
+  // malla pelada y no encarece; `standard` es 2K, `detailed` 4K y `extreme` 8K.
+  texture:         v => v === 'detailed' || v === 'extreme',
   size:            v => typeof v === 'string' && /2048|3840|2160/.test(v),
 }
 

@@ -45,6 +45,11 @@ const CADENAS = {
       },
       {
         clave: '3d', workflow: 'V57_STUDIO_3D_Production_Characters', etiqueta: '3D production',
+        // Tripo serie P (P2) convive con P1: ver `workflowDelProyecto`. Un .glb de P2 no casa
+        // con uno de P1, así que lo ya generado se queda donde está y solo los proyectos
+        // posteriores al registro del sucesor nacen con él. Mientras el sucesor esté INACTIVO
+        // no lo elige nadie — se activa cuando su corrida de prueba haya salido bien.
+        sucesor: { workflow: 'V57_STUDIO_3D_Production_Characters_P2' },
         que:    'One textured .glb model, to the right of the views.',
         porque: 'This is the asset the vertical slice actually ships.',
         entradas: { image: 'concept_art:front', image_left: 'concept_art:left', image_back: 'concept_art:back' },
@@ -63,6 +68,11 @@ const CADENAS = {
       },
       {
         clave: '3d', workflow: 'V57_STUDIO_3D_Production_Props', etiqueta: '3D production',
+        // Tripo serie P (P2) convive con P1: ver `workflowDelProyecto`. Un .glb de P2 no casa
+        // con uno de P1, así que lo ya generado se queda donde está y solo los proyectos
+        // posteriores al registro del sucesor nacen con él. Mientras el sucesor esté INACTIVO
+        // no lo elige nadie — se activa cuando su corrida de prueba haya salido bien.
+        sucesor: { workflow: 'V57_STUDIO_3D_Production_Props_P2' },
         que:    'One .glb model of the prop.',
         porque: 'This is the asset the vertical slice actually ships.',
         entradas: { image: 'concept_art:concept' },
@@ -202,6 +212,11 @@ const CADENAS = {
       },
       {
         clave: '3d', workflow: 'V57_STUDIO_3D_Production_Environment', etiqueta: '3D production',
+        // Tripo serie P (P2) convive con P1: ver `workflowDelProyecto`. Un .glb de P2 no casa
+        // con uno de P1, así que lo ya generado se queda donde está y solo los proyectos
+        // posteriores al registro del sucesor nacen con él. Mientras el sucesor esté INACTIVO
+        // no lo elige nadie — se activa cuando su corrida de prueba haya salido bien.
+        sucesor: { workflow: 'V57_STUDIO_3D_Production_Environment_P2' },
         que:    'One .glb per part: twenty models, each to the right of its own part.',
         porque: 'These are the pieces the scene is assembled from.',
         // El workflow del 3D toma UNA imagen y devuelve UN modelo, así que corre una vez por
@@ -275,6 +290,36 @@ function pasoDe(asset) {
   const def = CADENAS[c.nombre]
   const i = def ? def.pasos.findIndex(p => p.clave === c.paso) : -1
   return i === -1 ? 0 : i + 1
+}
+
+// ─── Dos versiones de un workflow conviviendo ────────────────────────────────
+//
+// Un proveedor saca un modelo nuevo y ComfyUI lo publica como un NODO distinto —Tripo P1 y la
+// serie P son clases separadas—, así que actualizar no es parchear: es otro workflow. Y el
+// resultado cambia: un `.glb` de P2 no casa con uno de P1.
+//
+// Por eso no se pisa el workflow viejo. Se registra el nuevo con su propio nombre, el paso lo
+// declara como `sucesor`, y cuál le toca a cada proyecto lo decide la MISMA regla que los maestros
+// del ASG: la fecha. Un proyecto anterior al registro del sucesor se queda donde estaba —lo que ya
+// generó y pagó sigue casando—; uno posterior nace con el nuevo.
+//
+// Dos guardas, y las dos importan:
+//   · sin el sucesor registrado no hay nada que elegir, y se sigue con el de siempre;
+//   · el sucesor tiene que estar ACTIVO. Es el interruptor para registrarlo y revisarlo antes de
+//     que empiece a correr solo — ComfyUI no valida un grafo sin ejecutarlo, así que entre
+//     registrar y confiar hay una corrida pagada de por medio.
+async function workflowDelProyecto({ db, project_id, paso }) {
+  if (!paso?.sucesor || !project_id) return paso
+
+  const { data: p } = await db().from('projects').select('created_at').eq('id', project_id).maybeSingle()
+  if (!p?.created_at) return paso
+
+  const { data: nuevo } = await db().from('comfyui_workflows')
+    .select('created_at, is_active').eq('name', paso.sucesor.workflow).maybeSingle()
+  if (!nuevo?.created_at || !nuevo.is_active) return paso
+
+  if (new Date(p.created_at) <= new Date(nuevo.created_at)) return paso
+  return { ...paso, ...paso.sucesor, heredado_de: paso.workflow }
 }
 
 // Lo que el recuadro previo del §8 tiene que poder decir ANTES de gastar: qué se genera y por qué.
@@ -393,10 +438,14 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
   for (let k = 0; k < pasos; k++) {
     const i = pasoDe(anterior)
     if (i >= def.pasos.length) break
-    const paso = def.pasos[i]
+    const pasoBase = def.pasos[i]
+    // Un paso puede tener dos versiones de su workflow conviviendo —Tripo P1 y P2, por ejemplo—.
+    // Cuál le toca a ESTE proyecto lo decide la fecha, igual que los maestros del ASG.
+    const paso = await workflowDelProyecto({ db, project_id, paso: pasoBase })
 
     const entry = await getWorkflowByName(paso.workflow)
     if (!entry) throw new Error(`Workflow "${paso.workflow}" is not registered`)
+    if (paso.heredado_de) console.log(`[cadena] ${paso.clave}: ${paso.workflow} (sucesor de ${paso.heredado_de})`)
     const roles = entry.inject_config?.salidas || null
 
     // Un paso normal despacha UNA vez. Uno marcado `porCadaSalidaDe` despacha una vez por cada
@@ -865,4 +914,4 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
   return { cadena: nombreCadena, creados }
 }
 
-module.exports = { CADENAS, cadenaDe, pasoDe, proximoPaso, avanzar, etiquetasDeCadenas }
+module.exports = { CADENAS, cadenaDe, pasoDe, proximoPaso, avanzar, etiquetasDeCadenas, workflowDelProyecto }
