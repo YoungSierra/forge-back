@@ -6438,7 +6438,10 @@ router.post('/laboratory/abrir', async (req, res, next) => {
     // el tercero un servicio que se está levantando. `LAB_DORMIDO` faltaba, así que un laboratorio
     // arrancando salía como «Internal server error» y había que ir a encenderlo a mano por su
     // enlace directo. El servicio ya redactaba el mensaje útil; la ruta no lo dejaba pasar.
-    if (err.code === 'SIN_TDD' || err.code === 'SIN_LAB' || err.code === 'LAB_DORMIDO') {
+    // `LAB_ERROR` faltaba, y era el que de verdad llegaba: un push rechazado por un Laboratory a
+    // medio arrancar caía en `next(err)` y el navegador recibía «Internal server error» con la
+    // causa escondida. El servicio ya redacta el mensaje útil; la ruta tiene que dejarlo pasar.
+    if (['SIN_TDD', 'SIN_LAB', 'LAB_DORMIDO', 'LAB_ERROR'].includes(err.code)) {
       return res.status(400).json({ success: false, error: err.message, code: err.code })
     }
     next(err)

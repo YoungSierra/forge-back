@@ -205,31 +205,56 @@ async function estadoDelLaboratorio({ db, project_id }) {
  * No devuelve el resultado a propósito: lo único que hace falta es que el proceso de allá
  * arranque. Quien de verdad necesite saber si hay build, lo pregunta con `estadoDelLaboratorio`.
  */
+// Lo que contesta el PROXY de Render cuando el servicio de atrás no está escuchando todavía.
+//
+// Esto es lo que rompía el despertador. Un servicio dormido no tarda en responder: su proxy
+// contesta 502 al INSTANTE. El código leía «me contestó algo» como «está en pie», seguía adelante
+// y empujaba el TDD a un proceso que aún arrancaba. Ese push fallaba con un Error sin código, la
+// ruta no lo reconocía y al navegador llegaba un 500 genérico — el «Internal server error» que
+// David reportó tres veces. La rama de LAB_DORMIDO, que existe justo para esto, no se alcanzaba
+// nunca. Y al pulsar de nuevo un rato después funcionaba, porque aquel 502 había encendido el
+// servicio.
+const ARRANCANDO = new Set([502, 503, 504])
+
 /**
- * Preguntar por el laboratorio hasta que conteste, o rendirse.
+ * Preguntar por el laboratorio hasta que conteste de verdad, o rendirse diciéndolo.
  *
- * Preguntar ES despertarlo: la misma petición que informa del estado levanta el proceso. Por eso
- * se insiste en vez de fallar a la primera — la primera siempre la pierde un servicio dormido.
+ * Preguntar ES despertarlo: la misma petición que informa del estado levanta el proceso. Por eso se
+ * insiste en vez de fallar a la primera — la primera siempre la pierde un servicio dormido.
  *
- * Tres intentos de 10 s cubren los ~22 s que tarda en arrancar y se quedan lejos del corte de
- * Render. Contesta al primer OK: con el servicio despierto son 0,3 s y no se nota.
+ * Se trabaja contra un PLAZO y no contra un número de intentos. Un intento corto que se corta a los
+ * 10 s puede estar abandonando una petición que habría contestado a los 12, y el arranque no dura
+ * siempre lo mismo: el Laboratory tarda ~22 s, pero Render avisa de que puede irse a 50 o más.
+ * Setenta segundos cubren el caso malo y dejan sitio para el push, que con el servicio ya despierto
+ * son dos segundos.
  */
-async function esperarAlLaboratorio(base, intentos = 3, esperaMs = 10000) {
-  for (let i = 1; i <= intentos; i++) {
-    const t0 = Date.now()
+async function esperarAlLaboratorio(base, plazoMs = 70000, porIntentoMs = 25000) {
+  const t0 = Date.now()
+  let intento = 0
+  while (Date.now() - t0 < plazoMs) {
+    intento++
+    const ti = Date.now()
     try {
-      const r = await fetch(`${base}/api/gameplay/status`, { signal: AbortSignal.timeout(esperaMs) })
+      const r = await fetch(`${base}/api/gameplay/status`, { signal: AbortSignal.timeout(porIntentoMs) })
       if (r.ok) {
-        if (i > 1) console.log(`[lab] despertó en el intento ${i} (${Math.round((Date.now() - t0) / 1000)}s)`)
+        if (intento > 1) console.log(`[lab] despertó en el intento ${intento}, a los ${Math.round((Date.now() - t0) / 1000)}s`)
         return true
       }
-      // Contestó algo que no es OK: está en pie y el push dirá qué pasa. No es un arranque.
-      console.warn(`[lab] responde HTTP ${r.status} — se sigue igual`)
+      if (ARRANCANDO.has(r.status)) {
+        console.warn(`[lab] intento ${intento}: HTTP ${r.status} — el proxy dice que todavía arranca`)
+        // El 502 vuelve al instante, así que sin esta pausa se gastaría el plazo en cientos de
+        // intentos inútiles contra un servicio que necesita segundos para levantarse.
+        await new Promise(r2 => setTimeout(r2, 3000))
+        continue
+      }
+      // Cualquier otro código SÍ es el Laboratory contestando: está en pie y el push dirá qué pasa.
+      console.warn(`[lab] responde HTTP ${r.status} — está en pie, se sigue`)
       return true
     } catch (e) {
-      console.warn(`[lab] intento ${i}/${intentos} sin respuesta (${e.name}) tras ${Math.round((Date.now() - t0) / 1000)}s`)
+      console.warn(`[lab] intento ${intento} sin respuesta (${e.name}) tras ${Math.round((Date.now() - ti) / 1000)}s`)
     }
   }
+  console.warn(`[lab] no despertó en ${Math.round(plazoMs / 1000)}s`)
   return false
 }
 
@@ -319,10 +344,28 @@ async function abrirLaboratorio({ db, project_id, nombreProyecto }) {
     throw err
   }
   const cuerpo = await r.text()
-  if (!r.ok) throw new Error(`The Laboratory refused the TDD (${r.status}): ${cuerpo.slice(0, 200)}`)
+  if (!r.ok) {
+    // Un fallo del push TIENE que llegar con código. Sin él la ruta no lo reconoce y manda un 500
+    // genérico: es el «Internal server error» que veía David, con la causa real —un 502 de un
+    // servicio que arrancaba— escondida detrás de un mensaje que no dice nada.
+    const err = new Error(ARRANCANDO.has(r.status)
+      ? 'The Laboratory was still starting when the TDD was pushed. It takes about 22 seconds to '
+        + 'wake up: try again in a moment.'
+      : `The Laboratory refused the TDD (${r.status}): ${cuerpo.slice(0, 200)}`)
+    err.code = ARRANCANDO.has(r.status) ? 'LAB_DORMIDO' : 'LAB_ERROR'
+    throw err
+  }
 
   let res
-  try { res = JSON.parse(cuerpo) } catch { throw new Error('The Laboratory did not answer with JSON') }
+  try {
+    res = JSON.parse(cuerpo)
+  } catch {
+    // Lo mismo: una respuesta que no es JSON suele ser la página de error del proxy, no del
+    // Laboratory. Con código, para que el usuario lea algo que le sirva.
+    const err = new Error('The Laboratory did not answer with JSON — it may still be starting. Try again in a moment.')
+    err.code = 'LAB_ERROR'
+    throw err
+  }
 
   return {
     url: `${base}/?tdd=${encodeURIComponent(res.slug)}`,
