@@ -45,6 +45,48 @@ const norm = s => String(s || '')
   .replace(/[^a-z0-9]+/g, ' ')
   .trim()
 
+/**
+ * El texto del level_map de un proyecto, lo haya producido el nodo salida por salida o entero.
+ *
+ * Exigir `output_key = 'level_map'` dejaba ciego al caso del NODO ENTERO, que no escribe clave en
+ * ninguna parte: en `test_pinball_migue_v.10` el documento existe —50.048 caracteres, 96 líneas de
+ * tabla y su columna `Environment`— y se llama «Level Design — Output», así que el montaje decía
+ * que el 3.5 no había producido nada con el documento delante. Lo reportó JuanK el 01-10, y es la
+ * misma familia de bug que ya mordió con el manifiesto de hojas y con el empaquetador.
+ *
+ * Tres vías, en orden de preferencia, y la primera que dé texto gana:
+ *   1 · la clave en la sesión — como hasta ahora;
+ *   2 · la clave en la propia pieza, que es donde vive desde la migración 054;
+ *   3 · cualquier documento del 3.5, para el modo nodo entero.
+ *
+ * La vía 3 no afloja la comprobación: la tabla se sigue reconociendo por su columna `Environment`,
+ * así que un documento que no la traiga no aporta ningún nivel. Se lee más texto, no peores datos.
+ */
+async function textoDelLevelMap(db, project_id) {
+  const { data: ses } = await db().from('forge_sessions')
+    .select('id').eq('project_id', project_id).eq('output_key', 'level_map')
+  if ((ses || []).length) {
+    const { data: docs } = await db().from('forge_assets')
+      .select('content').in('session_id', ses.map(s => s.id)).not('content', 'is', null)
+    const md = (docs || []).map(d => d.content).join('\n\n')
+    if (md.trim()) return { md, de: 'sesión con clave' }
+  }
+
+  const { data: porPieza } = await db().from('forge_assets')
+    .select('content').eq('project_id', project_id).eq('output_key', 'level_map').not('content', 'is', null)
+  if ((porPieza || []).length) {
+    const md = porPieza.map(d => d.content).join('\n\n')
+    if (md.trim()) return { md, de: 'clave en la pieza' }
+  }
+
+  const { data: n } = await db().from('forge_nodes').select('id').eq('node_key', '3.5').maybeSingle()
+  if (!n) return { md: '', de: null }
+  const { data: todos } = await db().from('forge_assets')
+    .select('content, name').eq('project_id', project_id).eq('node_id', n.id).not('content', 'is', null)
+  const md = (todos || []).map(d => d.content).join('\n\n')
+  return md.trim() ? { md, de: 'documento del 3.5 (nodo entero)' } : { md: '', de: null }
+}
+
 /** El entorno que retrata esta pieza, o `null` si no es una hoja de entorno. */
 function entornoDe(asset) {
   const n = String(asset?.name || '')
@@ -123,17 +165,14 @@ async function estadoDeMontaje({ db, project_id, asset_id }) {
 
   const faltantes = []
 
-  // 1 · El level_map, que es quien dice qué nivel usa este entorno.
-  const { data: sesLM } = await db().from('forge_sessions')
-    .select('id').eq('project_id', project_id).eq('output_key', 'level_map')
+  // 1 · El level_map, que es quien dice qué nivel usa este entorno. Se busca por las tres vías
+  // —ver `textoDelLevelMap`—, porque el nodo puede haber corrido entero y entonces no hay clave.
+  const { md, de } = await textoDelLevelMap(db, project_id)
   let niveles = []
-  let hayLevelMap = false
-  if ((sesLM || []).length) {
-    const { data: docs } = await db().from('forge_assets')
-      .select('content').in('session_id', sesLM.map(s => s.id)).not('content', 'is', null)
-    const md = (docs || []).map(d => d.content).join('\n\n')
-    hayLevelMap = Boolean(md.trim())
-    if (hayLevelMap) niveles = nivelesDelEntorno(md, entorno)
+  const hayLevelMap = Boolean(md.trim())
+  if (hayLevelMap) {
+    niveles = nivelesDelEntorno(md, entorno)
+    if (de !== 'sesión con clave') console.log(`[montaje] level_map leído de: ${de}`)
   }
   if (!hayLevelMap) {
     faltantes.push({ que: 'level_map', dice: 'Level Design (node 3.5) has not produced its level map yet' })
@@ -405,12 +444,11 @@ async function estadoDesdeLevelMap({ db, project_id }) {
   const faltantes = []
   const niveles = []
 
-  const { data: ses } = await db().from('forge_sessions')
-    .select('id').eq('project_id', project_id).eq('output_key', 'level_map')
-  if ((ses || []).length) {
-    const { data: docs } = await db().from('forge_assets')
-      .select('content').in('session_id', ses.map(s => s.id)).not('content', 'is', null)
-    const md = (docs || []).map(d => d.content).join('\n\n')
+  // Las tres vías, igual que el disparador: la clave puede estar en la sesión, en la pieza, o en
+  // ningún sitio si el nodo corrió entero.
+  const { md, de } = await textoDelLevelMap(db, project_id)
+  if (md.trim()) {
+    if (de !== 'sesión con clave') console.log(`[montaje] level_map leído de: ${de}`)
     // La tabla de niveles se reconoce por su columna `Environment`, igual que hace el disparador.
     // Leer cualquier fila con barras se tragaba las OTRAS tablas del documento: en el proyecto de
     // prueba salieron «Intent», «Teach», «Life range» y «1–4» ofrecidos como niveles.
