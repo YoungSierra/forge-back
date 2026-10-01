@@ -216,6 +216,17 @@ async function estadoDelLaboratorio({ db, project_id }) {
 // servicio.
 const ARRANCANDO = new Set([502, 503, 504])
 
+// Y el 429 es la plataforma pidiendo que bajemos el ritmo.
+//
+// Lo provocó el propio arreglo: al dejar de creerse el 502, el bucle empezó a reintentar cada tres
+// segundos: unas veintitrés peticiones seguidas en setenta segundos. Render las limita, y la que
+// pagaba el límite era el push —«The Laboratory refused the TDD (429)»—, que va después de todas
+// ellas. Insistir más rápido no despierta antes a nadie; solo gasta el cupo de quien va detrás.
+const FRENANDO = 429
+
+/** Espera creciente: 2, 4, 8, 12 y de ahí 15 s. Ocho intentos en 70 s en vez de veintitrés. */
+const esperaDelIntento = n => Math.min(2000 * 2 ** (n - 1), 15000)
+
 /**
  * Preguntar por el laboratorio hasta que conteste de verdad, o rendirse diciéndolo.
  *
@@ -240,11 +251,13 @@ async function esperarAlLaboratorio(base, plazoMs = 70000, porIntentoMs = 25000)
         if (intento > 1) console.log(`[lab] despertó en el intento ${intento}, a los ${Math.round((Date.now() - t0) / 1000)}s`)
         return true
       }
-      if (ARRANCANDO.has(r.status)) {
-        console.warn(`[lab] intento ${intento}: HTTP ${r.status} — el proxy dice que todavía arranca`)
-        // El 502 vuelve al instante, así que sin esta pausa se gastaría el plazo en cientos de
-        // intentos inútiles contra un servicio que necesita segundos para levantarse.
-        await new Promise(r2 => setTimeout(r2, 3000))
+      if (ARRANCANDO.has(r.status) || r.status === FRENANDO) {
+        const pausa = r.status === FRENANDO ? Math.max(esperaDelIntento(intento), 8000) : esperaDelIntento(intento)
+        console.warn(`[lab] intento ${intento}: HTTP ${r.status} — ${r.status === FRENANDO
+          ? 'la plataforma pide bajar el ritmo' : 'todavía arranca'}; se espera ${pausa / 1000}s`)
+        // Sin pausa se gastaría el plazo en cientos de intentos inútiles: el 502 vuelve al
+        // instante. Y creciente, para no ser nosotros quienes provoquemos el 429.
+        await new Promise(r2 => setTimeout(r2, pausa))
         continue
       }
       // Cualquier otro código SÍ es el Laboratory contestando: está en pie y el push dirá qué pasa.
@@ -328,20 +341,30 @@ async function abrirLaboratorio({ db, project_id, nombreProyecto }) {
   // Con timeout: sin él, un laboratorio a medio levantar deja la petición colgada hasta que Render
   // corta el request, y entonces lo que llega al navegador es un 502 sin explicación. Un minuto es
   // de sobra — el TDD son ~112.000 caracteres y el push tarda unos 2 s con el servicio en pie.
+  // El push es quien paga el cupo: va DESPUÉS de todas las llamadas del despertador, así que si la
+  // plataforma está frenando, el 429 le toca a él. Por eso reintenta —dos veces, espaciadas— en vez
+  // de rendirse: el TDD ya está compuesto y el servicio ya está en pie; lo único que falta es que
+  // nos dejen hablar.
   let r
-  try {
-    r = await fetch(`${base}/api/tdds/push`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ slug, text: texto }),
-      signal: AbortSignal.timeout(60000),
-    })
-  } catch (e) {
-    const err = new Error(e.name === 'TimeoutError'
-      ? 'The Laboratory took too long to accept the TDD. It may still be starting: try again in a moment.'
-      : `The Laboratory could not be reached: ${e.message}`)
-    err.code = 'LAB_DORMIDO'
-    throw err
+  for (let intento = 1; intento <= 3; intento++) {
+    try {
+      r = await fetch(`${base}/api/tdds/push`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ slug, text: texto }),
+        signal: AbortSignal.timeout(60000),
+      })
+    } catch (e) {
+      const err = new Error(e.name === 'TimeoutError'
+        ? 'The Laboratory took too long to accept the TDD. It may still be starting: try again in a moment.'
+        : `The Laboratory could not be reached: ${e.message}`)
+      err.code = 'LAB_DORMIDO'
+      throw err
+    }
+    if (r.status !== FRENANDO || intento === 3) break
+    const pausa = 5000 * intento
+    console.warn(`[lab] el push recibió 429 (intento ${intento}/3): se espera ${pausa / 1000}s`)
+    await new Promise(x => setTimeout(x, pausa))
   }
   const cuerpo = await r.text()
   if (!r.ok) {
@@ -351,8 +374,10 @@ async function abrirLaboratorio({ db, project_id, nombreProyecto }) {
     const err = new Error(ARRANCANDO.has(r.status)
       ? 'The Laboratory was still starting when the TDD was pushed. It takes about 22 seconds to '
         + 'wake up: try again in a moment.'
+      : r.status === FRENANDO
+      ? 'The hosting platform is rate-limiting the Laboratory right now. Wait about a minute and try again.'
       : `The Laboratory refused the TDD (${r.status}): ${cuerpo.slice(0, 200)}`)
-    err.code = ARRANCANDO.has(r.status) ? 'LAB_DORMIDO' : 'LAB_ERROR'
+    err.code = ARRANCANDO.has(r.status) || r.status === FRENANDO ? 'LAB_DORMIDO' : 'LAB_ERROR'
     throw err
   }
 
