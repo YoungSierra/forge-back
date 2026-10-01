@@ -444,7 +444,16 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
     const paso = await workflowDelProyecto({ db, project_id, paso: pasoBase })
 
     const entry = await getWorkflowByName(paso.workflow)
-    if (!entry) throw new Error(`Workflow "${paso.workflow}" is not registered`)
+    if (!entry) {
+      // «No está registrado» y «está registrado pero apagado» mandan a hacer cosas distintas, y el
+      // motor solo ve los activos, así que no puede distinguirlos solo. Se pregunta antes de
+      // mentir: un sucesor recién registrado nace apagado a propósito.
+      const { data: existe } = await db().from('comfyui_workflows')
+        .select('is_active').eq('name', paso.workflow).maybeSingle()
+      throw new Error(existe
+        ? `Workflow "${paso.workflow}" is registered but switched off, so nothing can run it`
+        : `Workflow "${paso.workflow}" is not registered`)
+    }
     if (paso.heredado_de) console.log(`[cadena] ${paso.clave}: ${paso.workflow} (sucesor de ${paso.heredado_de})`)
     const roles = entry.inject_config?.salidas || null
 
