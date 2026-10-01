@@ -130,6 +130,10 @@ app.use('/api/assets', assetsRoutes)
 app.use('/api/validate', validationRoutes)
 app.use('/api/members', membersRoutes)
 app.use('/api/feedback', feedbackRoutes)
+// El Laboratory guarda y recupera su estado acá. Fuera de `/api/projects` a propósito: ese prefijo
+// exige el JWT de un usuario y quien llama es otro servicio, no una persona. Lleva su propio
+// guardia de secreto compartido, dentro del router.
+app.use('/api/lab', require('./routes/laboratorio-estado.routes'))
 app.use('/api/admin', requirePlatformAdmin, adminRoutes)
 app.use('/api/admin', requirePlatformAdmin, adminConfigsRoutes)
 app.use('/api/admin', requirePlatformAdmin, adminPromptsRoutes)
