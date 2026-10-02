@@ -114,6 +114,122 @@ function textoDeItem(el) {
   return (cab.length || resto.length) ? [cab.join(' — '), ...resto].filter(Boolean).join('\n\n') : ''
 }
 
+// Lo mismo, pero para un encargo de IMAGEN. La diferencia es qué NO se le manda al modelo: los
+// campos con los que el modelo justifica su decisión —el porqué, la sección de destino, las
+// notas— describen el encargo a una persona, no la imagen. Mandárselos al generador es mandarle
+// razonamiento como si fuera instrucción.
+//
+// Va aparte de `textoDeItem` a propósito: ése también arma las fichas de documento —semillas de
+// concepto y demás—, y ahí el porqué SÍ es contenido legítimo de la ficha. Un solo compositor
+// obligaba a elegir cuál de los dos se rompía.
+//
+// Solo actúa cuando la entrada no trae `prompt`: medido el 01-10 sobre los 11 sobres legibles de
+// la base, las 58 entradas traen `prompt` y ninguna cae acá. Es la red, no el camino.
+const RAZONAMIENTO = new Set(['why', 'rationale', 'reason', 'justification', 'notes', 'note',
+  'target_section', 'section', 'placement_in_concept_document', 'placement', 'anchor', 'source'])
+function promptDeItem(el) {
+  if (typeof el === 'string') return el
+  if (!el || typeof el !== 'object') return String(el ?? '')
+  const cab = CABECERA.map(k => el[k]).filter(v => typeof v === 'string' && v.trim())
+  const resto = Object.entries(el)
+    .filter(([k, v]) => !CABECERA.includes(k) && !OCULTO.has(k) && !RAZONAMIENTO.has(k) && plano(v).trim())
+    .map(([k, v]) => `${rotulo(k)}: ${plano(v)}`)
+  // Si al quitar el razonamiento no queda nada con lo que describir la imagen, vale más la
+  // descripción entera que un encargo vacío: el filtro es para limpiar, no para dejar en cero.
+  if (!cab.length && !resto.length) return textoDeItem(el)
+  return [cab.join(' — '), ...resto].filter(Boolean).join('\n\n')
+}
+
+// ─── La proporción de cada output ────────────────────────────────────────────
+// Hasta hoy el tamaño no lo decidía el output: lo traía el WORKFLOW. Los cuatro que salen
+// cuadrados usan `Character_Template_Generator`, que lleva `size: "1024x1024"` escrito en su nodo
+// 268; los cinco apaisados usan `V57_STUDIO_2D_ui_preproduction`, con `size: "Custom"` y
+// 1920×1088. Medido el 01-10 sobre las 257 imágenes de la base: no hay una sola excepción.
+//
+// El workflow nuevo (`V57_STUDIO_2D_LOAD_IMAGE_DOCUMENT`) corre en `model.size: auto`, o sea que
+// la proporción la elegiría GPT según el prompt. Cuando los diez outputs pasen a ese workflow,
+// cinco de ellos dejarían de ser 16:9 sin que nadie lo pidiera — una lámina de HUD cuadrada no
+// sirve. Así que la proporción pasa a declararse acá, en el motor, y se inyecta al despachar.
+//
+// Decidido con Pedro el 01-10. `ui_screen_mockups` es el décimo y él no lo nombró: nunca ha
+// generado una imagen —no hay nada que conservar— y comparte el workflow de los apaisados, así
+// que va con ellos. Avisado para que lo corrija si quería otra cosa.
+//
+// Los valores salen del catálogo vivo de ComfyUI, no de la cabeza: `OpenAIGPTImageNodeV2` con
+// `gpt-image-2.5-sunburst` admite auto · 1024x1024 · 1024x1536 · 1536x1024 · 2048x2048 ·
+// 2048x1152 · 1152x2048 · 3840x2160 · 2160x3840 · Custom, y en Custom el lado va de 480 a 3840
+// en pasos de 16. 1920 y 1088 son múltiplos de 16.
+const APAISADO = { size: 'Custom', width: 1920, height: 1088 }
+const CUADRADO = { size: '1024x1024' }
+const TAMANO_POR_OUTPUT = {
+  concept_seeds:      CUADRADO,
+  pitch_document:     CUADRADO,
+  development_images: CUADRADO,
+  reference_images:   CUADRADO,
+  orientation_images: APAISADO,
+  pillar_schematics:  APAISADO,
+  world_visuals:      APAISADO,
+  item_catalog_sheet: APAISADO,
+  hud_schematic:      APAISADO,
+  ui_screen_mockups:  APAISADO,
+}
+
+// ─── Auditoría del prompt despachado ─────────────────────────────────────────
+// ComfyUI no es determinista: un render no se puede repetir para averiguar después con qué se
+// pidió. Si el prompt no queda escrito en el momento, la pregunta «¿por qué esta imagen no se
+// parece al plan?» no tiene respuesta — hasta hoy se contestaba leyendo la salida del proceso,
+// que se va con el reinicio.
+//
+// El TEXTO no va en la fila del log. Medido el 01-10 sobre decks reales: una página del ASG llega
+// a 16.288 caracteres y el deck entero suma 188.636, y `GET /analytics/logs` hace `select('*')`
+// devolviendo hasta 200 filas — serían respuestas de decenas de MB. Es la misma trampa que el
+// `canvas_layout` de 738 KB por nodo.
+//
+// Así que el texto va a R2 y la fila es el índice: tamaños, los primeros caracteres para poder
+// ojearlo en la lista, y la llave donde está completo.
+const CABEZA_PROMPT = 400
+
+/** El prompt completo, a R2. Devuelve la llave, o null si no se pudo: el registro del gasto no se
+ *  cae porque falle una subida de auditoría, pero tampoco finge que el texto está guardado. */
+async function guardarPromptEnR2(project_id, nombre, cuerpo) {
+  try {
+    const { uploadToStorage } = require('./storage.service')
+    const llave = `projects/${project_id}/render-prompts/${nombre}.json`
+    await uploadToStorage(Buffer.from(JSON.stringify(cuerpo, null, 2), 'utf8'), llave, 'application/json')
+    return llave
+  } catch (e) {
+    console.error(`[img] no se pudo guardar el prompt despachado para auditoría: ${e.message}`)
+    return null
+  }
+}
+
+/** Lo que se escribe en la fila de un render suelto. */
+const indiceDelPrompt = (prompt, { condition = null, ref = null, llave = null } = {}) => {
+  const p = String(prompt || '')
+  return {
+    prompt_chars: p.length,
+    prompt_head:  p.slice(0, CABEZA_PROMPT),
+    ...(llave ? { prompt_ref: llave } : { prompt_sin_guardar: true }),
+    ...(condition?.trim() ? { variation: condition.trim() } : {}),
+    ...(ref ? { ref_image: typeof ref === 'string' ? ref : (ref.url || ref.filename || null) } : {}),
+  }
+}
+
+/** El prompt de cada página de un deck, leído DEL GRAFO que se despachó y no del armado: entre
+ *  el armado y el despacho el prompt recibe la cola y las sustituciones del nombre del juego. */
+function promptsDelGrafo(wf, paginas, campoDe) {
+  return (paginas || []).map(p => ({
+    pagina: p.nombre,
+    prompt: String(wf?.[p.prompt_node]?.inputs?.[campoDe(p)] ?? ''),
+  }))
+}
+
+/** Y lo que de eso va en la fila: una línea por página con su tamaño, más la llave del archivo. */
+const indiceDelDeck = (prompts, llave) => ({
+  prompts: prompts.map(({ pagina, prompt }) => ({ pagina, chars: prompt.length })),
+  ...(llave ? { prompts_ref: llave } : { prompts_sin_guardar: true }),
+})
+
 // Trae URL y no trae prompt: es una REFERENCIA a arte que ya existe, no un encargo. Estaba
 // escrito dos veces con el mismo cuerpo —dentro del lector del sobre y en quien filtra los
 // encargos—; ahora es uno solo, porque el nombrado de las imagenes depende de que las dos
@@ -317,7 +433,7 @@ function parseOutputItems(content, format, outputKey = null, soloDeclarado = fal
             const v = o?.[campo]
             if (typeof v === 'string' && v.trim()) return v.trim()
           }
-          return textoDeItem(o)
+          return promptDeItem(o)
         }).filter(x => String(x).trim())
         if (items.length) {
           console.log(`[img] ${outputKey}: sobre leído desde su propia sección — ${items.length} ítem(s)`)
@@ -366,7 +482,7 @@ function parseOutputItems(content, format, outputKey = null, soloDeclarado = fal
         let arr
         try { arr = JSON.parse(desde.slice(0, fin + 1)) } catch { continue }
         if (!Array.isArray(arr)) continue
-        return arr.map(o => (typeof o === 'string' ? o : textoDeItem(o))).filter(x => String(x).trim())
+        return arr.map(o => (typeof o === 'string' ? o : promptDeItem(o))).filter(x => String(x).trim())
       }
     }
 
@@ -391,7 +507,7 @@ function parseOutputItems(content, format, outputKey = null, soloDeclarado = fal
       if (prompts.filter(Boolean).length * 2 < arr.length) continue
       // Sin recorte: un prompt declarado va COMPLETO. El tope de 700 del respaldo existe para no
       // mandar un documento entero, no para cortar a la mitad un prompt que el modelo escribió.
-      const items = arr.map((o, i) => prompts[i] || textoDeItem(o)).filter(x => x.trim())
+      const items = arr.map((o, i) => prompts[i] || promptDeItem(o)).filter(x => x.trim())
       if (items.length) return items
     }
   }
@@ -597,6 +713,12 @@ async function generateOneImage({
 
   const imgStart = Date.now()
 
+  // La referencia que se enchufó, para el log: se asigna en la rama de ComfyUI, pero el registro
+  // de abajo tiene que poder nombrarla. Sin esto, dos renders del mismo prompt —uno con arte del
+  // proyecto y otro sin él— quedaban idénticos en el log y no había forma de saber cuál salió
+  // fuera de estilo y por qué.
+  let refUsada = null
+
   let result
   if (provider === 'comfyui') {
     const { generateImageComfyUI } = require('./providers/comfyui.provider')
@@ -607,9 +729,14 @@ async function generateOneImage({
     // toma el aspecto. Ese segundo hueco viene desconectado a propósito: si no hay arte del
     // proyecto NO se enchufa nada. Conectar un relleno sería decirle al modelo «así se ve este
     // juego» con una imagen ajena — el error que nos costó una corrida del ASG.
-    const refProyecto = await imagenDelProyecto(project_id, node_id).catch(() => null)
+    const refProyecto = await referenciaDelProyecto({ projectId: project_id, nodeId: node_id, outputKey: output_key }).catch(() => null)
+    refUsada = refProyecto || null
+    // La proporción que le toca a este output. El workflow que la declara en su `inject_config`
+    // la recibe; el que no —los dos vivos de hoy, que la traen escrita en el grafo— la ignora y
+    // sigue saliendo igual que siempre.
+    const tam = TAMANO_POR_OUTPUT[output_key] || null
     result = await generateImageComfyUI(modelOrWf, imagePrompt, 1024, 1024, storagePath,
-      refProyecto ? { ref_proyecto: refProyecto } : {})
+      { ...(refProyecto ? { ref_proyecto: refProyecto } : {}), ...(tam ? { size: tam } : {}) })
   } else if (provider === 'openai') {
     const { generateImageOpenAI } = require('./providers/openai.image.provider')
     result = await generateImageOpenAI(modelOrWf, imagePrompt, 1024, 1024, storagePath)
@@ -619,6 +746,15 @@ async function generateOneImage({
   } else {
     throw new Error(`Provider de imagen no soportado: "${provider}"`)
   }
+
+  // El prompt despachado, a R2 para poder auditarlo. Va después del render: si falla, el registro
+  // del gasto sigue entrando igual.
+  const llavePrompt = await guardarPromptEnR2(project_id, `${node_key}-${output_key}-${session_id}-${item_index}`, {
+    node_key, output_key, item_index, provider, model: modelOrWf,
+    prompt: imagePrompt, item_text, condition: condition || null,
+    ref_image: refUsada ? (typeof refUsada === 'string' ? refUsada : refUsada.url || null) : null,
+    despachado_en: new Date(imgStart).toISOString(),
+  })
 
   // Registrar costo estimado (no bloqueante, nunca rompe el flujo)
   try {
@@ -633,7 +769,9 @@ async function generateOneImage({
       duration_ms:   Date.now() - imgStart,
       started_at:    new Date(imgStart).toISOString(),
       status:        'success',
-      metadata:      { output_key, item_index, width: 1024, height: 1024, node_key },
+      // Y el índice del prompt que SE MANDÓ —tamaño, cabeza y la llave de R2 donde está completo.
+      metadata:      { output_key, item_index, width: 1024, height: 1024, node_key,
+                       ...indiceDelPrompt(imagePrompt, { condition, ref: refUsada, llave: llavePrompt }) },
     })
   } catch (logErr) {
     console.error('[image-gen.service] logExec failed (non-fatal):', logErr.message)
@@ -659,6 +797,97 @@ async function esDeck(outDef) {
 // Se busca entre lo que ESTE nodo recibe por sus cables, no en todo el proyecto: el 2.5 declara
 // `orientation_images` y `pitch_images` como entradas, y esas son las que deben ilustrarlo. Gana
 // la más reciente aprobada; si no hay ninguna, se devuelve null y el hueco queda sin conectar.
+/**
+ * La imagen de referencia que le toca a un output, según su `image_routing` (v2.9.40).
+ *
+ * Tres escalones, en este orden, y el primero que dé imagen gana:
+ *
+ *   1. `ref_source` — una lista ORDENADA de {node, output}. Se busca esa salida EN EL PROYECTO,
+ *      por nodo, haya o no un cable directo. Ésa es la corrección de Pedro: hasta hoy solo se
+ *      miraban las fuentes cableadas, así que un 3.1 que debía heredar del 2.4 no veía nada si
+ *      nadie los había conectado a mano.
+ *   2. `ref_fallback: 'library'` — una imagen de la LIBRERÍA, pero solo si está CABLEADA a este
+ *      nodo en el lienzo. Nunca una imagen suelta de la librería: en Wort hay tres imágenes y
+ *      solo `Main_Concept Art.png` está en el lienzo; las otras dos son versiones low-poly que no
+ *      deben usarse. Y solo las de tipo imagen — al 2.1 llegan también dos PDF y un txt.
+ *      Con varias cableadas, la del cable más reciente.
+ *   3. Lo de siempre: la png más reciente de las fuentes cableadas. Se conserva para que un output
+ *      SIN `image_routing` se comporte exactamente igual que hoy.
+ */
+async function referenciaDelProyecto({ projectId, nodeId, outputKey }) {
+  const { db } = require('./supabase.service')
+
+  const { data: dna, error: eDna } = await db().from('forge_nodes').select('outputs').eq('id', nodeId).maybeSingle()
+  if (eDna) console.warn(`[img] no pude leer la DNA del nodo: ${eDna.message}`)
+  const def = (Array.isArray(dna?.outputs) ? dna.outputs : []).find(o => (o.key || o.name) === outputKey)
+  const ruta = def?.image_routing || null
+
+  // ── 1 · las fuentes que declara el routing, en su orden ──
+  for (const fuente of (ruta?.ref_source || [])) {
+    if (!fuente?.node || !fuente?.output) continue
+    const { data: nodoFuente, error: e1 } = await db().from('forge_nodes').select('id').eq('node_key', String(fuente.node)).maybeSingle()
+    if (e1) { console.warn(`[img] ref_source ${fuente.node}: ${e1.message}`); continue }
+    if (!nodoFuente?.id) { console.warn(`[img] ref_source apunta al nodo "${fuente.node}", que no está en el catálogo`); continue }
+
+    const { data: imgs, error: e2 } = await db().from('forge_assets')
+      .select('storage_url, name').eq('project_id', projectId).eq('node_id', nodoFuente.id)
+      .eq('output_key', fuente.output).eq('format', 'png')
+      .in('status', ['approved', 'auto_approved']).not('storage_url', 'is', null)
+      .order('created_at', { ascending: false })
+    if (e2) { console.warn(`[img] ref_source ${fuente.node}/${fuente.output}: ${e2.message}`); continue }
+    if (!imgs?.length) continue
+
+    // `pick: selected_seed` — de todas las semillas, la que eligió el gate. El id vive en el
+    // `bound_item_ref` del lane. OJO: el nombre de la imagen lleva ese id en unos proyectos
+    // («Concept Exploration — seed_01») y en otros no («CS-01», «Concept Seeds 1»), así que esto
+    // acierta cuando puede y, cuando no, se queda con la más reciente y lo DICE. Preguntado a
+    // Pedro cómo quiere identificarla; mientras tanto no se adivina en silencio.
+    let elegida = imgs[0]
+    if (fuente.pick === 'selected_seed') {
+      const { data: lanes } = await db().from('forge_project_nodes')
+        .select('bound_item_ref').eq('project_id', projectId).not('bound_item_ref', 'is', null)
+      const ids = [...new Set((lanes || []).map(l => l.bound_item_ref?.id).filter(Boolean))]
+      const porId = ids.length ? imgs.find(i => ids.some(id => String(i.name || '').includes(id))) : null
+      if (porId) elegida = porId
+      else if (ids.length) console.warn(`[img] ${outputKey}: el gate eligió ${ids.join(', ')} pero ninguna imagen de ${fuente.output} lo lleva en el nombre — va la más reciente`)
+    }
+    console.log(`[img] ${outputKey}: referencia de ${fuente.node}/${fuente.output} — «${elegida.name}»`)
+    return elegida.storage_url
+  }
+
+  // ── 2 · la librería, pero solo lo CABLEADO a este nodo ──
+  if (ruta?.ref_fallback === 'library') {
+    const { data: destinos, error: e3 } = await db().from('forge_project_nodes')
+      .select('id').eq('project_id', projectId).eq('node_id', nodeId).eq('removed', false)
+    if (e3) console.warn(`[img] librería: ${e3.message}`)
+    if (destinos?.length) {
+      const { data: cables, error: e4 } = await db().from('forge_project_edges')
+        .select('source_node_id, created_at').eq('project_id', projectId)
+        .in('target_node_id', destinos.map(d => d.id))
+        .order('created_at', { ascending: false })
+      if (e4) console.warn(`[img] librería: ${e4.message}`)
+      if (cables?.length) {
+        const { data: origenes, error: e5 } = await db().from('forge_project_nodes')
+          .select('id, node_type, forge_project_library_assets ( display_name, asset_type, storage_url )')
+          .in('id', [...new Set(cables.map(c => c.source_node_id))]).eq('node_type', 'library_asset')
+        if (e5) console.warn(`[img] librería: ${e5.message}`)
+        const porPn = Object.fromEntries((origenes || []).map(o => [o.id, o]))
+        // En el orden de los cables, que ya viene del más reciente al más viejo.
+        for (const c of cables) {
+          const lib = porPn[c.source_node_id]?.forge_project_library_assets
+          if (lib?.asset_type === 'image' && lib.storage_url) {
+            console.log(`[img] ${outputKey}: referencia de la librería CABLEADA — «${lib.display_name}»`)
+            return lib.storage_url
+          }
+        }
+      }
+    }
+  }
+
+  // ── 3 · lo de siempre ──
+  return imagenDelProyecto(projectId, nodeId)
+}
+
 async function imagenDelProyecto(projectId, nodeId) {
   const { db } = require('./supabase.service')
   const { data: pns } = await db()
@@ -1470,6 +1699,15 @@ ${cola}`
     if (/completed|success/i.test(estado) && vistos.size >= total) break
   }
 
+  // Los prompts de las páginas, a R2: un deck son 20 o 30 renders en un solo job y sin esto la
+  // fila decía cuántas páginas salieron y ninguna con qué se pidió cada una.
+  const promptsPaginas = promptsDelGrafo(wf, armado.paginas, campoDe)
+  const llavePrompts = await guardarPromptEnR2(project_id, `deck-${deck}-${jobId}`, {
+    deck, node_key, output_key, maestro, jobId,
+    despachado_en: new Date(t0).toISOString(),
+    paginas: promptsPaginas,
+  })
+
   try {
     logExecution({
       project_id, node_id, session_id,
@@ -1479,7 +1717,8 @@ ${cola}`
       is_estimated: true, duration_ms: Date.now() - t0,
       started_at: new Date(t0).toISOString(),
       status: paginas.length === total ? 'success' : 'partial',
-      metadata: { output_key, node_key, deck, jobId, paginas: paginas.length, esperadas: total, ...(contexto || {}) },
+      metadata: { output_key, node_key, deck, jobId, paginas: paginas.length, esperadas: total, ...(contexto || {}),
+        ...indiceDelDeck(promptsPaginas, llavePrompts) },
     })
   } catch (e) { console.error('[deck] logExec falló (no fatal):', e.message) }
 
@@ -1539,4 +1778,4 @@ function nombreDeImagen ({ tituloNodo, etiqueta, ids, idx, total }) {
   return total > 1 ? `${base} ${idx + 1}` : base
 }
 
-module.exports = { imageOutputsOf, parseOutputItems, idsDeclarados, nombreDeImagen, sobreDeLaSeccion, tieneEntidades, cleanItemText, generateOneImage, generateDeck, esDeck, paginaDelASG, imagenDeNodoPorTitulo, referenciaDeContexto }
+module.exports = { imageOutputsOf, parseOutputItems, referenciaDelProyecto, imagenDelProyecto, idsDeclarados, nombreDeImagen, sobreDeLaSeccion, tieneEntidades, cleanItemText, generateOneImage, generateDeck, esDeck, paginaDelASG, imagenDeNodoPorTitulo, referenciaDeContexto }

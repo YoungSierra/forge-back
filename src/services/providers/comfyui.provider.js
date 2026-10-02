@@ -47,6 +47,25 @@ async function submitWorkflow(workflowName, prompt, width, height, extras = {}, 
   injectPoint(workflow, inject.height, height)
   injectPoint(workflow, inject.seed,   Math.floor(Math.random() * 2147483647))
 
+  // La proporción que pide el output. Hasta ahora la traía escrita el grafo —cada workflow la
+  // suya— y por eso no hacía falta inyectarla. El workflow nuevo corre en `size: auto`, o sea que
+  // la elegiría el modelo según el prompt: cinco de los diez outputs que pasan a ese grafo
+  // dejarían de salir en 16:9 sin que nadie lo pidiera.
+  //
+  // Solo actúa si el workflow DECLARA el punto. Los dos grafos vivos no lo declaran, así que
+  // siguen saliendo exactamente igual que hoy.
+  if (inject.size && extras.size) {
+    const { node, field, custom_width_field, custom_height_field } = inject.size
+    const t = extras.size
+    injectPoint(workflow, { node, field }, t.size)
+    // `Custom` es el único valor que mira los lados; con cualquier otro, el nodo los ignora.
+    if (t.size === 'Custom') {
+      if (custom_width_field)  injectPoint(workflow, { node, field: custom_width_field },  t.width)
+      if (custom_height_field) injectPoint(workflow, { node, field: custom_height_field }, t.height)
+    }
+    console.log(`[ComfyUI] tamaño → ${t.size}${t.size === 'Custom' ? ` ${t.width}x${t.height}` : ''}`)
+  }
+
   // Extra injection points (string, int, float, image)
   if (inject.extra) {
     for (const [key, point] of Object.entries(inject.extra)) {

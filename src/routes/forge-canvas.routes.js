@@ -349,6 +349,28 @@ function promptsDelSobre(contenido, targetOutputKey) {
     .filter(e => e.id && e.prompt.length >= 40)
 }
 
+// Los campos que la DNA declara alrededor del prompt en cada entrada del plan. Son los que lo
+// CIERRAN: el corte tiene que pararse ahí, lleven negrita o no.
+//
+// Antes se paraba solo ante una viñeta EN NEGRITA, y los planes no usan negrita: escriben
+// `section:`, `subject:`, `prompt:`, `why:` en líneas sueltas. Así que el prompt se llevaba el
+// `why` entero y hasta el `---` que separa entradas. Medido contra planes reales: 3.283 caracteres
+// donde el prompt eran 2.853, y al modelo le llegaba el razonamiento como si fuera instrucción.
+//
+// Solo etiquetas CONOCIDAS, a propósito: el prompt que escribe el modelo empieza por «Style: …» y
+// lleva «Subject: …» a media prosa, así que «una palabra con dos puntos» se cortaría a sí mismo.
+// Y solo a principio de línea, por lo mismo.
+const CAMPOS_DE_ENTRADA = 'why|rationale|reason|target[ _]section|section|subject|id|title|notes?|caption|aspect|size'
+const RX_PROMPT_ENTRADA = new RegExp(
+  '(?:^|\\n)[ \\t]*(?:[-*][ \\t]*)?\\**[ \\t]*(?:generation[ _]prompt|image[ _]prompt|prompt)[ \\t]*:?[ \\t]*\\**[ \\t]*:?[ \\t]*' +
+  '([\\s\\S]*?)' +
+  '(?=' +
+    '\\n[ \\t]*(?:[-*][ \\t]*)?\\**[ \\t]*(?:' + CAMPOS_DE_ENTRADA + ')[ \\t]*\\**[ \\t]*:' +  // otro campo
+    '|\\n[ \\t]*(?:[-*][ \\t]*)?\\*\\*' +                                                      // viñeta en negrita
+    '|\\n#{2,4}[ \\t]' +                                                                       // encabezado
+    '|\\n[ \\t]*(?:---+|___+|\\*\\*\\*+)[ \\t]*(?:\\n|$)' +                                    // regla horizontal
+    '|$)', 'i')
+
 // ─── Los prompts que ya escribió el hermano que declara las imágenes ───────────
 // Devuelve [{ id, prompt, fuente }] o [] si no hay de dónde sacarlos. El id es el título de la
 // entrada: el MISMO que el documento pone en su ancla `[ IMAGE: <id> ]`, que es lo que permite
@@ -433,10 +455,10 @@ async function promptsDelPlanHermano({ project_id, node_id, project_node_id, tar
     const desde  = titulos[i].index + titulos[i][0].length
     const hasta  = i + 1 < titulos.length ? titulos[i + 1].index : seccion.length
     const cuerpo = seccion.slice(desde, hasta)
-    // La viñeta del prompt, hasta la siguiente viñeta con etiqueta en negrita o el fin del bloque
+    // La viñeta del prompt, hasta el siguiente CAMPO de la entrada o el fin del bloque.
     // La viñeta es opcional: v2.9.18 enumera los campos (section/subject/prompt/why) sin fijar
     // cómo se maquetan, y una lista con guiones y una de líneas en negrita son la misma entrada.
-    const m = /(?:^|\n)[ \t]*(?:[-*][ \t]*)?\**[ \t]*(?:generation[ _]prompt|image[ _]prompt|prompt)[ \t]*:?[ \t]*\**[ \t]*:?[ \t]*([\s\S]*?)(?=\n[ \t]*(?:[-*][ \t]*)?\*\*|\n#{2,4}[ \t]|$)/i.exec(cuerpo)
+    const m = RX_PROMPT_ENTRADA.exec(cuerpo)
     if (!m) continue
     entradas.push({ id: titulos[i].clave, prompt: m[1].replace(/^["'`]|["'`]$/g, '').trim() })
   }
