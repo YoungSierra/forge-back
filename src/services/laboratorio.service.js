@@ -144,12 +144,10 @@ async function tddDeCorridaEntera(db, project_id) {
 /**
  * Si el botón tiene a dónde ir, sin empujar nada.
  *
- * Y de paso DESPIERTA el laboratorio. Corre en una instancia que se duerme sola: medido el 16-09,
- * la primera petición tarda **22,5 segundos** y la siguiente 0,28. Si ese arranque empieza cuando
- * alguien ya pulsó, se lo come esperando; empezándolo al abrir el panel, corre mientras lee.
- *
- * Cualquier petición lo despierta —no hace falta abrir su página—, así que se aprovecha la que ya
- * hace falta para saber si hay un Final construido.
+ * Esta consulta servía ADEMÁS para despertarlo, porque corría en una instancia que se dormía sola
+ * —medido el 16-09: la primera petición tardaba 22,5 segundos y la siguiente 0,28—. Desde el 01-10
+ * está en una instancia de pago y no se duerme, así que ya solo hace lo que dice: mirar si hay un
+ * Final construido.
  */
 async function estadoDelLaboratorio({ db, project_id }) {
   const doc = await tddDelProyecto(db, project_id)
@@ -211,7 +209,7 @@ async function estadoDelLaboratorio({ db, project_id }) {
 // contesta 502 al INSTANTE. El código leía «me contestó algo» como «está en pie», seguía adelante
 // y empujaba el TDD a un proceso que aún arrancaba. Ese push fallaba con un Error sin código, la
 // ruta no lo reconocía y al navegador llegaba un 500 genérico — el «Internal server error» que
-// David reportó tres veces. La rama de LAB_DORMIDO, que existe justo para esto, no se alcanzaba
+// David reportó tres veces. La rama de LAB_CAIDO, que existe justo para esto, no se alcanzaba
 // nunca. Y al pulsar de nuevo un rato después funcionaba, porque aquel 502 había encendido el
 // servicio.
 const ARRANCANDO = new Set([502, 503, 504])
@@ -271,14 +269,6 @@ async function esperarAlLaboratorio(base, plazoMs = 70000, porIntentoMs = 25000)
   return false
 }
 
-function despertarLaboratorio() {
-  const base = BASE()
-  if (!base) return { configurado: false }
-  fetch(`${base}/api/gameplay/status`, { signal: AbortSignal.timeout(90000) })
-    .then(() => console.log('[lab] despierto'))
-    .catch(() => { /* silencio: corre de fondo y su fallo no es de nadie que esté mirando */ })
-  return { configurado: true }
-}
 
 /**
  * Empuja el TDD y devuelve la dirección con la que abrir el Laboratory ya parado en él.
@@ -312,9 +302,10 @@ async function abrirLaboratorio({ db, project_id, nombreProyecto }) {
   // pregunta hasta que conteste, y solo si no lo hace se para — diciendo por qué.
   const listo = await esperarAlLaboratorio(base)
   if (!listo) {
-    const err = new Error('The Laboratory is waking up and did not answer in time. '
-      + 'It takes about 22 seconds to start: try again in a moment.')
-    err.code = 'LAB_DORMIDO'
+    const err = new Error('The Laboratory is not responding. It does not sleep any more, so this '
+      + 'means it is being redeployed or it is down. Wait a minute and try again; if it persists, '
+      + 'the service needs looking at.')
+    err.code = 'LAB_CAIDO'
     throw err
   }
 
@@ -358,7 +349,7 @@ async function abrirLaboratorio({ db, project_id, nombreProyecto }) {
       const err = new Error(e.name === 'TimeoutError'
         ? 'The Laboratory took too long to accept the TDD. It may still be starting: try again in a moment.'
         : `The Laboratory could not be reached: ${e.message}`)
-      err.code = 'LAB_DORMIDO'
+      err.code = 'LAB_CAIDO'
       throw err
     }
     if (r.status !== FRENANDO || intento === 3) break
@@ -372,12 +363,12 @@ async function abrirLaboratorio({ db, project_id, nombreProyecto }) {
     // genérico: es el «Internal server error» que veía David, con la causa real —un 502 de un
     // servicio que arrancaba— escondida detrás de un mensaje que no dice nada.
     const err = new Error(ARRANCANDO.has(r.status)
-      ? 'The Laboratory was still starting when the TDD was pushed. It takes about 22 seconds to '
-        + 'wake up: try again in a moment.'
+      ? 'The Laboratory did not accept the TDD because it is not running. It is probably mid-deploy '
+        + '(that takes under a minute): try again shortly. If it keeps failing, the service is down.'
       : r.status === FRENANDO
       ? 'The hosting platform is rate-limiting the Laboratory right now. Wait about a minute and try again.'
       : `The Laboratory refused the TDD (${r.status}): ${cuerpo.slice(0, 200)}`)
-    err.code = ARRANCANDO.has(r.status) || r.status === FRENANDO ? 'LAB_DORMIDO' : 'LAB_ERROR'
+    err.code = ARRANCANDO.has(r.status) || r.status === FRENANDO ? 'LAB_CAIDO' : 'LAB_ERROR'
     throw err
   }
 
@@ -404,4 +395,4 @@ async function abrirLaboratorio({ db, project_id, nombreProyecto }) {
   }
 }
 
-module.exports = { abrirLaboratorio, estadoDelLaboratorio, despertarLaboratorio, tddDelProyecto, slugDe, BASE }
+module.exports = { abrirLaboratorio, estadoDelLaboratorio, tddDelProyecto, slugDe, BASE }

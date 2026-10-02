@@ -85,17 +85,10 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString(), supabase: supabaseReady ? 'connected' : 'warming_up' })
 })
 
-// Despertar el Laboratory, sin esperarlo. Lo llama el login: el Laboratory vive en una instancia
-// que se duerme y su primera petición tarda ~22 s, así que si ese arranque empieza mientras
-// alguien escribe su contraseña, llega despierto a la primera pantalla.
-//
-// Contesta al instante y a propósito: no hay nada que esperar. El único efecto que se busca es
-// que el proceso de allá empiece a levantarse. Quien necesite saber si hay build lo pregunta por
-// la ruta del panel, que es la que sí mira.
-app.get('/api/health/lab', (req, res) => {
-  const { despertarLaboratorio } = require('./services/laboratorio.service')
-  res.json({ status: 'ok', ...despertarLaboratorio() })
-})
+// Acá vivía `/api/health/lab`, que despertaba el Laboratory desde la pantalla de login. Se quitó
+// el 01-10: el Laboratory pasó a una instancia de pago y ya no se duerme, así que no hay nada que
+// despertar. Si alguna vez no contesta, ya NO es que esté arrancando — está caído o
+// redesplegándose, y eso lo detecta y lo dice `abrirLaboratorio`.
 
 // DB health — tests Supabase connection (may be slow on cold start)
 app.get('/api/health/db', async (req, res) => {
