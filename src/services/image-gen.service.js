@@ -837,11 +837,15 @@ async function referenciaDelProyecto({ projectId, nodeId, outputKey }) {
     if (e2) { console.warn(`[img] ref_source ${fuente.node}/${fuente.output}: ${e2.message}`); continue }
     if (!imgs?.length) continue
 
-    // `pick: selected_seed` — de todas las semillas, la que eligió el gate. El id vive en el
-    // `bound_item_ref` del lane. OJO: el nombre de la imagen lleva ese id en unos proyectos
-    // («Concept Exploration — seed_01») y en otros no («CS-01», «Concept Seeds 1»), así que esto
-    // acierta cuando puede y, cuando no, se queda con la más reciente y lo DICE. Preguntado a
-    // Pedro cómo quiere identificarla; mientras tanto no se adivina en silencio.
+    // `pick: selected_seed` - de todas las semillas, la que eligio el gate. El id vive en el
+    // `bound_item_ref` del lane, y las imagenes del 1.1 lo llevan en el nombre
+    // («Concept Exploration - seed_01»). Medido el 01-10 sobre los 20 proyectos: de los 9 que
+    // tienen varias semillas, el gate corrio en 3 y los 3 emparejan; cero ambiguos.
+    //
+    // Conviven DOS grafias en el mismo proyecto -«Concept Seeds 1» y «seed_01»-, y son las
+    // `seed_0N` las que llevan el id. En los 3 casos medidos la mas reciente resulto ser la misma
+    // imagen que empareja, asi que esto no corrigio nada todavia: es el seguro para cuando el
+    // orden y la seleccion no coincidan. Si no empareja, se queda con la mas reciente y lo DICE.
     let elegida = imgs[0]
     if (fuente.pick === 'selected_seed') {
       const { data: lanes } = await db().from('forge_project_nodes')
