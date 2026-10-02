@@ -2702,31 +2702,40 @@ router.post('/nodes/:node_id/generate-pdf', async (req, res, next) => {
       }
     }
 
-    let q = db()
-      .from('forge_sessions')
-      .select('id, output_asset_id, status')
-      .eq('project_id', project_id)
-      .eq('node_id', node_id)
-      .in('status', ['approved', 'auto_approved'])
-      .order('completed_at', { ascending: false })
-      .limit(1)
-
     // Con fan-out el mismo nodo del catálogo vive en varios lanes; sin acotar por instancia se
-    // devolvería el documento del lane vecino. Igual que en GET /session.
-    if (project_node_id) q = q.eq('project_node_id', project_node_id)
+    // devolvería el documento del lane vecino. Por eso `buscar` arrastra `project_node_id`.
+
+    // Un PDF sale de un DOCUMENTO. Parece obvio y no lo era: hay outputs que son documento Y
+    // generan imágenes a la vez —`pitch_document` del 2.1 se declara `format: docx` con
+    // `image_gen: true`—, así que «la sesión de este output» puede ser perfectamente la que guarda
+    // una png. Medido el 02-10 en test_pinball_migue_v.10: dos sesiones aprobadas del 2.1, la de
+    // las imágenes (12:23) y la del nodo entero con el docx de 8.451 caracteres (12:05). Se cogía
+    // la primera, su `storage_url` era el png, y el atajo de caché de más abajo lo devolvía como si
+    // fuera el PDF. Eso es lo que recibía Migue al pulsar PDF.
+    const esDocumento = a => !!a && !!String(a.content || '').trim()
+      && !/^(png|jpe?g|gif|webp|image|glb|gltf|mp4|mov|webm|mp3|wav)$/i.test(String(a.format || ''))
 
     // La consulta se rearma en cada intento: encadenar `.eq()` sobre la misma la va mutando y el
     // segundo intento heredaría el filtro del primero.
+    //
+    // Y trae VARIAS, no una: con `limit(1)` bastaba que la sesión más reciente de ese output fuera
+    // de imágenes para no llegar nunca al documento que estaba justo detrás.
     const buscar = async filtro => {
       let c = db().from('forge_sessions')
         .select('id, output_asset_id, status')
         .eq('project_id', project_id).eq('node_id', node_id)
         .in('status', ['approved', 'auto_approved'])
-        .order('completed_at', { ascending: false }).limit(1)
+        .not('output_asset_id', 'is', null)
+        .order('completed_at', { ascending: false }).limit(10)
       if (project_node_id) c = c.eq('project_node_id', project_node_id)
       if (filtro) c = filtro(c)
-      const { data, error } = await c.maybeSingle()
-      return error ? null : data
+      const { data, error } = await c
+      if (error || !data?.length) return null
+      const { data: piezas } = await db().from('forge_assets')
+        .select('id, format, content').in('id', data.map(s => s.output_asset_id))
+      const porId = Object.fromEntries((piezas || []).map(a => [a.id, a]))
+      // En el orden de las sesiones, de la más reciente a la más vieja.
+      return data.find(s => esDocumento(porId[s.output_asset_id])) || null
     }
 
     let session = null
@@ -2752,14 +2761,19 @@ router.post('/nodes/:node_id/generate-pdf', async (req, res, next) => {
 
     const { data: asset } = await db()
       .from('forge_assets')
-      .select('id, name, content, storage_url')
+      .select('id, name, content, storage_url, format')
       .eq('id', session.output_asset_id)
       .single()
 
     if (!asset) return res.status(404).json({ success: false, error: 'Asset not found' })
 
-    // Si ya tiene URL, devolverla sin regenerar
-    if (asset.storage_url) {
+    // Si ya tiene URL, devolverla sin regenerar — pero SOLO si la pieza es un documento.
+    //
+    // Este atajo daba por hecho que cualquier `storage_url` era un PDF ya generado. En una imagen
+    // el `storage_url` ES la imagen, así que el botón PDF devolvía un png con cara de éxito en vez
+    // de fallar. `buscar` ya no entrega piezas que no sean documento, y esto lo vuelve a comprobar
+    // acá: es la línea que de verdad entregaba el archivo equivocado.
+    if (asset.storage_url && esDocumento(asset)) {
       return res.json({ success: true, url: asset.storage_url })
     }
 
