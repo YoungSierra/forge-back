@@ -4,11 +4,20 @@ const { db }  = require('../services/supabase.service')
 
 // ─── GET /api/admin/analytics/summary ────────────────────────────────────────
 // Totales globales con filtro opcional de fecha y proyecto
+// Las filas de DESPACHO quedan fuera de todo lo que agrega.
+//
+// Desde el 02-10 cada trabajo de ComfyUI deja una fila al despacharse, con su jobId y la pieza de
+// origen, para poder recoger lo que ya se pago si la espera se cae. Esa fila va con cost_usd 0, asi
+// que el gasto sigue bien; pero `total_calls` e `image_calls` cuentan FILAS, y sin este filtro cada
+// render pasaria a contar dos veces en el panel. El listado detallado si las muestra: ahi son
+// justo lo que hay que ver para encontrar un trabajo huerfano.
+const SIN_DESPACHOS = q => q.neq('status', 'dispatched')
+
 router.get('/summary', async (req, res, next) => {
   try {
     const { from, to, project_id, org_id } = req.query
 
-    let q = db().from('forge_execution_log').select('cost_usd, duration_ms, input_tokens, output_tokens, cached_tokens, status, executor_type')
+    let q = SIN_DESPACHOS(db().from('forge_execution_log').select('cost_usd, duration_ms, input_tokens, output_tokens, cached_tokens, status, executor_type'))
 
     if (from)       q = q.gte('created_at', from)
     if (to)         q = q.lte('created_at', to)
@@ -48,8 +57,8 @@ router.get('/breakdown', async (req, res, next) => {
   try {
     const { group_by = 'project', from, to, project_id, org_id } = req.query
 
-    let q = db().from('forge_execution_log')
-      .select('cost_usd, duration_ms, input_tokens, output_tokens, cached_tokens, status, executor_type, provider, model, project_id, org_id, triggered_by, created_at')
+    let q = SIN_DESPACHOS(db().from('forge_execution_log')
+      .select('cost_usd, duration_ms, input_tokens, output_tokens, cached_tokens, status, executor_type, provider, model, project_id, org_id, triggered_by, created_at'))
 
     if (from)       q = q.gte('created_at', from)
     if (to)         q = q.lte('created_at', to)
@@ -230,6 +239,7 @@ router.get('/project-chip/:projectId', async (req, res, next) => {
     const { data, error } = await db()
       .from('forge_execution_log')
       .select('cost_usd, executor_type, provider, model, input_tokens, cached_tokens')
+      .neq('status', 'dispatched')
       .eq('project_id', projectId)
 
     if (error) return res.status(500).json({ success: false, error: error.message })

@@ -6,7 +6,7 @@
 // Principio: el ADN manda. El conteo de imágenes NO se hardcodea — sale de cuántos
 // ítems produzca el contenido del output (parseOutputItems), tal como pida su prompt.
 
-const { logExecution } = require('./execution-log.service')
+const { logExecution, registrarDespacho } = require('./execution-log.service')
 
 // Con qué mime se guarda lo que devuelve un deck. Un deck ya no es solo imágenes: el de Marketing
 // entrega mp4 y el de Audio mp3, y subirlos como image/png los deja sin abrir en ningún visor.
@@ -736,7 +736,14 @@ async function generateOneImage({
     // sigue saliendo igual que siempre.
     const tam = TAMANO_POR_OUTPUT[output_key] || null
     result = await generateImageComfyUI(modelOrWf, imagePrompt, 1024, 1024, storagePath,
-      { ...(refProyecto ? { ref_proyecto: refProyecto } : {}), ...(tam ? { size: tam } : {}) })
+      { ...(refProyecto ? { ref_proyecto: refProyecto } : {}), ...(tam ? { size: tam } : {}) },
+      120_000,
+      // El id queda registrado en cuanto se despacha. Si lo que viene se cae, el render ya está
+      // pagado y esta fila es lo único que dice a qué output pertenece para ir a recogerlo.
+      jobId => registrarDespacho({
+        project_id, node_id, session_id, member_id, jobId, workflow: modelOrWf,
+        output_key, item_index, node_key,
+      }))
   } else if (provider === 'openai') {
     const { generateImageOpenAI } = require('./providers/openai.image.provider')
     result = await generateImageOpenAI(modelOrWf, imagePrompt, 1024, 1024, storagePath)
@@ -1600,6 +1607,12 @@ ${cola}`
   const txt = await res.text()
   if (!res.ok) throw new Error(`ComfyUI rechazó el deck: ${res.status} ${txt.slice(0, 400)}`)
   const jobId = JSON.parse(txt).prompt_id
+  // El id queda registrado en cuanto se despacha. Un deck son 20 o 30 renders en un solo trabajo:
+  // si la espera se cae, esta fila es lo unico que dice a que output pertenecia lo ya pagado.
+  registrarDespacho({
+    project_id, node_id, session_id, member_id,
+    jobId, workflow: maestro, deck, output_key, node_key, paginas: armado.paginas.length,
+  })
   // Sin esto el despacho es invisible en la consola: cuatro minutos sin una línea se ven igual
   // que un proceso muerto, y eso llevó a disparar el mismo render tres veces.
   // El nombre que se anuncia es el del maestro DESPACHADO, no el que nombra la DNA: con dos

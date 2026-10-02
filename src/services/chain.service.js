@@ -15,7 +15,7 @@ const { submitWorkflow, pollUntilDone, downloadOutputsByNode, uploadImageToComfy
 // `paso` porque en este archivo `paso` ya es el objeto del paso de la cadena.
 const enPaso = require('../utils/paso').crearPaso('chain')
 const { getWorkflowByName } = require('./config.service')
-const { logExecution } = require('./execution-log.service')
+const { logExecution, registrarDespacho } = require('./execution-log.service')
 const progreso = require('./progreso.service')
 
 // `origen` = el activo sobre el que se apretó Run. `<paso>:<rol>` = una salida del paso anterior.
@@ -788,6 +788,13 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
       } else {
         jobId = await enPaso(`${paso.etiqueta} · dispatching "${paso.workflow}" to ComfyUI`,
           () => submitWorkflow(paso.workflow, promptDelDespacho, 1024, 1024, extras, opciones))
+        // Registrado ANTES de esperarlo: si la espera se cae, el trabajo ya esta pagado y esta
+        // fila es lo unico que dice a que pieza pertenece para poder recogerlo.
+        registrarDespacho({
+          project_id, node_id: origen.node_id, member_id,
+          jobId, workflow: paso.workflow,
+          cadena: paso.etiqueta, origen: origen.id, origen_nombre: origen.name,
+        })
         progreso.marcar(project_id, origen.id, { estado: 'generando' })
         await enPaso(`${paso.etiqueta} · waiting for ComfyUI to finish job ${jobId.slice(0, 8)}`,
 () => pollUntilDone(jobId, 600_000))   // Tripo tarda mucho mas que un render local: medido 387 s el 02-10

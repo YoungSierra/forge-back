@@ -15,7 +15,7 @@
 const { submitWorkflow, pollUntilDone, downloadOutputsByNode, uploadImageToComfyUI, uploadBufferToComfyUI } = require('./providers/comfyui.provider')
 const { PNG } = require('pngjs')
 const { getWorkflowByName } = require('./config.service')
-const { logExecution } = require('./execution-log.service')
+const { logExecution, registrarDespacho } = require('./execution-log.service')
 
 // Qué herramienta puede correr sobre qué pieza. Es la decisión de Miguel (§5 del documento):
 // habilitar POR PROCEDENCIA, no detectando el fondo de la imagen. Las cadenas de concept art y la
@@ -203,6 +203,13 @@ async function correrHerramienta({ db, project_id, asset_id, clave, opciones = n
   const t0 = Date.now()
   const jobId = await paso(`${etq} · dispatching the workflow`,
     () => submitWorkflow(h.workflow, '', ancho, alto, extras, opciones))
+  // El id queda registrado ANTES de esperarlo: si lo que viene se cae, el trabajo ya esta pagado
+  // y esta fila es lo unico que permite saber a que pieza pertenece para ir a recogerlo.
+  registrarDespacho({
+    project_id, node_id: origen.node_id, member_id,
+    jobId, workflow: h.workflow,
+    herramienta: clave, origen: origen.id, origen_nombre: origen.name,
+  })
   // 600 s, no 300. Medido el 02-10 sobre los 100 trabajos del historial: el mas largo fue un 3D
   // de 387 s, y con el tope en 300 el `.glb` se quedo en ComfyUI ya pagado. No se sube mas alto
   // a proposito: esta ruta es una peticion normal que el navegador sostiene abierta, y esperar

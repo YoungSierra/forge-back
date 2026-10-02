@@ -430,10 +430,14 @@ async function subir(buffer, mime) {
   throw new Error(`no se pudo subir la referencia tras ${INTENTOS_SUBIDA} intentos: ${ultimo?.message}`)
 }
 
-async function generateImageComfyUI(workflowName, prompt, width, height, storagePath, extras = {}, timeoutMs = 120_000) {
+// `onJob` recibe el id en cuanto se despacha, ANTES de esperarlo. Sin esto el id vivía solo dentro
+// de esta función: si la espera o la descarga se caían, el trabajo quedaba pagado y sin forma de
+// saber a qué pieza pertenecía. Es opcional, así que quien no lo necesite llama igual que siempre.
+async function generateImageComfyUI(workflowName, prompt, width, height, storagePath, extras = {}, timeoutMs = 120_000, onJob = null) {
   const startTime = Date.now()
   const promptId = await submitWorkflow(workflowName, prompt, width, height, extras)
   console.log(`[ComfyUI] Submitted job ${promptId} workflow:${workflowName} timeout:${timeoutMs / 1000}s`)
+  try { onJob?.(promptId) } catch (e) { console.warn(`[ComfyUI] onJob falló (no fatal): ${e.message}`) }
   await pollUntilDone(promptId, timeoutMs)
   const result = await downloadOutput(promptId, storagePath)
   console.log(`[ComfyUI] Done in ${Date.now() - startTime}ms`)

@@ -162,4 +162,32 @@ function logExecution(params) {
   })
 }
 
-module.exports = { logExecution, calculateLLMCost }
+/**
+ * Deja constancia de un trabajo de ComfyUI EN EL MOMENTO DE DESPACHARLO, antes de esperarlo.
+ *
+ * El 02-10 se perdieron dos trabajos ya pagados de Migue León: uno tardó más que nuestro tope y
+ * el otro se cayó por un parpadeo de red. Los dos habían terminado bien del lado de ComfyUI y sus
+ * archivos seguían ahí. No se pudieron devolver a su sitio porque **no guardábamos en ningún lado
+ * a qué pieza pertenecía cada trabajo**: el id solo aparecía en el mensaje de error, y para
+ * entonces ya era tarde. Buscarlo por la imagen de entrada tampoco sirve — la máscara se compone y
+ * se sube nueva en cada intento, así que el mismo encargo da un hash distinto cada vez.
+ *
+ * Con esta fila, un trabajo huérfano se puede recoger: dice qué proyecto, qué pieza de origen y
+ * qué herramienta lo pidió.
+ *
+ * `cost_usd: 0` a propósito: el gasto lo registra la fila de éxito. Si ésta llevara costo, cada
+ * render se cobraría DOS veces — `logExecution` cobra crédito a la organización cuando hay costo.
+ */
+function registrarDespacho({ project_id, node_id, session_id = null, member_id = null, jobId, workflow, ...resto }) {
+  logExecution({
+    project_id, node_id, session_id,
+    triggered_by: member_id,
+    trigger_type: 'image_gen', executor_type: 'comfyui', provider: 'comfyui', model: workflow,
+    cost_usd: 0, is_estimated: false,
+    started_at: new Date().toISOString(),
+    status: 'dispatched',
+    metadata: { jobId, despachado: true, ...resto },
+  })
+}
+
+module.exports = { logExecution, calculateLLMCost, registrarDespacho }
