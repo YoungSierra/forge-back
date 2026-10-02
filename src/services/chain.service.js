@@ -790,7 +790,7 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
           () => submitWorkflow(paso.workflow, promptDelDespacho, 1024, 1024, extras, opciones))
         progreso.marcar(project_id, origen.id, { estado: 'generando' })
         await enPaso(`${paso.etiqueta} · waiting for ComfyUI to finish job ${jobId.slice(0, 8)}`,
-          () => pollUntilDone(jobId, 300_000))   // Tripo y gpt-image-2 tardan bastante más que un render local
+() => pollUntilDone(jobId, 600_000))   // Tripo tarda mucho mas que un render local: medido 387 s el 02-10
         progreso.marcar(project_id, origen.id, { estado: 'publicando' })
         // La convención de JuanK (Fase 4, punto 4): `<ID_Personaje>/<Movimiento>`. Lo que salía era
         // «Moon_Jelly_6_mesh_shader_animation__idle_00001_.mp4» — el nombre que le puso el nodo de

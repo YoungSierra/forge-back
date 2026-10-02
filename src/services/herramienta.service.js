@@ -203,7 +203,12 @@ async function correrHerramienta({ db, project_id, asset_id, clave, opciones = n
   const t0 = Date.now()
   const jobId = await paso(`${etq} · dispatching the workflow`,
     () => submitWorkflow(h.workflow, '', ancho, alto, extras, opciones))
-  await paso(`${etq} · waiting for ComfyUI`, () => pollUntilDone(jobId, 300_000))
+  // 600 s, no 300. Medido el 02-10 sobre los 100 trabajos del historial: el mas largo fue un 3D
+  // de 387 s, y con el tope en 300 el `.glb` se quedo en ComfyUI ya pagado. No se sube mas alto
+  // a proposito: esta ruta es una peticion normal que el navegador sostiene abierta, y esperar
+  // quince minutos cambiaria un fallo nuestro por un corte del navegador. Lo que de verdad
+  // cierra el caso es que el error lleve el id para poder RECOGER el trabajo.
+  await paso(`${etq} · waiting for ComfyUI`, () => pollUntilDone(jobId, 600_000))
   const base = `projects/${project_id}/tool/${clave}/${jobId.slice(0, 8)}`
   const salidas = await paso(`${etq} · downloading the results and storing them`,
     () => downloadOutputsByNode(jobId, base))

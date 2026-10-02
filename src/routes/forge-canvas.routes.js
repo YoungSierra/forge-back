@@ -5665,8 +5665,10 @@ router.post('/assets/:asset_id/montaje-subido',
         return res.status(400).json({ success: false, code: 'RENDER_INVALIDO', error: `Renders must be .png or .jpg — got "${malos[0].originalname}"` })
       }
 
+      // `session_id` se trae porque el montaje lo HEREDA: es obligatorio en `forge_assets` y la
+      // pieza nueva pertenece a la misma sesión que la hoja de la que deriva.
       const { data: hoja } = await db().from('forge_assets')
-        .select('id, node_id, name, metadata').eq('id', asset_id).eq('project_id', project_id).maybeSingle()
+        .select('id, node_id, name, metadata, session_id').eq('id', asset_id).eq('project_id', project_id).maybeSingle()
       if (!hoja) return res.status(404).json({ success: false, error: 'Asset not found' })
 
       const { uploadToStorage } = require('../services/storage.service')
@@ -5682,9 +5684,18 @@ router.post('/assets/:asset_id/montaje-subido',
       }
 
       const nombre = `${String(hoja.name).split(/\s+[—–]\s+/).pop()} — Level assembly`
-      const { data: previo } = await db().from('forge_assets')
+      // Con `error` comprobado a propósito. Si esta consulta falla y se ignora, `previo` queda en
+      // null y el camino de abajo CREA una pieza nueva en vez de reemplazar: el nivel acabaría con
+      // dos montajes en el moodboard, que es justo lo que la regla de JuanK prohíbe. Un fallo de
+      // lectura no es «no hay montaje anterior».
+      const { data: previo, error: errPrevio } = await db().from('forge_assets')
         .select('id, storage_url, metadata').eq('project_id', project_id).eq('derived_from_id', asset_id)
         .not('metadata->montaje_subido', 'is', null).order('created_at', { ascending: false }).limit(1).maybeSingle()
+      if (errPrevio) {
+        const e = new Error(`Could not check whether this level already has an assembly: ${errPrevio.message}`)
+        e.publico = true; e.status = 500; e.code = 'MONTAJE_PREVIO_ILEGIBLE'
+        throw e
+      }
 
       const marca = {
         en: new Date().toISOString(), por: member_id,
@@ -5713,13 +5724,22 @@ router.post('/assets/:asset_id/montaje-subido',
         pieza = { id: previo.id, reemplazado: true }
       } else {
         const { data: nuevo, error } = await db().from('forge_assets').insert({
-          project_id, node_id: hoja.node_id, name: nombre,
+          project_id, node_id: hoja.node_id, session_id: hoja.session_id, name: nombre,
           format: 'glb', mime_type: 'model/gltf-binary',
           status: 'approved', approved_by: member_id, approved_at: new Date().toISOString(),
           storage_url: urlModelo, file_size_bytes: modelo.size,
           derived_from_id: asset_id, metadata: { montaje_subido: marca },
         }).select('id').single()
-        if (error) throw error
+        // Este insert fallaba SIEMPRE por no escribir `session_id`, que es NOT NULL desde la
+        // migración 006. El `.glb` de 88,7 MB y sus renders ya estaban en R2 cuando reventaba, así
+        // que cada intento dejaba una carpeta huérfana y el usuario veía «Internal server error».
+        // JuanK lo intentó seis veces el 01-10. La ruta no había funcionado nunca: cero montajes
+        // en la base. El motivo tiene que VIAJAR, o el próximo fallo vuelve a costar un día.
+        if (error) {
+          const e = new Error(`Could not register the assembly: ${error.message}`)
+          e.publico = true; e.status = 500; e.code = 'MONTAJE_NO_REGISTRADO'
+          throw e
+        }
         pieza = { id: nuevo.id, reemplazado: false }
       }
 

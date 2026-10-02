@@ -23,6 +23,10 @@ function crearPaso(ambito) {
       err.status  = e?.status || 502
       err.code    = e?.code || 'PASO_FALLIDO'
       err.cause   = e
+      // El id del trabajo de ComfyUI viaja. Es lo que permite RECOGER un trabajo que ya se pagó
+      // en vez de despachar otro; envolver el error y perderlo acá dejaba la única salida en
+      // volver a pagar.
+      if (e?.jobId) err.jobId = e.jobId
       throw err
     }
   }

@@ -151,14 +151,44 @@ async function submitWorkflow(workflowName, prompt, width, height, extras = {}, 
   return json.prompt_id
 }
 
+// Cuántos fallos de red SEGUIDOS se aguantan antes de dar el trabajo por perdido. Con el sondeo
+// cada 3 s son ~30 segundos de bache tolerados, que cubre un corte pasajero y sigue parando ante
+// uno de verdad.
+const TOPE_FALLOS = 10
+
 async function pollUntilDone(promptId, timeoutMs = 120000) {
   const deadline = Date.now() + timeoutMs
   const INTERVAL = 3000
+  let fallosSeguidos = 0
 
   while (Date.now() < deadline) {
     await new Promise(r => setTimeout(r, INTERVAL))
 
-    const res = await fetch(`${BASE_URL()}/api/job/${promptId}/status`, { headers: headers() })
+    // Un parpadeo de red NO puede costar un trabajo ya pagado.
+    //
+    // Este bucle toleraba que ComfyUI contestara mal —un 502, un 500: reintenta— pero no que la
+    // petición no llegara a salir. Un `TypeError: fetch failed` reventaba fuera del bucle y se
+    // llevaba el trabajo entero, que para entonces ya estaba cobrado.
+    //
+    // Y pregunta cada 3 segundos: un trabajo de 387 s son ~130 oportunidades de tropezar, uno de
+    // 25 s son 8. Por eso fallaban justo los largos —3D y design edits— y nunca los cortos. El
+    // 02-10 se perdieron así dos trabajos de Migue León que ComfyUI había terminado bien.
+    //
+    // Se toleran fallos SEGUIDOS hasta `TOPE_FALLOS`; uno bueno reinicia la cuenta. Así un corte
+    // de verdad sigue parando, pero un bache de unos segundos ya no cuesta dinero.
+    let res
+    try {
+      res = await fetch(`${BASE_URL()}/api/job/${promptId}/status`, { headers: headers() })
+      fallosSeguidos = 0
+    } catch (e) {
+      fallosSeguidos++
+      console.warn(`[ComfyUI] poll ${promptId} sin salida (${e.message}) — ${fallosSeguidos}/${TOPE_FALLOS}`)
+      if (fallosSeguidos < TOPE_FALLOS) continue
+      const err = new Error(`Lost contact with the image service while waiting for job ${promptId}. `
+        + `The job may have finished and been charged — check it before paying for another.`)
+      err.publico = true; err.status = 504; err.code = 'COMFYUI_SIN_CONTACTO'; err.jobId = promptId
+      throw err
+    }
     if (!res.ok) {
       console.warn(`[ComfyUI] poll ${promptId} → HTTP ${res.status}, retrying`)
       continue
@@ -184,10 +214,15 @@ async function pollUntilDone(promptId, timeoutMs = 120000) {
     console.log(`[ComfyUI] job ${promptId} → ${status}`)
   }
 
-  const e = new Error(`The image service did not finish within ${Math.round(timeoutMs / 1000)}s. The job may still be running — check before paying for another.`)
+  // El id va EN el error. Un trabajo que termina tarde sigue estando ahí y se puede recoger: sin
+  // el id, la única salida era pagar otro. El 02-10 un 3D de Migue León tardó 387 s contra un tope
+  // de 300 y el `.glb` se quedó en ComfyUI sin que nadie pudiera ir a buscarlo.
+  const e = new Error(`The image service did not finish within ${Math.round(timeoutMs / 1000)}s. `
+    + `The job (${promptId}) may still be running and already charged — collect it instead of paying for another.`)
   e.publico = true
   e.status = 504
   e.code = 'COMFYUI_TIMEOUT'
+  e.jobId = promptId
   throw e
 }
 
