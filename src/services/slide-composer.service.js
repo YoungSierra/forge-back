@@ -710,14 +710,64 @@ function parsearFills(texto) {
     m.set(etiqueta, buffer.join('\n').trim())
     buffer = []
   }
+  // Un rótulo corto vale siempre; uno largo, solo si trae su marcador de sección.
+  //
+  // El tope de 80 existe para que una línea de prosa acabada en dos puntos no se lea como rótulo.
+  // Pero TRES rótulos de los maestros del ASG lo pasan —«CHARACTER ARCHETYPES - name · visual
+  // signature · …» son 112 caracteres— y se perdían en silencio. Un campo sin fill no queda vacío:
+  // recibe la sección ADI entera, así que salían tres campos con un ladrillo dentro.
+  //
+  // Acortarlos no es opción: el emparejamiento es por rótulo y éstos son los del maestro, literal.
+  //
+  // Subir el tope a secas tampoco: medido sobre las 791 líneas de las respuestas reales que hay en
+  // la base, pasar a 120 colaba OCHO líneas de prosa —filas de tabla, frases descriptivas— como si
+  // fueran rótulos. Lo que separa limpiamente a unos de otros es el «§»: los tres rótulos largos lo
+  // llevan y ninguna de las ocho falsas. Por eso el tope sube SOLO para los que lo traen.
+  // El cambio es ESTRICTAMENTE ADITIVO: hasta 80 se acepta exactamente lo mismo que antes —filas
+  // de tabla incluidas, que ya se leían así—, y solo por encima de 80 se exige el marcador de
+  // sección y que no sea una fila. Al excluir las filas en las dos ramas se perdían doce que hoy
+  // sí se leen en Wort, y eso es cambiar algo que funciona para arreglar otra cosa.
+  //
+  // La fila hay que excluirla en la rama larga porque el `§` solo no basta: medido, una de 152
+  // caracteres —«| Sonic mood | Audio must reinforce…»— cita su sección y se colaba.
+  const LARGO_CORTO = 80, LARGO_MAXIMO = 160
+  const esRotulo = s => !/^https?$/i.test(s)
+    && (s.length <= LARGO_CORTO || (/§/.test(s) && !/^\|/.test(s)))
+
+  // El separador es el primer dos puntos FUERA de paréntesis.
+  //
+  // Un rótulo del maestro puede llevarlos dentro: «DYNAMIC ARC (per section: energy · instruments
+  // in · mood) - INTRO / BUILD / PEAK (§7.10.1)». Cortando en el primero a secas, el rótulo
+  // quedaba en «DYNAMIC ARC (per section» y ese campo no casaba con nada. Lo detectó Pedro.
+  const partir = linea => {
+    // La viñeta exige espacio detrás. Sin eso, en «**core_fantasy**: …» el primer `*` se comía
+    // como viñeta, quedaba un `*` suelto dentro del rótulo y la línea se descartaba. El regex que
+    // había podía retroceder y acertaba; una lectura carácter a carácter no, así que hay que ser
+    // explícito. Medido: sin esto se perdían rótulos que hoy SÍ se leen en Wort.
+    const pre = /^\s*(?:[-*][ \t]+)?(?:\*\*)?/.exec(linea)[0]
+    let hondo = 0
+    for (let i = pre.length; i < linea.length; i++) {
+      const c = linea[i]
+      if (c === '(') hondo++
+      else if (c === ')') hondo = Math.max(0, hondo - 1)
+      else if (c === ':' && hondo === 0) {
+        const cruda = linea.slice(pre.length, i).replace(/\*\*$/, '').trim()
+        // Sin `*` dentro y con largo acotado, igual que la expresión que había antes.
+        if (cruda.includes('*') || cruda.length < 2 || cruda.length > LARGO_MAXIMO) return null
+        return [cruda, linea.slice(i + 1).trim()]
+      }
+    }
+    return null
+  }
+
   for (const linea of String(texto).split('\n')) {
-    const mm = linea.match(/^\s*(?:[-*]\s*)?(?:\*\*)?([^:*\n]{2,80}?)(?:\*\*)?:\s*(.*)$/)
-    if (mm && !/^https?$/i.test(mm[1].trim())) {
+    const mm = partir(linea)
+    if (mm && esRotulo(mm[0])) {
       cerrar()
-      const cruda = mm[1].trim()
+      const [cruda, valor] = mm
       etiqueta = cruda.replace(/^This slide\s*(?:image)?\s*[—–-]?\s*/i, '').trim()
       if (/^This slide[\s—–-]/i.test(cruda + ' ')) m.propias.add(normalizar(etiqueta))
-      buffer = mm[2] ? [mm[2].trim()] : []
+      buffer = valor ? [valor] : []
     } else if (etiqueta && linea.trim()) {
       buffer.push(linea.trim())
     }

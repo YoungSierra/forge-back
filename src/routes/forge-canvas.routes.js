@@ -867,6 +867,8 @@ async function executeImageOutput({ project_id, node_id, targetOutputKey, member
       for (const hermano of (def.uses?.siblings_if_present || [])) {
         const hDef = dna.outputs.find(o => (o.key || o.name) === hermano)
         if (!hDef || hDef.type !== 'connection') continue
+        // Los fills son la ENTRADA del deck, escrita por el LLM: el volcado no los pisa.
+        if (/_fills$/.test(hermano)) continue
 
         const { data: yaHay } = await db().from('forge_sessions').select('id')
           .eq('project_id', project_id).eq('node_id', node_id).eq('output_key', hermano)
@@ -5387,6 +5389,9 @@ router.post('/nodes/:project_node_id/auto-run', async (req, res, next) => {
     for (const o of (Array.isArray(nodeDna?.outputs) ? nodeDna.outputs : [])) {
       if (!(await esDeck(o))) continue
       for (const h of (o.uses?.siblings_if_present || [])) {
+        // Un hermano `*_fills` es trabajo del LLM que el deck LEE, no una salida de auditoria que
+        // escriba el motor: se queda en la corrida de texto del nodo.
+        if (/_fills$/.test(h)) continue
         const hDef = nodeDna.outputs.find(x => (x.key || x.name) === h)
         if (hDef?.type === 'connection') porDeck.add(h)
       }
