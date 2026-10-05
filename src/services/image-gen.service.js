@@ -1020,7 +1020,22 @@ async function paginaDelASG(db, projectId, numero, nombre = null, frase = false)
   // aflojar a «empieza con» sin exigir unicidad emparejaría «Video Marketing» con la lámina
   // «Video Marketing Sheet», que es otra página.
   const norm = s => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '')
-  const parteDePagina = a => String(a.name || '').split(/\s[—–-]\s/).pop()
+  // El tramo del nombre que ES la página, que no siempre es el último.
+  //
+  // El 3.20 nombra las páginas con una descripción detrás: «Art Style Guide — 21_UIComponentSheet
+  // — UI/HUD (6 elements), icons (2 used), fonts (2)». Quedándose con el último tramo se buscaba
+  // «uihud6elementsicons2usedfonts2» y no encontraba nada. Lo que identifica la página es el tramo
+  // con su número delante (`21_UIComponentSheet`), que es el prefijo del SaveImage del maestro.
+  //
+  // Medido el 05-10: por eso el deck de UI no arrancaba en Professor_Wort_&_Sprat_world teniendo
+  // su página renderizada y aprobada. En pinball resolvía de carambola, porque ahí conviven piezas
+  // con dos tramos y el último SÍ era la página.
+  //
+  // Sin tramo numerado se conserva el último, que es como venían los nombres antes.
+  const parteDePagina = a => {
+    const tramos = String(a.name || '').split(/\s[—–-]\s/)
+    return tramos.find(t => /^\s*\d+[_\s]/.test(t)) || tramos[tramos.length - 1]
+  }
   const sinNumero = s => String(s).replace(/^\d+[_\s]*/, '')
 
   if (nombre) {

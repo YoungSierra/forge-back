@@ -41,6 +41,9 @@ async function callMimo(systemPrompt, userMessage, options = {}) {
   const apiKey = process.env.MIMO_API_KEY
   if (!apiKey) throw new Error('MIMO_API_KEY no está configurada')
 
+  // El respaldo, para cuando nadie elige modelo. Se deja en 2.5-pro a propósito aunque ya exista
+  // el 2.6: ningún nodo declara mimo todavía, así que esta línea nunca ha corrido y cambiarla
+  // sería estrenar un modelo nuevo por la puerta de atrás. El 2.6 se elige en el admin.
   const model     = options.model || 'xiaomi/mimo-v2.5-pro'
   const startTime = Date.now()
 
