@@ -925,15 +925,26 @@ async function executeImageOutput({ project_id, node_id, targetOutputKey, member
       // Cuántas páginas esperar. El orden importa: si la DNA acota un subconjunto (`def.pages`)
       // manda ese; si no, el maestro que le toca a ESTE proyecto, que con dos maestros
       // conviviendo no es el que declara la DNA. El techo de la DNA queda de último recurso.
-      let esperadas = (Array.isArray(def.pages) && def.pages.length) || null
-      if (!esperadas && deckDelOutput) {
+      // Y las dos cosas se CRUZAN, no se eligen. Desde el v2.9.44 la DNA declara 1..31 para cubrir
+      // los dos maestros del ASG a la vez; dando por buena esa lista sin más, un proyecto en el
+      // maestro de 25 enseñaría «18/31» y parecería que se quedaron páginas sin hacer. El
+      // subconjunto que declara la DNA sigue mandando — solo se descartan los índices que su
+      // maestro no tiene. Avisado por Pedro al entregar el v2.9.44.
+      let delMaestro = null
+      if (deckDelOutput) {
         try {
           const { paginasDelMaestro } = require('../services/slide-composer.service')
-          esperadas = await paginasDelMaestro({ db, projectId: project_id, deck: deckDelOutput })
+          delMaestro = await paginasDelMaestro({ db, projectId: project_id, deck: deckDelOutput })
         } catch (e) {
           // Es solo el número que ve la barra de avance: que falle no puede tumbar el despacho.
           console.warn('[deck] no se pudo resolver el maestro para el conteo:', e.message)
         }
+      }
+      let esperadas = null
+      if (Array.isArray(def.pages) && def.pages.length) {
+        esperadas = delMaestro ? def.pages.filter(n => Number(n) <= delMaestro).length : def.pages.length
+      } else if (delMaestro) {
+        esperadas = delMaestro
       }
       if (!esperadas) esperadas = require('../services/image-count').techoDeclarado(def)
 
