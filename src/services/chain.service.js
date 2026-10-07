@@ -35,6 +35,18 @@ const CADENAS = {
     pasos: [
       {
         clave: 'concept_art', workflow: 'V57_STUDIO_ConceptArt_Characters', etiqueta: 'Concept art',
+        // Dos poses para el mismo paso (Migue Leon, 06-10). El usuario elige en la ventana de Run y
+        // su respuesta llega en `opciones.pose`; cada una lanza SU workflow. El de T-pose es el que
+        // habia y sigue siendo el valor por defecto, asi que una corrida sin elegir nada se comporta
+        // igual que siempre.
+        //
+        // La pose queda escrita en la metadata de cada vista y se propaga al 3D: los dos workflows
+        // guardan los MISMOS nombres de archivo (`character_front`...), asi que sin ese dato las dos
+        // versiones de un personaje son indistinguibles en la Asset Library.
+        variantes: {
+          t_pose:  'V57_STUDIO_ConceptArt_Characters',
+          neutral: 'V57_STUDIO_ConceptArt_Characters_NeutralPose',
+        },
         que:    'Three pages to the right: the front, side and back views of this character.',
         porque: 'A mesh cannot be built from one picture — the three views are what make the body consistent.',
         entradas: { image: 'origen' },
@@ -335,6 +347,20 @@ function proximoPaso(asset) {
     indice: i + 1, de: def.pasos.length,
     clave: p.clave, etiqueta: p.etiqueta, que: p.que, porque: p.porque,
     pide_prompt: !!p.pide_prompt, workflow: p.workflow,
+
+    // Las poses entre las que el usuario elige, cuando el paso tiene variantes. Van DESDE AQUI y
+    // no escritas en el front a proposito: el dia que una cadena gane otra variante, la ventana se
+    // entera sola. Si el paso no tiene `variantes`, esto no viaja y la ventana no pregunta nada.
+    //
+    // El rotulo y la ayuda son los que escribio Migue Leon en su documento del 06-10.
+    ...(p.variantes ? {
+      poses: [
+        { clave: 't_pose',  etiqueta: 'T-Pose',
+          ayuda: 'Arms extended to the sides at 90°. Standard pose for bipedal characters going to rig.' },
+        { clave: 'neutral', etiqueta: 'Neutral Pose',
+          ayuda: "Keeps the character's natural resting pose from the Character Sheet. Recommended for quadrupeds, creatures and non-humanoid characters." },
+      ].filter(x => p.variantes[x.clave]),
+    } : {}),
     // Qué paso alimenta a éste cuando corre una vez por cada salida. El recuadro necesita saberlo
     // para contar cuántos despachos son: apretar Run sobre una parte del escenario dispara las
     // veinte, y eso no puede quedar detrás de un botón que no lo dice.
@@ -373,6 +399,14 @@ function proximoPaso(asset) {
 // aparte. Se guardan además en el metadata de cada activo producido: es lo que deja mostrarlas
 // bajo la imagen y reusarlas al rehacerla.
 async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, member_id = null, limitePorCada = 0, opciones = null, clips = null, solo = null, promptsClips = null }) {
+  // La pose NO es una opcion de generacion: elige QUE workflow se lanza, no un valor dentro de uno.
+  // Se separa aqui, antes de que `opciones` llegue a `aplicarOpciones`, que valida cada clave contra
+  // el catalogo de ComfyUI y avisaria de una opcion que ese grafo no tiene.
+  const pose = opciones?.pose ? String(opciones.pose) : null
+  if (pose) {
+    const { pose: _, ...resto } = opciones
+    opciones = Object.keys(resto).length ? resto : null
+  }
   const { data: origen, error: e0 } = await db().from('forge_assets')
     .select('id, project_id, node_id, session_id, name, storage_url, metadata')
     .eq('id', asset_id).single()
@@ -786,13 +820,18 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
         }
         for (const pg of r.paginas) porRol[pg.name] = { url: pg.url, kind: pg.kind || 'image' }
       } else {
-        jobId = await enPaso(`${paso.etiqueta} · dispatching "${paso.workflow}" to ComfyUI`,
-          () => submitWorkflow(paso.workflow, promptDelDespacho, 1024, 1024, extras, opciones))
+        // La variante que pidio el usuario, o la de siempre. Un paso sin `variantes` no cambia.
+        const wfDelPaso = paso.variantes?.[pose] || paso.workflow
+        if (pose && paso.variantes && !paso.variantes[pose]) {
+          console.warn(`[cadena] el paso "${paso.clave}" no tiene variante "${pose}" — se usa ${paso.workflow}`)
+        }
+        jobId = await enPaso(`${paso.etiqueta} · dispatching "${wfDelPaso}" to ComfyUI`,
+          () => submitWorkflow(wfDelPaso, promptDelDespacho, 1024, 1024, extras, opciones))
         // Registrado ANTES de esperarlo: si la espera se cae, el trabajo ya esta pagado y esta
         // fila es lo unico que dice a que pieza pertenece para poder recogerlo.
         registrarDespacho({
           project_id, node_id: origen.node_id, member_id,
-          jobId, workflow: paso.workflow,
+          jobId, workflow: wfDelPaso,
           cadena: paso.etiqueta, origen: origen.id, origen_nombre: origen.name,
         })
         progreso.marcar(project_id, origen.id, { estado: 'generando' })
@@ -873,6 +912,11 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
       const { versionVigente } = require('./actualizacion.service')
       const versionDelPadre = await versionVigente(db, padre).catch(() => null)
 
+      // La pose que lleva esta pieza: la que el usuario eligio en ESTE paso, o la que ya traia el
+      // origen. Lo segundo es lo que hace que el .glb del 3D diga de que pose salio sin que nadie
+      // vuelva a elegir — el paso 3D no pregunta, usa las vistas aprobadas.
+      const poseDeLaPieza = (paso.variantes && pose) ? pose : (origen?.metadata?.pose || null)
+
       for (const [rol, sal] of publicables) {
         // Con instancias, el nombre lleva la parte; sin ellas, el rol solo si hay más de uno.
         const sufijo = cada ? ` — ${cada}` : (publicables.length > 1 ? ` — ${rol}` : '')
@@ -897,6 +941,11 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
             // tarjeta dice de dónde viene y quien mira decide sin abrir las dos.
             ...(versionDelPadre !== null ? { derivado_de_version: versionDelPadre } : {}),
             ...(opciones && Object.keys(opciones).length ? { opciones } : {}),
+            // La pose con la que se produjo. Los dos workflows guardan los MISMOS nombres de
+            // archivo, asi que sin este dato las dos versiones de un personaje son indistinguibles
+            // en la Asset Library. Se HEREDA del padre cuando este paso no la elige: asi el .glb
+            // del 3D dice de que pose salio, que es lo que necesita saber quien lo rigea.
+            ...(poseDeLaPieza ? { pose: poseDeLaPieza } : {}),
           },
         }).select('id, name, storage_url, format, metadata').single()
         if (error) throw error
@@ -916,6 +965,33 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
         acumulado[cada ? cada : rol] = { ...sal, assetId: a.id }
         nuevos.push(a)
         creados.push(a)
+      }
+    }
+
+    // Cambiar de pose deja CADUCADO el 3D que salio de las vistas anteriores (Migue Leon, §5.3).
+    //
+    // No se borra ni se regenera solo: un .glb cuesta y la decision de rehacerlo es de quien mira.
+    // Lo que no puede pasar es que siga pareciendo vigente — alimenta el rig, y un modelo en T-pose
+    // presentado como la version neutral se descubre en animacion, tarde.
+    //
+    // Solo cuando la pose CAMBIA de verdad: re-correr la misma pose no caduca nada.
+    if (paso.variantes && pose) {
+      try {
+        const { data: viejos } = await db().from('forge_assets')
+          .select('id, name, metadata')
+          .eq('project_id', project_id)
+          .eq('format', 'glb')
+          .contains('metadata', { cadena: { nombre: nombreCadena } })
+        const caducan = (viejos || []).filter(g => (g.metadata?.pose || 't_pose') !== pose && !g.metadata?.pose_caducada)
+        for (const g of caducan) {
+          await db().from('forge_assets')
+            .update({ metadata: { ...(g.metadata || {}), pose_caducada: { desde: g.metadata?.pose || 't_pose', ahora: pose, en: new Date().toISOString() } } })
+            .eq('id', g.id)
+        }
+        if (caducan.length) console.log(`[cadena] ${caducan.length} modelo(s) 3D marcados como caducados: la pose paso a "${pose}"`)
+      } catch (e) {
+        // Marcar es informativo: que falle no puede tumbar un paso que ya se pago.
+        console.warn(`[cadena] no se pudo marcar el 3D como caducado: ${e.message}`)
       }
     }
 

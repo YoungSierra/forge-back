@@ -50,6 +50,7 @@ async function isBlueprintSealed(project_id, blueprint_id) {
 
 // ─── Outputs de texto/asset de un nodo (Decision 5: imágenes fuera de scope v1) ──
 // Los outputs de imagen (image_gen + format png/image) los maneja la tarea #8, no Run.
+
 function textOutputsOf(node) {
   const outs = (Array.isArray(node?.outputs) ? node.outputs : []).map(o => ({ ...o, key: o.key || o.name }))
   return outs.filter(o => o.key && !(o.image_gen === true && (o.format === 'png' || o.format === 'image')))
@@ -714,7 +715,12 @@ async function executeImageOutput({ project_id, node_id, targetOutputKey, member
       // con la DNA vieja y con la nueva sin bifurcar el motor.
       let fills = null
       for (const h of (def.uses?.siblings_if_present || [])) {
-        if (!/_fills$/.test(h)) continue
+        const hDefF = (dna?.outputs || []).find(o => (o.key || o.name) === h)
+        // La regla: manda `deck_role` de la DNA (v2.9.43); el sufijo del nombre queda de RESPALDO
+        // para la DNA vieja que aun no declara el campo. Va EN LINEA y no en un ayudante
+        // compartido a proposito: el arnes con el que Pedro verifica estos bloques los recorta
+        // y los corre aislados, asi que un ayudante de modulo lo dejaria sin funcionar.
+        if (!(hDefF?.deck_role === 'fills' || /_fills$/.test(h))) continue
         const { data: hs } = await db().from('forge_sessions').select('output_asset_id')
           .eq('project_id', project_id).eq('node_id', node_id).eq('output_key', h)
           .in('status', ['approved', 'auto_approved']).order('completed_at', { ascending: false })
@@ -868,7 +874,7 @@ async function executeImageOutput({ project_id, node_id, targetOutputKey, member
         const hDef = dna.outputs.find(o => (o.key || o.name) === hermano)
         if (!hDef || hDef.type !== 'connection') continue
         // Los fills son la ENTRADA del deck, escrita por el LLM: el volcado no los pisa.
-        if (/_fills$/.test(hermano)) continue
+        if (hDef.deck_role === 'fills' || /_fills$/.test(hermano)) continue
 
         const { data: yaHay } = await db().from('forge_sessions').select('id')
           .eq('project_id', project_id).eq('node_id', node_id).eq('output_key', hermano)
@@ -5400,10 +5406,10 @@ router.post('/nodes/:project_node_id/auto-run', async (req, res, next) => {
     for (const o of (Array.isArray(nodeDna?.outputs) ? nodeDna.outputs : [])) {
       if (!(await esDeck(o))) continue
       for (const h of (o.uses?.siblings_if_present || [])) {
-        // Un hermano `*_fills` es trabajo del LLM que el deck LEE, no una salida de auditoria que
-        // escriba el motor: se queda en la corrida de texto del nodo.
-        if (/_fills$/.test(h)) continue
         const hDef = nodeDna.outputs.find(x => (x.key || x.name) === h)
+        // Un hermano de fills es trabajo del LLM que el deck LEE, no una salida de auditoria que
+        // escriba el motor: se queda en la corrida de texto del nodo.
+        if (hDef?.deck_role === 'fills' || /_fills$/.test(h)) continue
         if (hDef?.type === 'connection') porDeck.add(h)
       }
     }

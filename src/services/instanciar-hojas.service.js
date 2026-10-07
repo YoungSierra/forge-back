@@ -137,11 +137,40 @@ async function instanciarHojas({
   const creados = []
   const fallos = []
 
+  // Los fills, igual que en el despacho del deck.
+  //
+  // Sin esto cada instancia componia extrayendo del documento, que es el camino de respaldo: la
+  // hoja plantilla salia con los fills del LLM y sus instancias no, con lo que la misma hoja decia
+  // una cosa y sus fichas otra. Lo senalo Pedro al entregar el v2.9.42.
+  //
+  // Se carga aqui y no se reutiliza el bloque de la ruta a proposito: ese bloque lo recorta el
+  // arnes con el que Pedro verifica el motor, y moverlo lo dejaria sin funcionar.
+  let fills = null
+  try {
+    const { data: dna } = await db().from('forge_nodes').select('outputs').eq('id', node_id).maybeSingle()
+    const def = (dna?.outputs || []).find(o => (o.key || o.name) === output_key)
+    for (const h of (def?.uses?.siblings_if_present || [])) {
+      const hDef = (dna?.outputs || []).find(o => (o.key || o.name) === h)
+      if (!(hDef?.deck_role === 'fills' || /_fills$/.test(h))) continue
+      const { data: hs } = await db().from('forge_sessions').select('output_asset_id')
+        .eq('project_id', project_id).eq('node_id', node_id).eq('output_key', h)
+        .in('status', ['approved', 'auto_approved']).order('completed_at', { ascending: false })
+        .limit(1).maybeSingle()
+      if (!hs?.output_asset_id) continue
+      const { data: a } = await db().from('forge_assets').select('content').eq('id', hs.output_asset_id).maybeSingle()
+      if (a?.content) { fills = a.content; break }
+    }
+  } catch (e) {
+    // Que falle la carga no puede tumbar el instanciado: sin fills se compone como antes.
+    console.warn(`[instanciar] no se pudieron cargar los fills: ${e.message}`)
+  }
+  console.log(`[instanciar] fills ${fills ? `cargados (${fills.length} chars)` : 'no disponibles — se compone del documento'}`)
+
   for (const t of recortado) {
     try {
       const r = await generateDeck({
         db, project_id, node_id, session_id: null, node_key, output_key,
-        image_gen_model, deck, member_id,
+        image_gen_model, deck, member_id, fills,
         solo: [t.indice],
         extraPrompt: pedidoDe(t.pagina, t.item),
       })

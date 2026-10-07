@@ -1340,6 +1340,15 @@ ${cola}`
   // mañana una página cambia de fuente, cambia sola.
   const avisosRef = []
   const sinRef    = new Set()
+  // Páginas que piden referencia, no la consiguieron y se renderizan igual, solo con su plantilla.
+  // No se descartan: la ranura de referencia se desconecta del nodo del modelo y la poda se lleva
+  // el LoadImage REF. Es el resultado que ya tenían antes de que el workflow pidiera referencia.
+  const templateOnly = new Set()
+  // ¿Se puede renderizar esta página sin su referencia? Solo si el prompt, sin la línea
+  // «IMAGE 2 = …», ya no la cita: hay decks (UI) cuyo estilo sale entero de IMAGE 2 y la mencionan
+  // en todo el texto; mandarlos sin ella pediría estilizar desde una imagen que no llega.
+  const promptSinRef = texto => typeof texto === 'string' ? texto.replace(/^IMAGE 2 = [^\n]*\n?/m, '') : texto
+  const aguantaSinRef = texto => typeof texto !== 'string' || !/IMAGE 2/.test(promptSinRef(texto))
   {
     const conBatch = armado.paginas.filter(p => {
       const gpt = wf[p.prompt_node]
@@ -1367,17 +1376,18 @@ ${cola}`
         // inválido. Se reconecta el nodo del modelo directo a la plantilla y el batch queda
         // huérfano; la poda posterior lo descarta.
         const sinAncla = motivo => {
-          // La página se queda sin referencia SIEMPRE que se entre acá, se haya podido puentear el
-          // batch o no. Antes solo se contaba el caso en que ni siquiera se pudo puentear, así que
-          // el parte decía «referencias de estilo: 1/1» mientras el modelo recibía una sola imagen
-          // — un contador que tapaba justo lo que tenía que denunciar.
-          sinRef.add(p.nombre)
+          // Si el batch se puede puentear, la página se queda y sale solo con la plantilla; se
+          // cuenta en `templateOnly`, no en `sinRef`, para que el parte lo diga sin descartarla.
+          // Solo si no hay forma de puentear —grafo que quedaría inválido— se descarta.
           const plantillaId = Object.values(batch.inputs).map(v => v?.[0])[0]
           const puerto = Object.entries(gpt.inputs).find(([, v]) => Array.isArray(v))?.[0]
-          if (plantillaId && puerto) {
+          if (plantillaId && puerto && aguantaSinRef(gpt.inputs.prompt)) {
             gpt.inputs[puerto] = [String(plantillaId), 0]
-            avisosRef.push(`${p.nombre}: ${motivo} — se renderiza solo con la plantilla`)
+            gpt.inputs.prompt = promptSinRef(gpt.inputs.prompt)
+            templateOnly.add(p.nombre)
+            avisosRef.push(`${p.nombre}: ${motivo} — renders template-only`)
           } else {
+            sinRef.add(p.nombre)
             avisosRef.push(`${p.nombre}: ${motivo}`)
           }
         }
@@ -1439,7 +1449,7 @@ ${cola}`
           sinAncla(`no se pudo subir la referencia (${e.message})`)
         }
       }
-      console.log(`[deck] referencias de estilo: ${conBatch.length - sinRef.size}/${conBatch.length} páginas`)
+      console.log(`[deck] referencias de estilo: ${conBatch.length - sinRef.size - templateOnly.size}/${conBatch.length} páginas`)
     }
 
     // 1c. El Art Bible: su ÚNICA entrada es la página ya renderizada del ASG que el prompt cita.
@@ -1516,6 +1526,34 @@ ${cola}`
       const { uploadImageToComfyUI } = require('./providers/comfyui.provider')
       const subidas = new Map()
 
+      // Sin referencia, la página NO se manda sin más ni se descarta: se borra del nodo del modelo
+      // la ranura que apunta al LoadImage REF (`model.images.image_2`) y la poda posterior lo
+      // elimina; la página se renderiza solo con su plantilla (`image_1`). Si la ranura no cuelga
+      // del nodo del modelo no hay qué desconectar y se mantiene el descarte de siempre.
+      const soloPlantilla = (p, h, motivo) => {
+        const gpt = wf[p.prompt_node]
+        const ranura = Object.entries(gpt?.inputs || {})
+          .find(([, v]) => Array.isArray(v) && String(v[0]) === String(h.node))?.[0]
+        // Solo es «referencia opcional» si al quitarla el modelo conserva OTRA imagen (su plantilla).
+        // Decks cuyo único LoadImage es la fuente (audio, marketing, Art Bible) no tienen plantilla que
+        // conservar: ahí se mantiene el descarte de siempre.
+        // La plantilla es un LoadImage que NO es fuente declarada: un deck con dos fuentes
+        // (marketing) no tiene plantilla, y quitarle una dejaría a la otra fuente haciendo de lienzo.
+        const fuentes = new Set((p.image_inputs || []).filter(x => String(x?.source || '').trim()).map(x => String(x.node)))
+        const otras = Object.entries(gpt?.inputs || {})
+          .filter(([k, v]) => k !== ranura && Array.isArray(v) && wf[String(v[0])]?.class_type === 'LoadImage'
+            && !fuentes.has(String(v[0])))
+        const campo = p.prompt_field || 'prompt'
+        if (!ranura || !otras.length || !aguantaSinRef(gpt?.inputs?.[campo])) {
+          avisosRef.push(`${p.nombre}: ${motivo}`); sinRef.add(p.nombre); return
+        }
+        delete gpt.inputs[ranura]
+        // El prompt no puede seguir hablando de una IMAGE 2 que ya no llega.
+        gpt.inputs[campo] = promptSinRef(gpt.inputs[campo])
+        templateOnly.add(p.nombre)
+        avisosRef.push(`${p.nombre}: ${motivo} — renders template-only`)
+      }
+
       for (const p of directas) {
         const huecos = p.image_inputs?.length
           ? p.image_inputs
@@ -1544,36 +1582,36 @@ ${cola}`
           if (!fuente) {
             // Sin `source` Y sin Add Context no hay de dónde sacarla. Se dice lo segundo, que es
             // lo accionable: quien mire este aviso puede subir una referencia y volver a correr.
-            avisosRef.push(`${p.nombre}: no tiene referencia — súbele una con Add Context`)
-            sinRef.add(p.nombre); continue
+            soloPlantilla(p, h, 'no tiene referencia — súbele una con Add Context'); continue
           }
           // Puede ser un nodo del canvas («Pitch Document») o una página del ASG nombrada dentro
           // de una frase («the game's VISUAL DNA page»). Se prueban las dos, en ese orden.
           const url = await imagenDeNodoPorTitulo(db, project_id, fuente)
                    || await paginaDelASG(db, project_id, null, fuente, true)
           if (!url) {
-            avisosRef.push(`${p.nombre}: no hay imagen de «${fuente}» en el proyecto todavía`)
-            sinRef.add(p.nombre); continue
+            soloPlantilla(p, h, `no hay imagen de «${fuente}» en el proyecto todavía`); continue
           }
           try {
             if (!subidas.has(url)) subidas.set(url, await uploadImageToComfyUI(url))
             wf[h.node].inputs.image = subidas.get(url)
           } catch (e) {
-            avisosRef.push(`${p.nombre}: no se pudo subir la referencia (${e.message})`)
-            sinRef.add(p.nombre)
+            soloPlantilla(p, h, `no se pudo subir la referencia (${e.message})`)
           }
         }
       }
-      console.log(`[deck] referencias directas: ${directas.length - sinRef.size}/${directas.length} páginas`)
+      console.log(`[deck] referencias directas: ${directas.length - sinRef.size - templateOnly.size}/${directas.length} páginas`
+        + (templateOnly.size ? ` · ${templateOnly.size} solo con plantilla` : ''))
     }
   }
 
   // Una página que pide referencia y no la consiguió NO se manda. Dejarla pasar significa
   // renderizarla contra la imagen de relleno del workflow —un caballero de fantasía— y presentar
   // eso como el estilo del juego: sale caro y hay que tirarlo. Mejor falta que equivocada.
+  // Los avisos de referencia viajan siempre: una página que sale solo con plantilla también se dice.
+  armado.avisos = [...(armado.avisos || []), ...avisosRef]
+  if (templateOnly.size) console.log(`[deck] ${templateOnly.size} página(s) solo con plantilla: ${[...templateOnly].join(', ')}`)
   if (sinRef.size) {
     armado.paginas = armado.paginas.filter(p => !sinRef.has(p.nombre))
-    armado.avisos  = [...(armado.avisos || []), ...avisosRef]
     console.log(`[deck] ${sinRef.size} página(s) omitidas por falta de referencia: ${[...sinRef].join(', ')}`)
     if (!armado.paginas.length) {
       throw new Error(

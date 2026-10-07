@@ -93,7 +93,13 @@ async function itemsDelManifiesto({ db, project_id }) {
   let fuera = 0
 
   for (const pg of paginas) {
-    const hoja = String(pg?.page || '').trim()
+    // `page_key` ANTES que `page`. El modelo escribía el número en `page` —«page: 20»— y el nombre
+    // en `page_key` —«20_PropSheet»—, y este lector solo miraba el primero: un número no casa con
+    // ninguna hoja, así que el manifiesto entero se descartaba y el alcance caía al VS Spec. En
+    // Wort eso daba UNA Prop Sheet donde el manifiesto declaraba once. Lo encontró Pedro, y su
+    // v2.9.45 arregla el prompt para los manifiestos nuevos; esto rescata los YA escritos sin
+    // volver a correr el nodo ni pagar nada.
+    const hoja = String(pg?.page_key || pg?.page || '').trim()
     if (!hoja) continue
 
     const estado = String(pg?.status || '').toUpperCase()
