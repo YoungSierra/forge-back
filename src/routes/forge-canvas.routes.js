@@ -1311,11 +1311,48 @@ async function executeImageOutput({ project_id, node_id, targetOutputKey, member
     if (!firstAssetId) firstAssetId = asset?.id || null
   }
 
+  // ── De quién es el hueco de la pieza aprobada ──
+  //
+  // De la SALIDA, no de la primera imagen. Un output cuyo formato es de imagen se representa con su
+  // png y está bien; pero hay tres que declaran `image_gen` y NO son imágenes —1.1/concept_seeds
+  // (list<concept_seed>), 2.1/pitch_document (docx) y 99.1.1/concept_list (structured)—, y en esos
+  // el png se sentaba en el sitio del documento. El resultado que ve el usuario es un output
+  // VACÍO: el modal dice «this asset is stored as a file» y no hay nada que leer, encima aprobado.
+  //
+  // Medido el 07-oct: en seis proyectos el 1.1 tiene su sesión general `active` SIN pieza y una
+  // sesión `concept_seeds` aprobada con una pieza png de CERO caracteres. Lo reportó Migue («el
+  // output aparece vacío y no me deja reiterar») y es la misma raíz por la que el botón PDF del
+  // 2.1 devolvía una imagen esta mañana.
+  //
+  // Lo que NO se hace acá: inventarle un texto. La tentación es guardar `replyText`, que ya se
+  // guarda como mensaje del agente — pero medido contra las corridas reales del 07-oct, en dos de
+  // tres ese texto es un parte de máquina («Dispatched 3 image(s) declared by `emission block`») y
+  // no el contenido de la salida. Una pieza con eso adentro se lee como contenido y no lo es, que
+  // es peor que el hueco vacío. El texto lo produce la corrida del output, no este despacho.
+  //
+  // Las png siguen siendo filas propias, así que los nodos de abajo las encuentran igual y las
+  // imágenes se siguen viendo por `output_images`. Lo único que cambia es de quién es el hueco.
+  const FORMATOS_IMAGEN = ['png', 'png[]', 'image', 'image[]']
+  const esSalidaDeImagen = FORMATOS_IMAGEN.includes(String(outDef?.format || '').toLowerCase())
+
+  let assetDelOutput = firstAssetId
+  if (!esSalidaDeImagen) {
+    // Si la rama del documento ya dejó una pieza en esta sesión, esa es la suya y manda.
+    const { data: yaHay } = await db().from('forge_assets')
+      .select('id').eq('session_id', session.id).neq('format', 'png')
+      .order('created_at', { ascending: false }).limit(1).maybeSingle()
+    assetDelOutput = yaHay?.id ?? null
+    if (!yaHay?.id) {
+      console.warn(`[auto-run img] ${targetOutputKey}: formato ${outDef?.format} — las imágenes no`
+        + ' ocupan el hueco del documento; la salida queda sin pieza hasta que su texto se produzca')
+    }
+  }
+
   await db().from('forge_sessions')
-    .update({ status: 'auto_approved', output_asset_id: firstAssetId, completed_at: new Date().toISOString(), iteration_count: 1 })
+    .update({ status: 'auto_approved', output_asset_id: assetDelOutput, completed_at: new Date().toISOString(), iteration_count: 1 })
     .eq('id', session.id)
 
-  return { output_key: targetOutputKey, session_id: session.id, asset_id: firstAssetId, images: ok.length }
+  return { output_key: targetOutputKey, session_id: session.id, asset_id: assetDelOutput, images: ok.length }
 }
 
 // Multer para attachments de chat — límite 50 MB por archivo
