@@ -2463,6 +2463,94 @@ router.post('/nodes/:node_id/accept', async (req, res, next) => {
   } catch (err) { next(err) }
 })
 
+// ─── POST /api/projects/:id/canvas/nodes/:node_id/reopen ─────
+// Deshace una aprobación: devuelve la sesión a `active` para poder seguir trabajándola.
+//
+// El producto YA le decía al usuario que hiciera esto —«Reopen it and undo the approval first»,
+// en dos sitios— y el control no existía en ninguna parte: ni botón, ni ruta.
+//
+// Para qué hace falta, medido el 07-oct contra la base viva: un nodo corrido entero deja su
+// sesión general `active` con la respuesta esperando el Accept, y las corridas POR OUTPUT que
+// vienen después se auto-aprueban una a una. Cuando cae la última, el nodo cuenta como aprobado
+// y el chat se vuelve de solo lectura SOBRE una respuesta que nadie contestó. En
+// test_smack_migue_v.09 el 3.12 respondió a las 15:46 y quedó cerrado a las 16:27 —cuarenta y un
+// minutos de nueve salidas aprobándose por detrás—, y lo mismo en otros ocho casos. Lo reportó
+// Migue como «se auto aprobaba estando inactivo con respuesta pendiente». No hay ningún reloj:
+// son las otras corridas del mismo nodo.
+//
+// NO se toca la pieza: queda `approved`, que es lo que leen los nodos de abajo para armar sus
+// insumos. Reabrir es poder volver a escribir, no borrar lo hecho ni dejar sin comer al que sigue.
+router.post('/nodes/:node_id/reopen', async (req, res, next) => {
+  try {
+    const { id: project_id, node_id } = req.params
+    const { output_key = null, project_node_id = null } = req.body || {}
+
+    const { data: node } = await db()
+      .from('forge_nodes').select('id, node_key, title').eq('id', node_id).maybeSingle()
+    if (!node) return res.status(404).json({ success: false, error: 'Node not found' })
+
+    // La instancia: con fan-out el mismo nodo vive en varios lanes y reabrir «el» nodo sin decir
+    // cuál abriría el del vecino. Si no viene y hay una sola, es inequívoca.
+    let pn = null
+    if (project_node_id) {
+      const { data } = await db().from('forge_project_nodes')
+        .select('id, blueprint_id').eq('id', project_node_id).maybeSingle()
+      pn = data
+    } else {
+      const { data } = await db().from('forge_project_nodes')
+        .select('id, blueprint_id').eq('project_id', project_id).eq('node_id', node_id).eq('removed', false)
+      if ((data || []).length === 1) pn = data[0]
+      else if ((data || []).length > 1) {
+        return res.status(409).json({
+          success: false, error: 'ambiguous_instance',
+          message: `${node.node_key} lives in more than one lane. Reopen it from the lane you are working in.`,
+        })
+      }
+    }
+
+    // Una fase sellada por un gate ACCEPT no se reabre desde acá: esa decisión se deshace en el
+    // gate, que es quien la tomó.
+    if (pn?.blueprint_id && await isBlueprintSealed(project_id, pn.blueprint_id)) {
+      return res.status(409).json({
+        success: false, error: 'blueprint_sealed',
+        message: `${node.node_key} belongs to a phase already sealed by the gate. Reopen the gate first.`,
+      })
+    }
+
+    let q = db().from('forge_sessions')
+      .select('id, output_key, status, created_at')
+      .eq('project_id', project_id).eq('node_id', node_id)
+      .in('status', ['approved', 'auto_approved'])
+      .order('created_at', { ascending: false }).limit(1)
+    q = output_key ? q.eq('output_key', output_key) : q.is('output_key', null)
+    if (pn?.id) q = q.eq('project_node_id', pn.id)
+    const { data: filas, error: qErr } = await q
+    if (qErr) throw qErr
+    const sesion = (filas || [])[0]
+    if (!sesion) {
+      return res.status(404).json({
+        success: false, error: 'nothing_to_reopen',
+        message: `${node.node_key}${output_key ? ` → ${output_key}` : ''} has no approved session to reopen.`,
+      })
+    }
+
+    // `completed_at` se borra: una sesión abierta no tiene fecha de cierre, y dejándola puesta el
+    // panel sigue mostrando «completed» sobre algo que está otra vez en curso.
+    const { error: upErr } = await db().from('forge_sessions')
+      .update({ status: 'active', completed_at: null }).eq('id', sesion.id)
+    if (upErr) throw upErr
+
+    console.log(`[reopen] ${node.node_key}${output_key ? ` → ${output_key}` : ' (nodo entero)'}`
+      + ` · sesión ${sesion.id.slice(0, 8)} de ${sesion.status} a active`)
+
+    res.json({
+      success: true, session_id: sesion.id,
+      output_key: sesion.output_key ?? null, previous_status: sesion.status,
+      node_key: node.node_key,
+    })
+  } catch (err) { next(err) }
+})
+
 // ─── POST /api/projects/:id/canvas/nodes/:node_id/sessions/:session_id/generate-item-image ─
 // Genera imagen on-demand para un item de un output con image_gen:true
 router.post('/nodes/:node_id/sessions/:session_id/generate-item-image', async (req, res, next) => {
