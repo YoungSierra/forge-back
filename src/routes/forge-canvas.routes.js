@@ -5,6 +5,7 @@ const { db, dbAsUser } = require('../services/supabase.service')
 const { autoWire, cleanupAndRewire } = require('../services/auto-wire.service')
 const { extractSection } = require('../utils/extract-section')
 const { canRun } = require('../services/credits.service')
+const { requireAdmin } = require('../middleware/requireAdmin')
 
 // Cancelaciones PEDIDAS. Antes el único modo de cancelar era que el navegador cerrara la
 // conexión, y eso no distingue «el usuario apretó Stop» de «la conexión se cayó»: el 3.12 tarda
@@ -2548,6 +2549,175 @@ router.post('/nodes/:node_id/reopen', async (req, res, next) => {
       output_key: sesion.output_key ?? null, previous_status: sesion.status,
       node_key: node.node_key,
     })
+  } catch (err) { next(err) }
+})
+
+// ─── POST /api/projects/:id/canvas/nodes/:node_id/clean ─────
+// Deja un nodo —o solo algunas de sus salidas— en cero, para volver a correrlo.
+//
+// Hasta hoy esto se pedía y lo hacía una persona a mano con un script. Que el equipo dependa de
+// alguien para empezar de cero es el cuello; que esa persona borre a mano en producción es el
+// riesgo. Esta ruta hace lo mismo que el script, con sus mismas precauciones.
+//
+// Dos modos, el MISMO código: con `dry_run` cuenta y no borra. El cartel de confirmación del front
+// enseña esos números, así que lo que el usuario lee es literalmente lo que se va a borrar — no una
+// cuenta parecida hecha por otro camino.
+//
+// Lo que NO se toca:
+//   · R2. Los archivos quedan donde están. Borrar la fila deja el objeto huérfano, que no estorba
+//     y se puede revisar; borrar el objeto no se deshace.
+//   · Nada, si antes no se pudo escribir el respaldo. Un borrado sin respaldo no se repone, y el
+//     respaldo no puede vivir en el computador de nadie: va a R2, con el proyecto.
+router.post('/nodes/:node_id/clean', requireAdmin, async (req, res, next) => {
+  try {
+    const { id: project_id, node_id } = req.params
+    const { output_keys = null, project_node_id = null, dry_run = false } = req.body || {}
+    const member_id = req.adminMemberId || null
+
+    const { data: node } = await db()
+      .from('forge_nodes').select('id, node_key, title, outputs').eq('id', node_id).maybeSingle()
+    if (!node) return res.status(404).json({ success: false, error: 'Node not found' })
+
+    // La instancia, igual que en /reopen: con fan-out el mismo nodo vive en varios lanes y limpiar
+    // «el» nodo borraría el trabajo del vecino.
+    const { data: instancias } = await db().from('forge_project_nodes')
+      .select('id, blueprint_id').eq('project_id', project_id).eq('node_id', node_id).eq('removed', false)
+    const unicaInstancia = (instancias || []).length === 1
+
+    let pn = null
+    if (project_node_id) {
+      const { data } = await db().from('forge_project_nodes')
+        .select('id, blueprint_id').eq('id', project_node_id).maybeSingle()
+      pn = data
+    } else if (unicaInstancia) {
+      pn = instancias[0]
+    } else if ((instancias || []).length > 1) {
+      return res.status(409).json({
+        success: false, error: 'ambiguous_instance',
+        message: `${node.node_key} lives in more than one lane. Clean it from the lane you are working in.`,
+      })
+    }
+
+    if (pn?.blueprint_id && await isBlueprintSealed(project_id, pn.blueprint_id)) {
+      return res.status(409).json({
+        success: false, error: 'blueprint_sealed',
+        message: `${node.node_key} belongs to a phase already sealed by the gate, and sealed work is not deleted from here.`,
+      })
+    }
+
+    const claves = Array.isArray(output_keys) && output_keys.length ? output_keys : null
+    const nodoEntero = !claves
+
+    // ── Qué se va ──
+    let qSes = db().from('forge_sessions').select('*').eq('project_id', project_id).eq('node_id', node_id)
+    // Las sesiones ANTERIORES al fan-out no tienen instancia. Acotando solo por `project_node_id`
+    // se quedaban fuera, y el usuario limpiaba el nodo y lo seguía viendo con trabajo encima:
+    // medido en test_smack_migue_v.09, el 3.12 tiene 10 sesiones con instancia y 4 sin ella. Si el
+    // nodo vive en UNA sola instancia esas cuatro son suyas sin discusión —es el mismo respaldo que
+    // usa el lienzo para mostrarlas—. Si vive en varias, arriba ya se rechazó por ambiguo, así que
+    // nunca se borra a ciegas el trabajo de otro lane.
+    if (pn?.id) {
+      qSes = unicaInstancia
+        ? qSes.or(`project_node_id.eq.${pn.id},project_node_id.is.null`)
+        : qSes.eq('project_node_id', pn.id)
+    }
+    if (claves) qSes = qSes.in('output_key', claves)
+    const { data: sesiones, error: eSes } = await qSes
+    if (eSes) throw eSes
+    const idsSes = (sesiones || []).map(s => s.id)
+
+    // Las piezas se buscan por SU SESIÓN, que es lo único que sabe de qué salida vinieron. Limpiando
+    // el nodo entero se añaden además las del nodo cuya sesión ya no esté: filas viejas que de otro
+    // modo quedarían sueltas, visibles en el lienzo y sin conversación detrás.
+    const piezas = []
+    const vistas = new Set()
+    if (idsSes.length) {
+      const { data } = await db().from('forge_assets').select('*').in('session_id', idsSes)
+      for (const a of (data || [])) if (!vistas.has(a.id)) { vistas.add(a.id); piezas.push(a) }
+    }
+    if (nodoEntero) {
+      const { data } = await db().from('forge_assets').select('*')
+        .eq('project_id', project_id).eq('node_id', node_id)
+      for (const a of (data || [])) if (!vistas.has(a.id)) { vistas.add(a.id); piezas.push(a) }
+    }
+    const idsPiezas = piezas.map(a => a.id)
+
+    const { data: versiones } = idsPiezas.length
+      ? await db().from('forge_asset_versions').select('*').in('asset_id', idsPiezas) : { data: [] }
+    const { data: mensajes } = idsSes.length
+      ? await db().from('forge_messages').select('*').in('session_id', idsSes) : { data: [] }
+
+    // Lo único que puede romperse: una pieza de OTRO nodo derivada de estas.
+    const { data: hijas } = idsPiezas.length
+      ? await db().from('forge_assets').select('id, name, node_id').in('derived_from_id', idsPiezas) : { data: [] }
+    const deFuera = (hijas || []).filter(h => !idsPiezas.includes(h.id))
+
+    const resumen = {
+      node_key: node.node_key, title: node.title,
+      outputs: claves, whole_node: nodoEntero,
+      sessions: (sesiones || []).length, assets: piezas.length,
+      versions: (versiones || []).length, messages: (mensajes || []).length,
+      derived_elsewhere: deFuera.map(h => h.name).slice(0, 10),
+    }
+
+    if (dry_run) return res.json({ success: true, dry_run: true, ...resumen })
+
+    if (!idsSes.length && !idsPiezas.length) {
+      return res.json({ success: true, ...resumen, backup_url: null, message: 'Nothing to clean.' })
+    }
+
+    // ── Respaldo PRIMERO, y a R2 ──
+    // Si esto falla no se borra nada. Es la única red: sin él, una limpieza equivocada no se repone.
+    let backupUrl = null
+    try {
+      const { uploadToStorage } = require('../services/storage.service')
+      const sello = new Date().toISOString().replace(/[:.]/g, '-')
+      const ruta = `projects/${project_id}/limpiezas/${node.node_key}_${sello}.json`
+      const cuerpo = Buffer.from(JSON.stringify({
+        project_id, node: { id: node.id, node_key: node.node_key, title: node.title },
+        project_node_id: pn?.id ?? null, output_keys: claves, whole_node: nodoEntero,
+        limpiado_en: new Date().toISOString(), limpiado_por: member_id,
+        sesiones, piezas, versiones: versiones || [], mensajes: mensajes || [],
+      }, null, 2), 'utf8')
+      backupUrl = await uploadToStorage(cuerpo, ruta, 'application/json')
+    } catch (e) {
+      console.error('[clean] el respaldo falló, no se borra nada:', e?.message || e)
+      return res.status(502).json({
+        success: false, error: 'backup_failed',
+        message: `Could not write the backup, so nothing was deleted: ${e?.message || e}`,
+      })
+    }
+
+    // ── Borrado, en el orden que permiten las claves foráneas ──
+    // Son circulares: `forge_sessions.output_asset_id` apunta a `forge_assets` y
+    // `forge_assets.session_id` apunta de vuelta. Primero se suelta el puntero de la sesión.
+    if (idsSes.length) {
+      const { error } = await db().from('forge_sessions').update({ output_asset_id: null }).in('id', idsSes)
+      if (error) throw error
+    }
+    for (const [etq, fn] of [
+      ['versions', () => idsPiezas.length ? db().from('forge_asset_versions').delete().in('asset_id', idsPiezas) : null],
+      ['messages', () => idsSes.length    ? db().from('forge_messages').delete().in('session_id', idsSes)        : null],
+      ['assets',   () => idsPiezas.length ? db().from('forge_assets').delete().in('id', idsPiezas)               : null],
+      ['sessions', () => idsSes.length    ? db().from('forge_sessions').delete().in('id', idsSes)                : null],
+    ]) {
+      const q = fn()
+      if (!q) continue
+      const { error } = await q
+      if (error) throw new Error(`${etq}: ${error.message}`)
+    }
+
+    // Lo que comía de este nodo ya no corresponde con lo que hay: queda desactualizado.
+    if (pn?.id) {
+      await db().from('forge_project_nodes').update({ is_stale: false }).eq('id', pn.id)
+      const { propagateStale } = require('../services/canvas-chat.service')
+      await propagateStale(db, project_id, pn.id)
+    }
+
+    console.log(`[clean] ${node.node_key}${nodoEntero ? ' (entero)' : ` → ${claves.join(', ')}`}`
+      + ` · ${piezas.length} piezas, ${(sesiones || []).length} sesiones · por ${member_id} · respaldo ${backupUrl}`)
+
+    res.json({ success: true, ...resumen, backup_url: backupUrl })
   } catch (err) { next(err) }
 })
 
