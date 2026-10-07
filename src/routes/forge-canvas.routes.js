@@ -2820,6 +2820,57 @@ router.post('/nodes/:node_id/sessions/:session_id/generate-item-image', async (r
     //
     // Un ítem que YA tiene su imagen sí se puede rehacer —es el radial Iterate, que versiona— así
     // que lo que se rechaza es el hueco NUEVO sobre un output ya completo, no la iteración.
+    // ── Ese MISMO ítem ya tiene imagen en otra sesión de la instancia ──
+    //
+    // La guarda de abajo frena el output COMPLETO —«ya tiene sus N»— y por eso no vio lo del
+    // 07-oct: en `smack gaspard 02` el 1.1 declara un techo de 5 semillas, el motor despachó 3 a
+    // las 15:52, y a las 15:53 Migue pidió las mismas 3 a mano desde la sesión general. Como 3 no
+    // llega a 5, el output no estaba completo y pasó. Seis renders para un output de tres.
+    //
+    // El techo no es la pregunta. La pregunta es si ESE índice ya tiene imagen: pedirlo otra vez
+    // es un duplicado aunque falten otros por hacer. Y no es culpa de quien lo pide — las del
+    // motor viven en OTRA sesión y el chat está parado en la general, así que él ve tres huecos
+    // vacíos y hace lo lógico.
+    //
+    // Por eso no se responde con un error: se le devuelve la imagen que ya existe, que es lo que
+    // venía a buscar. Iterar sigue pasando siempre: el radial manda `condition`, y además trabaja
+    // sobre un índice que ESTA sesión ya tiene.
+    if (!String(condition || '').trim()) {
+      const { data: ses0 } = await db().from('forge_sessions')
+        .select('project_id, project_node_id').eq('id', session_id).maybeSingle()
+      let q0 = db().from('forge_sessions').select('id, output_images')
+        .eq('node_id', node_id).not('output_images', 'is', null)
+      if (ses0?.project_id) q0 = q0.eq('project_id', ses0.project_id)
+      if (ses0?.project_node_id) q0 = q0.eq('project_node_id', ses0.project_node_id)
+      const { data: otras } = await q0
+
+      let ajena = null, propia = null
+      for (const s of (otras || [])) {
+        for (const it of ((s.output_images || {})[output_key] || [])) {
+          if (Number(it.index) !== Number(item_index)) continue
+          const ultima = (it.variations || []).at(-1)
+          if (!ultima?.url) continue
+          if (s.id === session_id) propia = it
+          else if (!ajena) ajena = it
+        }
+      }
+
+      if (ajena && !propia) {
+        const url = (ajena.variations || []).at(-1).url
+        console.warn(`[img-origen] REUSADA: ${output_key}[${item_index}] ya tenía imagen en otra`
+          + ' sesión de esta instancia — se devuelve esa y NO se paga un render nuevo')
+        const { data: yo } = await db().from('forge_sessions')
+          .select('output_images').eq('id', session_id).maybeSingle()
+        const mias = { ...(yo?.output_images || {}) }
+        const lista = [...(mias[output_key] || [])]
+        if (!lista.some(i => Number(i.index) === Number(item_index))) lista.push(ajena)
+        mias[output_key] = lista.sort((a, b) => Number(a.index) - Number(b.index))
+        // No se escribe nada: la imagen ya tiene su sitio en la sesión que la produjo, y copiarla
+        // acá duplicaría la fila sin duplicar el archivo. Esto es solo lo que el chat debe pintar.
+        return res.json({ success: true, image_url: url, output_images: mias, reused: true })
+      }
+    }
+
     {
       // Cuántas le tocan. `image_count` solo lo declaran algunos outputs —el 2.2 no lo tiene, su
       // contrato dice «mínimo una» y el número lo decide el plan—, así que cuando falta se
