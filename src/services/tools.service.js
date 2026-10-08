@@ -1137,17 +1137,160 @@ function pptxExtractField(rawLine) {
   return { label, value: m[2].trim(), isAllCaps }
 }
 
+// ── Tablas y código en el markdown del renderer de respaldo ─────────────────
+//
+// El renderer de respaldo pintaba cada línea de una tabla markdown como un párrafo —«| a | b |»,
+// «|---|---|»— y los bloques ```json línea a línea, con las vallas. Medido en el 2.7 de Smack
+// Gaspard (07-10). Ahora cada sección se parte en tramos: texto (como siempre), tabla (tabla nativa
+// de PowerPoint) y código (se omite y queda en los avisos: nunca se pinta como texto).
+const SEPARADOR_TABLA = /^\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/
+function celdasMd(linea) {
+  let t = String(linea).trim()
+  if (t.startsWith('|')) t = t.slice(1)
+  if (t.endsWith('|') && !t.endsWith('\\|')) t = t.slice(0, -1)
+  return t.split(/(?<!\\)\|/).map(c => c.replace(/\\\|/g, '|').trim())
+}
+const limpiarCelda = c => String(c ?? '')
+  .replace(/<br\s*\/?>/gi, '\n').replace(/\*\*/g, '').replace(/(^|[^*])\*([^*\n]+)\*/g, '$1$2')
+  .replace(/`/g, '').replace(/~~(.+?)~~/g, '$1').trim()
+
+function tramosDeSeccion(lines) {
+  const tramos = [], codigo = []
+  let texto = []
+  const cerrarTexto = () => { if (texto.some(l => l.trim())) tramos.push({ tipo: 'texto', lines: texto }); texto = [] }
+  for (let i = 0; i < lines.length; i++) {
+    const t = String(lines[i]).trim()
+    // Bloque de código: se omite entero, valla incluida.
+    const valla = t.match(/^(```|~~~)\s*([\w+-]*)/)
+    if (valla) {
+      let j = i + 1
+      while (j < lines.length && !String(lines[j]).trim().startsWith(valla[1])) j++
+      codigo.push({ lenguaje: valla[2] || '', lineas: Math.max(0, Math.min(j, lines.length) - i - 1) })
+      i = j
+      continue
+    }
+    // Tabla: fila de cabecera, separador |---|, y las filas que sigan empezando por «|».
+    if (t.startsWith('|') && i + 1 < lines.length && SEPARADOR_TABLA.test(String(lines[i + 1]).trim())) {
+      const cabecera = celdasMd(t).map(limpiarCelda)
+      const filas = []
+      let j = i + 2
+      while (j < lines.length && String(lines[j]).trim().startsWith('|')) { filas.push(celdasMd(lines[j]).map(limpiarCelda)); j++ }
+      cerrarTexto()
+      tramos.push({ tipo: 'tabla', cabecera, filas })
+      i = j - 1
+      continue
+    }
+    texto.push(lines[i])
+  }
+  cerrarTexto()
+  return { tramos, codigo }
+}
+
+// Anchos por contenido: cada columna pesa lo que su celda más larga (con tope), con un mínimo
+// legible; el resto se reparte en proporción.
+function anchosDeColumna(cabecera, filas, total, minimo = 0.9) {
+  const largo = c => Math.min(60, Math.max(0, ...String(c ?? '').split('\n').map(l => l.length)))
+  const peso  = cabecera.map((h, k) => Math.max(4, largo(h), ...filas.map(f => largo(f[k]))))
+  const suma  = peso.reduce((a, b) => a + b, 0)
+  let anchos  = peso.map(p => total * p / suma)
+  const chicas = anchos.map(a => a < minimo)
+  if (chicas.some(Boolean) && minimo * cabecera.length < total) {
+    const fijo  = chicas.filter(Boolean).length * minimo
+    const resto = peso.reduce((a, p, k) => a + (chicas[k] ? 0 : p), 0)
+    anchos = peso.map((p, k) => chicas[k] ? minimo : (total - fijo) * p / resto)
+  }
+  return anchos
+}
+
+// Reparte las filas en páginas según el alto que ocupa cada una. `disponible(p)` es el alto libre
+// de la página p (la primera puede llevar intro). Cada página repite la cabecera.
+function paginasDeTabla(cabecera, filas, anchos, pt, disponible, fuente) {
+  const altoFila = celdas => Math.max(...celdas.map((c, k) => altoTexto(String(c ?? ''), Math.max(0.3, anchos[k] - 0.12), pt, fuente))) + 0.1
+  const altoCab  = altoFila(cabecera)
+  const medidas  = filas.map(celdas => ({ celdas, alto: altoFila(celdas) }))
+  // 1) Cuántas páginas hacen falta llenando cada una hasta el borde.
+  let k = 1, usado = altoCab
+  for (const f of medidas) {
+    if (usado > altoCab && usado + f.alto > disponible(k - 1)) { k++; usado = altoCab }
+    usado += f.alto
+  }
+  // 2) Esas páginas se reparten las filas a partes iguales —11 filas en dos páginas son 6 + 5, no
+  //    9 + 2: una continuación con una o dos filas parece un error de maquetación—. Si alguna página
+  //    pareja no cabe (filas de alto muy distinto), se prueba con una página más.
+  const cabe = (pag, p) => pag.length <= 1 || pag.reduce((a, f) => a + f.alto, altoCab) <= disponible(p)
+  for (; k <= Math.max(1, medidas.length); k++) {
+    const base = Math.floor(medidas.length / k), extra = medidas.length % k
+    const paginas = []
+    let i = 0
+    for (let p = 0; p < k; p++) { const n = base + (p < extra ? 1 : 0); paginas.push(medidas.slice(i, i + n)); i += n }
+    if (paginas.every(cabe)) return { paginas, altoCab }
+  }
+  return { paginas: medidas.length ? medidas.map(f => [f]) : [[]], altoCab }
+}
+
+// Una fila con más celdas que la cabecera junta las sobrantes en la última; con menos, se rellena.
+const ajustarFilas = (filas, n) => filas.map(f => {
+  const r = f.slice(0, n)
+  while (r.length < n) r.push('')
+  if (f.length > n) r[n - 1] = [r[n - 1], ...f.slice(n)].filter(Boolean).join(' · ')
+  return r
+})
+
+// Tabla nativa en el estilo del renderer de respaldo: título blanco 22 pt con la línea ámbar debajo
+// (como renderContentSlide), cabecera ámbar sobre tarjeta, filas en gris claro, divisores grises.
+function renderTablaSlides(pptx, sectionTitle, tabla, intro, C) {
+  const cl     = s => (s || '').replace(/\*\*/g, '').replace(/\*/g, '').trim()
+  const TX = 0.5, TW = 12.33, FONDO = 6.95, FUENTE = 'arial'
+  const n      = tabla.cabecera.length
+  const filas  = ajustarFilas(tabla.filas, n)
+  const pt     = n >= 6 ? 9 : n >= 4 ? 10 : 11
+  const anchos = anchosDeColumna(tabla.cabecera, filas, TW)
+  const titulo = cl(sectionTitle).replace(/_/g, ' ')
+  const introTxt = cl(intro || '')
+  const altoIntro = introTxt ? altoTexto(introTxt, TW, 11, FUENTE) + 0.1 : 0
+  const Y0 = 1.0
+  const { paginas, altoCab } = paginasDeTabla(tabla.cabecera, filas, anchos, pt,
+    p => FONDO - Y0 - (p === 0 ? altoIntro : 0), FUENTE)
+  const borde = { type: 'solid', pt: 0.5, color: C.DIVIDER }
+  return paginas.map((pag, p) => {
+    const slide = pptx.addSlide()
+    slide.background = { color: C.BG_SLIDE }
+    slide.addText(p ? `${titulo} (cont.)` : titulo, { x: TX, y: 0.18, w: TW, h: 0.55, fontSize: 22, color: C.WHITE, bold: true, breakLine: true })
+    slide.addShape('rect', { x: TX, y: 0.78, w: TW, h: 0.025, fill: { color: C.AMBER } })
+    let y = Y0
+    if (!p && introTxt) {
+      slide.addText(introTxt, { x: TX, y, w: TW, h: altoIntro - 0.04, fontSize: 11, color: C.GRAY, breakLine: true, valign: 'top' })
+      y += altoIntro
+    }
+    const filasPptx = [
+      tabla.cabecera.map(h => ({ text: h, options: { bold: true, color: C.AMBER, fill: { color: C.BG_CARD } } })),
+      ...pag.map((f, k) => f.celdas.map(c => ({ text: c, options: { color: C.LIGHT, fill: { color: k % 2 ? C.BG_CARD : C.BG_SLIDE } } }))),
+    ]
+    slide.addTable(filasPptx, { x: TX, y, w: TW, colW: anchos, rowH: [altoCab, ...pag.map(f => f.alto)],
+      fontSize: pt, border: borde, valign: 'top', margin: 0.05, autoPage: false })
+    return slide
+  })
+}
+
 // Analiza el cuerpo de una slide y categoriza cada elemento
 function pptxParseSlideBody(lines) {
   const out = {
     eyebrow: null, title: null, taglines: [], factSheet: [], dirItems: [],
     bullets: [], paragraphs: [], strikethrough: null, imageHint: null, compItems: [],
   }
+  // La plantilla de comparación («THE CATEGORY TODAY / THIS PROJECT») solo cuando la sección la pide
+  // con una línea `Layout: comparison`. Antes la disparaba cualquier viñeta con «→»: en el 2.7 de
+  // Smack Gaspard una frase del briefing («Read → Navigate → Evade → Ascend») convirtió la sección
+  // entera en esa plantilla, cortada en la primera flecha y sin el resto del texto.
+  const MARCADOR_COMPARACION = /^layout\s*:\s*(comparison|category\s*vs\.?\s*project)\s*$/i
+  const sinMarcas = l => String(l).trim().replace(/^[-*•]\s+/, '').replace(/\*\*/g, '').trim()
+  const comparativa = lines.some(l => MARCADOR_COMPARACION.test(sinMarcas(l)))
   for (const raw of lines) {
     const line = raw.trim()
     if (!line || /^#{1,4}\s/.test(line) || /^---+$/.test(line)) continue
 
     const stripped = line.replace(/^[-*•]\s+/, '').replace(/\*\*/g, '').trim()
+    if (MARCADOR_COMPARACION.test(stripped)) continue
 
     // Image: image_wide/interior/object — capturar hint
     const imgMatch = stripped.match(/^Image\s*:\s*(image_\w+)/i)
@@ -1180,7 +1323,7 @@ function pptxParseSlideBody(lines) {
       const { label, value, isAllCaps } = field
       if (PPTX_SKIP_LABELS.has(label)) { continue }
       // Items de comparación: all-caps label CON → en el valor → comparison table, no stats bar
-      if (isAllCaps && value.includes('→')) { out.compItems.push(value); continue }
+      if (comparativa && isAllCaps && value.includes('→')) { out.compItems.push(value); continue }
       if (isAllCaps)                    { out.factSheet.push({ label, value }); continue }
       if (label === 'Eyebrow')          { out.eyebrow = value; continue }
       if (label === 'Title')            { out.title   = value; continue }
@@ -1198,7 +1341,7 @@ function pptxParseSlideBody(lines) {
     if (/^[-*•]\s+/.test(raw)) {
       const t = raw.replace(/^[-*•]\s+/, '').trim()
       // Bullet con → es item de tabla de comparación
-      if (t && t.includes('→')) out.compItems.push(t)
+      if (t && t.includes('→') && comparativa) out.compItems.push(t)
       else if (t)                out.bullets.push(t)
     } else {
       out.paragraphs.push(line)
@@ -1570,7 +1713,7 @@ function renderContentSlide(slide, sectionTitle, body, img, C) {
 
 // ─── PPTX Cinematic Renderer (JSON schema v2) ────────────────────────────────
 
-async function docGenPptxCinematic(deck, imageUrls, projectId) {
+async function docGenPptxCinematic(deck, imageUrls, projectId, tituloMotor = '') {
   const PptxGenJS = require('pptxgenjs')
   const https     = require('https')
   const http      = require('http')
@@ -1592,7 +1735,12 @@ async function docGenPptxCinematic(deck, imageUrls, projectId) {
 
   const W = 13.33, H = 7.5, M = 0.65
   const TITLE = 'Arial', MONO = 'Consolas', BODY = 'Calibri'
-  const gameTitle = (deck.meta?.game_title || 'UNTITLED').toUpperCase()
+  // Sin game_title en el deck, la cabecera usa el título con que el motor pidió el deck (nodo —
+  // proyecto), nunca «UNTITLED», que es como salían las diapositivas del 2.7 de Wort.
+  const gameTitle = String(deck.meta?.game_title || deck.meta?.title || tituloMotor || 'Presentation').toUpperCase()
+  // Diapositivas totales, calculadas antes de pintar (una tabla o un texto largos dan más de una):
+  // la cabecera dice «NN / total», no «NN / 12» fijo.
+  let totalPaginas = 12
 
   // Descarga una URL a un archivo temporal, siguiendo redirects hasta 5 saltos
   function downloadToFile(srcUrl, destPath, hops) {
@@ -1702,7 +1850,7 @@ async function docGenPptxCinematic(deck, imageUrls, projectId) {
   function chrome(sl, prs, section, page) {
     txt(sl, `${gameTitle}  //  ${section}`, M, 0.12, 10, 0.28,  { size: 9, color: C.MUTED, font: MONO })
     // right edge en 12.65 para no solaparse con el bracket vertical (x=13.11)
-    txt(sl, `${String(page).padStart(2, '0')} / 12`, 11.5, 0.12, 1.15, 0.28, { size: 9, color: C.MUTED, font: MONO, align: 'right' })
+    txt(sl, `${String(page).padStart(2, '0')} / ${String(totalPaginas).padStart(2, '0')}`, 11.5, 0.12, 1.15, 0.28, { size: 9, color: C.MUTED, font: MONO, align: 'right' })
     txt(sl, `${deck.meta?.studio || ''}  ·  CONFIDENTIAL`, M, H-0.38, 7, 0.26, { size: 8, color: C.MUTED, font: MONO })
     txt(sl, gameTitle, 10.3, H-0.38, 2.35, 0.26, { size: 8, color: C.MUTED, font: MONO, align: 'right' })
   }
@@ -1713,6 +1861,56 @@ async function docGenPptxCinematic(deck, imageUrls, projectId) {
 
   function rule(sl, prs, x, y, w) {
     rct(sl, prs, x, y, w, 0.012, { fill: C.DIM })
+  }
+
+  // Un tipo que este renderer no conoce (table, verdict, ranking…) se pinta como texto —título y
+  // cuerpo— en vez de desaparecer. Antes se descartaba en silencio: el 2.7 de Wort (01-10) pidió
+  // section, two_col, table, table y salió un pptx de CERO diapositivas reportado como éxito.
+  const CAMPOS_TITULO = ['title', 'heading', 'headline', 'name', 'label']
+  const CAMPOS_FUERA  = new Set(['type', 'id', 'section', 'eyebrow', 'image', 'image_hint', 'notes', 'speaker_notes', ...CAMPOS_TITULO])
+  function plano(v) {
+    if (v == null) return ''
+    if (typeof v !== 'object') return String(v)
+    if (Array.isArray(v)) {
+      return v.map(x => Array.isArray(x) ? x.map(plano).join('  |  ')
+        : (x && typeof x === 'object') ? Object.values(x).map(plano).filter(Boolean).join(' · ')
+        : plano(x)).filter(Boolean).map(l => `• ${l}`).join('\n')
+    }
+    return Object.entries(v).map(([k, x]) => `${k.replace(/_/g, ' ')}: ${plano(x).replace(/\n/g, ' · ')}`).join('\n')
+  }
+  // El cuerpo va al tamaño de texto del renderer (14 pt, como los 13–15 pt de los otros tipos). Si no
+  // cabe, sigue en otra diapositiva: antes se encogía hasta el mínimo y salía diminuto.
+  const CUERPO_PT = 14, CUERPO_Y = 2.45, CUERPO_H = H - 2.45 - 0.6
+  function planTexto(s) {
+    const paginas = [[]]
+    for (const l of cuerpoDeTexto(s).split('\n')) {
+      const actual = paginas[paginas.length - 1]
+      if (actual.length && altoTexto([...actual, l].join('\n'), W-2*M, CUERPO_PT, BODY) > CUERPO_H) paginas.push([])
+      paginas[paginas.length - 1].push(l)
+    }
+    return { paginas: paginas.map(p => { while (p.length && !p[0].trim()) p.shift(); return p.join('\n') }) }
+  }
+  function renderTextoSimple(prs, sl, s, page, plan = planTexto(s)) {
+    const titulo = CAMPOS_TITULO.map(k => s[k]).find(v => typeof v === 'string' && v.trim()) || String(s.type || '')
+    plan.paginas.forEach((cuerpo, p) => {
+      const slide = p === 0 ? sl : prs.addSlide()
+      slide.background = { color: C.BG }
+      brackets(slide, prs)
+      chrome(slide, prs, s.section || String(s.type || 'SLIDE').toUpperCase(), page + p)
+      if (s.eyebrow) eb(slide, s.eyebrow, M, 0.95)
+      txt(slide, `${titulo}${p ? '  (cont.)' : ''}`, M, 1.35, W-2*M, 0.82, { size: 28, color: C.WHITE, bold: true, font: TITLE })
+      rule(slide, prs, M, 2.3, W-2*M)
+      txt(slide, cuerpo, M, CUERPO_Y, W-2*M, CUERPO_H, { size: CUERPO_PT, color: C.LIGHT, font: BODY })
+    })
+  }
+  function cuerpoDeTexto(s) {
+    return Object.entries(s)
+      // Fuera también los campos de estilo (bg_color, text_color, layout…): son instrucciones de
+      // maquetación del modelo, no contenido.
+      .filter(([k, v]) => !CAMPOS_FUERA.has(k) && !/(^|_)(colou?r|bg|background|layout|style|palette_hint|accent)$/i.test(k) && v != null && v !== '')
+      .map(([k, v]) => (typeof v === 'string' && ['body', 'text', 'content', 'subtitle', 'description'].includes(k))
+        ? v : `${k.replace(/_/g, ' ').toUpperCase()}\n${plano(v)}`)
+      .join('\n\n')
   }
 
   // ── Slide renderers ───────────────────────────────────────────────────────────
@@ -1735,7 +1933,7 @@ async function docGenPptxCinematic(deck, imageUrls, projectId) {
     if (s.footer) {
       txt(sl, s.footer, M, H-0.62, W-2*M, 0.28, { size: 9, color: C.MUTED, font: MONO })
     }
-    txt(sl, '01 / 12', 11.5, H-0.38, 1.15, 0.28, { size: 9, color: C.MUTED, font: MONO, align: 'right' })
+    txt(sl, `01 / ${String(totalPaginas).padStart(2, '0')}`, 11.5, H-0.38, 1.15, 0.28, { size: 9, color: C.MUTED, font: MONO, align: 'right' })
   }
 
   function renderOneLiner(prs, sl, s, page) {
@@ -2012,6 +2210,61 @@ async function docGenPptxCinematic(deck, imageUrls, projectId) {
         { size: 9, color: C.MUTED, font: MONO, align: 'center' })
   }
 
+  // ── Tabla ─────────────────────────────────────────────────────────────────────
+  // { type: 'table', title, columns: [...], rows: [[...]], note? } — forma exacta en TABLA_DECK.md.
+  // Se aceptan los alias que ya mandaron los modelos: headers/header por columns, y data/table_data
+  // con la cabecera en la primera fila. Si no cabe, sigue en otra diapositiva con la cabecera repetida.
+  function filasDeTabla(s) {
+    // Los datos pueden venir anidados en `table` (así los mandó migue v.12: comparison_table.table.rows).
+    if (s.table && typeof s.table === 'object') s = Array.isArray(s.table) ? { ...s, rows: s.table } : { ...s, ...s.table }
+    let cols = s.columns || s.headers || s.header || null
+    let rows = s.rows || s.data || s.table_data || []
+    if (!Array.isArray(rows)) rows = []
+    if ((!Array.isArray(cols) || !cols.length) && Array.isArray(rows[0])) { cols = rows[0]; rows = rows.slice(1) }
+    const defs   = Array.isArray(cols) ? cols : []
+    const claves = defs.map(c => (c && typeof c === 'object') ? (c.key ?? c.name ?? c.label) : c)
+    const nombres = defs.map(c => String((c && typeof c === 'object') ? (c.label ?? c.name ?? c.key ?? '') : (c ?? '')))
+    const celda  = c => (c && typeof c === 'object') ? Object.values(c).map(x => String(x ?? '')).join(' · ') : String(c ?? '')
+    const filas  = rows.map(r => Array.isArray(r) ? r : (r && typeof r === 'object') ? (claves.length ? claves.map(k => r[k]) : Object.values(r)) : [r])
+      .map(r => r.map(celda))
+    return { cols: nombres, filas }
+  }
+  // Tipos que se pintan como tabla: `table` y los alias que ya mandaron los modelos.
+  const TIPOS_TABLA = new Set(['table', 'comparison_table', 'table_data'])
+  function planTabla(s) {
+    const { cols, filas } = filasDeTabla(s)
+    const n = cols.length
+    if (!n) return null
+    const filasN  = ajustarFilas(filas, n)
+    const TW = W - 2*M, TOP = 2.4, FONDO = H - 0.62
+    const pt      = n >= 6 ? 10 : n >= 4 ? 11 : 12
+    const anchos  = anchosDeColumna(cols, filasN, TW)
+    const nota    = String(s.note || s.footnote || s.caption || '')
+    const altoNota = nota ? 0.42 : 0
+    const { paginas, altoCab } = paginasDeTabla(cols, filasN, anchos, pt, () => FONDO - TOP - altoNota, 'calibri')
+    return { cols, anchos, pt, nota, altoNota, paginas, altoCab, TW, TOP, FONDO }
+  }
+  function renderTable(prs, sl, s, page, plan) {
+    const { cols, anchos, pt, nota, altoNota, paginas, altoCab, TW, TOP, FONDO } = plan
+    const borde = { type: 'solid', pt: 0.5, color: C.DIM }
+    paginas.forEach((pag, p) => {
+      const slide = p === 0 ? sl : prs.addSlide()
+      slide.background = { color: C.BG }
+      brackets(slide, prs)
+      chrome(slide, prs, s.section || 'TABLE', page + p)
+      eb(slide, s.eyebrow || 'TABLE', M, 0.95)
+      txt(slide, `${s.title || ''}${p ? '  (cont.)' : ''}`, M, 1.35, TW, 0.82, { size: 28, color: C.WHITE, bold: true, font: TITLE })
+      rule(slide, prs, M, 2.25, TW)
+      const filasPptx = [
+        cols.map(h => ({ text: h, options: { bold: true, color: C.ACCENT, fontFace: MONO, fill: { color: C.CARD } } })),
+        ...pag.map((f, k) => f.celdas.map(c => ({ text: c, options: { color: C.LIGHT, fill: { color: k % 2 ? C.SURFACE : C.BG } } }))),
+      ]
+      slide.addTable(filasPptx, { x: M, y: TOP, w: TW, colW: anchos, rowH: [altoCab, ...pag.map(f => f.alto)],
+        fontSize: pt, fontFace: BODY, border: borde, valign: 'top', margin: 0.05, autoPage: false })
+      if (nota && p === paginas.length - 1) txt(slide, nota, M, FONDO - altoNota + 0.06, TW, 0.36, { size: 10, color: C.MUTED, font: BODY })
+    })
+  }
+
   // ── Dispatch y render ─────────────────────────────────────────────────────────
 
   const renderers = {
@@ -2032,11 +2285,44 @@ async function docGenPptxCinematic(deck, imageUrls, projectId) {
   const prs = new PptxGenJS()
   prs.layout = 'LAYOUT_WIDE'
 
-  ;(deck.slides || []).forEach((s, i) => {
-    const fn = renderers[s.type]
-    if (!fn) return
-    fn(prs, prs.addSlide(), s, i + 1)
+  const avisos = []
+  let dibujadas = 0
+  // Primero cuántas diapositivas da cada una: el «NN / total» de la cabecera tiene que ser el real.
+  const planes = (deck.slides || []).map(s => {
+    if (!s || typeof s !== 'object') return null
+    if (TIPOS_TABLA.has(s.type)) {
+      const t = planTabla(s)
+      if (t) return { tipo: 'tabla', plan: t, n: t.paginas.length }
+      const x = planTexto(s)
+      return { tipo: 'texto', plan: x, n: x.paginas.length, tablaVacia: true }
+    }
+    if (renderers[s.type]) return { tipo: 'conocido', n: 1 }
+    const x = planTexto(s)
+    return { tipo: 'texto', plan: x, n: x.paginas.length }
   })
+  totalPaginas = planes.reduce((a, pl) => a + (pl ? pl.n : 0), 0)
+  let posicion = 0
+  ;(deck.slides || []).forEach((s, i) => {
+    const pl = planes[i]
+    if (!pl) { avisos.push(`Slide ${i + 1} is not an object and was skipped.`); return }
+    const pg = posicion + 1
+    if (pl.tipo === 'tabla') renderTable(prs, prs.addSlide(), s, pg, pl.plan)
+    else if (pl.tipo === 'conocido') renderers[s.type](prs, prs.addSlide(), s, pg)
+    else {
+      avisos.push(pl.tablaVacia
+        ? `Slide ${i + 1}: table with no columns or rows — drawn as plain text (title + body).`
+        : `Slide ${i + 1}: type "${s.type ?? '(none)'}" is not a deck slide type — drawn as plain text (title + body).`)
+      renderTextoSimple(prs, prs.addSlide(), s, pg, pl.plan)
+    }
+    posicion += pl.n
+    dibujadas++
+  })
+
+  // Cero diapositivas no es un deck: no se sube nada y se dice.
+  if (!dibujadas) {
+    for (const p of Object.values(images)) { try { fs.unlinkSync(p) } catch {} }
+    return { success: false, error: 'The deck has no slide that could be drawn. Nothing was generated.', warnings: avisos.length ? avisos : undefined }
+  }
 
   const buffer      = await prs.write({ outputType: 'nodebuffer' })
 
@@ -2049,7 +2335,7 @@ async function docGenPptxCinematic(deck, imageUrls, projectId) {
     buffer, storagePath,
     'application/vnd.openxmlformats-officedocument.presentationml.presentation',
   )
-  return { success: true, url, filename: `${deck.meta?.game_title || 'deck'}.pptx`, format: 'pptx' }
+  return { success: true, url, filename: `${deck.meta?.game_title || tituloMotor || 'deck'}.pptx`, format: 'pptx', warnings: avisos.length ? avisos : undefined }
 }
 
 // ─── PPTX generator ──────────────────────────────────────────────────────────
@@ -2074,9 +2360,17 @@ async function docGenPptx(title, content, images, projectId, nodeId) {
 
     const deck = JSON.parse(src)
     if (deck?.slides && Array.isArray(deck.slides) && deck.slides.length > 0) {
-      return docGenPptxCinematic(deck, imgs, projectId)
+      return docGenPptxCinematic(deck, imgs, projectId, title)
+    }
+    // Un deck JSON sin diapositivas no es un deck. Antes caía al renderer de markdown con un
+    // objeto en la mano y reventaba, o salía una portada sola presentada como éxito.
+    if (deck && typeof deck === 'object' && !Array.isArray(deck) && (Array.isArray(deck.slides) || deck.meta)) {
+      return { success: false, error: 'The deck has no slides: the JSON deck carries an empty "slides" list. Nothing was generated.' }
     }
   } catch {}
+  if (typeof content !== 'string') {
+    return { success: false, error: 'The deck content is neither a JSON deck with slides nor markdown text. Nothing was generated.' }
+  }
 
   const PptxGenJS = require('pptxgenjs')
   const pptx = new PptxGenJS()
@@ -2127,6 +2421,11 @@ async function docGenPptx(title, content, images, projectId, nodeId) {
   const coverSec     = contentSlides[0] && isCoverTitle(contentSlides[0].title) ? contentSlides[0] : null
   const coverBody    = coverSec ? pptxParseSlideBody(coverSec.lines) : { eyebrow: null, title: null, taglines: [], factSheet: [], bullets: [], paragraphs: [] }
 
+  // Sin diapositivas de contenido el deck sería la portada sola: es un fallo y se dice.
+  if (contentSlides.length - (coverSec ? 1 : 0) <= 0) {
+    return { success: false, error: 'The deck has no content slide: the text has no "## " section to turn into a slide. Nothing was generated.' }
+  }
+
   const coverTitle   = coverBody.title       || gameTitle
   const coverTagline = coverBody.taglines[0] || ''
   const coverEyebrow = coverBody.eyebrow     || docType.toUpperCase()
@@ -2173,12 +2472,45 @@ async function docGenPptx(title, content, images, projectId, nodeId) {
   const loopStart = coverSec ? 1 : 0
   let imgCursor   = validImgs.length > 1 ? 1 : 0
 
+  // Una sección puede dar varias diapositivas (texto, tabla, tabla partida): el número de página
+  // es un contador, no el índice de la sección. Con una diapositiva por sección da lo mismo que antes.
+  let pagina = 1
+  const avisos = []
+  const cerrarDiapositiva = slide => {
+    amberStripe(slide, 0)
+    amberStripe(slide, 7.44)
+    pagina++
+    slide.addText(`${pagina}`, {
+      x: 12.88, y: 7.1, w: 0.38, h: 0.25, fontSize: 8, color: C.GRAY_DIM, align: 'right',
+    })
+  }
+
   for (let si = loopStart; si < contentSlides.length; si++) {
     const sec  = contentSlides[si]
-    const body = pptxParseSlideBody(sec.lines)
 
     // Limpiar prefijo "Slide N — " para evitar que aparezca en el título visible
     const cleanTitle = sec.title.replace(/^Slide\s+\d+\s*[—\-–]\s*/i, '').trim()
+
+    const { tramos, codigo } = tramosDeSeccion(sec.lines)
+    for (const c of codigo) avisos.push(`"${cleanTitle}": a ${c.lenguaje ? c.lenguaje + ' ' : ''}code block (${c.lineas} lines) was left out of the deck.`)
+    // Una sección sin nada (ni texto ni tabla ni código) sigue dando su diapositiva de título, como antes.
+    if (!tramos.length && !codigo.length) tramos.push({ tipo: 'texto', lines: sec.lines })
+
+    for (let ti = 0; ti < tramos.length; ti++) {
+    const tramo = tramos[ti]
+    if (tramo.tipo === 'tabla') {
+      for (const sl of renderTablaSlides(pptx, cleanTitle, tramo, tramo.intro, C)) cerrarDiapositiva(sl)
+      continue
+    }
+    // Unas pocas líneas cortas justo antes de una tabla son su introducción: van encima de la tabla,
+    // no en una diapositiva aparte.
+    const llenas = tramo.lines.map(l => String(l).trim()).filter(l => l && !/^---+$/.test(l))
+    const siguiente = tramos[ti + 1]
+    if (siguiente?.tipo === 'tabla' && llenas.length <= 3 && llenas.join(' ').length <= 300 && !llenas.some(l => /^#{1,4}\s|^[-*•]\s/.test(l))) {
+      siguiente.intro = llenas.join('\n')
+      continue
+    }
+    const body = pptxParseSlideBody(tramo.lines)
 
     const hasComp   = body.compItems.length > 0
     const hasHero   = body.title !== null || body.taglines.length > 0 || body.strikethrough || body.dirItems.length > 0
@@ -2205,13 +2537,14 @@ async function docGenPptx(title, content, images, projectId, nodeId) {
       renderContentSlide(slide, cleanTitle, body, slideImg, C)
     }
 
-    // Barras amber encima de todo el contenido
-    amberStripe(slide, 0)
-    amberStripe(slide, 7.44)
+    // Barras amber encima de todo el contenido, y el número de página
+    cerrarDiapositiva(slide)
+    }
+  }
 
-    slide.addText(`${si - loopStart + 2}`, {
-      x: 12.88, y: 7.1, w: 0.38, h: 0.25, fontSize: 8, color: C.GRAY_DIM, align: 'right',
-    })
+  // Si todas las secciones eran código omitido, no queda ninguna diapositiva de contenido.
+  if (pagina === 1) {
+    return { success: false, error: 'The deck has no content slide: its sections only held code blocks, which are left out of decks. Nothing was generated.', warnings: avisos.length ? avisos : undefined }
   }
 
   const buffer      = await pptx.write({ outputType: 'nodebuffer' })
@@ -2222,7 +2555,67 @@ async function docGenPptx(title, content, images, projectId, nodeId) {
     'application/vnd.openxmlformats-officedocument.presentationml.presentation',
   )
 
-  return { success: true, url, filename: `${title || 'deck'}.pptx`, format: 'pptx' }
+  return { success: true, url, filename: `${title || 'deck'}.pptx`, format: 'pptx', warnings: avisos.length ? avisos : undefined }
+}
+
+// ─── Qué recibe el deck automático ──────────────────────────────────────────
+//
+// Corriendo el NODO ENTERO, la respuesta lleva todos los outputs, cada uno bajo su `## <clave>`.
+// El deck automático recibía esa respuesta entera: en el 2.7 de Smack Gaspard (07-10) salieron
+// cuatro diapositivas tituladas `lock_briefing`, `comparison deck`, `lock candidates` y
+// `gate decision`, con las tablas del briefing y el JSON del gate dentro. El PDF automático ya
+// recorta la sección de su output; el deck no lo hacía.
+//
+// Ahora el deck sale SOLO de la sección de su output pptx. Si la sección no está, no hay deck y
+// se dice por qué: un deck con todo dentro es peor que ninguno, porque parece terminado.
+// Con output objetivo (corrida enfocada) la respuesta ya ES ese output y se pasa tal cual, salvo que
+// no traiga ni un `## `: entonces el renderer no tenía de dónde sacar diapositivas y entregaba la
+// portada sola como si fuera el deck.
+function contenidoDelDeck({ replyText, outputDefs, targetOutput }) {
+  const claveDe = o => (typeof o === 'object' ? (o?.key || o?.name) : o)
+  let texto, clave, nombre
+  if (targetOutput) {
+    clave  = claveDe(targetOutput)
+    nombre = (typeof targetOutput === 'object' && targetOutput.label) || clave || 'Deck'
+    texto  = String(replyText || '')
+  } else {
+    const { extractSection } = require('../utils/extract-section')
+    const defs    = Array.isArray(outputDefs) ? outputDefs : []
+    const deckDef = defs.find(o => String(o?.format || '').toLowerCase() === 'pptx')
+    if (!deckDef) {
+      return { ok: false, motivo: 'The deck was not generated: this run has no pptx output to take it from.' }
+    }
+    clave  = claveDe(deckDef)
+    nombre = deckDef.label || clave
+    const seccion = extractSection(String(replyText || ''), clave, defs.map(claveDe).filter(Boolean))
+    if (!seccion) {
+      return { ok: false, motivo: `The deck was not generated: the reply has no "## ${clave}" section. Run the ${nombre} output on its own to get the deck.` }
+    }
+    // Un encabezado `## clave_en_snake_case` es otra salida o un bloque de máquina —el
+    // `## lock_candidates` que el 2.7 escribe al final—, nunca el título de una diapositiva: ahí
+    // acaba el deck. El extractor solo conoce las claves de la DNA, y ese bloque no es una de ellas.
+    const corte = /^##\s+[a-z][a-z0-9]*(?:_[a-z0-9]+)+\s*$/m.exec(seccion)
+    texto = (corte ? seccion.slice(0, corte.index) : seccion).trim()
+    if (!texto) {
+      return { ok: false, motivo: `The deck was not generated: the "## ${clave}" section of the reply is empty.` }
+    }
+  }
+  // El deck puede venir como JSON en un bloque ```json: ese es el deck del modelo.
+  for (const m of texto.matchAll(/```(?:json)?\s*\n([\s\S]*?)```/g)) {
+    try {
+      const d = JSON.parse(m[1])
+      if (d && Array.isArray(d.slides) && d.slides.length) return { ok: true, contenido: d, clave }
+    } catch { /* no era el deck */ }
+  }
+  // En una corrida enfocada que ya trae `## `, nada cambia.
+  if (targetOutput && /^##\s+/m.test(texto)) return { ok: true, contenido: replyText, clave }
+  // Cada `## ` es una diapositiva. Si el modelo usó `###` para sus apartados, esos son las
+  // diapositivas. Lo que va antes del primer encabezado abre el deck con el nombre del output:
+  // el renderer descarta el texto que no cuelga de ningún `## `.
+  let cuerpo = texto.trim()
+  if (!/^##\s+/m.test(cuerpo) && /^###\s+/m.test(cuerpo)) cuerpo = cuerpo.replace(/^###\s+/gm, '## ')
+  if (!/^##\s+/.test(cuerpo)) cuerpo = `## ${nombre}\n${cuerpo}`
+  return { ok: true, contenido: cuerpo, clave }
 }
 
 // ─── Dispatcher ───────────────────────────────────────────────────────────────
@@ -2254,4 +2647,4 @@ async function executeTool(name, args, context = {}) {
   }
 }
 
-module.exports = { getToolsBlock, getDocPolicyBlock, willExportDoc, herramientasDelOutput, isDataDump, parseToolCalls, executeTool }
+module.exports = { getToolsBlock, getDocPolicyBlock, willExportDoc, herramientasDelOutput, isDataDump, parseToolCalls, executeTool, contenidoDelDeck }

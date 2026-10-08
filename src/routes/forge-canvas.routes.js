@@ -16,6 +16,10 @@ const { requireAdmin } = require('../middleware/requireAdmin')
 // conjunto vive en memoria del proceso a propósito: es de una corrida en curso, y una corrida en
 // curso vive en un proceso. Reiniciar el back mata la corrida de todos modos.
 const cancelacionesPedidas = new Set()
+// El AbortController de cada generación de chat en curso, por sesión. El Stop solo marcaba
+// `cancelacionesPedidas`, que el bucle mira ANTES de cada llamada: la llamada en vuelo seguía hasta
+// el final y se pagaba entera. Con esto el Stop aborta la petición al proveedor en el acto.
+const controladoresEnCurso = new Map()
 
 // Frente 4: gate de crédito. Bloquea correr un nodo si la org no tiene saldo, o si el proyecto/miembro
 // alcanzó su sub-tope (el más restrictivo manda). Devuelve true si se puede seguir; si no, responde 402.
@@ -57,6 +61,26 @@ function textOutputsOf(node) {
   return outs.filter(o => o.key && !(o.image_gen === true && (o.format === 'png' || o.format === 'image')))
 }
 
+// Los outputs que declaran hermanos (`uses.siblings_if_present` / `siblings`) van DESPUÉS de esos
+// hermanos cuando también están pendientes. Orden estable: entre los que ya pueden correr se
+// conserva el de la DNA. Un ciclo (A↔B) no bloquea: si nadie está libre sale primero el que tenga
+// `uses.inputs` con algo — ése puede producirse desde el upstream — y solo si ninguno lo tiene, el
+// primero de la lista. Así en el 3.12 `tdd_complete` (con upstream) corre antes que sus seis
+// reportes (`uses.inputs: []`), que viven de él.
+function ordenarPorHermanos(claves, outputs) {
+  const defs = Array.isArray(outputs) ? outputs : []
+  const defDe = k => defs.find(o => (o.key || o.name) === k)
+  const hermanosDe = k => defDe(k)?.uses?.siblings_if_present ?? defDe(k)?.uses?.siblings ?? []
+  const conUpstream = k => Array.isArray(defDe(k)?.uses?.inputs) && defDe(k).uses.inputs.length > 0
+  const pendientes = [...claves], orden = []
+  while (pendientes.length) {
+    let i = pendientes.findIndex(k => !hermanosDe(k).some(h => h !== k && pendientes.includes(h)))
+    if (i < 0) i = Math.max(0, pendientes.findIndex(conUpstream))
+    orden.push(...pendientes.splice(i, 1))
+  }
+  return orden
+}
+
 // ─── Outputs PENDIENTES de un nodo — qué debe correr Run (bug A, per-output-aware) ──
 // Reglas locked:
 //  · Decision 3A: si el nodo está stale → se re-corren TODOS sus outputs.
@@ -92,8 +116,12 @@ async function pendingOutputsForNode(project_id, node_id, isStale, node, project
 // ─── Ejecuta UN output de un nodo como sesión per-output auto-aprobada ──────────
 // Núcleo reusable del auto-run. No toca otros outputs ya aprobados (bug A).
 async function executeOneOutput({ project_id, node_id, targetOutputKey, member_id, project_node_id = null }) {
-  const { buildSystemPrompt, runReActLoop } = require('../services/canvas-chat.service')
+  const { buildSystemPrompt, runReActLoop, verificarHermanos } = require('../services/canvas-chat.service')
   const { logExecution } = require('../services/execution-log.service')
+
+  // Antes de abrir la sesión: sin hermano aprobado no hay fuente (422 SIBLING_NOT_APPROVED), y
+  // comprobarlo después dejaba la sesión recién creada en `active` para siempre.
+  await verificarHermanos(db, { projectId: project_id, nodeId: node_id, targetOutputKey })
 
   // Sesión enfocada en este output (output_key = key)
   const { data: session, error: sessErr } = await db()
@@ -113,17 +141,36 @@ async function executeOneOutput({ project_id, node_id, targetOutputKey, member_i
   if (sessErr) throw sessErr
 
   const userMessage = 'Generate the output for this step'
+  const inicioLlamada = new Date().toISOString()
 
   // La instancia viaja con la llamada: sin ella, un nodo que vive en varios lanes no puede saber
   // cuál de los dos es y se queda sin ningún input.
-  const { finalSystemPrompt, baseUserMsg, executorStr, activeTools, resolvedInputs, visualRefs, node, targetOutput, skillHeadings } =
-    await buildSystemPrompt(db, { projectId: project_id, nodeId: node_id, sessionId: session.id, userMessage, targetOutputKey, projectNodeId: project_node_id })
-
-  const { replyText, allToolCalls, docUrl, docFormat, meta } = await runReActLoop({
-    finalSystemPrompt, baseUserMsg, executorStr, activeTools, resolvedInputs, visualRefs,
-    projectId: project_id, nodeId: node_id, nodeName: node.title,
-    sessionId: session.id, targetOutput,
-  })
+  let armado, generado
+  try {
+    armado = await buildSystemPrompt(db, { projectId: project_id, nodeId: node_id, sessionId: session.id, userMessage, targetOutputKey, projectNodeId: project_node_id })
+    generado = await runReActLoop({
+      finalSystemPrompt: armado.finalSystemPrompt, baseUserMsg: armado.baseUserMsg, executorStr: armado.executorStr,
+      activeTools: armado.activeTools, resolvedInputs: armado.resolvedInputs, visualRefs: armado.visualRefs,
+      projectId: project_id, nodeId: node_id, nodeName: armado.node.title,
+      sessionId: session.id, targetOutput: armado.targetOutput,
+    })
+  } catch (err) {
+    // Antes el error subía sin más y la sesión recién creada quedaba `active` para siempre, sin
+    // mensaje ni fila de log. Ahora queda dicho qué pasó y el error sigue subiendo igual.
+    const { marcarSesionFallida } = require('../services/sesion-fallida.service')
+    await marcarSesionFallida(db, {
+      session_id: session.id, project_id, node_id, node_key: armado?.node?.node_key || null, output_key: targetOutputKey,
+      member_id, trigger_type: 'auto_run', error: err, provider: err?.provider || null, model: armado?.executorStr || null, started_at: inicioLlamada,
+    })
+    throw err
+  }
+  const { finalSystemPrompt, executorStr, node, skillHeadings } = armado
+  const { replyText, allToolCalls, docUrl, docFormat, meta } = generado
+  // El modelo chocó con max_tokens: el texto está cortado. Se guarda TAL CUAL (el content es el texto
+  // del modelo, byte a byte), marcado en metadata y sin aprobarse solo; el aviso va en un mensaje
+  // aparte con role `system`.
+  const truncado = meta?.truncated === true
+  if (truncado) console.warn(`[auto-run] ${targetOutputKey}: respuesta truncada (finish_reason=length) — no se aprueba automáticamente`)
 
   // ¿Copió el playbook en vez de seguirlo? Se mide sobre los encabezados, que es la huella
   // inconfundible, y se avisa: la respuesta ya está pagada, pero así el fallo tiene un número en
@@ -139,7 +186,7 @@ async function executeOneOutput({ project_id, node_id, targetOutputKey, member_i
     provider: meta?.provider || null, model: meta?.model || null,
     tokens: meta?.tokens_used || null, duration_ms: meta?.duration_ms || null,
     started_at: new Date(Date.now() - (meta?.duration_ms || 0)).toISOString(),
-    status: 'success', metadata: { node_key: node.node_key, output_key: targetOutputKey },
+    status: 'success', metadata: { node_key: node.node_key, output_key: targetOutputKey, ...(meta?.finish_reason ? { finish_reason: meta.finish_reason } : {}), ...(truncado ? { truncated: true } : {}) },
   }) } catch (logErr) { console.error('[auto-run] logExecution failed (non-fatal):', logErr.message) }
 
   await db().from('forge_messages').insert({ session_id: session.id, role: 'human', content: userMessage, order_index: 0, tool_calls: [] })
@@ -156,15 +203,25 @@ async function executeOneOutput({ project_id, node_id, targetOutputKey, member_i
     .insert({
       node_id, project_id, session_id: session.id, name: assetName,
       format:      docUrl ? (docFormat === 'pptx' ? 'pptx' : 'docx') : 'markdown',
-      status:      'approved', content: replyText, storage_url: docUrl || null,
-      approved_by: member_id || null, approved_at: new Date().toISOString(),
+      status:      truncado ? 'pending' : 'approved', content: replyText, storage_url: docUrl || null,
+      approved_by: truncado ? null : (member_id || null), approved_at: truncado ? null : new Date().toISOString(),
+      ...(truncado ? { metadata: { truncated: true, finish_reason: meta?.finish_reason ?? 'length' } } : {}),
     })
     .select('id')
     .single()
   if (assetErr) throw assetErr
 
+  if (truncado) {
+    await db().from('forge_messages').insert({
+      session_id: session.id, role: 'system', order_index: 2, tool_calls: [],
+      content: '_TRUNCATED — the model reached its output limit (finish_reason=length). The saved text is incomplete and was not approved: review it, then run this output again or split it._',
+    })
+  }
+
+  // Truncado: la sesión queda `active` con su asset `pending`, así el próximo Run la vuelve a pedir
+  // y nadie la consume como aprobada. Entero: como siempre.
   await db().from('forge_sessions')
-    .update({ status: 'auto_approved', output_asset_id: asset.id, completed_at: new Date().toISOString(), iteration_count: 1 })
+    .update({ status: truncado ? 'active' : 'auto_approved', output_asset_id: asset.id, completed_at: new Date().toISOString(), iteration_count: 1 })
     .eq('id', session.id)
 
   return { output_key: targetOutputKey, session_id: session.id, asset_id: asset.id, reply: replyText, doc_url: docUrl || undefined, doc_format: docFormat || undefined }
@@ -3359,6 +3416,8 @@ router.get('/nodes/:node_id/session', async (req, res, next) => {
     const messages = (msgs || []).map(m => ({
       id:            m.id,
       role:          m.role === 'human' ? 'user' : 'assistant',
+      // Avisos del motor (fallo, truncado): se ven en el hilo pero no son la respuesta del nodo.
+      ...(m.role === 'system' ? { aviso: true } : {}),
       content:       m.content,
       attachments:   attachmentsByMsg[m.id] || [],
       tool_calls:    m.tool_calls?.length ? m.tool_calls : undefined,
@@ -3442,6 +3501,9 @@ router.get('/nodes/:node_id/session', async (req, res, next) => {
 // ─── POST /api/projects/:id/canvas/nodes/:node_id/chat ────────
 // Conversación multi-turno con un nodo usando forge_sessions/forge_messages
 router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req, res, next) => {
+  // Lo que el catch necesita para dejar rastro de un fallo. Se rellena en cuanto existe la sesión;
+  // vive fuera del try porque dentro no es visible desde el catch.
+  let rastro = null
   try {
     const { id: project_id, node_id } = req.params
     let { user_message, session_id, member_id, attachment_url, target_output_key = null, project_node_id: explicit_project_node_id = null } = req.body
@@ -3502,6 +3564,13 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
       target_output_key = null
     }
     const directContext = node.inputs?.direct_context || ''
+
+    // Un output sin upstream que vive de sus hermanos no abre sesión sin al menos uno aprobado:
+    // el 422 (SIBLING_NOT_APPROVED) llega ANTES de crear nada. Ver verificarHermanos.
+    if (targetOutput && !isAssembly) {
+      const { verificarHermanos } = require('../services/canvas-chat.service')
+      await verificarHermanos(db, { projectId: project_id, nodeId: node_id, targetOutputKey: targetOutput.key })
+    }
 
     // Buscar o crear sesión activa
     let session = null
@@ -3576,6 +3645,8 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
       }
       session = created
     }
+    rastro = { session_id: session.id, project_id, node_id, output_key: target_output_key || null, member_id: member_id || null, started_at: new Date().toISOString(), iteraciones_previas: session.iteration_count || 0 }
+    controladoresEnCurso.set(session.id, abortar)
 
     // ── Procesar adjunto (Reference Injection 5.2) ───────────────
     let pendingAttachment = null
@@ -3942,6 +4013,7 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
 
     // Historial como texto plano para el LLM
     const historyText = (historyMsgs || [])
+      .filter(m => m.role !== 'system')   // avisos del motor (fallo, truncado): no son conversación
       .map(m => `${m.role === 'human' ? 'Human' : 'Agent'}: ${m.content}`)
       .join('\n\n')
 
@@ -3954,6 +4026,7 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
     // executor.model ya tiene el formato correcto provider:model (ej: minimax:MiniMax-M2.7)
     // executor.type indica el tipo de ejecutor (llm, hybrid, comfyui...) — no es el provider
     const executorStr = node.executor?.model || process.env.DEFAULT_MODEL
+    if (rastro) { rastro.model = executorStr; rastro.node_key = node.node_key }
 
     // El banner refleja lo que el modelo REALMENTE puede llamar en esta corrida. Imprimir la
     // lista del nodo hacía leer el log como si la herramienta estuviera disponible cuando el
@@ -4162,6 +4235,11 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
           docFormat  = toolResult.format || (tc.tool === 'doc_gen_pptx' ? 'pptx' : 'pdf')
           resultText = `File generated successfully.\nFilename: ${toolResult.filename}\nDownload URL: ${toolResult.url}\n\nTell the user the file is ready. Do NOT reproduce the slide content again.`
         }
+        // Los avisos del deck y su fallo llegan al usuario, no solo al modelo.
+        if (tc.tool === 'doc_gen_pptx') {
+          if (Array.isArray(toolResult.warnings)) docWarnings.push(...toolResult.warnings)
+          if (!toolResult.success) docWarnings.push(/^The deck/.test(toolResult.error || '') ? toolResult.error : `The deck was not generated: ${toolResult.error || 'unknown error'}`)
+        }
 
         toolResultParts.push(`<tool_result tool="${tc.tool}">\n${resultText}\n</tool_result>`)
       }
@@ -4186,10 +4264,18 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
         duration_ms:  meta?.duration_ms || null,
         started_at:   new Date(Date.now() - (meta?.duration_ms || 0)).toISOString(),
         status:       'success',
-        metadata:     { node_key: node.node_key, iter_count: allToolCalls.length > 0 ? undefined : 1 },
+        metadata:     { node_key: node.node_key, iter_count: allToolCalls.length > 0 ? undefined : 1, ...(meta?.finish_reason ? { finish_reason: meta.finish_reason } : {}), ...(meta?.truncated ? { truncated: true } : {}) },
       })
     } catch (logErr) {
       console.error('[forge-chat] logExecution failed (non-fatal):', logErr.message)
+    }
+
+    // El modelo chocó con max_tokens (finish_reason=length): el texto está cortado. El texto se deja
+    // TAL CUAL (es lo que Accept guarda); el aviso va en `warnings`, en `truncated` de la respuesta y
+    // en un mensaje `system` aparte, que Accept no toma.
+    if (meta?.truncated === true) {
+      docWarnings.push('The reply is TRUNCATED: the model hit its output limit (finish_reason=length). Do not accept it as complete.')
+      console.warn(`[forge-chat] ${node.node_key}: respuesta truncada (finish_reason=length)`)
     }
 
     // Eliminar párrafo de disclaimer cuando un tool falla y el LLM lo anuncia
@@ -4374,20 +4460,29 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
           .map(s => { const m = s.match(/URL:\s*(https?:\/\/\S+)/); return m ? m[1] : null })
           .filter(Boolean)
 
-        const pptxResult = await executeTool('doc_gen_pptx', {
+        // Nodo entero: el deck sale SOLO de la sección de su output pptx, como el PDF de arriba.
+        // Sin esa sección no hay deck, y el aviso dice por qué (ver contenidoDelDeck).
+        const deckIn = require('../services/tools.service').contenidoDelDeck({ replyText, outputDefs: allOutputDefs, targetOutput })
+        const pptxResult = !deckIn.ok ? { success: false, error: deckIn.motivo } : await executeTool('doc_gen_pptx', {
           title:   `${node.title} — ${project?.name ?? 'Presentation'}`,
-          content: replyText,
+          content: deckIn.contenido,
           images:  pngImageUrls,
         }, { project_id, node_id })
+        if (Array.isArray(pptxResult.warnings)) docWarnings.push(...pptxResult.warnings)
+        if (!pptxResult.success) docWarnings.push(/^The deck/.test(pptxResult.error || '') ? pptxResult.error : `The deck was not generated: ${pptxResult.error || 'unknown error'}`)
 
         // Un deck sin una sola imagen es formalmente válido y comercialmente inútil, y hasta ahora
         // salía en silencio: el 2.5 de Horror_casual_game generó 12 slides con cero arte porque el
         // 2.4 todavía no había producido las orientation_images. No se bloquea -un deck de texto
         // sigue sirviendo como borrador- pero se avisa, para que nadie lo mande creyendo que está
         // completo. Las imágenes llegan por los cables de entrada, no desde los assets del nodo.
-        if (!pngImageUrls.length) {
+        // Solo si el nodo espera imágenes: una entrada de imagen cableada (las orientation_images del
+        // 2.5). El 2.7 no recibe imágenes por diseño y el aviso salía en todos sus decks.
+        const entradas = typeof node.inputs === 'string' ? JSON.parse(node.inputs) : node.inputs
+        const esperaImagenes = (entradas?.wired || []).some(i => /^image/i.test(String(i?.type || '')))
+        if (!pngImageUrls.length && pptxResult.success && esperaImagenes) {
           console.warn('[forge-chat] doc_gen_pptx SIN IMÁGENES — ningún input upstream aportó PNG; el deck sale solo con texto')
-          docWarnings.push('El deck se generó sin ninguna imagen: ningún nodo conectado aportó arte. Revisá que el 2.4 haya generado sus imágenes y que esté conectado antes de presentarlo.')
+          docWarnings.push('The deck was generated without images: no connected node provided art. Check that the image node (2.4) has generated its images and is wired in before presenting the deck.')
         }
 
         if (pptxResult.success && pptxResult.url) {
@@ -4445,6 +4540,13 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
     if (agentInsertErr) {
       console.error('[forge-chat] forge_messages agent insert error:', agentInsertErr)
       throw new Error(`Failed to save agent message: ${agentInsertErr.message}`)
+    }
+
+    if (meta?.truncated === true) {
+      await db().from('forge_messages').insert({
+        session_id: session.id, role: 'system', order_index: nextIndex + 2, tool_calls: [],
+        content: '_TRUNCATED — the model reached its output limit (finish_reason=length). The reply above is incomplete: review it, then run again or ask for the missing part._',
+      })
     }
 
     // La generación de imágenes de una iteración la dispara el front (`triggerAutoImageGen`),
@@ -4552,6 +4654,7 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
       console.log(`[forge-chat] terminado sin cliente · sesión ${session.id} · ${replyText.length} chars guardados`)
     }
     cancelacionesPedidas.delete(session.id)
+    controladoresEnCurso.delete(session.id)
 
     // Un output de imagen que vuelve del chat SIN haber despachado nada NO está hecho, por muy
     // convencido que suene la respuesta.
@@ -4589,6 +4692,7 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
       // LLM de pegamento. Sin esto, un documento compuesto por código es una caja negra.
       assembly:   assemblyReport ?? undefined,
       warnings:   docWarnings.length ? docWarnings : undefined,
+      truncated:  meta?.truncated === true ? true : undefined,
       attachment: pendingAttachment ? {
         file_name:       pendingAttachment.file_name,
         mime_type:       pendingAttachment.mime_type,
@@ -4597,6 +4701,17 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
       } : undefined,
     })
   } catch (err) {
+    if (rastro) controladoresEnCurso.delete(rastro.session_id)
+    // Antes de responder, el rastro: sesión `abandoned` (si no había respuesta previa), aviso `system`
+    // con la causa y fila de log con status `error` (un Stop es status `error` con error_code ABORTED;
+    // un timeout, status `timeout`). Sin esto la sesión quedaba `active`
+    // para siempre y el fallo era invisible — es lo que se midió el 07-10 en el 3.9 de Wort.
+    if (rastro) {
+      try {
+        const { marcarSesionFallida } = require('../services/sesion-fallida.service')
+        await marcarSesionFallida(db, { ...rastro, trigger_type: 'chat', error: err, provider: err?.provider || null })
+      } catch (e2) { console.error('[forge-chat] no se pudo dejar rastro del fallo:', e2?.message || e2) }
+    }
     // Cancelar no es un fallo. El cliente ya se fue, así que no hay a quién responderle, y pasarlo
     // al manejador de errores llenaría los logs de rojo por algo que el usuario pidió.
     if (err?.code === 'ABORTED' || err?.name === 'AbortError' || res.writableEnded) {
@@ -5766,8 +5881,13 @@ router.post('/nodes/:project_node_id/auto-run', async (req, res, next) => {
       textTargets  = imageKeys.has(explicitKey) ? [] : [explicitKey]
       imageTargets = imageKeys.has(explicitKey) ? [explicitKey] : []
     } else {
-      textTargets  = (await pendingOutputsForNode(project_id, node_id, pNode.is_stale, nodeDna || {}, project_node_id))
-        .filter(k => !diferidos.has(k) && !porDeck.has(k))
+      // Un output que vive de un hermano corre DESPUÉS del hermano cuando los dos están
+      // pendientes: en el orden de la DNA el 3.8 pedía gdd_ref antes que gdd_complete.
+      textTargets  = ordenarPorHermanos(
+        (await pendingOutputsForNode(project_id, node_id, pNode.is_stale, nodeDna || {}, project_node_id))
+          .filter(k => !diferidos.has(k) && !porDeck.has(k)),
+        nodeDna?.outputs,
+      )
       imageTargets = (await pendingImageOutputsForNode(project_id, node_id, pNode.is_stale, nodeDna || {}, project_node_id))
         .filter(k => !diferidos.has(k))
     }
@@ -7489,6 +7609,8 @@ router.post('/nodes/:node_id/stop', async (req, res, next) => {
     if (!s) return res.status(404).json({ success: false, error: 'Session not found' })
 
     cancelacionesPedidas.add(session_id)
+    // Corta también la llamada en vuelo (mimo la escucha vía signal; anthropic ya lo hacía).
+    controladoresEnCurso.get(session_id)?.abort()
     console.warn(`[forge-chat] STOP pedido · sesion ${session_id}`)
     res.json({ success: true, session_id, status: s.status })
   } catch (err) { next(err) }

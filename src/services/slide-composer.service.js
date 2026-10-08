@@ -899,10 +899,28 @@ async function composeDeck({ db, projectId, deck = 'asg', fills = null, solo = n
   // su primer encabezado —«## Happy Habitat — Game Design Document»— y lo hace igual en 7 de los
   // 10 proyectos que tienen documento del 3.8. Cuando no lo declara se sigue usando el nombre del
   // proyecto, que es lo que había.
-  const tituloDelJuego = (() => {
+  const tituloDelJuego = await (async () => {
     for (const a of assets || []) {
       const m = /^#{1,3}\s*(.+?)\s*[—–-]\s*Game Design Document\s*$/im.exec(a.content || '')
       if (m && m[1].trim().length >= 2) return m[1].trim()
+    }
+    // El título que el propio concepto declara: `title` del `concept_data` del 2.2. Los decks que
+    // leen el 3.9 (ASG, marketing, audio) no tienen un GDD donde buscar el encabezado y caían al
+    // nombre del proyecto, que es el de la carpeta de pruebas — medido el 06-10 en Wort:
+    // «Professor_Wort_&_Sprat_world» en la portada del ASG con «Professor Wort & Sprat» en el
+    // concept_data. Se acepta también la pieza de nodo entero (sin clave), que lleva el mismo json.
+    const { data: n22 } = await db().from('forge_nodes').select('id').eq('node_key', '2.2').maybeSingle()
+    if (n22?.id) {
+      const { data: cs } = await db().from('forge_assets')
+        .select('content,output_key,forge_sessions!session_id(output_key)')
+        .eq('project_id', projectId).eq('node_id', n22.id).in('status', ['approved', 'auto_approved'])
+        .neq('format', 'png').order('created_at', { ascending: false })
+      for (const a of cs || []) {
+        const clave = a.output_key ?? a.forge_sessions?.output_key ?? null
+        if (clave !== null && clave !== 'concept_data') continue
+        const m = /"title"\s*:\s*"([^"\n]{2,120})"/.exec(a.content || '')
+        if (m) return m[1].trim()
+      }
     }
     return proyecto?.name || null
   })()

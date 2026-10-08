@@ -449,6 +449,38 @@ async function resolverInstancia(db, { projectId, nodeId, projectNodeId = null, 
   return filas[0]
 }
 
+// Un output que NO consume upstream (`uses.inputs: []`) vive de sus hermanos declarados. Si ninguno
+// está aprobado, el modelo no tiene una sola fuente y la inventa — medido en Wort el 02-10: gdd_ref
+// corrió antes que gdd_complete y escribió el GDD de otro juego. Se corta con 422 ANTES de abrir la
+// sesión, para no dejar una sesión `active` huérfana, y antes de pagar la llamada. Mismo contrato
+// que `SOURCE_NOT_APPROVED` en el compositor de decks, y mismo emparejado por nombre de asset
+// («Título del nodo — Label del output») que usa buildSystemPrompt para inyectarlos.
+async function verificarHermanos(db, { projectId, nodeId, targetOutputKey }) {
+  if (!projectId || !nodeId || !targetOutputKey) return
+  const { data: node } = await db().from('forge_nodes')
+    .select('node_key, title, outputs').eq('id', nodeId).maybeSingle()
+  const defs = Array.isArray(node?.outputs) ? node.outputs : []
+  const def  = defs.find(o => (o.key || o.name) === targetOutputKey)
+  const hermanos = def?.uses?.siblings_if_present ?? def?.uses?.siblings ?? []
+  const sinUpstream = Array.isArray(def?.uses?.inputs) && def.uses.inputs.length === 0
+  if (!sinUpstream || !hermanos.length) return
+
+  const labelOf = o => (typeof o === 'object' ? (o.label || o.name || o.key) : o)
+  const wantNames = new Set(hermanos.map(k =>
+    `${node.title} — ${labelOf(defs.find(o => (o.key || o.name) === k) || k)}`.toLowerCase().trim()))
+  const { data: assets } = await db().from('forge_assets')
+    .select('name, content')
+    .eq('project_id', projectId).eq('node_id', nodeId)
+    .in('status', ['approved', 'auto_approved']).neq('format', 'png')
+  if ((assets || []).some(a => a.content && wantNames.has((a.name || '').toLowerCase().trim()))) return
+
+  const e = new Error(`Approve ${hermanos.join(', ')} of node ${node.node_key} before generating ${targetOutputKey} (it derives from them and none is approved in this project)`)
+  e.publico = true
+  e.status  = 422
+  e.code    = 'SIBLING_NOT_APPROVED'
+  throw e
+}
+
 async function buildSystemPrompt(db, { projectId, nodeId, sessionId, userMessage, historyMsgs = [], attachmentParts = [], targetOutputKey = null, projectNodeId = null }) {
   const { getPrompt, getSkill } = require('./prompt.service')
 
@@ -1176,19 +1208,36 @@ async function runReActLoop({ finalSystemPrompt, baseUserMsg, executorStr, activ
   const pptxAlreadyCalled = allToolCalls.some(tc => tc.tool === 'doc_gen_pptx')
   if (hasPptxTool && !pptxAlreadyCalled && replyText.trim().length > 200) {
     try {
-      const { executeTool: et } = require('./tools.service')
+      const { executeTool: et, contenidoDelDeck } = require('./tools.service')
       const pngImageUrls = resolvedInputs
         .filter(s => s.includes('(generated image)'))
         .map(s => { const m = s.match(/URL:\s*(https?:\/\/\S+)/); return m ? m[1] : null })
         .filter(Boolean)
 
-      const pptxResult = await et('doc_gen_pptx', { title: nodeName, content: replyText, images: pngImageUrls }, { project_id: projectId, node_id: nodeId })
+      // Con output objetivo la respuesta es ese output; sin él, solo su sección (contenidoDelDeck).
+      const deckIn = contenidoDelDeck({ replyText, outputDefs: null, targetOutput })
+      const pptxResult = deckIn.ok
+        ? await et('doc_gen_pptx', { title: nodeName, content: deckIn.contenido, images: pngImageUrls }, { project_id: projectId, node_id: nodeId })
+        : { success: false, error: deckIn.motivo }
+      // El intento queda registrado también cuando falla: es de donde sale la causa de abajo.
+      allToolCalls.push({ tool: 'doc_gen_pptx', args: { auto: true }, result: pptxResult })
       if (pptxResult.success && pptxResult.url) {
         docUrl    = pptxResult.url
         docFormat = 'pptx'
-        allToolCalls.push({ tool: 'doc_gen_pptx', args: { auto: true }, result: pptxResult })
       }
     } catch (e) { console.error('[canvas-chat] auto doc_gen_pptx failed:', e.message) }
+  }
+
+  // Un output pptx que termina sin deck no es un output terminado: no se guarda como aprobado.
+  // Antes se aprobaba el texto con el deck vacío o ausente y nadie se enteraba.
+  const outFmt = String((typeof targetOutput === 'object' ? targetOutput?.format : '') || '').toLowerCase()
+  if (hasPptxTool && outFmt === 'pptx' && !(docUrl && docFormat === 'pptx')) {
+    const ultimo = [...allToolCalls].reverse().find(tc => tc.tool === 'doc_gen_pptx')?.result
+    const causa = ultimo?.error || 'no deck came out of this run'
+    const e = new Error(/^The deck/.test(causa) ? causa : `The deck was not generated: ${causa}`)
+    e.code = 'DECK_FAILED'
+    e.publico = true
+    throw e
   }
 
   return { replyText, allToolCalls, docUrl, docFormat, meta }
@@ -1329,4 +1378,4 @@ async function resolveAssemblyPools(db, { projectId, currentPNodeId, node, outpu
 }
 
 module.exports = {
-  resolverImagenesDeItems, buildSystemPrompt, resolveNodeInputs, resolveAssemblyPools, runReActLoop, propagateStale, injectVars, injectSkillVars, resolverInstancia }
+  resolverImagenesDeItems, buildSystemPrompt, resolveNodeInputs, resolveAssemblyPools, runReActLoop, propagateStale, injectVars, injectSkillVars, resolverInstancia, verificarHermanos }

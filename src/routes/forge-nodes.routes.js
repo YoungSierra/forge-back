@@ -80,7 +80,30 @@ router.patch('/:id', async (req, res, next) => {
     for (const key of allowed) {
       if (req.body[key] !== undefined) updates[key] = req.body[key]
     }
+
+    // Quién cambió la DNA y qué. `requirePlatformAdmin` ya deja la identidad en
+    // `req.adminMemberId`; la fila se lee ANTES de escribir para guardar solo las claves que de
+    // verdad cambian. Los jsonb se comparan por contenido con las claves ordenadas: el admin manda
+    // el objeto entero y el orden de sus claves no es un cambio.
+    const { data: antes, error: errAntes } = await db()
+      .from('forge_nodes')
+      .select(allowed.join(', '))
+      .eq('id', req.params.id)
+      .maybeSingle()
+    if (errAntes) throw errAntes
+    if (!antes) return res.status(404).json({ success: false, error: 'Node not found' })
+
+    const canon = v => JSON.stringify(v ?? null, (_, x) =>
+      x && typeof x === 'object' && !Array.isArray(x)
+        ? Object.keys(x).sort().reduce((o, k) => { o[k] = x[k]; return o }, {})
+        : x)
+    const cambios = {}
+    for (const k of Object.keys(updates)) {
+      if (canon(antes[k]) !== canon(updates[k])) cambios[k] = { antes: antes[k] ?? null, despues: updates[k] }
+    }
+
     updates.updated_at = new Date().toISOString()
+    updates.updated_by = req.adminMemberId || null
 
     const { data, error } = await db()
       .from('forge_nodes')
@@ -91,7 +114,18 @@ router.patch('/:id', async (req, res, next) => {
 
     if (error) throw error
     if (!data) return res.status(404).json({ success: false, error: 'Node not found' })
-    res.json({ success: true, node: data })
+
+    // El historial no frena el guardado: si la tabla no está migrada todavía, se avisa y sigue.
+    if (Object.keys(cambios).length) {
+      const { error: errHist } = await db().from('forge_nodes_history').insert({
+        node_id:   req.params.id,
+        node_key:  data.node_key,
+        member_id: req.adminMemberId || null,
+        cambios,
+      })
+      if (errHist) console.error('[forge-nodes] history insert failed:', errHist.message)
+    }
+    res.json({ success: true, node: data, changed: Object.keys(cambios) })
   } catch (err) { next(err) }
 })
 
