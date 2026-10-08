@@ -49,14 +49,36 @@ async function planDeInstancias({ db, project_id, deck = 'asg' }) {
     if (k && !porNombre.has(k)) porNombre.set(k, p)
   }
 
+  // Lo que YA tiene su hoja. Es la misma cuenta que hace `instanciarHojas` al despachar, con la
+  // misma clave `pagina::item` sobre `metadata.instancia` — un dato del motor, no del nombre.
+  //
+  // Vivía SOLO dentro del despacho, así que desde fuera no había forma de saber qué faltaba: el
+  // plan decía «20 hojas» tanto si estaban todas hechas como si no había ninguna. Por eso una
+  // corrida cortada no se podía continuar — el 08-oct se cortó el ASG de Wort a mitad y la única
+  // salida fue limpiar el output y pagar las 26 páginas del deck otra vez. Diciéndolo acá, quien
+  // mira el recuadro puede pedir solo la diferencia.
+  const { data: previas } = await db().from('forge_assets')
+    .select('metadata').eq('project_id', project_id).not('metadata->instancia', 'is', null)
+  const yaHay = new Set()
+  for (const a of previas || []) {
+    const i = a.metadata?.instancia
+    if (i?.pagina && i?.item) yaHay.add(`${i.pagina}::${i.item}`)
+  }
+
   const paginas = []
   const ausentes = []
   for (const [hoja, items] of Object.entries(alcance.porHoja || {})) {
     const pag = porNombre.get(hoja) ?? porNombre.get(sinNumero(hoja))
     if (!pag) { ausentes.push(hoja); continue }
+    const conEstado = items.map(i => ({
+      nombre: i.nombre, de: i.de, cuenta: i.cuenta,
+      hecha: yaHay.has(`${hoja}::${i.nombre}`),
+    }))
     paginas.push({
       pagina: hoja, indice: pag.indice, kind: pag.kind || 'image',
-      items: items.map(i => ({ nombre: i.nombre, de: i.de, cuenta: i.cuenta })),
+      items: conEstado,
+      hechas: conEstado.filter(i => i.hecha).length,
+      faltan: conEstado.filter(i => !i.hecha).length,
     })
   }
   paginas.sort((a, b) => a.indice - b.indice)
@@ -64,7 +86,11 @@ async function planDeInstancias({ db, project_id, deck = 'asg' }) {
   return {
     hay: true,
     paginas,
+    // `despachos` sigue siendo el total del alcance, que es lo que ya leen el recuadro previo y el
+    // motor. `faltan` es lo nuevo: lo que de verdad habría que pagar hoy.
     despachos: paginas.reduce((n, p) => n + p.items.length, 0),
+    faltan: paginas.reduce((n, p) => n + p.faltan, 0),
+    hechas: paginas.reduce((n, p) => n + p.hechas, 0),
     // Lo que el alcance pide y el deck no sabe producir. Callarlo haría parecer que el slice
     // está cubierto cuando le falta una hoja entera.
     ausentes,
