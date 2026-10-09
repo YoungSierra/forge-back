@@ -29,6 +29,10 @@ const A_LA_HOJA = [
   { hoja: '21_UIComponentSheet',    etiqueta: 'UI Component Sheet',    re: /\bui\b|\bhud\b|\bscreens?\b|\bmenus?\b/i },
   { hoja: '23_AudioSheet',          etiqueta: 'Audio Sheet',           re: /\baudio\b|\bsfx\b|\bmusic\b|\bvoices?\b|\bvo\b|\bstems?\b/i },
   { hoja: '24_AnimationSheet',      etiqueta: 'Animation Sheet',       re: /\banimation\b|\bclips?\b|\brigs?\b/i },
+  // ANTES que la del entorno, y no por gusto: un skybox se nombra por el entorno que rodea
+  // —«Skybox — Sector 7 Hydro Labs»— asi que la regla del entorno se lo llevaria. El orden de
+  // esta lista es el que decide, y aca si importa.
+  { hoja: '25_SkyboxSheet',         etiqueta: 'Skybox Sheet',          re: /\bskyboxe?s?\b|\bpanoramas?\b|\b360\b/i },
   { hoja: '19_EnvironmentSheet',    etiqueta: 'Environment Sheet',     re: /\benv-\d|\benvironments?\b|\bbackgrounds?\b|\blevels?\b/i },
   { hoja: '20_PropSheet',           etiqueta: 'Prop Sheet',            re: /\bprops?\b|\bitems?\b|\bobjects?\b/i },
   { hoja: '25_VideoMarketingSheet', etiqueta: 'Video Marketing Sheet', re: /\bmarketing\b|\btrailer\b|\bteaser\b|\bpromo\b/i },

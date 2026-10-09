@@ -62,7 +62,7 @@ async function planDeInstancias({ db, project_id, deck = 'asg' }) {
   const yaHay = new Set()
   for (const a of previas || []) {
     const i = a.metadata?.instancia
-    if (i?.pagina && i?.item) yaHay.add(`${i.pagina}::${i.item}`)
+    if (i?.pagina && i?.item) yaHay.add(claveDeHoja(i.pagina, i.item))
   }
 
   const paginas = []
@@ -72,7 +72,10 @@ async function planDeInstancias({ db, project_id, deck = 'asg' }) {
     if (!pag) { ausentes.push(hoja); continue }
     const conEstado = items.map(i => ({
       nombre: i.nombre, de: i.de, cuenta: i.cuenta,
-      hecha: yaHay.has(`${hoja}::${i.nombre}`),
+      // Se conserva, no se recorta: es lo que la Skybox Sheet usa para elegir la referencia de su
+      // entorno padre, y si el plan lo tira acá ya no hay de dónde recuperarlo al despachar.
+      ...(i.parent_environment_id ? { parent_environment_id: i.parent_environment_id } : {}),
+      hecha: yaHay.has(claveDeHoja(hoja, i.nombre)),
     }))
     paginas.push({
       pagina: hoja, indice: pag.indice, kind: pag.kind || 'image',
@@ -102,6 +105,19 @@ async function planDeInstancias({ db, project_id, deck = 'asg' }) {
     fuente: alcance.fuente || null,
   }
 }
+
+// La clave con la que se reconoce una hoja ya hecha. SIN el número de página.
+//
+// El número cambia entre maestros y el nombre no: la Prop Sheet es la 20 en el maestro de 25, la
+// 25 en el de 31 y la 26 en el de 32. La ficha guardada dice «20_PropSheet» y el plan, tras migrar,
+// diría «26_PropSheet»: comparando con el número no coinciden, las quince Prop Sheets de Wort
+// contarían como nuevas y se volverían a despachar y a pagar.
+//
+// Es justo lo contrario de lo que pide la migración de Miguel León (08-oct): «generar solo la
+// página 25, sin regenerar el resto». Y es la cuarta vez que muerde la misma regla — el número es
+// una posición, no una identidad.
+const claveDeHoja = (pagina, item) =>
+  `${String(pagina || '').replace(/^\d+[_\s-]*/, '').toLowerCase().replace(/[^a-z0-9]+/g, '')}::${String(item || '').trim().toLowerCase()}`
 
 /** La línea que le dice al modelo DE CUÁL de los ítems es esta instancia. */
 const pedidoDe = (pagina, item) => [
@@ -142,14 +158,14 @@ async function instanciarHojas({
   const yaHay = new Set()
   for (const a of previas || []) {
     const i = a.metadata?.instancia
-    if (i?.pagina && i?.item) yaHay.add(`${i.pagina}::${i.item}`)
+    if (i?.pagina && i?.item) yaHay.add(claveDeHoja(i.pagina, i.item))
   }
 
   const trabajo = []
   const repetidas = []
   for (const p of paginas) {
     for (const item of p.items || []) {
-      if (yaHay.has(`${p.pagina}::${item.nombre}`)) { repetidas.push({ pagina: p.pagina, item: item.nombre }); continue }
+      if (yaHay.has(claveDeHoja(p.pagina, item.nombre))) { repetidas.push({ pagina: p.pagina, item: item.nombre }); continue }
       trabajo.push({ pagina: p.pagina, indice: p.indice, item })
     }
   }
@@ -199,6 +215,9 @@ async function instanciarHojas({
         image_gen_model, deck, member_id, fills,
         solo: [t.indice],
         extraPrompt: pedidoDe(t.pagina, t.item),
+        // El entorno padre viaja como DATO, no dentro del texto del pedido: la Skybox Sheet lo
+        // necesita para elegir la referencia de SU entorno y no la del vecino.
+        instancia: t.item?.parent_environment_id ? { parent_environment_id: t.item.parent_environment_id } : null,
       })
       const pg = r.paginas?.[0]
       if (!pg?.url) { fallos.push({ ...t, motivo: 'the workflow returned no image' }); continue }

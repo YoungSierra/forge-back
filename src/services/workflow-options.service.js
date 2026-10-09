@@ -46,6 +46,13 @@ const EXPUESTAS = new Set([
   'enable_image_autofix', 'auto_size', 'export_uv', 'compress_geometry',
   'quality', 'model', 'size',                // imagen
   'custom_width', 'custom_height',           // resolución, cuando `size` = Custom
+  // Video — Seedance 2.5 (`ByteDance2ReferenceNodeV2`), pedido por Miguel León el 08-10.
+  // Su regla: «toda capacidad de un nodo nuevo tiene que seguir disponible en Forge como control
+  // editable; nada se cablea en el .json ni se recorta». Sin estos nombres el descubridor solo
+  // ofrecía `model` y las otras diez quedaban fijas en el grafo, que es justo lo que pide evitar.
+  'resolution', 'ratio', 'duration',
+  'generate_audio', 'task_type', 'output_format',
+  'auto_downscale', 'auto_upscale', 'watermark',
 ])
 
 // Tipos que son un VALOR y no un cable. Sin esto, `model` de KSampler entraría como opción.
@@ -64,6 +71,10 @@ const ENCARECE = {
   // malla pelada y no encarece; `standard` es 2K, `detailed` 4K y `extreme` 8K.
   texture:         v => v === 'detailed' || v === 'extreme',
   size:            v => typeof v === 'string' && /2048|3840|2160/.test(v),
+  // Video: los dos ejes que mueven el precio. Un teaser de 10 s a 1080p no cuesta lo que uno de
+  // 5 s a 480p, y el recuadro de coste tiene que avisarlo ANTES de despachar.
+  resolution:      v => typeof v === 'string' && /720|1080|2k|4k/i.test(v),
+  duration:        v => Number(v) > 5,
 }
 
 let cacheObjectInfo = null
@@ -171,7 +182,7 @@ async function opcionesDe (workflowJson) {
  * Escribe las opciones elegidas en el grafo. Devuelve cuántas escrituras hizo, para poder decir en
  * el log qué se cambió de verdad: una opción que no encuentra su nodo es un silencio caro.
  */
-function aplicarOpciones (grafo, elegidas, catalogo) {
+function aplicarOpciones (grafo, elegidas, catalogo, espejo = null) {
   if (!elegidas || !Object.keys(elegidas).length) return { escrituras: 0, avisos: [] }
   const porClave = new Map((catalogo || []).map(o => [o.clave, o]))
   let escrituras = 0
@@ -222,6 +233,36 @@ function aplicarOpciones (grafo, elegidas, catalogo) {
         const valor = validas[campo]
         if (valor !== undefined) { inputs[campo] = valor; escrituras++ }
       }
+    }
+  }
+
+  // ── El mismo valor, en dos sitios ──
+  //
+  // Hay workflows donde un ajuste vive DOS veces: en el parámetro real del nodo y, además, escrito
+  // en el prompt. El teaser de marketing es así — la proporción y la duración van al nodo del
+  // modelo y también a sendos `CustomCombo` que el prompt concatena —, y si las dos copias
+  // discrepan el modelo recibe instrucciones contradictorias: el parámetro dice 10 segundos y el
+  // texto le pide cinco. Lo señaló Miguel León en su §3.3: un control, dos escrituras.
+  //
+  // El espejo se DECLARA en el registro del workflow (`inject_config.espejo`), no se adivina
+  // buscando combos que contengan el valor. Adivinar acertaría hoy y escribiría en el combo
+  // equivocado el día que dos controles compartan un valor.
+  for (const [clave, destino] of Object.entries(espejo || {})) {
+    const valor = validas[clave]
+    if (valor === undefined) continue
+    const inputs = grafo[destino.node]?.inputs
+    if (!inputs) { avisos.push(`el espejo de "${clave}" apunta al nodo ${destino.node}, que no está en el grafo`); continue }
+    // El texto puede no ser el valor pelado: el combo de duración lista «10s » —con el espacio
+    // final— y escribir «10» dejaría una opción que no es ninguna de las suyas.
+    const texto = destino.formato ? String(destino.formato).replace('{v}', String(valor)) : String(valor)
+    inputs[destino.field] = texto
+    escrituras++
+    // Y si ese texto no está entre las opciones del combo, se añade: ofrecer una proporción que el
+    // combo no lista dejaría el prompt pidiendo algo que su propia lista no admite.
+    const opciones = Object.keys(inputs).filter(k => /^option\d+$/.test(k))
+    if (opciones.length && !opciones.some(k => inputs[k] === texto)) {
+      inputs[`option${opciones.length + 1}`] = texto
+      escrituras++
     }
   }
 

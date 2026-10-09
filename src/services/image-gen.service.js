@@ -821,7 +821,33 @@ async function esDeck(outDef) {
  *   3. Lo de siempre: la png más reciente de las fuentes cableadas. Se conserva para que un output
  *      SIN `image_routing` se comporte exactamente igual que hoy.
  */
-async function referenciaDelProyecto({ projectId, nodeId, outputKey }) {
+/**
+ * La imagen de UNA instancia concreta de una hoja del ASG: «la Environment Sheet de Hydro Labs»,
+ * no «la Environment Sheet más reciente».
+ *
+ * Se reconoce por `metadata.instancia`, que lo escribe el propio motor al instanciar — un dato
+ * suyo, no el nombre del activo, así que renombrar una hoja a mano no engaña a la búsqueda. La
+ * hoja se compara SIN su número: la Environment Sheet es la 19 en el maestro de 25, la 24 en el
+ * de 31 y la 24 en el de 32, y el número es una posición, no una identidad.
+ */
+async function imagenDeInstancia(db, projectId, hoja, item) {
+  if (!hoja || !item) return null
+  const sinNumero = s => String(s || '').replace(/^\d+[_\s-]*/, '').toLowerCase().replace(/[^a-z0-9]+/g, '')
+  const norm = s => String(s || '').trim().toLowerCase()
+  const { data, error } = await db().from('forge_assets')
+    .select('storage_url, metadata, created_at')
+    .eq('project_id', projectId).eq('format', 'png')
+    .in('status', ['approved', 'auto_approved']).not('storage_url', 'is', null)
+    .not('metadata->instancia', 'is', null)
+    .order('created_at', { ascending: false })
+  if (error) { console.warn(`[img] instancia de ${hoja}: ${error.message}`); return null }
+  const buscada = sinNumero(hoja)
+  const suya = (data || []).find(a =>
+    sinNumero(a.metadata?.instancia?.pagina) === buscada && norm(a.metadata?.instancia?.item) === norm(item))
+  return suya?.storage_url || null
+}
+
+async function referenciaDelProyecto({ projectId, nodeId, outputKey, instancia = null }) {
   const { db } = require('./supabase.service')
 
   const { data: dna, error: eDna } = await db().from('forge_nodes').select('outputs').eq('id', nodeId).maybeSingle()
@@ -854,6 +880,33 @@ async function referenciaDelProyecto({ projectId, nodeId, outputKey }) {
     // imagen que empareja, asi que esto no corrigio nada todavia: es el seguro para cuando el
     // orden y la seleccion no coincidan. Si no empareja, se queda con la mas reciente y lo DICE.
     let elegida = imgs[0]
+
+    // `pick: parent_environment` — la hoja del entorno que ESTA skybox rodea.
+    //
+    // Cada Skybox Sheet cuelga de una Environment Sheet concreta, y el entorno de una no sirve de
+    // referencia para otra. Pero `ref_source` resuelve por nodo y salida, no por instancia: sin
+    // esto apuntaría al Environment Sheet y se quedaría con la más reciente, que es la del vecino
+    // tantas veces como entornos haya.
+    //
+    // El padre viaja en la instancia (`parent_environment_id`), que el 3.20 emite desde el VS Spec
+    // y `environments_x4` (acuerdo con Pedro, 09-oct). Si no viene, se cae en la más reciente y se
+    // DICE: callarlo dejaría una skybox ilustrada con el entorno equivocado sin rastro de por qué.
+    if (fuente.pick === 'parent_environment') {
+      const padre = instancia?.parent_environment_id || null
+      if (!padre) {
+        console.warn(`[img] ${outputKey}: la instancia no trae parent_environment_id — va la más reciente de ${fuente.output}`)
+      } else {
+        const { data: conInst } = await db().from('forge_assets')
+          .select('storage_url, name, metadata').eq('project_id', projectId).eq('node_id', nodoFuente.id)
+          .eq('format', 'png').in('status', ['approved', 'auto_approved']).not('storage_url', 'is', null)
+          .order('created_at', { ascending: false })
+        const norm = v => String(v || '').trim().toLowerCase()
+        const suya = (conInst || []).find(a => norm(a.metadata?.instancia?.item) === norm(padre))
+        if (suya) { elegida = suya; console.log(`[img] ${outputKey}: referencia del entorno padre «${padre}»`) }
+        else console.warn(`[img] ${outputKey}: ninguna ${fuente.output} es del entorno padre «${padre}» — va la más reciente`)
+      }
+    }
+
     if (fuente.pick === 'selected_seed') {
       const { data: lanes } = await db().from('forge_project_nodes')
         .select('bound_item_ref').eq('project_id', projectId).not('bound_item_ref', 'is', null)
@@ -1217,6 +1270,22 @@ async function generateDeck({
   // que esa fila —la que tiene el `jobId`, o sea la del despacho de verdad— no necesite una
   // segunda fila al lado contándolo otra vez. Ver el comentario del log más abajo.
   contexto = null,
+  // Recoger un trabajo YA despachado en vez de despachar uno nuevo.
+  //
+  // Un reinicio del back mata el sondeo, y con él se pierde la imagen: el render termina en
+  // ComfyUI, está pagado, y nadie lo recoge. Pasó el 08-oct con el ASG de Wort — un despliegue mío
+  // cortó la cadena y la única salida fue limpiar el output y pagar el deck de 26 páginas otra vez.
+  // El `jobId` se registra desde el 02-10 justo para esto y nada lo usaba.
+  //
+  // Con esto puesto se salta el despacho —no se paga nada— y se entra directo al sondeo, que es el
+  // mismo de siempre: la misma bajada, la misma ruta de R2, el mismo guardado. No se reimplementa
+  // nada, que es lo que haría que lo recogido no se pareciera a lo normal.
+  reclamarJob = null,
+  // De qué instancia es este despacho, cuando se instancia una hoja por ítem. Hoy solo lleva el
+  // entorno padre, que es lo que la Skybox Sheet necesita para elegir SU referencia y no la del
+  // vecino. Viaja aparte del `extraPrompt` porque no es una instrucción para el modelo: es un
+  // dato del motor, y mezclarlo en el texto obligaría a volver a extraerlo de ahí.
+  instancia = null,
 }) {
   const { composeDeck, DECKS } = require('./slide-composer.service')
   const { getWorkflowByName } = require('./config.service')
@@ -1439,8 +1508,26 @@ ${cola}`
         // una frase («the game's KEY ART page»). Se prueban las dos, en ese orden — igual que en
         // la rama `directas`. Probar solo la primera era la otra mitad del fallo: la fuente del
         // deck de UI es una página del ASG, así que jamás habría resuelto.
-        const url = await imagenDeNodoPorTitulo(db, project_id, fuente)
-                 || await paginaDelASG(db, project_id, null, fuente, true)
+        // El entorno PADRE manda sobre la fuente editorial, cuando la instancia lo nombra.
+        //
+        // Una Skybox Sheet rodea a UN entorno concreto, y el de otra no le sirve de referencia.
+        // La fuente del registro —texto como «Environment Sheet»— resuelve por título y se queda
+        // con la más reciente, que es la del vecino tantas veces como entornos haya. El padre
+        // viaja en la instancia (`parent_environment_id`), que el 3.20 emite desde el VS Spec y
+        // `environments_x4` (acuerdo con Pedro, 09-oct).
+        //
+        // Si no viene, o si no hay ninguna hoja de ese padre, se sigue por el camino de siempre y
+        // se DICE: callarlo dejaría una skybox ilustrada con el entorno equivocado sin rastro.
+        let url = null
+        const padre = instancia?.parent_environment_id || null
+        if (padre) {
+          url = await imagenDeInstancia(db, project_id, 'EnvironmentSheet', padre)
+          if (url) console.log(`[deck] ${p.name}: referencia del entorno padre «${padre}»`)
+          else console.warn(`[deck] ${p.name}: no hay Environment Sheet del padre «${padre}» — se sigue por «${fuente}»`)
+        }
+        url = url
+           || await imagenDeNodoPorTitulo(db, project_id, fuente)
+           || await paginaDelASG(db, project_id, null, fuente, true)
         if (!url) { sinAncla(`sin imagen de «${fuente}» en el proyecto`); continue }
         try {
           if (!subidas.has(url)) subidas.set(url, await uploadImageToComfyUI(url))
@@ -1653,16 +1740,25 @@ ${cola}`
   const H    = () => ({ 'Content-Type': 'application/json', ...(KEY ? { Authorization: `Bearer ${KEY}` } : {}) })
 
   const t0  = Date.now()
-  const res = await fetch(`${BASE}/api/prompt`, {
-    method: 'POST', headers: H(),
-    body: JSON.stringify({ prompt: wf, ...(KEY ? { extra_data: { api_key_comfy_org: KEY } } : {}) }),
-  })
-  const txt = await res.text()
-  if (!res.ok) throw new Error(`ComfyUI rechazó el deck: ${res.status} ${txt.slice(0, 400)}`)
-  const jobId = JSON.parse(txt).prompt_id
+  let jobId
+  if (reclamarJob) {
+    // Nada se manda a ComfyUI: el trabajo ya existe y ya se cobró.
+    jobId = reclamarJob
+    console.log(`[deck] ${output_key} · RECLAMANDO el job ${jobId} — no se despacha ni se paga nada`)
+  } else {
+    const res = await fetch(`${BASE}/api/prompt`, {
+      method: 'POST', headers: H(),
+      body: JSON.stringify({ prompt: wf, ...(KEY ? { extra_data: { api_key_comfy_org: KEY } } : {}) }),
+    })
+    const txt = await res.text()
+    if (!res.ok) throw new Error(`ComfyUI rechazó el deck: ${res.status} ${txt.slice(0, 400)}`)
+    jobId = JSON.parse(txt).prompt_id
+  }
   // El id queda registrado en cuanto se despacha. Un deck son 20 o 30 renders en un solo trabajo:
   // si la espera se cae, esta fila es lo unico que dice a que output pertenecia lo ya pagado.
-  registrarDespacho({
+  // Al reclamar NO se registra: la fila del despacho ya existe. Registrarla otra vez contaría dos
+  // veces un trabajo que se pagó una, y la analítica cuenta FILAS.
+  if (!reclamarJob) registrarDespacho({
     project_id, node_id, session_id, member_id,
     jobId, workflow: maestro, deck, output_key, node_key, paginas: armado.paginas.length,
   })
@@ -1848,4 +1944,4 @@ function nombreDeImagen ({ tituloNodo, etiqueta, ids, idx, total }) {
   return total > 1 ? `${base} ${idx + 1}` : base
 }
 
-module.exports = { imageOutputsOf, parseOutputItems, referenciaDelProyecto, imagenDelProyecto, idsDeclarados, nombreDeImagen, sobreDeLaSeccion, tieneEntidades, cleanItemText, generateOneImage, generateDeck, esDeck, paginaDelASG, imagenDeNodoPorTitulo, referenciaDeContexto }
+module.exports = { imagenDeInstancia, imageOutputsOf, parseOutputItems, referenciaDelProyecto, imagenDelProyecto, idsDeclarados, nombreDeImagen, sobreDeLaSeccion, tieneEntidades, cleanItemText, generateOneImage, generateDeck, esDeck, paginaDelASG, imagenDeNodoPorTitulo, referenciaDeContexto }

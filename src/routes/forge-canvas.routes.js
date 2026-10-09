@@ -2558,6 +2558,221 @@ router.post('/nodes/:node_id/accept', async (req, res, next) => {
   } catch (err) { next(err) }
 })
 
+// ─── POST /api/projects/:id/canvas/nodes/:node_id/images/delete ─────
+// Borra UNA imagen del chat sin romper el historial. Lo pidió Migue Amez (doc del 08-oct).
+//
+// Borrado SUAVE, y en los TRES sitios donde una imagen existe. Esto es lo que su documento no
+// podía saber: marcarla solo en el array de outputs la quita de la vista y la deja alimentando a
+// los nodos de abajo, que es lo contrario de lo que pide su propio §3.3.
+//   1. `forge_sessions.output_images` — lo que pinta el chat y el modal
+//   2. `forge_messages.output_images` — el historial del turno que la produjo
+//   3. la fila png de `forge_assets` — lo que consumen los nodos siguientes
+//
+// El (3) es el que de verdad corta el cable, y se hace con UNA escritura: la pieza pasa a
+// `status: 'deleted'`. Todos los lectores de aguas abajo ya filtran por `approved`/`auto_approved`,
+// así que quedan excluidos solos. Parchear los lectores uno a uno habría sido la trampa de
+// siempre —el caché de miniaturas tenía cuatro sitios y se arreglaron tres—.
+//
+// NO se toca R2: el archivo se queda donde está. Borrar un objeto de R2 no se deshace, y el
+// documento pide justo lo contrario, poder depurar después. Lo que se rompe es la referencia.
+router.post('/nodes/:node_id/images/delete', async (req, res, next) => {
+  try {
+    const { id: project_id, node_id } = req.params
+    const { session_id, output_key, url, index = null, message_id = null, member_id = null } = req.body || {}
+
+    if (!session_id || !output_key || !url) {
+      return res.status(400).json({ success: false, error: 'session_id, output_key and url are required' })
+    }
+
+    // La sesión tiene que ser de ESTE nodo y proyecto. Es la misma guarda que el accept: sesión y
+    // nodo llegan por caminos distintos y nada obliga a que coincidan, y escribir cruzado deja a
+    // un nodo sin su imagen y a otro con una lápida que no le toca.
+    const { data: ses } = await db().from('forge_sessions')
+      .select('id, node_id, project_id, output_images').eq('id', session_id).maybeSingle()
+    if (!ses) return res.status(404).json({ success: false, error: 'Session not found' })
+    if (ses.node_id !== node_id || ses.project_id !== project_id) {
+      return res.status(409).json({ success: false, error: 'session_node_mismatch',
+        message: 'That session belongs to another node. Reopen the node and try again.' })
+    }
+
+    const marcado = new Date().toISOString()
+
+    // Marca la variación que lleva esa url. Se busca por URL y no por índice: el índice es la
+    // posición del ítem, y un mismo ítem puede tener varias variaciones de iterar.
+    const marcar = (mapa) => {
+      if (!mapa || typeof mapa !== 'object') return { mapa, tocadas: 0 }
+      let tocadas = 0
+      const salida = {}
+      for (const [clave, items] of Object.entries(mapa)) {
+        salida[clave] = (items || []).map(it => {
+          if (clave !== output_key) return it
+          if (index !== null && Number(it.index) !== Number(index)) return it
+          const vars = (it.variations || []).map(v => {
+            if (v?.url !== url || v?.deleted) return v
+            tocadas++
+            return { ...v, deleted: true, deleted_at: marcado, deleted_by: member_id || null }
+          })
+          return { ...it, variations: vars }
+        })
+      }
+      return { mapa: salida, tocadas }
+    }
+
+    let tocadas = 0
+
+    const s = marcar(ses.output_images)
+    tocadas += s.tocadas
+    if (s.tocadas) {
+      const { error } = await db().from('forge_sessions').update({ output_images: s.mapa }).eq('id', session_id)
+      if (error) throw error
+    }
+
+    // El historial por turno. Sin `message_id` se recorren los del hilo: la imagen puede colgar de
+    // un turno anterior —iterar crea una variación nueva en el mismo ítem— y dejarla ahí la haría
+    // reaparecer al recargar, que es justo el escenario «Persistencia de Interfaz» de su matriz.
+    let qMsg = db().from('forge_messages').select('id, output_images').eq('session_id', session_id).not('output_images', 'is', null)
+    if (message_id) qMsg = qMsg.eq('id', message_id)
+    const { data: msgs } = await qMsg
+    for (const m of msgs || []) {
+      const r = marcar(m.output_images)
+      if (!r.tocadas) continue
+      tocadas += r.tocadas
+      const { error } = await db().from('forge_messages').update({ output_images: r.mapa }).eq('id', m.id)
+      if (error) throw error
+    }
+
+    // Y la pieza. Es la que corta el cable hacia abajo.
+    const { data: piezas } = await db().from('forge_assets')
+      .select('id, name, status, metadata').eq('project_id', project_id).eq('storage_url', url)
+    let piezasMarcadas = 0
+    for (const a of piezas || []) {
+      if (a.status === 'deleted') continue
+      const { error } = await db().from('forge_assets').update({
+        status: 'deleted',
+        metadata: { ...(a.metadata || {}), deleted: true, deleted_at: marcado, deleted_by: member_id || null, estado_previo: a.status },
+      }).eq('id', a.id)
+      if (error) throw error
+      piezasMarcadas++
+    }
+
+    if (!tocadas && !piezasMarcadas) {
+      return res.status(404).json({ success: false, error: 'image_not_found',
+        message: 'That image is not in this session: nothing was deleted.' })
+    }
+
+    console.log(`[imagen-borrada] ${output_key} · ${tocadas} variación(es) y ${piezasMarcadas} pieza(s) · url ${String(url).slice(-28)}`)
+
+    const { data: fresca } = await db().from('forge_sessions').select('output_images').eq('id', session_id).maybeSingle()
+    res.json({ success: true, output_images: fresca?.output_images ?? {}, variations_marked: tocadas, assets_marked: piezasMarcadas })
+  } catch (err) { next(err) }
+})
+
+// ─── POST /api/projects/:id/canvas/nodes/:node_id/jobs/reclaim ─────
+// Recoge los trabajos de ComfyUI que se despacharon, terminaron y nadie recogió.
+//
+// Un reinicio del back mata el sondeo. El render sigue en ComfyUI, termina y se cobra, pero el
+// hilo que iba a bajarlo ya no existe: la imagen queda pagada y perdida. Pasó el 08-oct con el ASG
+// de Wort —un despliegue cortó la cadena a mitad— y la única salida fue limpiar el output y pagar
+// el deck de 26 páginas entero otra vez. El `jobId` se registra desde el 02-10 precisamente para
+// esto, y hasta hoy nada lo usaba.
+//
+// Esto NO despacha nada: `generateDeck` entra en modo reclamo, se salta la llamada a ComfyUI y usa
+// el mismo sondeo, la misma bajada y la misma ruta de R2 que una corrida normal. Lo recogido es
+// indistinguible de lo que habría entrado solo.
+router.post('/nodes/:node_id/jobs/reclaim', async (req, res, next) => {
+  try {
+    const { id: project_id, node_id } = req.params
+    const { dry_run = false, member_id = null, desde_minutos = 720 } = req.body || {}
+
+    const { data: node } = await db()
+      .from('forge_nodes').select('id, node_key, title, outputs').eq('id', node_id).maybeSingle()
+    if (!node) return res.status(404).json({ success: false, error: 'Node not found' })
+
+    // Despachos sin cierre. Se mira una ventana —por defecto 12 h— porque un job muy viejo ya no
+    // está en ComfyUI y preguntarlo es ruido.
+    const desde = new Date(Date.now() - Math.max(1, Number(desde_minutos)) * 60_000).toISOString()
+    const { data: log } = await db().from('forge_execution_log')
+      .select('created_at, status, metadata, session_id')
+      .eq('project_id', project_id).eq('node_id', node_id)
+      .gte('created_at', desde).order('created_at')
+
+    const cerrados = new Set((log || []).filter(r => r.status === 'success').map(r => r.metadata?.jobId).filter(Boolean))
+    const huerfanos = (log || [])
+      .filter(r => r.status === 'dispatched' && r.metadata?.jobId && !cerrados.has(r.metadata.jobId))
+    if (!huerfanos.length) {
+      return res.json({ success: true, huerfanos: 0, reclamados: [], message: 'No dispatched job is waiting to be collected.' })
+    }
+
+    const BASE = (process.env.COMFYUI_BASE_URL || '').replace(/\/$/, '')
+    const KEY = process.env.COMFYUI_API_KEY
+    const H = () => (KEY ? { Authorization: `Bearer ${KEY}` } : {})
+
+    const informe = []
+    for (const h of huerfanos) {
+      const jobId = h.metadata.jobId
+      let j = null
+      try { j = await (await fetch(`${BASE}/api/jobs/${jobId}`, { headers: H() })).json() } catch (e) {
+        informe.push({ jobId, estado: `no se pudo preguntar: ${e.message}` }); continue
+      }
+      const completo = j?.execution_status?.completed === true || j?.status === 'completed'
+      const imagenes = Object.values(j?.outputs || {}).reduce((n, nd) => n + (nd?.images || []).length, 0)
+      if (!completo) { informe.push({ jobId, estado: j?.status || 'sin estado', imagenes: 0, reclamado: false }); continue }
+      if (!imagenes)  { informe.push({ jobId, estado: 'completo pero sin imágenes', imagenes: 0, reclamado: false }); continue }
+
+      // De qué ítem era, cuando era una hoja de instancia. La frase la escribe NUESTRO código
+      // (`pedidoDe` en instanciar-hojas), así que leerla no es adivinar: es leer lo que pusimos.
+      const texto = JSON.stringify(j?.workflow || {})
+      const mItem = /This sheet is for ONE item of the vertical slice scope: \\"([^"]+)\\"/.exec(texto)
+      const item = mItem ? mItem[1] : null
+
+      informe.push({ jobId, estado: 'completo', imagenes, item, output_key: h.metadata.output_key, reclamado: false, dry_run: !!dry_run })
+      if (dry_run) continue
+
+      const clave = h.metadata.output_key
+      const def = (node.outputs || []).find(o => (o.key || o.name) === clave)
+      const { generateDeck } = require('../services/image-gen.service')
+      const r = await generateDeck({
+        db, project_id, node_id, session_id: null,
+        node_key: node.node_key, output_key: clave,
+        image_gen_model: def?.image_gen_model, deck: h.metadata.deck || 'asg',
+        member_id, reclamarJob: jobId,
+      })
+      const pg = r.paginas?.[0]
+      if (!pg?.url) { informe[informe.length - 1].estado = 'el reclamo no devolvió imagen'; continue }
+
+      // Sesión y pieza con la MISMA forma que las que entraron solas: una sesión por despacho, y
+      // el nombre conservando el documento y la página. Sin esto la pieza queda invisible en el
+      // producto — `generateDeck` sube a R2 pero no crea ni la sesión ni el activo.
+      const documento = node.title
+      const { data: ses, error: eSes } = await db().from('forge_sessions').insert({
+        project_id, node_id, output_key: clave, status: 'auto_approved', iteration_count: 1,
+        started_at: new Date().toISOString(), completed_at: new Date().toISOString(), triggered_by: member_id,
+      }).select('id').single()
+      if (eSes) throw eSes
+
+      const nombre = item ? `${documento} — ${pg.name} — ${item}` : `${documento} — ${pg.name}`
+      const { data: activo, error: eAct } = await db().from('forge_assets').insert({
+        node_id, project_id, session_id: ses.id, output_key: clave, name: nombre,
+        format: 'png', status: 'approved', storage_url: pg.url, mime_type: 'image/png',
+        approved_by: member_id, approved_at: new Date().toISOString(),
+        ...(item ? { metadata: { instancia: { de: 'sheet_instance_manifest', job: jobId, item, pagina: pg.name } } } : {}),
+      }).select('id').single()
+      if (eAct) throw eAct
+
+      informe[informe.length - 1].reclamado = true
+      informe[informe.length - 1].asset_id = activo.id
+      console.log(`[reclamo] ${node.node_key}/${clave} · job ${jobId.slice(0, 8)} · «${nombre}» recogido sin pagar nada`)
+    }
+
+    res.json({
+      success: true,
+      huerfanos: huerfanos.length,
+      reclamados: informe.filter(x => x.reclamado).length,
+      detalle: informe,
+    })
+  } catch (err) { next(err) }
+})
+
 // ─── POST /api/projects/:id/canvas/nodes/:node_id/reopen ─────
 // Deshace una aprobación: devuelve la sesión a `active` para poder seguir trabajándola.
 //
@@ -4264,7 +4479,14 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
         duration_ms:  meta?.duration_ms || null,
         started_at:   new Date(Date.now() - (meta?.duration_ms || 0)).toISOString(),
         status:       'success',
-        metadata:     { node_key: node.node_key, iter_count: allToolCalls.length > 0 ? undefined : 1, ...(meta?.finish_reason ? { finish_reason: meta.finish_reason } : {}), ...(meta?.truncated ? { truncated: true } : {}) },
+        // QUÉ salida corrió, y si fue el nodo entero.
+        //
+        // Sin esto el registro no distingue las dos cosas, y el chat es por donde pasa casi todo:
+        // medido el 08-oct, 754 de las 765 corridas de LLM de los últimos 45 días vienen de acá y
+        // ninguna apunta la salida. Así que a la pregunta de si correr enfocado es mejor o peor que
+        // correr el nodo entero —que es justo lo que el equipo cree y practica— no se puede
+        // responder con datos: no los hay. El Run sí lo apuntaba desde siempre; faltaba este lado.
+        metadata:     { node_key: node.node_key, output_key: target_output_key || null, modo: target_output_key ? 'focus' : 'nodo_entero', iter_count: allToolCalls.length > 0 ? undefined : 1, ...(meta?.finish_reason ? { finish_reason: meta.finish_reason } : {}), ...(meta?.truncated ? { truncated: true } : {}) },
       })
     } catch (logErr) {
       console.error('[forge-chat] logExecution failed (non-fatal):', logErr.message)
@@ -6329,7 +6551,7 @@ const manejarEdicion = clave => async (req, res, next) => {
     if (opciones && Object.keys(opciones).length) {
       const { opcionesDe, aplicarOpciones } = require('../services/workflow-options.service')
       const catalogo = await opcionesDe(entry.workflow_json)
-      const { escrituras, avisos } = aplicarOpciones(wf, opciones, catalogo)
+      const { escrituras, avisos } = aplicarOpciones(wf, opciones, catalogo, cfg.espejo || null)
       if (avisos.length) return res.status(400).json({ success: false, error: avisos.join(' · ') })
       console.log(`[design-edit] opciones del usuario: ${escrituras} escritura(s)`)
     }

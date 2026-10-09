@@ -127,6 +127,9 @@ async function itemsDelManifiesto({ db, project_id }) {
         // Las páginas de lenguaje con las que esta instancia tiene que cumplir. Viajan porque son
         // las que la cascada marca [V] cuando cambian: es el mismo dato, declarado en el origen.
         must_comply_with: Array.isArray(inst?.must_comply_with) ? inst.must_comply_with : null,
+        // El entorno que esta instancia rodea. Solo lo traen las Skybox Sheets, y lo emite el
+        // 3.20 desde el VS Spec y environments_x4. Sin el, la referencia cae en la mas reciente.
+        parent_environment_id: inst?.parent_environment_id ?? null,
       })
     }
     if (items.length) porHoja[hoja] = items

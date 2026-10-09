@@ -134,6 +134,27 @@ const CADENAS = {
     ],
   },
 
+  // El cielo lejano de un entorno. Lo trajo Miguel León el 08-oct como hoja nueva del ASG (p.25).
+  //
+  // Una sola etapa: entra la Skybox Sheet aprobada de ESTA instancia y sale un panorama
+  // equirectangular 2:1 de 2048×1024. La regla que él fija es «cada hoja gobierna lo que produce»:
+  // el workflow lee SOLO la Skybox Sheet —antes leía la del entorno— así que acá no hay entradas
+  // extra que declarar.
+  //
+  // Cada Skybox va ligada a su Environment Sheet padre (`parent_environment_id` en la instancia).
+  // Eso no es cosa de la cadena sino del instanciado, y por eso no aparece acá.
+  skybox: {
+    etiqueta: 'Skybox',
+    pasos: [
+      {
+        clave: 'skybox', workflow: 'V57_STUDIO_Skybox', etiqueta: '360° panorama',
+        que:    'One seamless 360° equirectangular panorama (2:1) to the right of this sheet.',
+        porque: 'This sheet specifies the distant world around its environment, and that is what the panorama has to render.',
+        entradas: {},
+      },
+    ],
+  },
+
   // La hoja de poses de cada movimiento. Es la cadena más corta y la única que NO termina dentro
   // de Forge: entrega las láminas y de ahí el flujo sigue en Cascadeur, por script, fuera del
   // Moodboard. Eso no es un hueco a cerrar —no hay forma de correr Cascadeur desde ComfyUI
@@ -287,6 +308,9 @@ function cadenaDe(asset) {
   // Antes devolvía null razonando que «produce una pieza del proyecto entero y no de una hoja»,
   // y por eso al pulsar Run sobre la hoja el aviso decía que no había nada que correr, con el
   // workflow registrado y funcionando.
+  // Va suelta y no antes de la del entorno: «Skybox Sheet» no contiene «environment sheet», así
+  // que la regla de arriba no se la lleva por delante. Se comprobó, no se supuso.
+  if (/skybox\s*sheet/i.test(n))       return 'skybox'
   if (/video\s*marketing/i.test(n))    return 'marketing'
   return null
 }

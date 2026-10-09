@@ -105,7 +105,10 @@ async function submitWorkflow(workflowName, prompt, width, height, extras = {}, 
     const { opcionesDe, aplicarOpciones } = require('../workflow-options.service')
     try {
       const catalogo = await opcionesDe(entry.workflow_json)
-      const { escrituras, avisos } = aplicarOpciones(workflow, opciones, catalogo)
+      // El espejo lo declara el registro del workflow: hay ajustes que viven dos veces -el
+      // parámetro del nodo y el texto del prompt- y tienen que escribirse en los dos.
+      const espejo = (typeof entry.inject_config === 'string' ? JSON.parse(entry.inject_config) : entry.inject_config)?.espejo || null
+      const { escrituras, avisos } = aplicarOpciones(workflow, opciones, catalogo, espejo)
       console.log(`[ComfyUI] opciones del usuario: ${escrituras} escritura(s) en ${workflowName}`)
       avisos.forEach(a => console.warn(`[ComfyUI] opción ignorada: ${a}`))
     } catch (e) {
