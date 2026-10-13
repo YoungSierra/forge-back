@@ -396,6 +396,18 @@ function parseInline(text) {
   return runs.length ? runs : [{ text, bold: false, italic: false }]
 }
 
+// Engine v1.9 — un encabezado con marcas inline («*Smack Gaspard*», «**Hook**») se dibuja en negrita, y la
+// cursiva como negrita-cursiva, sin asteriscos. Antes salía con los marcadores impresos.
+function renderHeadingInline(doc, text, x, y, opts, fontSize, color) {
+  const runs = parseInline(String(text || ''))
+  for (let i = 0; i < runs.length; i++) {
+    const run = runs[i], isLast = i === runs.length - 1
+    doc.font(run.italic ? 'Helvetica-BoldOblique' : 'Helvetica-Bold').fontSize(fontSize).fillColor(color)
+    if (i === 0) doc.text(run.text, x, y, { ...opts, continued: !isLast })
+    else         doc.text(run.text, { ...opts, continued: !isLast })
+  }
+}
+
 // Renderiza texto con inline bold/italic desde posición x,y
 function renderInline(doc, text, x, y, opts, fontSize, color) {
   const runs  = parseInline(text)
@@ -780,6 +792,44 @@ async function docGenDocx(title, content, projectId, nodeId, itemImages = []) {
     doc.addPage({ margin: 0, size: 'A4' })
     let y = 44
 
+    // Engine v1.9 — maquetación de imágenes. Una imagen de concepto es cuadrada (1024×1024) y a todo el
+    // ancho ocupaba 475 pt: no cabía bajo su título, saltaba de página y dejaba media hoja en blanco
+    // (medido el 08-10 en los PDF del 2.1 y 2.2). Regla: tope del 60 % del alto útil, proporción intacta;
+    // si queda menos del 40 % de página libre, salta a la siguiente; si queda más, se escala a lo libre.
+    const ALTO_UTIL   = doc.page.height - 44 - 40
+    const TOPE_IMAGEN = Math.round(ALTO_UTIL * 0.6)
+    const MIN_LIBRE   = Math.round(ALTO_UTIL * 0.4)
+    function colocarImagen(buf, x) {
+      let im
+      try { im = doc.openImage(buf) } catch { return false }
+      const anchoMax = CONTENT_W - (x - MARGIN)
+      let alto = im.height * (anchoMax / im.width)
+      if (!(alto > 0)) return false
+      if (alto > TOPE_IMAGEN) alto = TOPE_IMAGEN
+      let libre = doc.page.height - 40 - (y + 6)
+      if (libre < MIN_LIBRE || libre < 60) { doc.addPage({ margin: 0, size: 'A4' }); y = 44; libre = doc.page.height - 40 - (y + 6) }
+      if (alto > libre) alto = libre
+      const ancho = Math.min(anchoMax, im.width * (alto / im.height))
+      const dx = x + Math.round((anchoMax - ancho) / 2)
+      try {
+        doc.image(buf, dx, y + 6, { width: ancho, height: alto })
+        marcoImagen(doc, dx, y + 6, ancho, alto)
+        y += alto + 16
+        return true
+      } catch { return false }
+    }
+    // Alto aproximado del primer bloque que sigue a un encabezado, para no dejar el título solo al pie
+    // (keep-with-next): un párrafo medido, dos líneas para listas y tablas, y nunca más de 120 pt.
+    function altoBloque(block) {
+      if (!block) return 0
+      if (block.type === 'paragraph' || block.type === 'bullet' || block.type === 'numbered') {
+        doc.font('Helvetica').fontSize(10)
+        return Math.min(120, doc.heightOfString(String(block.text || '').replace(/[*_`]/g, ''), { width: CONTENT_W - 20, lineGap: 3 }) + 5)
+      }
+      if (block.type === 'heading') return (block.level <= 1 ? 16 : block.level === 2 ? 13 : 11) + 20
+      return 30
+    }
+
     // La imagen que un ítem generó va JUSTO DEBAJO de su título.
     //
     // El primer intento fue ponerla al cierre del bloque, que es donde uno la espera al leer.
@@ -814,7 +864,7 @@ async function docGenDocx(title, content, projectId, nodeId, itemImages = []) {
       if (!hit) return 0
       try {
         const im = doc.openImage(hit.buf)
-        return im.height * ((CONTENT_W - (x - MARGIN)) / im.width)
+        return Math.min(im.height * ((CONTENT_W - (x - MARGIN)) / im.width), TOPE_IMAGEN)
       } catch { return 0 }
     }
 
@@ -827,19 +877,8 @@ async function docGenDocx(title, content, projectId, nodeId, itemImages = []) {
       // concepto: chica no cumple ninguna función. Un cuadrado ocupa entonces 475 de alto, que
       // no entra bajo el título — por eso el salto de página de abajo es la regla, no la
       // excepción: la imagen abre página y se ve entera.
-      const ancho = CONTENT_W - (x - MARGIN)
-      let alto = 0
-      try { const im = doc.openImage(buf); alto = im.height * (ancho / im.width) } catch { return }
-      if (!(alto > 0)) return
-      // El espacio ya se reservó junto con el título; esto solo cubre el caso de una imagen
-      // dibujada fuera de ese camino (una lista numerada de verdad).
-      if (y + alto > doc.page.height - 60) checkPageBreak(alto + 40)
-      try {
-        doc.image(buf, x, y + 6, { width: ancho })
-        marcoImagen(doc, x, y + 6, ancho, alto)
-        y += alto + 16
-      } catch (e) {
-        console.warn('[doc_gen] no se pudo incrustar la imagen de', hit.t, e.message)
+      if (!colocarImagen(buf, x)) console.warn('[doc_gen] no se pudo incrustar la imagen de', hit.t)
+      {
       }
     }
 
@@ -888,29 +927,30 @@ async function docGenDocx(title, content, projectId, nodeId, itemImages = []) {
         if (anclas.has(t)) continue
         porTitulo.delete(t)
         try {
-          const im    = doc.openImage(buf)
-          const alto  = im.height * (CONTENT_W / im.width)
-          if (!(alto > 0)) continue
-          checkPageBreak(alto + 40)
-          doc.image(buf, MARGIN, y, { width: CONTENT_W })
-          marcoImagen(doc, MARGIN, y, CONTENT_W, alto)
-          y += alto + 18
+          if (!colocarImagen(buf, MARGIN)) continue
         } catch (e) { console.warn('[doc_gen] portada sin imagen:', e.message) }
       }
     }
 
     for (const section of contentSections) {
-      checkPageBreak(100)
+      const blocks = groupLines(section.lines)
+      // Engine v1.9 — una sección sin nada debajo (ni bloques ni imagen propia) no se dibuja: «Development
+      // Images» salía como título huérfano con nada dentro.
+      if (section.title && !blocks.length && !buscarImagen(section.title)) continue
 
       const sectionLabel = section.title
         .replace(/_/g, ' ')
         .replace(/\b\w/g, c => c.toUpperCase())
 
+      // keep-with-next: el título reserva su alto más el del primer bloque (o su imagen); si no caben
+      // juntos, salta antes del título y no después («Setting» solo al pie de la página 2).
+      const altoImgSec = sectionLabel ? altoImagenDeItem(section.title, MARGIN) : 0
+      checkPageBreak((sectionLabel ? (section.level === 2 ? 48 : 30) : 0) + (altoImgSec ? altoImgSec + 26 : altoBloque(blocks[0])) + 20)
+
       if (sectionLabel && section.level === 2) {
         // H2 — barra ember + título grande + línea separadora
         doc.rect(MARGIN, y + 3, 4, 16).fill(PDF_EMBER)
-        doc.font('Helvetica-Bold').fontSize(15).fillColor(PDF_TEXT)
-          .text(sectionLabel, MARGIN + 12, y, { width: CONTENT_W - 12 })
+        renderHeadingInline(doc, sectionLabel, MARGIN + 12, y, { width: CONTENT_W - 12 }, 15, PDF_TEXT)
         y = doc.y + 8
         doc.rect(MARGIN, y, CONTENT_W, 0.5).fill(PDF_LINE)
         y += 12
@@ -919,14 +959,12 @@ async function docGenDocx(title, content, projectId, nodeId, itemImages = []) {
         // ancla y aun así salía sin imagen. Se usa el título original, no el capitalizado.
         dibujarImagenDeItem(section.title, MARGIN)
       } else if (sectionLabel) {
-        doc.font('Helvetica-Bold').fontSize(11).fillColor(PDF_H3_CLR)
-          .text(sectionLabel, MARGIN, y, { width: CONTENT_W })
+        renderHeadingInline(doc, sectionLabel, MARGIN, y, { width: CONTENT_W }, 11, PDF_H3_CLR)
         y = doc.y + 8
       }
 
-      const blocks = groupLines(section.lines)
-
-      for (const block of blocks) {
+      for (let bi = 0; bi < blocks.length; bi++) {
+        const block = blocks[bi]
         checkPageBreak(40)
 
         if (block.type === 'hr') {
@@ -940,11 +978,15 @@ async function docGenDocx(title, content, projectId, nodeId, itemImages = []) {
           // cierra el anterior, que es donde va su imagen.
           const fontSize = lvl <= 1 ? 16 : lvl === 2 ? 13 : lvl === 3 ? 11 : 10
           const color    = lvl <= 1 ? PDF_TEXT : PDF_H3_CLR
-          // El título arrastra a su imagen: se reserva el espacio de los dos juntos, para que
-          // no quede el encabezado solo al pie de una hoja y la imagen abriendo la siguiente.
-          checkPageBreak(fontSize + 20 + (altoImagenDeItem(block.text, MARGIN) ? altoImagenDeItem(block.text, MARGIN) + 26 : 0))
-          doc.font('Helvetica-Bold').fontSize(fontSize).fillColor(color)
-            .text(block.text, MARGIN, y, { width: CONTENT_W })
+          const altoImg  = altoImagenDeItem(block.text, MARGIN)
+          // Engine v1.9 — un encabezado sin nada debajo (otro encabezado igual o mayor, o el final) no se
+          // dibuja, salvo que ancle una imagen.
+          const siguiente = blocks[bi + 1]
+          if (!altoImg && (!siguiente || (siguiente.type === 'heading' && siguiente.level <= lvl))) continue
+          // El título arrastra a su imagen o a su primer bloque: se reserva el espacio de los dos juntos,
+          // para que no quede el encabezado solo al pie de una hoja (keep-with-next).
+          checkPageBreak(fontSize + 20 + (altoImg ? altoImg + 26 : altoBloque(siguiente)))
+          renderHeadingInline(doc, block.text, MARGIN, y, { width: CONTENT_W }, fontSize, color)
           y = doc.y + (lvl <= 2 ? 10 : 6)
           dibujarImagenDeItem(block.text, MARGIN)
 

@@ -3398,7 +3398,7 @@ router.post('/nodes/:node_id/generate-pdf', async (req, res, next) => {
 
     const { data: asset } = await db()
       .from('forge_assets')
-      .select('id, name, content, storage_url, format')
+      .select('id, name, content, storage_url, format, metadata')
       .eq('id', session.output_asset_id)
       .single()
 
@@ -3410,7 +3410,12 @@ router.post('/nodes/:node_id/generate-pdf', async (req, res, next) => {
     // el `storage_url` ES la imagen, así que el botón PDF devolvía un png con cara de éxito en vez
     // de fallar. `buscar` ya no entrega piezas que no sean documento, y esto lo vuelve a comprobar
     // acá: es la línea que de verdad entregaba el archivo equivocado.
-    if (asset.storage_url && esDocumento(asset)) {
+    // Engine v1.9 — y SOLO si el PDF guardado lleva el nombre ACTUAL del proyecto (metadata.pdf_title):
+    // «Smack JM New V1» se renombró a «Smack Surface Rush» y el botón seguía devolviendo el PDF con la
+    // cabecera vieja. Una pieza sin marca regenera una vez y queda marcada.
+    const { data: proyectoActual } = await db().from('projects').select('name').eq('id', project_id).maybeSingle()
+    const tituloActual = (() => { const tipo = String(asset.name || '').split(' — ')[0] || asset.name; return proyectoActual?.name ? `${tipo} — ${proyectoActual.name}` : tipo })()
+    if (asset.storage_url && esDocumento(asset) && asset.metadata?.pdf_title === tituloActual) {
       return res.json({ success: true, url: asset.storage_url })
     }
 
@@ -3460,6 +3465,16 @@ router.post('/nodes/:node_id/generate-pdf', async (req, res, next) => {
       }
     }
 
+    // Engine v1.9 — solo lo que se lee entra al PDF: la vista de documento (audience) deja fuera los
+    // outputs `internal` y los bloques de máquina; sin output_key, el documento entero del nodo sin sus
+    // planes ni sus sobres. Si la vista deja menos de 600 caracteres se conserva lo de siempre.
+    {
+      const { vistaDocumento } = require('../services/vista-documento.service')
+      const { data: dnaV } = await db().from('forge_nodes').select('outputs').eq('id', node_id).maybeSingle()
+      const v = vistaDocumento({ content: docContent, outputDefs: Array.isArray(dnaV?.outputs) ? dnaV.outputs : [], outputKey: output_key || null })
+      if (v.content.trim().length >= 600) docContent = v.content
+    }
+
     // Las imágenes del documento se resolvían SOLO cuando el PDF nacía dentro de la corrida. Este
     // botón llamaba al generador con título y texto, así que todo PDF pedido a mano salía sin una
     // sola imagen — en cualquier proyecto, no solo en los de fan-out.
@@ -3494,7 +3509,7 @@ router.post('/nodes/:node_id/generate-pdf', async (req, res, next) => {
     // Actualizar el asset con la URL para futuras llamadas
     await db()
       .from('forge_assets')
-      .update({ storage_url: docResult.url, format: 'document' })
+      .update({ storage_url: docResult.url, format: 'document', metadata: { ...(asset.metadata && typeof asset.metadata === 'object' ? asset.metadata : {}), pdf_title: tituloPortada } })
       .eq('id', asset.id)
 
     res.json({ success: true, url: docResult.url })
@@ -4439,6 +4454,14 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
           const hasNonUrls = tc.args.images.some(img => !img.startsWith('http'))
           if (hasNonUrls) tc.args.images = contextPngUrls
         }
+        // Engine v1.9 — lo que el modelo no pasó lo pone el proyecto: `images` desde las aprobadas (y los ids
+        // que el deck cite en meta.images) y `meta.palette` desde concept_data. Lo que trae no se toca.
+        if (tc.tool === 'doc_gen_pptx') {
+          const { completarDeck } = require('../services/deck-defaults.service')
+          const c = await completarDeck({ content: tc.args?.content, images: tc.args?.images, resolvedInputs, db, projectId: project_id })
+          tc.args = { ...tc.args, content: c.content, images: c.images }
+          for (const n of c.notas) { docWarnings.push(`[deck] ${n}`); console.log(`[deck] ${n}`) }
+        }
 
         const toolResult = await executeTool(tc.tool, tc.args, { project_id, node_id })
         allToolCalls.push({ ...tc, result: toolResult })
@@ -4630,6 +4653,18 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
           console.log(`[forge-chat] auto doc_gen_docx — extracción descartada (${docContent.trim().length} < ${Math.round(piso)}), usando respuesta completa`)
         }
 
+        // Engine v1.9 — al PDF entra solo lo que se lee: la vista de documento quita los outputs `internal`
+        // (planes, sobres, connections) y los bloques de máquina. Si la vista deja menos de 600 caracteres
+        // se conserva lo de siempre.
+        {
+          const { vistaDocumento } = require('../services/vista-documento.service')
+          const v = vistaDocumento({ content: docContent, outputDefs: allOutputDefs, outputKey: targetOutput ? (outKeyOf(targetOutput) || null) : null })
+          if (v.content.trim().length >= 600) {
+            if (v.hidden) console.log(`[forge-chat] auto doc_gen_docx — ${v.hidden} internal block(s) left out of the PDF`)
+            docContent = v.content
+          }
+        }
+
         // Post-process: el LLM a veces reproduce placeholders literalmente en el output
         const studioVal = project?.studio_name || 'V57 Studio'
         const titleVal  = project?.name        || ''
@@ -4685,10 +4720,13 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
         // Nodo entero: el deck sale SOLO de la sección de su output pptx, como el PDF de arriba.
         // Sin esa sección no hay deck, y el aviso dice por qué (ver contenidoDelDeck).
         const deckIn = require('../services/tools.service').contenidoDelDeck({ replyText, outputDefs: allOutputDefs, targetOutput })
+        // Engine v1.9 — imágenes y paleta completadas desde el proyecto cuando faltan (deck-defaults.service).
+        const deckCompleto = deckIn.ok ? await require('../services/deck-defaults.service').completarDeck({ content: deckIn.contenido, images: pngImageUrls, resolvedInputs, db, projectId: project_id }) : null
+        if (deckCompleto) for (const n of deckCompleto.notas) { docWarnings.push(`[deck] ${n}`); console.log(`[deck] ${n}`) }
         const pptxResult = !deckIn.ok ? { success: false, error: deckIn.motivo } : await executeTool('doc_gen_pptx', {
           title:   `${node.title} — ${project?.name ?? 'Presentation'}`,
-          content: deckIn.contenido,
-          images:  pngImageUrls,
+          content: deckCompleto.content,
+          images:  deckCompleto.images,
         }, { project_id, node_id })
         if (Array.isArray(pptxResult.warnings)) docWarnings.push(...pptxResult.warnings)
         if (!pptxResult.success) docWarnings.push(/^The deck/.test(pptxResult.error || '') ? pptxResult.error : `The deck was not generated: ${pptxResult.error || 'unknown error'}`)

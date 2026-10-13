@@ -1190,9 +1190,18 @@ async function runReActLoop({ finalSystemPrompt, baseUserMsg, executorStr, activ
         db, projectId, nodeId, sessionId, outKey, contenido: replyText,
       })
 
+      // Engine v1.9 — al PDF entra solo lo que se lee: sin los bloques de máquina del output (el sobre de
+      // imágenes del pitch) ni las secciones `internal`. Si la vista deja menos de 600 caracteres, lo de siempre.
+      const contenidoLegible = (() => {
+        const { vistaDocumento } = require('./vista-documento.service')
+        const defs = targetOutput && typeof targetOutput === 'object' ? [targetOutput] : []
+        const v = vistaDocumento({ content: replyText, outputDefs: defs, outputKey: typeof targetOutput === 'object' ? (targetOutput?.key || targetOutput?.name || null) : null })
+        return v.content.trim().length >= 600 ? v.content : replyText
+      })()
+
       const docResult = await et(
         'doc_gen_docx',
-        { title: docTitle, content: replyText, item_images: itemImages },
+        { title: docTitle, content: contenidoLegible, item_images: itemImages },
         { project_id: projectId, node_id: nodeId },
       )
       if (docResult.success && docResult.url) {
@@ -1216,8 +1225,11 @@ async function runReActLoop({ finalSystemPrompt, baseUserMsg, executorStr, activ
 
       // Con output objetivo la respuesta es ese output; sin él, solo su sección (contenidoDelDeck).
       const deckIn = contenidoDelDeck({ replyText, outputDefs: null, targetOutput })
+      // Engine v1.9 — imágenes y paleta completadas desde el proyecto cuando faltan (deck-defaults.service).
+      const deckCompleto = deckIn.ok ? await require('./deck-defaults.service').completarDeck({ content: deckIn.contenido, images: pngImageUrls, resolvedInputs, db, projectId }) : null
+      if (deckCompleto) for (const n of deckCompleto.notas) console.log(`[deck] ${n}`)
       const pptxResult = deckIn.ok
-        ? await et('doc_gen_pptx', { title: nodeName, content: deckIn.contenido, images: pngImageUrls }, { project_id: projectId, node_id: nodeId })
+        ? await et('doc_gen_pptx', { title: nodeName, content: deckCompleto.content, images: deckCompleto.images }, { project_id: projectId, node_id: nodeId })
         : { success: false, error: deckIn.motivo }
       // El intento queda registrado también cuando falla: es de donde sale la causa de abajo.
       allToolCalls.push({ tool: 'doc_gen_pptx', args: { auto: true }, result: pptxResult })

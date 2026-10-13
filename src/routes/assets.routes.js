@@ -122,10 +122,26 @@ router.get('/:id/content', async (req, res, next) => {
 
     const { data: forge } = await db()
       .from('forge_assets')
-      .select('name, content, format')
+      .select('name, content, format, node_id, project_id, storage_url, output_key, forge_sessions!session_id(output_key)')
       .eq('id', id)
       .maybeSingle()
     if (forge?.content) {
+      // Engine v1.9 — `?view=document`: lo que se lee y, aparte, los outputs `internal` y los bloques de
+      // máquina (`data[]`), y los ARCHIVOS que son el entregable de un output document de imagen o deck
+      // (`files[]`: el visual_pitch del 2.5, el .pptx). Sin `view` la respuesta es la de siempre: la pieza cruda.
+      if (req.query.view === 'document') {
+        const { vistaDocumento, claveDePieza, archivosDeLaVista } = require('../services/vista-documento.service')
+        let outputs = [], nodeTitle = ''
+        if (forge.node_id) {
+          const { data: nodo } = await db().from('forge_nodes').select('title, outputs').eq('id', forge.node_id).maybeSingle()
+          outputs = Array.isArray(nodo?.outputs) ? nodo.outputs : []
+          nodeTitle = nodo?.title || ''
+        }
+        const clave = claveDePieza({ name: forge.name, sessionOutputKey: forge.forge_sessions?.output_key, assetOutputKey: forge.output_key, nodeTitle, outputDefs: outputs })
+        const v = vistaDocumento({ content: forge.content, outputDefs: outputs, outputKey: clave })
+        const files = await archivosDeLaVista(db, { project_id: forge.project_id, node_id: forge.node_id, nodeTitle, outputDefs: outputs, archivos: v.archivos, pieza: forge })
+        return res.json({ success: true, name: forge.name, format: forge.format, content: v.content, data: v.data, files, hidden: v.hidden, view: 'document' })
+      }
       return res.json({ success: true, name: forge.name, format: forge.format, content: forge.content })
     }
 
@@ -328,8 +344,23 @@ router.get('/project-assets', async (req, res, next) => {
     if (mediaOnly) {
       const docIds = (forgeAssets || []).filter(a => DOC_FORMATS.includes(a.format)).map(a => a.id)
       if (docIds.length) {
-        const { data: docs } = await db().from('forge_assets').select('id, content').in('id', docIds)
-        for (const d of (docs || [])) previewMap[d.id] = recortarMd(d.content)
+        const { data: docs } = await db().from('forge_assets').select('id, name, content, node_id, output_key, forge_sessions!session_id(output_key)').in('id', docIds)
+        // Engine v1.9 — el asomo sale de la vista de documento (sin los outputs internal ni los bloques de
+        // máquina); una pieza sin nada que leer asoma su primer bloque de datos, como antes.
+        const { vistaDocumento, claveDePieza } = require('../services/vista-documento.service')
+        const nodeIds = [...new Set((docs || []).map(d => d.node_id).filter(Boolean))]
+        const dnaPorNodo = {}
+        if (nodeIds.length) {
+          const { data: nodos } = await db().from('forge_nodes').select('id, title, outputs').in('id', nodeIds)
+          for (const n of (nodos || [])) dnaPorNodo[n.id] = n
+        }
+        for (const d of (docs || [])) {
+          const n = dnaPorNodo[d.node_id]
+          const outputs = Array.isArray(n?.outputs) ? n.outputs : []
+          const clave = claveDePieza({ name: d.name, sessionOutputKey: d.forge_sessions?.output_key, assetOutputKey: d.output_key, nodeTitle: n?.title || '', outputDefs: outputs })
+          const v = vistaDocumento({ content: d.content, outputDefs: outputs, outputKey: clave })
+          previewMap[d.id] = recortarMd(v.content) ?? recortarMd(v.data[0]?.content) ?? recortarMd(d.content)
+        }
       }
     }
 
