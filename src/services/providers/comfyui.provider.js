@@ -9,6 +9,17 @@ function headers() {
 }
 
 function injectPoint(workflow, point, value) {
+  // Un punto de inyección puede ser UNO o VARIOS.
+  //
+  // Un grafo con dos muestreadores tiene dos semillas, y las dos alimentan la misma salida: el
+  // Skybox de Miguel León pasó de 30 a 52 nodos el 13-oct y gano un segundo KSampler. Inyectando
+  // solo la primera, iterar variaba media imagen y la otra mitad salía idéntica — y eso no se ve
+  // como un fallo, se ve como «el modelo no me hace caso».
+  //
+  // Se acepta una lista y se escribe el MISMO valor en todas: una semilla por corrida, no una por
+  // nodo. Repartir valores distintos haría que la misma semilla no reprodujera la misma imagen, y
+  // la semilla ya no reproduce bastante por su cuenta.
+  if (Array.isArray(point)) { for (const p of point) injectPoint(workflow, p, value); return }
   if (!point?.node || !point?.field) return
   const node = workflow[point.node]
   if (!node) { console.warn(`[ComfyUI] inject: node "${point.node}" not found in workflow`); return }
