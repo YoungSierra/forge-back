@@ -6899,6 +6899,35 @@ router.post('/assets/:asset_id/prompts-de-clips', async (req, res, next) => {
   } catch (err) { next(err) }
 })
 
+// ─── El Brief y la descripción del efecto, ANTES de generar el video ────────
+//
+// El equivalente de `prompts-de-clips` para la VFX Sheet, con una diferencia que importa: **esto
+// no cuesta nada**. No llama a ningún modelo — lee el documento de `asg_fills` que el 3.20 ya
+// escribió y reparte sus campos por la tabla de equivalencias de Miguel (§3.3 de su documento
+// v1.1). Por eso va en GET y se pide al abrir la ventana, sin botón de por medio.
+//
+// Los dos textos salen editables y la descripción es obligatoria: dentro del grafo es la que manda
+// sobre el Brief, y vacía deja al modelo animando lo que se le ocurra con el video ya pagado.
+router.get('/assets/:asset_id/vfx-brief', async (req, res, next) => {
+  try {
+    const { id: project_id, asset_id } = req.params
+    const { data: asset } = await db().from('forge_assets')
+      .select('id, name, metadata').eq('id', asset_id).eq('project_id', project_id).single()
+    if (!asset) return res.status(404).json({ success: false, error: 'Asset not found' })
+
+    // De qué efecto es esta lámina. Lo lleva escrito si la instanció el motor; si no, lo que va
+    // después del último guion largo del nombre, que es donde el sistema entero guarda el nombre
+    // propio. Es solo una etiqueta: el Brief sale de los fills, no de aquí.
+    const item = asset.metadata?.instancia?.item
+      || String(asset.name || '').split(/\s+[—–]\s+/).pop()?.trim()
+      || null
+
+    const { briefDeInstancia } = require('../services/vfx-brief.service')
+    const r = await briefDeInstancia({ db, project_id, item, asset })
+    res.json({ success: true, ...r })
+  } catch (err) { next(err) }
+})
+
 // ─── Avanzar la pieza por su cadena (§8 con pasos=1, §10 con pasos=3) ────────
 router.post('/assets/:asset_id/advance', async (req, res, next) => {
   try {
@@ -6951,10 +6980,25 @@ router.post('/assets/:asset_id/advance', async (req, res, next) => {
       return Object.keys(out).length ? out : null
     })()
 
+    // El Brief, la descripción y la duración del efecto, tal como quedaron en la ventana de Run.
+    // Mandan sobre lo derivado: si no mandaran, revisarlos no habría servido de nada — el despacho
+    // volvería a armarlos desde los fills y saldría otro texto distinto del que se aprobó. Es la
+    // misma regla que los prompts de los clips.
+    const vfx = (() => {
+      const v = req.body?.vfx
+      if (!v || typeof v !== 'object' || Array.isArray(v)) return null
+      const seg = Number(v.segundos)
+      return {
+        brief: typeof v.brief === 'string' ? v.brief : '',
+        descripcion: typeof v.descripcion === 'string' ? v.descripcion.trim() : '',
+        ...(Number.isFinite(seg) && seg > 0 ? { segundos: seg } : {}),
+      }
+    })()
+
     const { avanzar } = require('../services/chain.service')
     const progreso = require('../services/progreso.service')
     try {
-      const r = await avanzar({ db, project_id, asset_id, pasos, prompt, member_id, limitePorCada: limite, opciones, clips, solo, promptsClips })
+      const r = await avanzar({ db, project_id, asset_id, pasos, prompt, member_id, limitePorCada: limite, opciones, clips, solo, promptsClips, vfx })
       res.json({ success: true, ...r })
     } finally {
       // Pase lo que pase deja de figurar como corriendo. El servicio caduca solo a los diez
@@ -6970,7 +7014,7 @@ router.post('/assets/:asset_id/advance', async (req, res, next) => {
     // resuelve el problema ya redactado y a dos líneas de la pantalla.
     //
     // Lo reportó Migue Amez el 18-09 sobre la Animation Sheet de test_smack_migue_v.09.
-    const DEL_PROYECTO = ['SIN_CADENA', 'SIN_ANCLA', 'ANCLA_AMBIGUA', 'SIN_ADI', 'SIN_CLIPS']
+    const DEL_PROYECTO = ['SIN_CADENA', 'SIN_ANCLA', 'ANCLA_AMBIGUA', 'SIN_ADI', 'SIN_CLIPS', 'SIN_DESCRIPCION_VFX']
     if (DEL_PROYECTO.includes(err.code)) {
       return res.status(400).json({ success: false, error: err.message, code: err.code })
     }

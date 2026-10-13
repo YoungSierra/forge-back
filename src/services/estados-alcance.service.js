@@ -22,7 +22,10 @@ const REGLAS = {
   'animation.clips':                 { cadena: 'animation_sheet',   paso: 'animation_ref' },
   'environment.entornos':            { cadena: 'environment_sheet', paso: 'concept_art' },
   'prop.props':                      { cadena: 'prop_sheet',        paso: 'concept_art' },
-  'vfx.vfx':                         { cadena: 'vfx_sheet',         paso: 'flipbook' },
+  // Dos pasos: el de hoy y el que se jubiló. Lo que el flipbook dejó publicado sigue contando —no
+  // se mide el workflow, se mide si el efecto existe— y medirlo solo por el paso nuevo pondría en
+  // «pending» un alcance ya terminado.
+  'vfx.vfx':                         { cadena: 'vfx_sheet',         paso: ['loop', 'flipbook'] },
   'ui.pantallas':                    { cadena: 'ui_component_sheet', paso: 'ui' },
   'audio.sfx':                       { cadena: 'audio_sheet',       paso: 'audio' },
   'video_marketing.video_promocional': { cadena: 'marketing',       paso: 'video' },
@@ -86,8 +89,13 @@ function ultimoPasoDe(cadena) {
   try {
     const { CADENAS } = require('./chain.service')
     const pasos = (CADENAS?.[cadena]?.pasos || []).filter(p => p.workflow)
-    return pasos.length ? pasos[pasos.length - 1].clave : null
-  } catch { return null }
+    // Y los pasos JUBILADOS cierran igual. Lo que el flipbook produjo sigue publicado y aprobado
+    // en dos proyectos: si solo valiera el paso de hoy, cambiar el paso de una cadena bajaría a
+    // «en progreso» un alcance que está terminado y pagado. El trabajo no se deshace porque
+    // nosotros cambiemos el workflow.
+    const jubilados = CADENAS?.[cadena]?.retirados || []
+    return pasos.length ? [pasos[pasos.length - 1].clave, ...jubilados] : jubilados
+  } catch { return [] }
 }
 
 /** Lo que Forge no mide, y por qué. Viaja al front para poder decirlo en pantalla. */
@@ -128,7 +136,11 @@ async function estadosMedidos({ db, project_id }) {
 
   const estados = {}
   for (const [elemento, regla] of Object.entries(REGLAS)) {
-    const v = visto[`${regla.cadena}::${regla.paso}`]
+    // Una regla puede nombrar VARIOS pasos: cuenta el primero que haya dejado algo. Es lo que
+    // deja convivir un paso nuevo con el que reemplazó sin perder lo ya producido.
+    const cuales = Array.isArray(regla.paso) ? regla.paso : [regla.paso]
+    const v = cuales.map(x => visto[`${regla.cadena}::${x}`]).filter(Boolean)
+      .reduce((acc, x) => acc ? { hay: acc.hay + x.hay, aprobadas: acc.aprobadas + x.aprobadas } : x, null)
     if (!v) {
       // Un paso posterior sin el suyo no existe, pero un paso ANTERIOR de la misma cadena sí
       // cuenta como empezado: el concept art del personaje ya es progreso hacia su modelo.
@@ -201,7 +213,7 @@ async function estadosPorInstancia({ db, project_id, piezas }) {
       if (!cual) continue                       // pieza sin instancia: no se le atribuye a nadie
       const clave = `${cat}.${cual.nombre}`
       const aprobada = ['approved', 'auto_approved'].includes(p.status)
-      const cierra = cierre && p.metadata?.cadena?.paso === cierre && aprobada
+      const cierra = cierre.includes(p.metadata?.cadena?.paso) && aprobada
       if (cierra) estados[clave] = 'aprobado'
       else if (estados[clave] !== 'aprobado') estados[clave] = 'en_progreso'
     }

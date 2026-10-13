@@ -204,19 +204,34 @@ const CADENAS = {
     ],
   },
 
-  // El flipbook de un efecto. Un solo paso y catorce salidas, porque el workflow encadena solo:
-  // la lámina aprobada entra por su único `LoadImage`, de ahí sale el lookdev, del lookdev el
-  // atlas de 12 celdas, y de ese atlas se recorta cada frame. Publicar solo el atlas dejaría al
-  // motor de juego partiéndolo a mano; publicar solo los frames tiraría la hoja que el artista
-  // revisa. Van los catorce.
+  // El efecto, en movimiento. Dos salidas: el video en bucle y el fotograma del que sale.
+  //
+  // **Esto reemplaza al flipbook.** Lo jubiló Miguel el 09-10 y lo confirmó el 13: el atlas de 12
+  // celdas era una forma de contar movimiento con imágenes fijas, y el workflow nuevo entrega el
+  // movimiento directamente. El flipbook sigue REGISTRADO y activo en la base —no se borra nada—,
+  // simplemente ya no es el paso de esta cadena.
+  //
+  // Las tres entradas de texto no salen de la lámina sino del documento con el que se dibujó: el
+  // Brief y la descripción los arma `vfx-brief.service` desde los `asg_fills` de ESA instancia, y
+  // la ventana de Run los deja corregir antes de pagar. La descripción es obligatoria porque es
+  // la que manda sobre todo lo demás dentro del grafo (nodos 206 y 207): vacía, el modelo anima
+  // lo que se le ocurra.
+  //
+  // La duración viaja en SEGUNDOS y no en fotogramas. El §3.5 de Miguel lo pide explícitamente:
+  // el propio grafo la convierte con su expresión, y escribir `length` a mano la rompe.
   vfx_sheet: {
     etiqueta: 'VFX Sheet',
+    // Lo que produjo el flipbook sigue en los proyectos —catorce piezas por efecto— y hay que
+    // poder reconocerlo: sin esto, cada frame se leería como una lámina que nunca avanzó y Run
+    // ofrecería generarle un bucle encima. Ver `pasoDe`.
+    retirados: ['flipbook'],
     pasos: [
       {
-        clave: 'flipbook', workflow: 'V57_STUDIO_2D_vfx_flipbook', etiqueta: 'VFX flipbook',
-        que:    'Fourteen pages to the right: the lookdev, the 12-cell atlas, and each frame from START through PEAK to DISSIPATE.',
-        porque: 'The slice needs the effect of the main action and the one for taking damage, and an engine plays them frame by frame.',
+        clave: 'loop', workflow: 'V57_STUDIO_VFX_loop', etiqueta: 'VFX loop',
+        que:    'Two pages to the right: the effect looping on black, and the keyframe it was animated from.',
+        porque: 'An engine plays an effect in time, not in stills — and the keyframe is what lets you judge it before the motion.',
         entradas: { image: 'origen' },
+        pideVfx: true,
       },
     ],
   },
@@ -325,6 +340,11 @@ function pasoDe(asset) {
   if (!c?.paso) return 0
   const def = CADENAS[c.nombre]
   const i = def ? def.pasos.findIndex(p => p.clave === c.paso) : -1
+  // Un paso JUBILADO ya no está en la cadena, pero lo que produjo sigue en el proyecto. Sin esta
+  // línea, `findIndex` devuelve -1 y la pieza se lee como «nunca avanzó»: parado sobre un frame
+  // del flipbook, Run ofrecería generarle un bucle encima, y eso se paga. Jubilado significa
+  // terminado: de ahí no sale nada más.
+  if (i === -1 && (def?.retirados || []).includes(c.paso)) return def.pasos.length
   return i === -1 ? 0 : i + 1
 }
 
@@ -403,6 +423,13 @@ function proximoPaso(asset) {
     // puente. Lo cazó él.
     por_cada_clip: !!p.porCadaClip,
 
+    // Y si el paso pide el Brief y la descripción del efecto. La ventana de Run los va a buscar
+    // con esto puesto: el campo viaja desde acá por la misma razón que los dos de arriba —el día
+    // que otra cadena los pida, la ventana se entera sola— y por la contraria también, que es la
+    // que ya costó un informe: una condición escrita en el front contra el nombre del paso se
+    // queda muda en silencio cuando el paso cambia de nombre.
+    pide_vfx: !!p.pideVfx,
+
     // La cadena entera, para poder DIBUJARLA antes de correr (informe v6 #7, opción a de Miguel).
     // Solo los pasos de producción y con sus nombres llanos —«Concept art → 3D production»—; las
     // herramientas de edición no entran acá porque no son pasos de la cadena, son otra cosa que se
@@ -422,7 +449,7 @@ function proximoPaso(asset) {
 // 12). Valen para TODA la corrida —así lo confirmó Miguel—; regenerar una pieza suelta las pide
 // aparte. Se guardan además en el metadata de cada activo producido: es lo que deja mostrarlas
 // bajo la imagen y reusarlas al rehacerla.
-async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, member_id = null, limitePorCada = 0, opciones = null, clips = null, solo = null, promptsClips = null }) {
+async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, member_id = null, limitePorCada = 0, opciones = null, clips = null, solo = null, promptsClips = null, vfx = null }) {
   // La pose NO es una opcion de generacion: elige QUE workflow se lanza, no un valor dentro de uno.
   // Se separa aqui, antes de que `opciones` llegue a `aplicarOpciones`, que valida cada clave contra
   // el catalogo de ComfyUI y avisaria de una opcion que ese grafo no tiene.
@@ -709,6 +736,56 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
       // Se compone justo antes de despachar y no todos de una: si uno falla, los anteriores ya
       // están rendidos y pagados, y componer los ocho para descubrirlo al final no ahorra nada.
       let promptDelDespacho = paso.pide_prompt ? (prompt || '') : ''
+
+      // ── El efecto: Brief, descripción y duración ──────────────────────────
+      //
+      // Lo que llega de la ventana manda. Si no llega nada —una corrida disparada desde otro
+      // sitio— se deriva aquí de los `asg_fills`, que es la misma fuente que mira la ventana: así
+      // el camino de atrás no se queda sin Brief, pero tampoco inventa uno distinto.
+      //
+      // La descripción es obligatoria y se comprueba ANTES de despachar. Dentro del grafo es la
+      // que manda sobre el Brief (nodos 206 y 207); vacía, el modelo anima lo que se le ocurra y
+      // el video ya está pagado. Un fallo acá no cuesta nada, uno allá cuesta la corrida.
+      if (paso.pideVfx) {
+        let v = vfx
+        if (!v || !String(v.descripcion || '').trim()) {
+          const { briefDeInstancia } = require('./vfx-brief.service')
+          const d = await briefDeInstancia({
+            db, project_id, asset: origen,
+            item: origen.metadata?.instancia?.item || null,
+          })
+          v = {
+            brief:       String(v?.brief ?? d.brief ?? ''),
+            descripcion: String(v?.descripcion || d.descripcion || ''),
+            segundos:    Number(v?.segundos) > 0 ? Number(v.segundos) : d.segundos,
+          }
+        }
+        if (!String(v.descripcion || '').trim()) {
+          const e = new Error('This effect has no description yet, and the video is generated from it.'
+            + ' Open Run on the sheet, write what the effect does, and run from there.')
+          e.code = 'SIN_DESCRIPCION_VFX'
+          throw e
+        }
+
+        extras.vfx_brief       = String(v.brief || '')
+        extras.vfx_descripcion = String(v.descripcion).trim()
+        // En segundos. El grafo los convierte a fotogramas con su propia expresión —§3.5 del
+        // documento de Miguel— y escribir `length` a mano la rompería. Sin valor, el que trae el
+        // workflow: 5 s.
+        if (Number(v.segundos) > 0) extras.duracion_s = Number(v.segundos)
+
+        // Queda escrito en la lámina para que la próxima vez la ventana abra con lo que se
+        // corrigió. Es lo que pidió Miguel —«guardado por instancia»— y lo que evita reescribir
+        // el mismo párrafo cada vez que se itera el efecto.
+        const { data: antes } = await db().from('forge_assets')
+          .select('metadata').eq('id', origen.id).maybeSingle()
+        await db().from('forge_assets').update({
+          metadata: { ...(antes?.metadata || {}), vfx: {
+            brief: extras.vfx_brief, descripcion: extras.vfx_descripcion,
+            ...(extras.duracion_s ? { segundos: extras.duracion_s } : {}),
+          } },
+        }).eq('id', origen.id)
+      }
 
       // ── El video de referencia ────────────────────────────────────────────
       // Un párrafo que describe al personaje y su movimiento, y la duración en segundos. Las dos
