@@ -310,6 +310,18 @@ router.get('/project-assets', async (req, res, next) => {
 
     if (mediaOnly) forgeQuery = forgeQuery.in('format', [...MEDIA_FORMATS, ...DOC_FORMATS])
 
+    // Lo que el usuario borró no se enseña.
+    //
+    // Esta lista alimenta el moodboard y la librería, y NO filtraba por estado: una pieza marcada
+    // como borrada seguía pintándose igual. Lo reportó Migue Amez el 13-oct —«borré este asset
+    // pero no hubo cambio a nivel visual»— y tenía razón: el borrado sí había entrado, los nodos
+    // de abajo ya la excluían, pero la vista era la única que no se había enterado.
+    //
+    // Se filtra por `neq` y no por una lista de estados permitidos a propósito: los estados vivos
+    // son `approved` y `auto_approved` hoy, pero cualquiera que se añada mañana debería verse, y
+    // una lista blanca lo escondería en silencio. Lo que no se ve es exactamente lo borrado.
+    forgeQuery = forgeQuery.neq('status', 'deleted')
+
     if (project_id) forgeQuery = forgeQuery.eq('project_id', project_id)
 
     const { data: forgeAssets } = await forgeQuery
