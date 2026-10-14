@@ -5,15 +5,24 @@
 // video y la hoja dicen lo mismo. El ADI es el catálogo de TODOS los efectos y obligaría a adivinar
 // cuál es la fila que toca.
 //
-// OJO, lo que hoy no funciona y conviene no descubrir corriendo: **los fills no traen estos
-// campos**. Medido el 13-oct sobre los seis proyectos que tienen `asg_fills` producido — cero
-// EFFECT, cero TRIGGER, cero PARTICLE BUDGET, cero LIFECYCLE, cero COLOR USAGE. El prompt del 3.20
-// sí los pide; el modelo no los escribe. Así que esto devuelve el Brief con casi todo en blanco
-// hasta que eso se arregle del lado de Pedro.
+// El «cero» que medimos el 13-oct era NUESTRO, no de los fills. Lo encontró Pedro: Wort trae los 8
+// rótulos de la VFX Sheet, pero con su cita —«EFFECT NAME / ID (§8.4)»— y aquí se buscaba
+// «EFFECT NAME» por igualdad. Los otros cinco proyectos son anteriores a ese bloque y sí no los
+// tienen.
 //
-// Eso NO es un fallo de acá: es la regla de Miguel aplicada —«deja un campo en blanco si la hoja no
-// lo tiene, no inventes valores»— y por eso el Brief sale editable en la ventana de Run, para que
-// Dirección de Arte complete a mano lo que falte.
+// Cómo se busca ahora: los rótulos de la página salen de la DNA viva del 3.20 —su prompt de
+// `asg_fills` los lista bajo `[NN_VFXSheet]`— y solo entre ESOS se elige. Dos razones. Todos los
+// fills van a un mapa único y ahí conviven «CATEGORY (§8.4)» de la VFX con «CATEGORY (§7.10.1)» del
+// Audio: buscar suelto se traería el del Audio. Y la cita cambia —§0.4 pasa a §2.5 con el ADD
+// v6—, así que el rótulo se compara sin ella. El número de la página tampoco se mira: es 28 en
+// el maestro de 31 y 29 en el de 32.
+//
+// Lo que sigue en blanco es la regla de Miguel —«deja un campo en blanco si la hoja no lo tiene,
+// no inventes valores»— y por eso el Brief sale editable en la ventana de Run.
+//
+// OJO (Pedro, 13-oct): `asg_fills` trae un bloque por PÁGINA, no por efecto. Lo que se lee aquí
+// describe la VFX Sheet en general y es igual para todas las instancias; el dato por efecto
+// llegará por la DNA.
 
 const { parsearFills, fillDe } = require('./slide-composer.service')
 
@@ -32,7 +41,7 @@ const EQUIVALENCIAS = [
   { rotulo: 'PRIORITY TIER',     de: ['PRIORITY TIER', 'PRIORITY'] },
   { rotulo: 'PARTICLE BUDGET',   de: ['PARTICLE BUDGET'] },
   { rotulo: 'READABILITY RULES', de: ['READABILITY', 'READABILITY RULES'] },
-  { rotulo: 'COLOR USAGE (hex · role · limits)', de: ['COLOR USAGE'] },
+  { rotulo: 'COLOR USAGE (hex · role · limits)', de: ['COLOR USAGE', 'COLOR USAGE from the palette'] },
 ]
 
 // El ciclo de vida se parte en tres renglones del Brief. En los fills viene junto, bajo LIFECYCLE.
@@ -45,6 +54,56 @@ const CICLO = [
 // Nunca se rellena: no está en los fills y Miguel pidió explícitamente dejarlo vacío antes que
 // deducirlo. Un host inventado es justo lo que el workflow tiene prohibido dibujar.
 const HOST = 'HOST ASSET (… CONTEXT ONLY, NEVER RENDER IT)'
+
+// La hoja en el prompt de `asg_fills` del 3.20: `[28_VFXSheet]`, `[29_VFXSheet]`… por su nombre.
+const PAGINA = 'VFXSheet'
+
+/** «COLOR USAGE from the palette (§0.4)» → «COLOR USAGE from the palette». */
+const sinCita = s => String(s || '').replace(/\s*\(§[^)]*\)\s*$/, '').trim()
+const plano = s => sinCita(s).toLowerCase().replace(/\s+/g, ' ')
+
+/**
+ * Los rótulos que la DNA del 3.20 pide para una página, tal como el modelo los escribe en los
+ * fills (sin «This slide —»). [] si la DNA no trae ese bloque: entonces se busca como antes.
+ */
+function rotulosDePagina(outputs, pagina) {
+  const def = (Array.isArray(outputs) ? outputs : []).find(o => (o.key || o.name) === 'asg_fills')
+  const texto = String(def?.prompt || '')
+  const L = texto.split(/\r?\n/)
+  const i = L.findIndex(l => new RegExp(`^\\s*\\[\\d+_${pagina}\\]\\s*$`).test(l))
+  if (i < 0) return []
+  const out = []
+  for (const l of L.slice(i + 1)) {
+    if (/^\s*\[\d+_[A-Za-z]+\]\s*$/.test(l)) break
+    const m = l.match(/^\s*This slide\s*[—–-]\s*(.+?)\s*$/i)
+    if (m) out.push(m[1])
+  }
+  return out
+}
+
+/**
+ * El rótulo de la página que corresponde a un nombre de la equivalencia: igual sin la cita, o el
+ * nombre seguido de un separador —«EFFECT NAME» → «EFFECT NAME / ID (§8.4)», «LIFECYCLE» →
+ * «LIFECYCLE - start / peak / dissipate (§7.6)»—. «EFFECT» NO casa con «EFFECT NAME»: detrás no
+ * viene un separador. Es seguro porque solo se compara contra los rótulos de ESTA página.
+ */
+function rotuloDe(rotulos, nombre) {
+  const n = plano(nombre)
+  return rotulos.find(r => plano(r) === n)
+    || rotulos.find(r => { const p = plano(r); return p.startsWith(n) && /^\s*[-–—\/(]/.test(p.slice(n.length)) })
+    || null
+}
+
+/**
+ * El valor de un rótulo de la página en los fills. Primero exacto; si la cita cambió entre la DNA
+ * y los fills (§0.4 → §2.5), sin ella — pero solo si casa con UNO: dos son dos páginas distintas.
+ */
+function valorDe(fills, rotulo) {
+  const exacto = fillDe(fills, rotulo)
+  if (exacto != null) return exacto
+  const iguales = [...(fills || new Map()).keys()].filter(k => plano(k) === plano(rotulo))
+  return iguales.length === 1 ? fills.get(iguales[0]) : null
+}
 
 /** De «START: una gota cae / PEAK: estalla / DISSIPATE: se desvanece» saca el tramo pedido. */
 function tramoDelCiclo(texto, parte) {
@@ -73,7 +132,7 @@ async function briefDeInstancia({ db, project_id, item, asset = null }) {
   // corrida borraría la corrección de la primera y nadie entendería por qué.
   const guardado = asset?.metadata?.vfx || null
 
-  const { data: nodo } = await db().from('forge_nodes').select('id').eq('node_key', '3.20').maybeSingle()
+  const { data: nodo } = await db().from('forge_nodes').select('id, outputs').eq('node_key', '3.20').maybeSingle()
   if (!nodo?.id) return { brief: '', descripcion: '', avisos: ['node 3.20 is not registered'], campos: {} }
 
   // Por CLAVE, no por nombre. El 3.20 produce DOS juegos de fills —`asg_fills` y
@@ -97,17 +156,25 @@ async function briefDeInstancia({ db, project_id, item, asset = null }) {
   }
 
   const fills = parsearFills(doc.content)
+  const rotulos = rotulosDePagina(nodo.outputs, PAGINA)
+  if (!rotulos.length) avisos.push(`node 3.20 does not list the ${PAGINA} labels: searched by name`)
+  // Con los rótulos de la página, solo entre ellos; sin ellos, por nombre, como antes.
+  const buscar = nombre => {
+    if (!rotulos.length) return fillDe(fills, nombre)
+    const r = rotuloDe(rotulos, nombre)
+    return r ? valorDe(fills, r) : null
+  }
   const campos = {}
   for (const eq of EQUIVALENCIAS) {
     let valor = ''
     for (const nombre of eq.de) {
-      const v = fillDe(fills, nombre)
+      const v = buscar(nombre)
       if (v && String(v).trim()) { valor = String(v).trim(); break }
     }
     campos[eq.rotulo] = valor
   }
 
-  const ciclo = fillDe(fills, 'LIFECYCLE') || ''
+  const ciclo = buscar('LIFECYCLE') || ''
   for (const c of CICLO) campos[c.rotulo] = tramoDelCiclo(ciclo, c.parte)
   campos[HOST] = ''
 
@@ -180,4 +247,4 @@ async function briefDeInstancia({ db, project_id, item, asset = null }) {
   }
 }
 
-module.exports = { briefDeInstancia, EQUIVALENCIAS, CICLO, HOST }
+module.exports = { briefDeInstancia, rotulosDePagina, rotuloDe, EQUIVALENCIAS, CICLO, HOST }

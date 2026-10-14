@@ -21,28 +21,69 @@
 // Lo que no se reconoce NO se reparte por descarte: se devuelve en `sin_clasificar`. Repartir por
 // parecido es lo que hace que alguien pague tres despachos de una hoja que no iba.
 
+// Los límites de palabra no son cosmética. Medido contra el documento vivo, sin ellos:
+// «SFX dull t-hud» caía en la hoja de UI, y «custom sy-stem» en la de Audio.
+//
+// Pero NO pueden ser `\b`: en JavaScript el guion bajo es letra, así que entre «VFX» y «_» no hay
+// límite y `VFX_WaterSplash` no casaba con nada. Medido por Pedro el 13-10 en Wort: 40 filas del
+// inventario en `sin_clasificar` y ni una VFX Sheet ni una UI Sheet que instanciar, justo cuando
+// la cadena de la VFX acababa de publicarse. Acá el límite es «ni letra ni dígito», y el guion
+// bajo cuenta como separador. Fuera de eso, se acepta exactamente lo mismo que antes.
+const _ =(...alternativas) => new RegExp(alternativas.map(a => `(?<![a-z0-9])${a}(?![a-z0-9])`).join('|'), 'i')
+
 /** A qué hoja del ASG va cada clase de asset. Por palabra declarada, no por parecido. */
 const A_LA_HOJA = [
-  { hoja: '22_VFXSheet',            etiqueta: 'VFX Sheet',             re: /\bvfx\b|\bvisual effects?\b/i },
-  // Los límites de palabra no son cosmética. Medido contra el documento vivo, sin ellos:
-  // «SFX dull t-hud» caía en la hoja de UI, y «custom sy-stem» en la de Audio.
-  { hoja: '21_UIComponentSheet',    etiqueta: 'UI Component Sheet',    re: /\bui\b|\bhud\b|\bscreens?\b|\bmenus?\b/i },
-  { hoja: '23_AudioSheet',          etiqueta: 'Audio Sheet',           re: /\baudio\b|\bsfx\b|\bmusic\b|\bvoices?\b|\bvo\b|\bstems?\b/i },
-  { hoja: '24_AnimationSheet',      etiqueta: 'Animation Sheet',       re: /\banimation\b|\bclips?\b|\brigs?\b/i },
+  { hoja: '22_VFXSheet',            etiqueta: 'VFX Sheet',             re: _('vfx', 'visual effects?') },
+  { hoja: '21_UIComponentSheet',    etiqueta: 'UI Component Sheet',    re: _('ui', 'hud', 'screens?', 'menus?') },
+  { hoja: '23_AudioSheet',          etiqueta: 'Audio Sheet',           re: _('audio', 'sfx', 'music', 'voices?', 'vo', 'stems?') },
+  // Sin «rig»: «CHR_Wort (mesh, textures, rig)» es la fila del PERSONAJE, que también se riggea, y
+  // por esa palabra caía en una Animation Sheet. Una clase de animación se nombra por sus clips.
+  { hoja: '24_AnimationSheet',      etiqueta: 'Animation Sheet',       re: _('animations?', 'clips?') },
   // ANTES que la del entorno, y no por gusto: un skybox se nombra por el entorno que rodea
   // —«Skybox — Sector 7 Hydro Labs»— asi que la regla del entorno se lo llevaria. El orden de
   // esta lista es el que decide, y aca si importa.
-  { hoja: '25_SkyboxSheet',         etiqueta: 'Skybox Sheet',          re: /\bskyboxe?s?\b|\bpanoramas?\b|\b360\b/i },
-  { hoja: '19_EnvironmentSheet',    etiqueta: 'Environment Sheet',     re: /\benv-\d|\benvironments?\b|\bbackgrounds?\b|\blevels?\b/i },
-  { hoja: '20_PropSheet',           etiqueta: 'Prop Sheet',            re: /\bprops?\b|\bitems?\b|\bobjects?\b/i },
-  { hoja: '25_VideoMarketingSheet', etiqueta: 'Video Marketing Sheet', re: /\bmarketing\b|\btrailer\b|\bteaser\b|\bpromo\b/i },
-  { hoja: '18_CharacterSheet',      etiqueta: 'Character Sheet',       re: /\bchar\b|\bchar-\d|\bcharacters?\b|\bactors?\b|\benem(y|ies)\b|\bcreatures?\b|\bhero\b|\bnpc\b/i },
+  //
+  // «360» solo si no es un giro: un «360 turnaround» es la vuelta a un personaje, no un panorama.
+  { hoja: '25_SkyboxSheet',         etiqueta: 'Skybox Sheet',          re: /(?<![a-z0-9])(?:skyboxe?s?|panoramas?)(?![a-z0-9])|(?<![a-z0-9])360(?![a-z0-9])(?!\s*°?\s*(?:turn|spin|rotat))/i },
+  { hoja: '19_EnvironmentSheet',    etiqueta: 'Environment Sheet',     re: _('env-\\d+','environments?', 'backgrounds?', 'levels?') },
+  { hoja: '20_PropSheet',           etiqueta: 'Prop Sheet',            re: _('props?', 'items?', 'objects?') },
+  { hoja: '25_VideoMarketingSheet', etiqueta: 'Video Marketing Sheet', re: _('marketing', 'trailer', 'teaser', 'promo') },
+  { hoja: '18_CharacterSheet',      etiqueta: 'Character Sheet',       re: _('char', 'char-\\d+','characters?', 'actors?', 'enem(?:y|ies)', 'creatures?', 'hero', 'npc') },
 ]
+
+// La convención de `asset_id` de los propios nodos de Forge (el 3.9 la valida con
+// ^(CHR|PRP|ENV|VFX|UI|ICO|AUD|ITEM|LVL)_). Cuando la fila empieza por uno de estos, el prefijo
+// DICE la clase y manda sobre las palabras del resto de la fila.
+//
+// `ITEM_` no va a ninguna Sheet: el ítem lo cubre la página editorial `11_ItemCollectible`, la
+// misma regla que ya sigue el manifiesto del 3.20 («ITEM_ … are never Prop Sheets»). `CHR_` va al
+// personaje, que luego cuenta el roster. `LVL_` no tiene hoja.
+const POR_PREFIJO = {
+  VFX: '22_VFXSheet', UI: '21_UIComponentSheet', ICO: '21_UIComponentSheet', HUD: '21_UIComponentSheet',
+  AUD: '23_AudioSheet', ENV: '19_EnvironmentSheet', PRP: '20_PropSheet', CHR: '18_CharacterSheet',
+  ITEM: null, LVL: null,
+}
+
+// Y la `category` del brief aprobado del 3.9, que manda sobre las dos cosas anteriores cuando la
+// fila tiene brief: es lo que el nodo que produjo el asset dijo que es (decisión de Pedro, 13-10).
+// Con prefijo `ITEM_` sigue sin hoja aunque el brief diga Prop: ver arriba.
+const POR_CATEGORIA = [
+  [/^(prop|interactable|platform|decoration)$/i,                '20_PropSheet'],
+  [/^(environment blockout|environment kit|background)$/i,      '19_EnvironmentSheet'],
+  [/^vfx$/i,                                                    '22_VFXSheet'],
+  [/^(ui element|icon|font)$/i,                                 '21_UIComponentSheet'],
+  [/^(character|companion|boss)$/i,                             '18_CharacterSheet'],
+]
+
+/** El `asset_id` con el que empieza una fila del inventario: «PRP_AmberWarningLamp ×6» → PRP_AmberWarningLamp. */
+const idDeFila = nombre => (String(nombre).match(/^([A-Z]{2,5})_[A-Za-z0-9]+/) || [])[0] || null
 
 // Lo que el inventario declara pero NO es una lámina de arte: escenas de motor, sistemas de
 // código, perfiles de render. Se excluyen por nombre declarado y se cuentan aparte — repartirlas
 // por parecido es lo que mandaba «Scene: SCN_MainMenu_Menu» a la hoja de UI.
-const NO_ES_LAMINA = /^(scene|custom system|system|prefab|script|shader|material)\b|post-process|\bvolume profile\b/i
+//
+// Las escenas de QA y el concept art/moodboard son entregables, pero no láminas del ASG.
+const NO_ES_LAMINA = /^(scene|custom system|system|prefab|script|shader|material)\b|post-process|\bvolume profile\b|^qa test scenes?\b|^concept art\b|\bmood ?boards?\b/i
 
 /** La sección pedida, hasta el próximo encabezado del mismo nivel o superior. */
 function seccion(md, re) {
@@ -57,6 +98,37 @@ function seccion(md, re) {
     out.push(L[j])
   }
   return out.join('\n')
+}
+
+// Una fila que se reconoce y a propósito no lleva Sheet (los `ITEM_`). Distinto de null, que es
+// «no se sabe qué es» y va a `sin_clasificar`.
+const SIN_HOJA = Symbol('sin hoja')
+
+/**
+ * La hoja de una fila del inventario. En este orden: la `category` de su brief aprobado, el
+ * prefijo de su `asset_id`, y por último las palabras. Sin nada de eso, null — nunca Prop por
+ * descarte.
+ */
+function destinoDe(nombre, categorias, avisos) {
+  const hoja = h => A_LA_HOJA.find(d => d.hoja === h)
+  const id = idDeFila(nombre)
+  const pref = id ? id.split('_')[0].toUpperCase() : null
+  if (pref === 'ITEM') {
+    avisos.push(`“${nombre}”: ITEM_ rows get no Sheet — the item is covered by the editorial page 11_ItemCollectible`)
+    return SIN_HOJA
+  }
+  // Las animaciones de un personaje llevan SU id —«CHR_Wort animations (8 clips)»— y son una
+  // Animation Sheet, no otra Character Sheet: la palabra manda sobre el prefijo y sobre la
+  // categoría del brief, que es la del personaje.
+  const anim = hoja('24_AnimationSheet')
+  if (anim.re.test(nombre)) return anim
+  const cat = id && categorias?.get(id)
+  if (cat) {
+    const m = POR_CATEGORIA.find(([re]) => re.test(cat))
+    if (m) return hoja(m[1])
+  }
+  if (pref && pref in POR_PREFIJO) return POR_PREFIJO[pref] ? hoja(POR_PREFIJO[pref]) : SIN_HOJA
+  return A_LA_HOJA.find(d => d.re.test(nombre)) || null
 }
 
 /** Las filas de la primera tabla de un trozo de markdown, ya partidas en celdas. */
@@ -94,7 +166,7 @@ function cuenta(celda) {
  * y eso es un personaje con dos láminas, no dos personajes. Por eso instancia por FILA, no por
  * cuenta, y deja la cuenta a la vista para quien mire el recuadro antes de pagar.
  */
-function itemsDesdeSpec(md) {
+function itemsDesdeSpec(md, { categorias = null } = {}) {
   const porHoja = {}
   const sinClasificar = []
   const noSonLaminas = []
@@ -149,7 +221,8 @@ function itemsDesdeSpec(md) {
       const n = iCuenta > 0 ? cuenta(f[iCuenta]) : 1
       if (n === 0) continue                       // declarado y fuera del slice
       if (NO_ES_LAMINA.test(nombre)) { noSonLaminas.push({ nombre, cuenta: n }); continue }
-      const destino = A_LA_HOJA.find(d => d.re.test(nombre))
+      const destino = destinoDe(nombre, categorias, avisos)
+      if (destino === SIN_HOJA) continue
       if (!destino) { sinClasificar.push({ nombre, cuenta: n, de }); continue }
       // Los personajes los pone el roster, que los nombra uno por uno.
       if (destino.hoja === '18_CharacterSheet') { avisos.push(`“${nombre}”: counted from the actor roster, not from the inventory`); continue }
@@ -291,6 +364,42 @@ function conManifiesto(r, manifiesto, avisoManifiesto) {
   }
 }
 
+/**
+ * `asset_id` → `category` del `asset_briefs` APROBADO del 3.9. Sin pieza, o si no se puede leer,
+ * null: la clasificación sigue por prefijo y por palabra, como antes.
+ *
+ * Por clave, en los dos sitios donde vive (la pieza y su sesión), y con la pieza del modo nodo
+ * entero como respaldo: la reconoce su forma, `- asset_id:`, no su nombre.
+ */
+async function categoriasDeBriefs(db, project_id) {
+  try {
+    const { data: nodo } = await db().from('forge_nodes').select('id').eq('node_key', '3.9').maybeSingle()
+    if (!nodo?.id) return null
+    const { data: piezas } = await db().from('forge_assets')
+      .select('content, created_at, output_key, forge_sessions!session_id(output_key)')
+      .eq('project_id', project_id).eq('node_id', nodo.id)
+      .in('status', ['approved', 'auto_approved']).not('content', 'is', null)
+      .order('created_at', { ascending: false })
+    const clave = a => a.output_key ?? a.forge_sessions?.output_key ?? null
+    const pieza = (piezas || []).find(a => clave(a) === 'asset_briefs')
+      || (piezas || []).find(a => !clave(a) && /^- asset_id:/m.test(a.content))
+    if (!pieza) return null
+    const T = require('./tandas.service')
+    const YAML = require('yaml')
+    const m = new Map()
+    for (const tramo of T.tramos(T.bloqueYaml(pieza.content), 'asset_id')) {
+      try {
+        const v = YAML.parse(tramo); const o = Array.isArray(v) ? v[0] : v
+        if (o?.asset_id && o?.category) m.set(String(o.asset_id), String(o.category).trim())
+      } catch { /* un tramo roto no tumba los demás */ }
+    }
+    return m.size ? m : null
+  } catch (e) {
+    console.warn(`[alcance-vs] asset_briefs not read: ${e?.message}`)
+    return null
+  }
+}
+
 async function itemsDelAlcance({ db, project_id }) {
   const { itemsDelManifiesto } = require('./manifiesto-hojas.service')
   const manifiesto = await itemsDelManifiesto({ db, project_id })
@@ -352,7 +461,7 @@ async function itemsDelAlcance({ db, project_id }) {
   const orden = CLAVES_DEL_SPEC
     .flatMap(k => aprobadas.filter(x => x.output_key === k))
   if (!orden.length && deNodoEntero) {
-    const r = itemsDesdeSpec(deNodoEntero.content)
+    const r = itemsDesdeSpec(deNodoEntero.content, { categorias: await categoriasDeBriefs(db, project_id) })
     const total = Object.values(r.porHoja || {}).reduce((n, l) => n + l.length, 0)
     if (!total) {
       return {
@@ -371,7 +480,7 @@ async function itemsDelAlcance({ db, project_id }) {
   const md = elegido?.content || deNodoEntero?.content
   if (!md) return { hay: false, motivo: 'The approved Vertical Slice Specification has no text', porHoja: {}, sinClasificar: [], avisos: avisoManifiesto }
 
-  const r = itemsDesdeSpec(md)
+  const r = itemsDesdeSpec(md, { categorias: await categoriasDeBriefs(db, project_id) })
 
   // Un spec viejo se lee entero y no da NADA: los de antes de v2.9.2 no traen el inventario
   // §A7.1 del que salen las cuentas. Sin decirlo, el panel enseña cero instancias y parece que
