@@ -785,7 +785,7 @@ async function recuperarSeccionesFaltantes({ node_id, replyText, outputDefs, exe
 // primera enumeró 3 semillas y la segunda 4, así que el proyecto quedó con dos tandas de imágenes
 // distintas del mismo output —tres colgando de la sesión general y cuatro de la del output— y
 // siete renders de ComfyUI pagados donde correspondían cuatro.
-async function executeImageOutput({ project_id, node_id, targetOutputKey, member_id, project_node_id = null, respuestaPrevia = null }) {
+async function executeImageOutput({ project_id, node_id, targetOutputKey, member_id, project_node_id = null, respuestaPrevia = null, soloRespuestaPrevia = false }) {
   const { buildSystemPrompt, runReActLoop } = require('../services/canvas-chat.service')
   const { logExecution } = require('../services/execution-log.service')
   const { parseOutputItems, generateOneImage, esDeck, generateDeck, idsDeclarados, nombreDeImagen } = require('../services/image-gen.service')
@@ -1071,11 +1071,15 @@ async function executeImageOutput({ project_id, node_id, targetOutputKey, member
   // mismo id que el documento usó en sus anclas. Volver a correr el ReAct reescribía el documento
   // ENTERO —`doc_gen_docx` activo, hasta 5 iteraciones— para producir un texto que ya existe:
   // medido, 6+ minutos y otros $0.08 por nada.
-  let planos = await promptsDelPlanHermano({ project_id, node_id, project_node_id, targetOutputKey })
+  // Engine v1.10 — A1: el «Run output» con el nodo aprobado entero trae su sección aprobada (`soloRespuestaPrevia`): el
+  // sobre de ESA respuesta manda sobre el último turno de la sesión general (que puede ser otro, sin aprobar), y abajo no
+  // se hace el re-pedido al modelo — otra llamada es otra lista.
+  let planos = soloRespuestaPrevia ? promptsDelSobre(respuestaPrevia || '', targetOutputKey) : []
+  if (!planos?.length) planos = await promptsDelPlanHermano({ project_id, node_id, project_node_id, targetOutputKey })
 
   // Ni plan ni sobre: antes esto mandaba el despacho al ReAct completo. Se le pide SOLO el bloque,
   // con el documento que acaba de escribir como contexto.
-  if (!planos?.length) {
+  if (!planos?.length && !soloRespuestaPrevia) {
     let qC = db().from('forge_sessions').select('id').eq('project_id', project_id).eq('node_id', node_id).is('output_key', null)
     if (project_node_id) qC = qC.eq('project_node_id', project_node_id)
     const { data: gC } = await qC.order('created_at', { ascending: false }).limit(1).maybeSingle()
@@ -1156,7 +1160,8 @@ async function executeImageOutput({ project_id, node_id, targetOutputKey, member
       const v = require('../services/image-count').verificarCuenta(defP, listos.length)
       if (v && !v.ok) console.warn(`[conformidad] ${v.motivo}`)
     }
-    const outputItems = listos.map(r => ({ index: r.idx, name: r.id, variations: [{ url: r.url, condition: null }] }))
+    // Engine v1.10 — A1: `id` además de `name` (el mismo valor): es el campo por el que empareja todo lo de v1.10
+    const outputItems = listos.map(r => ({ index: r.idx, id: r.id, name: r.id, variations: [{ url: r.url, condition: null }] }))
     await db().from('forge_sessions').update({
       output_images: { [targetOutputKey]: outputItems },
       status: 'auto_approved', completed_at: new Date().toISOString(), iteration_count: 1,
@@ -1367,7 +1372,10 @@ async function executeImageOutput({ project_id, node_id, targetOutputKey, member
   }
 
   // Persistir en forge_sessions.output_images (formato nuevo con variations[])
-  const outputItems = ok.map(r => ({ index: r.idx, variations: [{ url: r.url, condition: null }] }))
+  // Engine v1.10 — A1: cada imagen guarda el `id` del encargo que la pidió (el sobre, por posición) además del índice.
+  // Accept, el modal y el PDF emparejan por id; el índice queda de respaldo para el historial sin ids.
+  const idsPos = require('../services/image-gen.service').idsPorPosicion(replyText || '', targetOutputKey)
+  const outputItems = ok.map(r => ({ index: r.idx, ...(idsPos?.[r.idx] ? { id: idsPos[r.idx] } : {}), variations: [{ url: r.url, condition: null }] }))
   // Una corrida que produce CERO imágenes tiene que cerrar igual. Quedándose en `active` el front
   // sigue esperando para siempre —«Waiting for images…» sobre algo que ya terminó— y el documento
   // nunca se libera. Terminó: sin imágenes, pero terminó.
@@ -1396,7 +1404,7 @@ async function executeImageOutput({ project_id, node_id, targetOutputKey, member
     const assetName = nombreDeImagen({
       tituloNodo: node.title,
       etiqueta:   outDef?.label || outDef?.name || targetOutputKey,
-      ids: idsDecl, idx: r.idx, total: ok.length,
+      ids: idsDecl, idx: r.idx, total: ok.length, id: idsPos?.[r.idx] || null,
     })
     const { data: asset } = await db()
       .from('forge_assets')
@@ -2522,7 +2530,7 @@ router.post('/nodes/:node_id/accept', async (req, res, next) => {
             name:        nombreDeImagen({
               tituloNodo: node.title,
               etiqueta:   outDef.label || outDef.name,
-              ids: idsDecl, idx: item.index ?? 0, total: items.length,
+              ids: idsDecl, idx: item.index ?? 0, total: items.length, id: item.id || null,
             }),
             format:      'png',
             status:      'approved',
@@ -3083,7 +3091,7 @@ router.post('/nodes/:node_id/clean', requireAdmin, async (req, res, next) => {
 router.post('/nodes/:node_id/sessions/:session_id/generate-item-image', async (req, res, next) => {
   try {
     const { id: project_id, node_id, session_id } = req.params
-    const { output_key, item_index, item_text, condition, message_id = null } = req.body
+    const { output_key, item_index, item_text, condition, message_id = null, item_id = null } = req.body
 
     // Cada render cuesta, y el 01-09 el 2.2 pagó ocho para un output de cuatro: cuatro por el
     // despacho del sobre —en su propia sesión, con sus ids— y cuatro más treinta segundos después
@@ -3279,14 +3287,18 @@ router.post('/nodes/:node_id/sessions/:session_id/generate-item-image', async (r
 
     // Append variación al ítem existente o crear nuevo
     const newVariation = { url: result.url, condition: condition?.trim() || null }
-    const existingIdx  = outputItems.findIndex(e => e.index === item_index)
+    // Engine v1.10 — por id primero (A1): tras iterar el nodo entero la posición del ítem puede haber cambiado. Una
+    // imagen nueva deja la entrada al día: se quitan `outdated` y `pending` (A2).
+    let existingIdx = item_id ? outputItems.findIndex(e => (e.id || e.name) === item_id) : -1
+    if (existingIdx < 0) existingIdx = outputItems.findIndex(e => e.index === item_index && (!item_id || !(e.id || e.name)))
     if (existingIdx >= 0) {
+      const { outdated: _o, pending: _p, ...previa } = outputItems[existingIdx]
       outputItems[existingIdx] = {
-        ...outputItems[existingIdx],
-        variations: [...(outputItems[existingIdx].variations || []), newVariation],
+        ...previa, index: item_index, ...(item_id ? { id: item_id } : {}),
+        variations: [...(previa.variations || []), newVariation],
       }
     } else {
-      outputItems.push({ index: item_index, variations: [newVariation] })
+      outputItems.push({ index: item_index, ...(item_id ? { id: item_id } : {}), variations: [newVariation] })
     }
     outputItems.sort((a, b) => a.index - b.index)
 
@@ -3338,9 +3350,10 @@ router.post('/nodes/:node_id/sessions/:session_id/generate-item-image', async (r
         .from('forge_messages').select('output_images').eq('id', message_id).maybeSingle()
       const mias  = migrateOutputImages(msg?.output_images || {})
       const lista = Array.isArray(mias[output_key]) ? [...mias[output_key]] : []
-      const i     = lista.findIndex(e => e.index === item_index)
-      if (i >= 0) lista[i] = { ...lista[i], variations: [...(lista[i].variations || []), newVariation] }
-      else        lista.push({ index: item_index, variations: [newVariation] })
+      let i       = item_id ? lista.findIndex(e => (e.id || e.name) === item_id) : -1
+      if (i < 0) i = lista.findIndex(e => e.index === item_index && (!item_id || !(e.id || e.name)))
+      if (i >= 0) lista[i] = { ...lista[i], ...(item_id ? { id: item_id } : {}), variations: [...(lista[i].variations || []), newVariation] }
+      else        lista.push({ index: item_index, ...(item_id ? { id: item_id } : {}), variations: [newVariation] })
       lista.sort((a, b) => a.index - b.index)
       // Si la columna todavía no existe (migración 051 sin correr), no se rompe la generación:
       // la imagen ya está guardada en la sesión.
@@ -3363,7 +3376,8 @@ router.post('/nodes/:node_id/sessions/:session_id/generate-item-image', async (r
 router.post('/nodes/:node_id/generate-pdf', async (req, res, next) => {
   try {
     const { id: project_id, node_id } = req.params
-    const { output_key = null, project_node_id = null } = req.body ?? {}
+    // Engine v1.10 — C: `force` rehace el PDF aunque la pieza ya tenga uno (el de la respuesta, sin imágenes).
+    const { output_key = null, project_node_id = null, force = false } = req.body ?? {}
 
     // Un PDF pedido mientras las imágenes del nodo se están renderizando sale con los
     // `[ IMAGE: … ]` impresos como texto: el resolvedor lee `output_images` al armarlo y todavía
@@ -3463,7 +3477,7 @@ router.post('/nodes/:node_id/generate-pdf', async (req, res, next) => {
     // cabecera vieja. Una pieza sin marca regenera una vez y queda marcada.
     const { data: proyectoActual } = await db().from('projects').select('name').eq('id', project_id).maybeSingle()
     const tituloActual = (() => { const tipo = String(asset.name || '').split(' — ')[0] || asset.name; return proyectoActual?.name ? `${tipo} — ${proyectoActual.name}` : tipo })()
-    if (asset.storage_url && esDocumento(asset) && asset.metadata?.pdf_title === tituloActual) {
+    if (!force && asset.storage_url && esDocumento(asset) && asset.metadata?.pdf_title === tituloActual) {
       return res.json({ success: true, url: asset.storage_url })
     }
 
@@ -4777,6 +4791,23 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
     const targetIsDump = isDataDump(replyText)
     if (targetIsDump) console.log('[forge-chat] auto doc_gen_docx OMITIDO — la respuesta es un bloque de datos, no un documento')
 
+    // Engine v1.10 — A3: corriendo el nodo ENTERO con outputs de imagen por despachar, el documento no se exporta en la
+    // respuesta: saldría sin imágenes y ese enlace se quedaba como «el PDF» del nodo. Se exporta al terminar el despacho.
+    // Mismo filtro que el post-pass de imágenes (pendientes, no diferidos, sin un «cero» declarado).
+    let difiereDoc = false
+    if (!target_output_key && currentPNode?.id) {
+      try {
+        const { data: pnD } = await db().from('forge_project_nodes').select('is_stale').eq('id', currentPNode.id).maybeSingle()
+        const { data: dnaD } = await db().from('forge_nodes').select('id, outputs').eq('id', node_id).single()
+        const defsD = Array.isArray(dnaD?.outputs) ? dnaD.outputs : []
+        const pendD = await pendingImageOutputsForNode(project_id, node_id, pnD?.is_stale, dnaD || {}, currentPNode.id)
+        difiereDoc = pendD.some(k => {
+          const d = defsD.find(o => (o.key || o.name) === k)
+          return !!d && d.production !== 'deferred' && !decidioCero(replyText, k, require('../services/plan-hermano').planHermano(d))
+        })
+      } catch (e) { console.warn('[forge-chat] A3: no se pudo saber si hay imágenes por despachar:', e?.message || e) }
+    }
+
     if (hasDocTool && !alreadyCalled && replyText.trim().length > 200 && targetIsDoc && !targetIsDump) {
       try {
         // Extraer solo la sección del output principal (format: document/pdf)
@@ -4897,7 +4928,12 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
         const targetLabel  = targetOutput ? outLabelOf(targetOutput) : ''
         const docTypeLabel = targetLabel ? `${node.title} · ${targetLabel}` : node.title
 
-        const docResult = await executeTool('doc_gen_docx', {
+        // Engine v1.10 — A3: se deja la marca con título y cuerpo; nodo-entero.service la exporta al terminar el despacho.
+        if (difiereDoc) {
+          allToolCalls.push({ tool: 'doc_gen_docx', args: { auto: true, deferred: 'images' }, result: { success: false, deferred: true, title: `${docTypeLabel} — ${project?.name ?? 'Document'}`, content: docContent } })
+          console.log('[forge-chat] auto doc_gen_docx DIFERIDO — se exporta cuando terminen las imágenes')
+        }
+        const docResult = difiereDoc ? { success: false } : await executeTool('doc_gen_docx', {
           title:   `${docTypeLabel} — ${project?.name ?? 'Document'}`,
           content: docContent,
         }, { project_id, node_id })
@@ -5033,6 +5069,10 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
     // leyendo prosa del documento o el plan hermano —medido: 3 ítems que no son prompts—. Es
     // `executeImageOutput` quien corre el ReAct del propio output, que sí emite su sobre.
     let imagenesDespachadas = []
+    // Engine v1.10 — A2: lo que cambió en las imágenes ya hechas (outdated / pending / deleted), para el front; A3: los
+    // despachos de este turno, para exportar el documento cuando terminen.
+    let imagenesActualizadas = {}
+    const despachosDoc = []
     if (!target_output_key && currentPNode?.id) {
       try {
         const { data: pnEstado } = await db()
@@ -5081,8 +5121,23 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
           console.warn(`[forge-chat] ${k}: ya tiene sus imágenes desde que arrancó la corrida — no se despacha`)
         }
 
+        // Engine v1.10 — A2: los outputs que YA tienen imágenes no se despachan; su sobre se compara por id con el del
+        // turno anterior y cada posición queda marcada (outdated / pending / deleted). Se regenera con ✦.
+        {
+          const { imageOutputsOf } = require('../services/image-gen.service')
+          const conImagenes = imageOutputsOf(dnaImg || {}).map(o => o.key)
+            .filter(k => !pendientes.includes(k) && porClave.get(k)?.production !== 'deferred')
+          if (conImagenes.length) {
+            try {
+              imagenesActualizadas = await require('../services/nodo-entero.service').marcarDesfasadas(db, {
+                project_id, node_id, project_node_id: currentPNode.id, session_id: session.id, replyNuevo: replyText, claves: conImagenes, member_id,
+              })
+            } catch (e) { console.error('[forge-chat] A2 (imágenes desfasadas):', e?.message || e) }
+          }
+        }
+
         for (const key of finales) {
-          executeImageOutput({ project_id, node_id, targetOutputKey: key, member_id, project_node_id: currentPNode.id, respuestaPrevia: replyText })
+          despachosDoc.push(executeImageOutput({ project_id, node_id, targetOutputKey: key, member_id, project_node_id: currentPNode.id, respuestaPrevia: replyText })
             .catch(async e => {
               // Un fallo acá no lo espera nadie: la primera vez dejó una sesión `active` con CERO
               // mensajes y el front consultando un avance que nunca iba a llegar. Se marca y se
@@ -5100,13 +5155,20 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
                   content: `Image generation did not start: ${e?.message || e}`,
                 })
               } catch (e2) { console.error('[forge-chat] no se pudo marcar la sesión rota:', e2?.message || e2) }
-            })
+            }))
           imagenesDespachadas.push(key)
         }
       } catch (e) {
         // Que el post-pass falle no puede tumbar la respuesta: el texto ya está guardado
         console.error('[forge-chat] post-pass de imágenes:', e?.message || e)
       }
+    }
+    // Engine v1.10 — A3: el documento diferido se exporta cuando terminan los despachos de este turno (si no hubo
+    // ninguno, enseguida). Sin esperar: la respuesta ya salió.
+    if (difiereDoc && agentMsg?.id) {
+      Promise.allSettled(despachosDoc)
+        .then(() => require('../services/nodo-entero.service').reexportarDocumentoDiferido(db, { project_id, node_id, session_id: session.id, message_id: agentMsg.id }))
+        .catch(e => console.error('[forge-chat] A3 (documento diferido):', e?.message || e))
     }
 
     // Incrementar contador de iteraciones
@@ -5156,6 +5218,8 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
       doc_format: imagenesDespachadas.length ? undefined : (docFormat ?? undefined),
       // Outputs de imagen que se despacharon en segundo plano: el front los consulta por sesión
       images_dispatched: imagenesDespachadas.length ? imagenesDespachadas : undefined,
+      // Engine v1.10 — A2: output_images reescritos por el diff del sobre ({ clave: lista }); el front los pinta ya
+      imagenes_actualizadas: Object.keys(imagenesActualizadas).length ? imagenesActualizadas : undefined,
       // Trazabilidad del ensamble: qué slot se llenó desde qué fuente y cuál pasó por el
       // LLM de pegamento. Sin esto, un documento compuesto por código es una caja negra.
       assembly:   assemblyReport ?? undefined,
@@ -6389,7 +6453,12 @@ router.post('/nodes/:project_node_id/auto-run', async (req, res, next) => {
     for (const key of imageTargets) {
       // La instancia va con la sesión: con fan-out el mismo nodo del catálogo vive en varios
       // lanes, y sin esto el modal del lane B mostraría lo que produjo el lane A.
-      ranImages.push(await executeImageOutput({ project_id, node_id, targetOutputKey: key, member_id, project_node_id }))
+      // Engine v1.10 — A1: si el nodo se aprobó ENTERO, la lista de este output ya está escrita en esa respuesta: se
+      // reusa su sección y no se le vuelve a preguntar al modelo. Otra llamada traía otra lista (otros ids, otro orden) y
+      // las imágenes quedaban nombradas con ella, no con los ítems del documento aprobado.
+      const respuestaPrevia = await require('../services/nodo-entero.service').seccionDelNodoEntero(db, { project_id, node_id, project_node_id, clave: key, outputs: nodeDna?.outputs })
+      if (respuestaPrevia) console.log(`[auto-run] ${key}: se reusa la sección aprobada del nodo entero (${respuestaPrevia.length} chars)`)
+      ranImages.push(await executeImageOutput({ project_id, node_id, targetOutputKey: key, member_id, project_node_id, respuestaPrevia, soloRespuestaPrevia: !!respuestaPrevia }))
     }
 
     // Limpiar is_stale del nodo y propagar stale a descendientes (una sola vez)

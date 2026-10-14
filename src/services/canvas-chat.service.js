@@ -890,7 +890,8 @@ async function resolverImagenesDeItems({ db, projectId, nodeId, sessionId, outKe
       for (const it of (sess?.output_images?.[clave] || [])) {
         const url = it?.variations?.length ? it.variations[it.variations.length - 1]?.url : it?.url
         const src = propios[it?.index]
-        if (url) imagenes.push({ title: it?.name ?? src?.title ?? src ?? '', url })
+        // Engine v1.10 — A1: el id que la imagen guardó al despacharse manda; la posición (`src`) es el respaldo
+        if (url) imagenes.push({ title: it?.id ?? it?.name ?? src?.title ?? src ?? '', url })
       }
     }
 
@@ -931,7 +932,7 @@ async function resolverImagenesDeItems({ db, projectId, nodeId, sessionId, outKe
         const urls = Object.values(sh?.output_images || {}).flat()
           .map(it => ({
             i: it.index,
-            id: it?.name || null,
+            id: it?.id || it?.name || null,
             url: it?.variations?.length ? it.variations[it.variations.length - 1]?.url : it?.url,
           }))
           .filter(x => x.url)

@@ -83,7 +83,7 @@ function urlDe(id, aprobadas, piezasPng) {
  * vacías, desde las imágenes aprobadas por sus pistas; sin pista, por orden. Devuelve [wide, interior, object]
  * con null en lo que no se pudo resolver, y las notas de qué se usó.
  */
-function imagenesDesde({ conceptData, metaImages, piezasPng }) {
+function imagenesDesde({ conceptData, metaImages, piezasPng, png24 = [] }) {
   const aprobadas = Array.isArray(conceptData?.approved_images) ? conceptData.approved_images.filter(x => x && typeof x === 'object' && x.id) : []
   const urls = [null, null, null], notas = [], usados = new Set()
   // 1 · lo que el deck cita
@@ -110,7 +110,35 @@ function imagenesDesde({ conceptData, metaImages, piezasPng }) {
     if (urls[i] || !libres.length) continue
     const x = libres.shift(); urls[i] = x.url; notas.push(`${pos} ← ${x.it.id} (approved image, by order)`)
   }
+  // 4 · Engine v1.10 — B: las png APROBADAS del 2.4 (Visual Convergence) cuando approved_images no cubre los huecos. El
+  //     concept_data del 2.2 se escribe antes de que exista el 2.4, así que su inventario nunca las lista; sin esto el
+  //     deck solo las usaba si el modelo las citaba. Por pista (el id del nombre «… — orient_NN_…») y luego por orden.
+  const libres24 = (Array.isArray(png24) ? png24 : []).filter(p => p?.storage_url && !urls.includes(p.storage_url))
+    .map(p => ({ id: String(p.name || '').split(' — ').pop(), url: p.storage_url }))
+  for (const pos of POSICIONES) {
+    const i = POSICIONES.indexOf(pos)
+    if (urls[i]) continue
+    const j = libres24.findIndex(x => PISTAS[pos].test(x.id.replace(/[_-]+/g, ' ')))
+    if (j >= 0) { urls[i] = libres24[j].url; notas.push(`${pos} ← ${libres24[j].id} (2.4 approved image, by its role)`); libres24.splice(j, 1) }
+  }
+  for (const pos of POSICIONES) {
+    const i = POSICIONES.indexOf(pos)
+    if (urls[i] || !libres24.length) continue
+    const x = libres24.shift(); urls[i] = x.url; notas.push(`${pos} ← ${x.id} (2.4 approved image, by order)`)
+  }
   return { urls, notas, aprobadas: aprobadas.length }
+}
+
+/** Engine v1.10 — B: las png aprobadas del 2.4 del proyecto, de la más nueva a la más vieja. Vacío si no hay base. */
+async function pngsAprobadasDel24(db, projectId) {
+  if (!db || !projectId) return []
+  try {
+    const { data: n } = await db().from('forge_nodes').select('id').eq('node_key', '2.4').maybeSingle()
+    if (!n?.id) return []
+    const { data } = await db().from('forge_assets').select('name, storage_url').eq('project_id', projectId).eq('node_id', n.id)
+      .in('format', ['png', 'image']).eq('status', 'approved').not('storage_url', 'is', null).order('created_at', { ascending: false })
+    return data || []
+  } catch { return [] }
 }
 
 /** Las piezas png del proyecto, para resolver ids sin url. Una lectura; vacío si no hay base. */
@@ -144,9 +172,10 @@ async function completarDeck({ content, images, resolvedInputs, db = null, proje
       if (p) { deck.meta.palette = p; notas.push(`palette from concept_data (${Object.values(p).join(' ')})`) }
     }
   }
-  if (!imgs.length && (cd || deck?.meta?.images)) {
+  if (!imgs.length && (cd || deck?.meta?.images || (db && projectId))) {
     const piezasPng = await piezasPngDe(db, projectId)
-    const r = imagenesDesde({ conceptData: cd, metaImages: deck?.meta?.images, piezasPng })
+    const png24 = await pngsAprobadasDel24(db, projectId)
+    const r = imagenesDesde({ conceptData: cd, metaImages: deck?.meta?.images, piezasPng, png24 })
     if (r.urls.some(Boolean)) {
       // la lista va por posición: una posición sin imagen queda como cadena vacía para no correr las demás
       const ultima = r.urls.map((u, i) => (u ? i : -1)).reduce((a, b) => Math.max(a, b), -1)
@@ -158,4 +187,4 @@ async function completarDeck({ content, images, resolvedInputs, db = null, proje
   return { content: salida, images: imgs, notas }
 }
 
-module.exports = { completarDeck, conceptDataDe, paletaDesde, imagenesDesde, urlDe, POSICIONES }
+module.exports = { completarDeck, conceptDataDe, paletaDesde, imagenesDesde, pngsAprobadasDel24, urlDe, POSICIONES }

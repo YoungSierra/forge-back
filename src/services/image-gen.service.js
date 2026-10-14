@@ -97,7 +97,7 @@ function bloquesEnumerados(texto) {
 // lo describe, no su serialización.
 const OCULTO = new Set(['id', 'key', 'index', 'seed_id', 'uuid', 'gaps_for_downstream'])
 const CABECERA = ['title', 'name', 'one_liner', 'oneLiner', 'summary', 'description', 'label']
-const rotulo = k => String(k).replace(/_/g, ' ').replace(/\w/g, c => c.toUpperCase())
+const rotulo = k => String(k).replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase())
 const plano = v =>
   Array.isArray(v) ? v.filter(x => x != null).map(x => typeof x === 'string' ? x : JSON.stringify(x)).join(' · ')
   : typeof v === 'string' ? v
@@ -1938,10 +1938,38 @@ function idsDeclarados (content, outputKey) {
  * salieron cinco imagenes, emparejar por posicion le pondria a una imagen el nombre del encargo de
  * otra, que es peor que un nombre generico.
  */
-function nombreDeImagen ({ tituloNodo, etiqueta, ids, idx, total }) {
+function nombreDeImagen ({ tituloNodo, etiqueta, ids, idx, total, id = null }) {
+  // Engine v1.10 — A1: la entrada que trae su propio id (guardado al despachar) se nombra por él, sin depender de que
+  // la cuenta coincida: es la identidad del encargo, no una posición.
+  if (typeof id === 'string' && id.trim()) return `${tituloNodo} — ${id.trim()}`
   const base = `${tituloNodo} — ${etiqueta}`
   if (Array.isArray(ids) && ids.length === total && ids[idx]) return `${tituloNodo} — ${ids[idx]}`
   return total > 1 ? `${base} ${idx + 1}` : base
 }
 
-module.exports = { imagenDeInstancia, imageOutputsOf, parseOutputItems, referenciaDelProyecto, imagenDelProyecto, idsDeclarados, nombreDeImagen, sobreDeLaSeccion, tieneEntidades, cleanItemText, generateOneImage, generateDeck, esDeck, paginaDelASG, imagenDeNodoPorTitulo, referenciaDeContexto }
+/**
+ * Engine v1.10 — A1: el id del sobre en cada POSICIÓN, con el mismo filtro que `parseOutputItems` (fuera las referencias a
+ * arte ya existente). A diferencia de `idsDeclarados`, no exige que todas traigan id: la que no lo trae queda en null.
+ */
+function idsPorPosicion (content, outputKey) {
+  const arr = sobreDeLaSeccion(String(content || ''), outputKey)
+  if (!arr) return null
+  return arr.filter(o => !esReferenciaDeArte(o)).map(o => (typeof o?.id === 'string' && o.id.trim()) ? o.id.trim() : null)
+}
+
+/**
+ * Engine v1.10 — A2: el sobre como [{ id, texto }]: el texto es lo que se mandaría a renderizar (`prompt` o, sin él, la
+ * entrada armada sin su razonamiento). Sirve para comparar dos turnos por id. null si no hay sobre.
+ */
+function sobreConIds (content, outputKey) {
+  const arr = sobreDeLaSeccion(String(content || ''), outputKey)
+  if (!arr) return null
+  return arr.filter(o => !esReferenciaDeArte(o)).map(o => {
+    if (typeof o === 'string') return { id: null, texto: o }
+    const id = (typeof o?.id === 'string' && o.id.trim()) ? o.id.trim() : null
+    for (const campo of ['prompt', 'image_prompt']) if (typeof o?.[campo] === 'string' && o[campo].trim()) return { id, texto: o[campo].trim() }
+    return { id, texto: promptDeItem(o) }
+  })
+}
+
+module.exports = { idsPorPosicion, sobreConIds, imagenDeInstancia, imageOutputsOf, parseOutputItems, referenciaDelProyecto, imagenDelProyecto, idsDeclarados, nombreDeImagen, sobreDeLaSeccion, tieneEntidades, cleanItemText, generateOneImage, generateDeck, esDeck, paginaDelASG, imagenDeNodoPorTitulo, referenciaDeContexto }

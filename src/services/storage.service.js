@@ -1,7 +1,7 @@
 const fs = require('fs')
 const path = require('path')
 const { PNG } = require('pngjs')
-const { S3Client, PutObjectCommand, GetObjectCommand, ListObjectsV2Command, DeleteObjectsCommand } = require('@aws-sdk/client-s3')
+const { S3Client, PutObjectCommand, GetObjectCommand, HeadObjectCommand, ListObjectsV2Command, DeleteObjectsCommand } = require('@aws-sdk/client-s3')
 
 const STORAGE_BASE = process.env.STORAGE_PATH || './storage/forge-assets'
 
@@ -125,6 +125,31 @@ async function uploadToStorage(buffer, storagePath, mimeType = 'image/jpeg', buc
   return publicUrl
 }
 
+/**
+ * Engine v1.10 — B: sube el deck y comprueba que se puede leer (HeadObject) antes de devolver su url. Un enlace que daba
+ * 404 en el chat (2.5 de JM, 09-10) no se pudo reproducir después; esto lo descarta en origen: se reintenta el Head con
+ * esperas crecientes, se vuelve a subir UNA vez si sigue sin aparecer, y si aun así no está, falla en vez de entregar un
+ * enlace roto. `opciones.cliente` / `opciones.esperas` existen para las pruebas.
+ */
+async function subirDeck(buffer, storagePath, mimeType, bucketKey = DEFAULT_BUCKET, opciones = {}) {
+  const cfg = BUCKET_CONFIG[bucketKey] || BUCKET_CONFIG[DEFAULT_BUCKET]
+  const client = opciones.cliente || getR2Client()
+  const esperas = opciones.esperas || [300, 800, 1600]
+  const dormir = ms => new Promise(r => setTimeout(r, ms))
+  const subir = () => client.send(new PutObjectCommand({ Bucket: cfg.name, Key: storagePath, Body: buffer, ContentType: mimeType }))
+  const existe = async () => { try { await client.send(new HeadObjectCommand({ Bucket: cfg.name, Key: storagePath })); return true } catch { return false } }
+  await subir()
+  for (let vuelta = 0; vuelta < 2; vuelta++) {
+    for (const ms of esperas) {
+      if (await existe()) return `${cfg.publicUrl}/${storagePath}`
+      await dormir(ms)
+    }
+    if (await existe()) return `${cfg.publicUrl}/${storagePath}`
+    if (vuelta === 0) { console.warn(`[storage] ${storagePath}: no aparece tras subir — se vuelve a subir una vez`); await subir() }
+  }
+  throw new Error(`The deck was uploaded but cannot be read back (${storagePath}); try again`)
+}
+
 async function getFromStorage(storagePath, bucketKey = DEFAULT_BUCKET) {
   const cfg = BUCKET_CONFIG[bucketKey] || BUCKET_CONFIG[DEFAULT_BUCKET]
   const client = getR2Client()
@@ -198,6 +223,7 @@ module.exports = {
   getAssetUrl,
   generatePlaceholderPNG,
   uploadToStorage,
+  subirDeck,
   getFromStorage,
   deleteStorageKeys,
   clearNodeStorage,

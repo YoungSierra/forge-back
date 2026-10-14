@@ -1,5 +1,5 @@
 const PDFDocument        = require('pdfkit')
-const { uploadToStorage } = require('./storage.service')
+const { uploadToStorage, subirDeck } = require('./storage.service')
 
 // ─── Tema del PDF ─────────────────────────────────────────────────────────────
 //
@@ -2373,7 +2373,8 @@ async function docGenPptxCinematic(deck, imageUrls, projectId, tituloMotor = '')
   }
   const slug        = Date.now()
   const storagePath = `projects/${projectId}/tools/deck_${slug}.pptx`
-  const url         = await uploadToStorage(
+  // Engine v1.10 — B: el deck se comprueba (HeadObject, con reintento) antes de entregar su enlace
+  const url         = await subirDeck(
     buffer, storagePath,
     'application/vnd.openxmlformats-officedocument.presentationml.presentation',
   )
@@ -2592,7 +2593,8 @@ async function docGenPptx(title, content, images, projectId, nodeId) {
   const buffer      = await pptx.write({ outputType: 'nodebuffer' })
   const slug        = Date.now()
   const storagePath = `projects/${projectId}/tools/deck_${slug}.pptx`
-  const url         = await uploadToStorage(
+  // Engine v1.10 — B: el deck se comprueba (HeadObject, con reintento) antes de entregar su enlace
+  const url         = await subirDeck(
     buffer, storagePath,
     'application/vnd.openxmlformats-officedocument.presentationml.presentation',
   )
