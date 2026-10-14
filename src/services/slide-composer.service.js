@@ -1283,6 +1283,11 @@ async function paginasDelMaestro({ db, projectId, deck }) {
 
 module.exports = {
   composeDeck, parsearIntake, parsearFills, seccionPorNombre, paginasDelMaestro,
+  // `fillDe` sale de acá porque buscar un rótulo en los fills tolerando diferencias de forma le
+  // hace falta a cualquiera que los lea, no solo al compositor: el Brief del Run de VFX es el
+  // segundo. Reimplementar la tolerancia en el otro lado es como las dos mitades acaban
+  // discrepando sobre si «COLOR USAGE» y «Color usage» son el mismo campo.
+  fillDe,
   // `seccionDeOutput` se exporta porque el problema que resuelve no es del compositor: leer una
   // salida dentro del documento de una corrida entera le hace falta a cualquiera que busque algo
   // por `output_key`. El Laboratory es el segundo que lo necesita.

@@ -115,7 +115,7 @@ async function pendingOutputsForNode(project_id, node_id, isStale, node, project
 
 // ─── Ejecuta UN output de un nodo como sesión per-output auto-aprobada ──────────
 // Núcleo reusable del auto-run. No toca otros outputs ya aprobados (bug A).
-async function executeOneOutput({ project_id, node_id, targetOutputKey, member_id, project_node_id = null }) {
+async function executeOneOutput({ project_id, node_id, targetOutputKey, member_id, project_node_id = null, regenerar = null }) {
   const { buildSystemPrompt, runReActLoop, verificarHermanos } = require('../services/canvas-chat.service')
   const { logExecution } = require('../services/execution-log.service')
 
@@ -145,10 +145,52 @@ async function executeOneOutput({ project_id, node_id, targetOutputKey, member_i
 
   // La instancia viaja con la llamada: sin ella, un nodo que vive en varios lanes no puede saber
   // cuál de los dos es y se queda sin ningún input.
-  let armado, generado
+  let armado, generado, regeneradas = null
   try {
     armado = await buildSystemPrompt(db, { projectId: project_id, nodeId: node_id, sessionId: session.id, userMessage, targetOutputKey, projectNodeId: project_node_id })
-    generado = await runReActLoop({
+    // Engine v1.7 — un output con `batches` en la DNA corre en tandas paralelas (tandas.service); un
+    // output que usa su inventario (`batches.inventory_for`) recibe la lista fija de ids vigente.
+    const T = require('../services/tandas.service')
+    const cfgT = T.configDe(armado.targetOutput)
+    const proveedorT = cfgT ? null : T.proveedorDeInventario(armado.outputDefs, targetOutputKey)
+    if (proveedorT) {
+      const inv = await T.inventarioVigente(db, { project_id, node_id, nodeTitle: armado.node.title, outputDef: proveedorT, cfg: T.configDe(proveedorT) })
+      if (inv && !T.inventarioYaPresente(armado.finalSystemPrompt, inv, T.configDe(proveedorT))) armado.finalSystemPrompt += '\n\n' + T.bloqueParaConsumidor(inv, T.configDe(proveedorT))
+    }
+    // Engine v1.8 — un output `extract` lo arma el motor desde su maestro (hermano), sin llamada al
+    // modelo: Conformance Gate, secciones enteras por número, cabecera fija. Si el Gate falla no hay pieza.
+    const X = require('../services/extraccion.service')
+    const cfgX = X.configExtract(armado.targetOutput)
+    if (cfgX) {
+      const t0x = Date.now()
+      const ctxX = { project_id, node_id, session_id: session.id, member_id, node_key: armado.node.node_key, output_key: targetOutputKey, trigger_type: 'auto_run', from: cfgX.from }
+      let paquete
+      try {
+        const { extractSection } = require('../utils/extract-section')
+        const master = await X.masterDeFila(db, { project_id, node_id, nodeTitle: armado.node.title, outputDefs: armado.outputDefs, from: cfgX.from, extractSection })
+        paquete = X.armarPaquete({ master, cfg: cfgX, label: targetOutputKey })
+      } catch (err) { X.registrar({ logExecution, ctx: ctxX, error: err, duration_ms: Date.now() - t0x }); throw err }
+      X.registrar({ logExecution, ctx: ctxX, paquete, duration_ms: Date.now() - t0x })
+      for (const a of paquete.avisos) console.warn(`[extract] ${targetOutputKey}: ${a}`)
+      generado = { replyText: paquete.texto, allToolCalls: [], docUrl: null, docFormat: null, meta: { provider: 'engine', model: 'extract', tokens_used: null, duration_ms: Date.now() - t0x, finish_reason: 'stop', truncated: false, porExtraccion: true } }
+    } else if (cfgT) {
+      const { callLLM } = require('../services/llm.service')
+      const { llamar, alLlamar } = T.enganche({ callLLM, logExecution, executorStr: armado.executorStr, ctx: { project_id, node_id, session_id: session.id, member_id, node_key: armado.node.node_key, output_key: targetOutputKey, trigger_type: 'auto_run' } })
+      const armadoT = { system: armado.finalSystemPrompt, user: armado.baseUserMsg }
+      // Engine v1.8 — un documento por secciones con grupos `slice_dependent` recibe el alcance del Vertical Slice
+      // (`slice_scope` de la DNA) cuando el proyecto ya lo tiene aprobado; `regenerar: 'slice'` rehace SOLO esos
+      // grupos sobre la pieza aprobada y deja el resto del documento tal cual.
+      const alcance = T.esPorSecciones(cfgT) ? await T.alcanceDelSlice(db, { project_id, cfg: cfgT }) : null
+      let t
+      if (regenerar === 'slice') {
+        const { extractSection } = require('../utils/extract-section')
+        const maestro = await X.masterDeFila(db, { project_id, node_id, nodeTitle: armado.node.title, outputDefs: armado.outputDefs, from: targetOutputKey, extractSection })
+        t = await T.regenerarGruposDelSlice({ cfg: cfgT, armado: armadoT, maestro, llamar, alLlamar, alcance })
+        regeneradas = t.regeneradas
+      } else t = await T.generarEnTandas({ cfg: cfgT, armado: armadoT, llamar, alLlamar, alcance, encabezadosDeInputs: (armado.resolvedInputs || []).map(s => String(s).split('\n')[0]) })
+      for (const a of t.avisos) console.warn(`[tandas] ${targetOutputKey}: ${a}`)
+      generado = { replyText: t.texto, allToolCalls: [], docUrl: null, docFormat: null, meta: { ...t.meta, porTandas: true } }
+    } else generado = await runReActLoop({
       finalSystemPrompt: armado.finalSystemPrompt, baseUserMsg: armado.baseUserMsg, executorStr: armado.executorStr,
       activeTools: armado.activeTools, resolvedInputs: armado.resolvedInputs, visualRefs: armado.visualRefs,
       projectId: project_id, nodeId: node_id, nodeName: armado.node.title,
@@ -180,7 +222,7 @@ async function executeOneOutput({ project_id, node_id, targetOutputKey, member_i
     if (r) console.warn(`[conformidad] ${node.node_key}: ${r.motivo}`)
   }
 
-  try { logExecution({
+  if (!meta?.porTandas && !meta?.porExtraccion) try { logExecution({
     project_id, node_id, session_id: session.id, triggered_by: member_id || null,
     trigger_type: 'auto_run', executor_type: 'llm',
     provider: meta?.provider || null, model: meta?.model || null,
@@ -224,7 +266,7 @@ async function executeOneOutput({ project_id, node_id, targetOutputKey, member_i
     .update({ status: truncado ? 'active' : 'auto_approved', output_asset_id: asset.id, completed_at: new Date().toISOString(), iteration_count: 1 })
     .eq('id', session.id)
 
-  return { output_key: targetOutputKey, session_id: session.id, asset_id: asset.id, reply: replyText, doc_url: docUrl || undefined, doc_format: docFormat || undefined }
+  return { output_key: targetOutputKey, session_id: session.id, asset_id: asset.id, reply: replyText, doc_url: docUrl || undefined, doc_format: docFormat || undefined, ...(regeneradas ? { regenerated: regeneradas } : {}) }
 }
 
 // ─── Outputs de IMAGEN pendientes de un nodo (auto-gen, #8) ────────────────────
@@ -703,7 +745,7 @@ async function pedirSeccionFaltante({ node_id, targetOutputKey, contenido, execu
 // se cosen en el sitio correcto de la respuesta.
 async function recuperarSeccionesFaltantes({ node_id, replyText, outputDefs, executorStr }) {
   const { extractSection } = require('../utils/extract-section')
-  const esTexto = o => typeof o === 'object' && !o.image_gen && o.production !== 'deferred'
+  const esTexto = o => typeof o === 'object' && !o.image_gen && o.production !== 'deferred' && !o.batches && !o.extract
     && o.assembly !== true && !['png', 'image'].includes(String(o.format || '').toLowerCase())
   const claves = outputDefs.map(o => (typeof o === 'object' ? (o.key || o.name) : o)).filter(Boolean)
   const textos = outputDefs.filter(esTexto)
@@ -2554,7 +2596,13 @@ router.post('/nodes/:node_id/accept', async (req, res, next) => {
       await propagateStale(db, project_id, pnId)
     }
 
-    res.json({ success: true, asset_id: asset.id, image_assets_saved: imageAssets.length })
+    // Engine v1.8 — si lo aceptado es el alcance de un documento por secciones (el VS Spec del 3.13 para el ADD),
+    // se regeneran en segundo plano sus desgloses del slice y se reextraen los ADI (disparo-slice.service).
+    const disparo = await require('../services/disparo-slice.service').trasAprobarSalida(db, {
+      project_id, node_key: node.node_key, output_keys: [outputKey], member_id, deps: { executeOneOutput, isBlueprintSealed },
+    })
+
+    res.json({ success: true, asset_id: asset.id, image_assets_saved: imageAssets.length, ...(disparo.length ? { slice_regeneration: disparo } : {}) })
   } catch (err) { next(err) }
 })
 
@@ -3765,10 +3813,10 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
     // Frente 4: gate de crédito ANTES de correr el LLM (bloquea sin gastar)
     if (!(await creditGate(project_id, res, req.auth?.memberId))) return
 
-    // Obtener definición del nodo para componer el prompt y resolver el modelo
+    // Obtener definición del nodo para componer el prompt y resolver el modelo (y `metadata.requires`)
     const { data: node, error: nodeErr } = await db()
       .from('forge_nodes')
-      .select('id, node_key, title, phase, purpose, inputs, outputs, constraints, tools, skills, default_prompt, standalone_prompt, role, executor')
+      .select('id, node_key, title, phase, purpose, inputs, outputs, constraints, tools, skills, default_prompt, standalone_prompt, role, executor, metadata')
       .eq('id', node_id)
       .single()
 
@@ -3794,6 +3842,10 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
       target_output_key = null
     }
     const directContext = node.inputs?.direct_context || ''
+
+    // Engine v1.8 — los requisitos del nodo (`metadata.requires`) se comprueban ANTES de abrir sesión y de pagar:
+    // 409 REQUIREMENTS_NOT_MET con la lista exacta de lo que falta (viaja al front por el manejador global).
+    await require('../services/requisitos.service').verificarRequisitos(db, { project_id, node })
 
     // Un output sin upstream que vive de sus hermanos no abre sesión sin al menos uno aprobado:
     // el 422 (SIBLING_NOT_APPROVED) llega ANTES de crear nada. Ver verificarHermanos.
@@ -4237,7 +4289,7 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
       }
     }
 
-    const finalSystemPrompt = attachmentParts.length
+    let finalSystemPrompt = attachmentParts.length
       ? systemPrompt + '\n\n## Attached references\n' + attachmentParts.join('\n\n')
       : systemPrompt
 
@@ -4257,6 +4309,82 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
     // executor.type indica el tipo de ejecutor (llm, hybrid, comfyui...) — no es el provider
     const executorStr = node.executor?.model || process.env.DEFAULT_MODEL
     if (rastro) { rastro.model = executorStr; rastro.node_key = node.node_key }
+
+    // ── Engine v1.7 — outputs en tandas (tandas.service) ──
+    //   B · foco en el output en tandas, PRIMER turno de la sesión: la generación va en tandas; los
+    //       turnos siguientes (editar lo generado) siguen siendo una llamada, como siempre, y el motor les
+    //       completa los campos que la DNA le encarga (status), igual que al unir tandas.
+    //   C · nodo entero con un output en tandas, EN SERIE: (1) pasada de inventario; (2) la respuesta
+    //       principal, sin esa sección y con el inventario fijo inyectado; (3) las tandas, con los hermanos
+    //       (style_guide, visual_targets) de ESA respuesta; (4) la sección se cose en su sitio. Si la
+    //       principal falla, no se lanza ninguna tanda. Así ui_screens, scene_manifest y los ADI citan los
+    //       mismos ids que los briefs.
+    //   Foco en un consumidor del inventario: recibe la lista fija vigente, salvo que su prompt ya la traiga.
+    //   Engine v1.8 — outputs `extract` (extraccion.service): el motor los arma desde su maestro, sin modelo.
+    //     B · foco: el primer turno extrae; un turno de edición se rechaza (se edita el maestro).
+    //     C · nodo entero: salen del contrato; tras la respuesta principal se extraen de la sección del
+    //         maestro de ESA respuesta y se cosen. Si el Gate falla, aviso y sin sección (como una tanda caída).
+    //   Y un nodo puede tener varios outputs en tandas (por ítems y por secciones): C los lleva en lista.
+    const T = require('../services/tandas.service')
+    const X = require('../services/extraccion.service')
+    let tandasFoco = null, extraccionFoco = null, edicion = null
+    const enteros = []
+    const extraerEnC = !target_output_key ? X.outputsExtract(allOutputDefs) : []
+    {
+      const cfgFoco = targetOutput ? T.configDe(targetOutput) : null
+      const cfgXFoco = targetOutput ? X.configExtract(targetOutput) : null
+      const primerTurno = !(historyMsgs || []).some(m => m.role === 'agent')
+      const enTandas = !target_output_key ? T.outputEnTandas(allOutputDefs) : null
+      const proveedor = targetOutput && !cfgFoco && !cfgXFoco ? T.proveedorDeInventario(allOutputDefs, target_output_key) : null
+      if (cfgXFoco && !primerTurno) {
+        // el texto viaja tal cual al front (index.js → api.ts request → NodeChatWindow setError)
+        const e = new Error('This package is extracted verbatim from the ADD. Edit the Art Direction Document and re-extract.')
+        e.code = 'EXTRACT_NOT_EDITABLE'; e.publico = true; e.status = 400
+        throw e
+      }
+      if (cfgXFoco) {
+        const t0x = Date.now()
+        const ctxX = { project_id, node_id, session_id: session.id, member_id, node_key: node.node_key, output_key: target_output_key, trigger_type: 'chat', from: cfgXFoco.from }
+        try {
+          const { extractSection } = require('../utils/extract-section')
+          const master = await X.masterDeFila(db, { project_id, node_id, nodeTitle: node.title, outputDefs: allOutputDefs, from: cfgXFoco.from, extractSection })
+          extraccionFoco = X.armarPaquete({ master, cfg: cfgXFoco, label: target_output_key })
+        } catch (err) { X.registrar({ logExecution, ctx: ctxX, error: err, duration_ms: Date.now() - t0x }); throw err }
+        X.registrar({ logExecution, ctx: ctxX, paquete: extraccionFoco, duration_ms: Date.now() - t0x })
+      }
+      if (proveedor) {
+        const cfgP = T.configDe(proveedor)
+        const inv = await T.inventarioVigente(db, { project_id, node_id, nodeTitle: node.title, outputDef: proveedor, cfg: cfgP })
+        if (inv && !T.inventarioYaPresente(finalSystemPrompt, inv, cfgP)) finalSystemPrompt += '\n\n' + T.bloqueParaConsumidor(inv, cfgP)
+      }
+      const conLog = output_key => T.enganche({ callLLM, logExecution, executorStr, ctx: { project_id, node_id, session_id: session.id, member_id, node_key: node.node_key, output_key, trigger_type: 'chat' } })
+      if (cfgFoco && primerTurno) {
+        const { llamar, alLlamar } = conLog(target_output_key)
+        const alcance = T.esPorSecciones(cfgFoco) ? await T.alcanceDelSlice(db, { project_id, cfg: cfgFoco }) : null
+        tandasFoco = await T.generarEnTandas({ cfg: cfgFoco, armado: { system: finalSystemPrompt, user: baseUserMsg }, llamar, alLlamar, signal: abortar.signal, alcance, encabezadosDeInputs: resolvedInputs.map(s => String(s).split('\n')[0]) })
+      } else if (cfgFoco) {
+        edicion = cfgFoco
+      } else if (enTandas) for (const def of T.outputsEnTandas(allOutputDefs)) {
+        const clave = def.key || def.name
+        const cfg = T.configDe(def)
+        const { buildSystemPrompt } = require('../services/canvas-chat.service')
+        const armadoT = await buildSystemPrompt(db, { projectId: project_id, nodeId: node_id, sessionId: session.id, userMessage: 'Generate the output for this step', targetOutputKey: clave, projectNodeId: currentPNode?.id || null })
+        const armadoTandas = { system: armadoT.finalSystemPrompt, user: armadoT.baseUserMsg }
+        const encabezados = (armadoT.resolvedInputs || []).map(s => String(s).split('\n')[0])
+        const { llamar, alLlamar } = conLog(clave)
+        if (T.esPorSecciones(cfg)) {
+          // por secciones: la espina va antes de la principal, y la principal la ve
+          const espina = await T.pasadaEspina({ cfg, armado: armadoTandas, llamar, alLlamar, signal: abortar.signal })
+          finalSystemPrompt += '\n\n' + T.bloqueEspina(clave, espina) + '\n\n' + T.notaNodoEnteroSecciones(clave)
+          enteros.push({ clave, cfg, outputDef: def, espina, armadoTandas, llamar, alLlamar, alcance: await T.alcanceDelSlice(db, { project_id, cfg }) })
+        } else {
+          const { items } = await T.pasadaInventario({ cfg, armado: armadoTandas, llamar, alLlamar, signal: abortar.signal, encabezadosDeInputs: encabezados })
+          finalSystemPrompt += '\n\n' + T.bloqueParaConsumidor(items, cfg) + '\n\n' + T.notaNodoEntero(clave, cfg)
+          enteros.push({ clave, cfg, outputDef: def, items, armadoTandas, llamar, alLlamar })
+        }
+      }
+      if (extraerEnC.length) finalSystemPrompt += '\n\n' + X.notaNodoEntero(extraerEnC.map(o => o.key || o.name))
+    }
 
     // El banner refleja lo que el modelo REALMENTE puede llamar en esta corrida. Imprimir la
     // lista del nodo hacía leer el log como si la herramienta estuviera disponible cuando el
@@ -4407,7 +4535,17 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
       : await collectVisualRefs(visualRefs)
     if (visionNota) currentUserMsg += visionNota
 
-    for (let iter = 0; !assemblyReport && iter < MAX_TOOL_ITERS; iter++) {
+    if (tandasFoco) {
+      replyText = tandasFoco.texto
+      meta = { ...tandasFoco.meta, porTandas: true }
+      if (tandasFoco.avisos.length) docWarnings.push(...tandasFoco.avisos)
+    }
+    if (extraccionFoco) {
+      replyText = extraccionFoco.texto
+      meta = { provider: 'engine', model: 'extract', tokens_used: null, duration_ms: 0, finish_reason: 'stop', truncated: false, porExtraccion: true }
+      if (extraccionFoco.avisos.length) docWarnings.push(...extraccionFoco.avisos)
+    }
+    for (let iter = 0; !assemblyReport && !tandasFoco && !extraccionFoco && iter < MAX_TOOL_ITERS; iter++) {
       // Entre iteraciones también: este bucle puede llamar al LLM hasta cinco veces, y sin el
       // corte apretar Stop en la primera igual pagaba las otras cuatro.
       // Se consulta el registro, que es donde deja su marca el Stop explícito; la señal del
@@ -4487,8 +4625,17 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
         + `\n\nAgent: ${replyText}\n\n${toolResultParts.join('\n\n')}\n\nContinue your response using the tool results above.`
     }
 
+    // Engine v1.7 — un turno de edición escribe el output en UNA llamada: los campos del motor (status) se
+    // completan igual que al unir tandas, y lo hecho queda en la fila de este turno.
+    let statusEdicion = null
+    if (edicion && !assemblyReport) {
+      const c = T.completarTexto(replyText, edicion)
+      replyText = c.texto
+      statusEdicion = { ...(c.completados.length ? { status_completados: c.completados.length } : {}), ...(c.corregidos.length ? { status_corregidos: c.corregidos } : {}) }
+    }
+
     // Registrar costo y performance del llamado LLM (no bloqueante, nunca rompe el flujo)
-    try {
+    if (!tandasFoco && !extraccionFoco) try {
       logExecution({
         project_id:   project_id,
         node_id:      node_id,
@@ -4509,7 +4656,7 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
         // ninguna apunta la salida. Así que a la pregunta de si correr enfocado es mejor o peor que
         // correr el nodo entero —que es justo lo que el equipo cree y practica— no se puede
         // responder con datos: no los hay. El Run sí lo apuntaba desde siempre; faltaba este lado.
-        metadata:     { node_key: node.node_key, output_key: target_output_key || null, modo: target_output_key ? 'focus' : 'nodo_entero', iter_count: allToolCalls.length > 0 ? undefined : 1, ...(meta?.finish_reason ? { finish_reason: meta.finish_reason } : {}), ...(meta?.truncated ? { truncated: true } : {}) },
+        metadata:     { node_key: node.node_key, output_key: target_output_key || null, modo: target_output_key ? 'focus' : 'nodo_entero', iter_count: allToolCalls.length > 0 ? undefined : 1, ...(meta?.finish_reason ? { finish_reason: meta.finish_reason } : {}), ...(meta?.truncated ? { truncated: true } : {}), ...(statusEdicion || {}) },
       })
     } catch (logErr) {
       console.error('[forge-chat] logExecution failed (non-fatal):', logErr.message)
@@ -4535,6 +4682,67 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
           replyText = replyText.slice(firstBreak).trimStart()
         }
       }
+    }
+
+    // C · Engine v1.7: la respuesta principal ya terminó bien; ahora las tandas, con los hermanos de esta
+    // misma corrida, y la sección entra en su sitio del documento.
+    const fallidos = new Map()   // outputs en tandas que no salieron en ESTA corrida, con su error
+    for (const entero of enteros) {
+      const { extractSection } = require('../utils/extract-section')
+      try {
+        const h = await T.armadoConHermanosDeLaCorrida(db, { project_id, node_id, nodeTitle: node.title, outputDefs: allOutputDefs, outputDef: entero.outputDef, armado: entero.armadoTandas, replyText, extractSection })
+        if (h.faltan.length) docWarnings.push(`The main reply has no ${h.faltan.join(', ')} section: '${entero.clave}' used the approved version, if any.`)
+        const t = await T.generarEnTandas({ cfg: entero.cfg, armado: h.armado, llamar: entero.llamar, alLlamar: entero.alLlamar, signal: abortar.signal, inventario: entero.items || null, espina: entero.espina || null, alcance: entero.alcance || null })
+        replyText = T.coserSeccion(replyText, entero.clave, t.texto, allOutputDefs, extractSection)
+        if (t.avisos.length) docWarnings.push(...t.avisos)
+      } catch (err) {
+        if (err?.code === 'ABORTED') throw err
+        fallidos.set(entero.clave, err)
+        docWarnings.push(`'${entero.clave}' was not generated: ${err.message}. Run that output again.`)
+        console.warn(`[tandas] ${node.node_key}/${entero.clave}: ${err.message}`)
+        // si el modelo escribió la sección pese a la nota, al menos lleva los campos del motor
+        const propia = extractSection(replyText, entero.clave, allOutputDefs.map(o => o.key || o.name).filter(k => k && k !== entero.clave))
+        if (propia && !T.esPorSecciones(entero.cfg)) {
+          const c = T.completarTexto(propia, entero.cfg)
+          if (c.completados.length || c.corregidos.length) {
+            replyText = T.coserSeccion(replyText, entero.clave, c.texto.trim(), allOutputDefs, extractSection)
+            docWarnings.push(`'${entero.clave}' came from the main reply: status completed in ${c.completados.length} and corrected in ${c.corregidos.length} entries.`)
+          }
+        }
+      }
+    }
+    // Engine v1.8 — los outputs `extract` salen del maestro de ESTA respuesta (su sección). Si el maestro
+    // se generaba en esta corrida y falló, NO se extrae del aprobado anterior (mezclaría versiones): esos
+    // paquetes no se generan y un solo aviso lo dice. Solo cuando el maestro no es de esta corrida se usa la
+    // pieza aprobada. Si el Gate falla, aviso y sin sección: la pieza del nodo entero sigue siendo válida.
+    const sinMaestro = []
+    for (const def of extraerEnC) {
+      const { extractSection } = require('../utils/extract-section')
+      const clave = def.key || def.name, cfgX = X.configExtract(def)
+      if (fallidos.has(cfgX.from)) { sinMaestro.push({ clave, from: cfgX.from, err: fallidos.get(cfgX.from) }); continue }
+      const t0x = Date.now()
+      const ctxX = { project_id, node_id, session_id: session.id, member_id, node_key: node.node_key, output_key: clave, trigger_type: 'chat', from: cfgX.from }
+      try {
+        const otras = allOutputDefs.map(o => o.key || o.name).filter(k => k && k !== cfgX.from)
+        const deEstaCorrida = enteros.some(e => e.clave === cfgX.from)
+        const master = extractSection(replyText, cfgX.from, otras) || (deEstaCorrida ? null : await X.masterDeFila(db, { project_id, node_id, nodeTitle: node.title, outputDefs: allOutputDefs, from: cfgX.from, extractSection }))
+        const paquete = X.armarPaquete({ master, cfg: cfgX, label: clave })
+        X.registrar({ logExecution, ctx: ctxX, paquete, duration_ms: Date.now() - t0x })
+        replyText = T.coserSeccion(replyText, clave, paquete.texto, allOutputDefs, extractSection)
+        if (paquete.avisos.length) docWarnings.push(...paquete.avisos.map(a => `'${clave}': ${a}`))
+      } catch (err) {
+        if (err?.code === 'ABORTED') throw err
+        X.registrar({ logExecution, ctx: ctxX, error: err, duration_ms: Date.now() - t0x })
+        docWarnings.push(`'${clave}' was not extracted: ${err.message}`)
+        console.warn(`[extract] ${node.node_key}/${clave}: ${err.message}`)
+      }
+    }
+    if (sinMaestro.length) {
+      const { from, err } = sinMaestro[0]
+      const grupo = err?.tanda != null ? `group ${err.tanda} failed` : (err?.code || 'failed')
+      const esADD = from === 'art_direction_document' && sinMaestro.every(x => /^ADI_/.test(x.clave))
+      docWarnings.push(esADD ? `ADI packages not generated: this run's ADD is incomplete (${grupo}).` : `${sinMaestro.map(x => x.clave).join(', ')} not generated: this run's ${from} is incomplete (${grupo}).`)
+      console.warn(`[extract] ${node.node_key}: ${sinMaestro.length} packages not generated — ${from} incomplete (${grupo})`)
     }
 
     // Normalizar secciones estructuradas — independiente de cómo las formateó el LLM
@@ -6094,12 +6302,20 @@ router.post('/nodes/:project_node_id/auto-run', async (req, res, next) => {
 
     const node_id = pNode.node_id
 
-    // DNA del nodo — para calcular qué outputs faltan
+    // DNA del nodo — para calcular qué outputs faltan (y `metadata.requires`, los requisitos antes de correr)
     const { data: nodeDna } = await db()
       .from('forge_nodes')
-      .select('id, title, outputs')
+      .select('id, node_key, title, outputs, metadata')
       .eq('id', node_id)
       .single()
+
+    // Engine v1.8 — un nodo con `metadata.requires` no corre (ni gasta) mientras falte algo: 409 público con la
+    // lista exacta. Hoy lo declara el 3.20: VS Spec aprobado, con sus assets nombrados, y los desgloses del ADD escritos.
+    try { await require('../services/requisitos.service').verificarRequisitos(db, { project_id, node: nodeDna }) }
+    catch (err) {
+      if (err?.code === 'REQUIREMENTS_NOT_MET') return res.status(409).json({ success: false, error_code: err.code, error: err.message, missing: err.missing || [] })
+      throw err
+    }
 
     // Targets: un output explícito (re-run manual de un output) o TODOS los pendientes.
     // Bug A: Run nunca rehace outputs ya aprobados — solo corre lo que falta o está stale.
@@ -6184,8 +6400,15 @@ router.post('/nodes/:project_node_id/auto-run', async (req, res, next) => {
 
     await propagateStale(db, project_id, project_node_id)
 
+    // Engine v1.8 — si lo aprobado es el alcance de un documento por secciones (el VS Spec del 3.13 para el ADD),
+    // se regeneran en segundo plano sus desgloses del slice y se reextraen los ADI. Una vez por corrida.
+    const disparo = await require('../services/disparo-slice.service').trasAprobarSalida(db, {
+      project_id, node_key: nodeDna?.node_key, output_keys: ran.map(r => r.output_key), member_id, deps: { executeOneOutput, isBlueprintSealed },
+    })
+
     res.json({
       success:    true,
+      ...(disparo.length ? { slice_regeneration: disparo } : {}),
       ran:        [...ran.map(r => r.output_key), ...ranImages.map(r => r.output_key)],
       sessions:   ran,
       images:     ranImages,  // [{ output_key, session_id, asset_id, images }]
@@ -6195,6 +6418,35 @@ router.post('/nodes/:project_node_id/auto-run', async (req, res, next) => {
       doc_url:    ran[0]?.doc_url,
       doc_format: ran[0]?.doc_format,
     })
+  } catch (err) { next(err) }
+})
+
+// Engine v1.8 — regenera SOLO los grupos `slice_dependent` de un output por secciones (el ADD: §7.3.1, §7.9.1,
+// §7.10.1, §7.11.1) sobre su pieza aprobada, con el Vertical Slice Specification aprobado a la vista, y vuelve a
+// extraer los outputs `extract` que salen de él (los 11 ADI). El resto del documento no se toca. Desde la
+// decisión de dirección de arte del 09-10 esto corre SOLO al aprobar el 3.13 (disparo-slice.service, al final
+// del Accept y del auto-run); la ruta queda como reintento. No marca stale a los descendientes: el slice no
+// cambió, y el 3.13 es descendiente del 3.9. Sin VS Spec aprobado: 422 SLICE_SCOPE_MISSING y no se gasta nada.
+router.post('/nodes/:project_node_id/regenerate-slice', async (req, res, next) => {
+  try {
+    const { id: project_id, project_node_id } = req.params
+    const { member_id } = req.body
+    if (!(await creditGate(project_id, res, req.auth?.memberId))) return
+    const { data: pNode } = await db().from('forge_project_nodes').select('node_id, node_type, blueprint_id').eq('id', project_node_id).eq('removed', false).maybeSingle()
+    if (!pNode || pNode.node_type !== 'forge_node') return res.status(404).json({ success: false, error: 'Project node not found or not a forge_node' })
+    if (await isBlueprintSealed(project_id, pNode.blueprint_id)) {
+      return res.status(423).json({ success: false, error_code: 'gate_sealed', error: 'This step belongs to a sealed phase — re-running is locked after the gate was accepted' })
+    }
+    const node_id = pNode.node_id
+    const { data: nodeDna } = await db().from('forge_nodes').select('id, title, outputs').eq('id', node_id).single()
+    const { regenerarSlice } = require('../services/disparo-slice.service')
+    let r
+    try { r = await regenerarSlice(db, { project_id, project_node_id, node_id, nodeDna, member_id, explicitKey: req.body.target_output_key || null, executeOneOutput }) }
+    catch (err) {
+      if (err?.publico && err.status === 422 && ['NO_SLICE_GROUPS', 'SLICE_SCOPE_MISSING'].includes(err.code)) return res.status(422).json({ success: false, error_code: err.code, error: err.message })
+      throw err
+    }
+    res.json({ success: true, ...r })
   } catch (err) { next(err) }
 })
 
