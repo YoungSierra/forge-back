@@ -136,6 +136,7 @@ const pedidoDe = (pagina, item) => [
 async function instanciarHojas({
   db, project_id, node_id, node_key, output_key, image_gen_model,
   paginas, deck = 'asg', documento = 'Art Style Guide', member_id = null, limite = 0,
+  alAvanzar = null,
 }) {
   const { generateDeck } = require('./image-gen.service')
 
@@ -221,7 +222,15 @@ async function instanciarHojas({
     console.warn(`[instanciar] no se pudo leer el manifiesto: ${e.message}`)
   }
 
+  // Quien llama sabe cuánto va: la corrida dura minutos y el navegador no espera tanto.
+  const avisar = actual => {
+    try { alAvanzar?.({ total: recortado.length, hechas: creados.length + fallos.length, creados, fallos, repetidas, actual }) }
+    catch (e) { console.warn(`[instancias] aviso de avance: ${e.message}`) }
+  }
+  avisar(null)
+
   for (const t of recortado) {
+    avisar(`${t.pagina} · ${t.item?.nombre}`)
     try {
       const fila = filaDe.get(claveDeHoja(t.pagina, t.item?.nombre)) || null
       const instancia = (t.item?.parent_environment_id || fila)
@@ -268,8 +277,83 @@ async function instanciarHojas({
       fallos.push({ ...t, motivo: e.message })
     }
   }
+  avisar(null)
 
   return { creados, fallos, repetidas, pedidos: recortado.length, de: trabajo.length }
 }
 
-module.exports = { planDeInstancias, instanciarHojas, pedidoDe, TOPE_DESPACHOS }
+// ─── La corrida en segundo plano ─────────────────────────────────────────────
+// Producir 21 hojas tarda unos 13 minutos, y el botón esperaba la respuesta con la petición
+// abierta. El 15-10 Migue produjo 21 en Wort: las 21 se pagaron y se publicaron, pero la petición
+// se cortó a mitad de camino, el recuadro dijo «Failed to fetch» y el lienzo no se refrescó. Ahora
+// la ruta responde enseguida con el id de la corrida y el front pregunta cómo va.
+//
+// Vive en memoria a propósito: si el back se reinicia, la corrida muere con él y lo ya hecho
+// queda publicado; al reabrir el recuadro sale tachado y lo que falta se puede continuar.
+const corridas = new Map()          // id → estado
+const MANTENER_MS = 60 * 60 * 1000  // lo terminado se puede seguir consultando una hora
+
+const vista = c => ({
+  id: c.id, project_id: c.project_id, estado: c.estado, total: c.total, hechas: c.hechas,
+  actual: c.actual, creados: c.creados, fallos: c.fallos, repetidas: c.repetidas,
+  pedidos: c.pedidos, de: c.de, error: c.error, empezada: c.empezada, terminada: c.terminada,
+})
+
+/** La que está corriendo en este proyecto, si hay. */
+function corridaEnCurso(project_id) {
+  for (const c of corridas.values()) if (c.project_id === project_id && c.estado === 'corriendo') return vista(c)
+  return null
+}
+
+function corrida(id) {
+  const c = corridas.get(id)
+  return c ? vista(c) : null
+}
+
+/**
+ * Arranca `instanciarHojas` sin esperar a que termine. Resuelve cuando la corrida ya empezó
+ * —pasadas las comprobaciones, así un SIN_PAGINAS o un TOPE siguen llegando como error— o con la
+ * corrida que ya estaba en marcha en el proyecto: dos clics no pagan dos veces.
+ */
+async function lanzarCorrida(args) {
+  const previa = corridaEnCurso(args.project_id)
+  if (previa) return { ...previa, ya_en_curso: true }
+
+  for (const [id, c] of corridas) {
+    if (c.terminada && Date.now() - Date.parse(c.terminada) > MANTENER_MS) corridas.delete(id)
+  }
+
+  const c = {
+    id: require('crypto').randomUUID(), project_id: args.project_id, estado: 'corriendo',
+    total: 0, hechas: 0, actual: null, creados: [], fallos: [], repetidas: [],
+    pedidos: 0, de: 0, error: null, empezada: new Date().toISOString(), terminada: null,
+  }
+  // Se anota YA, antes de las lecturas previas: dos clics seguidos tienen que ver la misma corrida.
+  corridas.set(c.id, c)
+  let empezo, yaEmpezo = false
+  const arranque = new Promise(r => { empezo = () => { yaEmpezo = true; r() } })
+
+  const cuerpo = instanciarHojas({
+    ...args,
+    alAvanzar: a => {
+      Object.assign(c, { total: a.total, hechas: a.hechas, actual: a.actual,
+        creados: [...a.creados], fallos: [...a.fallos], repetidas: [...a.repetidas] })
+      empezo()
+    },
+  }).then(r => {
+    Object.assign(c, { estado: 'terminada', actual: null, creados: r.creados, fallos: r.fallos,
+      repetidas: r.repetidas, pedidos: r.pedidos, de: r.de, hechas: r.creados.length + r.fallos.length,
+      terminada: new Date().toISOString() })
+    console.log(`[instancias] corrida ${c.id} terminada: ${r.creados.length} creadas, ${r.fallos.length} fallos`)
+  }, e => {
+    Object.assign(c, { estado: 'fallida', actual: null, error: e.message, terminada: new Date().toISOString() })
+    // Falló antes de despachar nada (SIN_PAGINAS, TOPE…): es un error de la petición, no una corrida.
+    if (!yaEmpezo) { corridas.delete(c.id); throw e }
+    console.warn(`[instancias] corrida ${c.id} cortada: ${e.message}`)
+  })
+
+  await Promise.race([arranque, cuerpo])
+  return vista(c)
+}
+
+module.exports = { planDeInstancias, instanciarHojas, pedidoDe, TOPE_DESPACHOS, lanzarCorrida, corrida, corridaEnCurso }

@@ -8130,8 +8130,10 @@ router.get('/alcance/estados', async (req, res, next) => {
 // previo tiene que poder enseñar: cada instancia se paga.
 router.get('/alcance/plan', async (req, res, next) => {
   try {
-    const { planDeInstancias } = require('../services/instanciar-hojas.service')
-    res.json({ success: true, ...await planDeInstancias({ db, project_id: req.params.id, deck: req.query.deck || 'asg' }) })
+    const { planDeInstancias, corridaEnCurso } = require('../services/instanciar-hojas.service')
+    // Si ya hay una corrida en marcha, el recuadro se engancha a ella en vez de ofrecer pagar otra.
+    res.json({ success: true, ...await planDeInstancias({ db, project_id: req.params.id, deck: req.query.deck || 'asg' }),
+      corrida: corridaEnCurso(req.params.id) })
   } catch (err) { next(err) }
 })
 
@@ -8139,7 +8141,7 @@ router.get('/alcance/plan', async (req, res, next) => {
 router.post('/alcance/instanciar', async (req, res, next) => {
   try {
     const { id: project_id } = req.params
-    const { instanciarHojas } = require('../services/instanciar-hojas.service')
+    const { lanzarCorrida } = require('../services/instanciar-hojas.service')
 
     // `outputs`, no `dna`: esa columna no existe en `forge_nodes` y la consulta fallaba ENTERA, así
     // que `data` volvía null y el botón contestaba «node 3.20 is not registered» con el nodo
@@ -8157,7 +8159,8 @@ router.post('/alcance/instanciar', async (req, res, next) => {
     const clave = req.body?.output_key || 'asg_content_images'
     const def = (nodo.outputs || []).find(o => (o.key || o.name) === clave)
 
-    const r = await instanciarHojas({
+    // Responde en cuanto la corrida arranca; el avance se pide a GET /alcance/instanciar/:corrida_id.
+    const corrida = await lanzarCorrida({
       db, project_id,
       node_id: nodo.id, node_key: nodo.node_key,
       output_key: clave,
@@ -8168,13 +8171,24 @@ router.post('/alcance/instanciar', async (req, res, next) => {
       member_id: req.body?.member_id || null,
       limite: Number(req.body?.limite) || 0,
     })
-    res.json({ success: true, ...r })
+    res.status(202).json({ success: true, corrida })
   } catch (err) {
     if (['SIN_PAGINAS', 'TOPE'].includes(err.code)) {
       return res.status(400).json({ success: false, code: err.code, error: err.message })
     }
     next(err)
   }
+})
+
+// Cómo va una corrida de instanciar. 404 si no existe: el back se reinició y se la llevó —lo ya
+// hecho quedó publicado y reabrir el recuadro deja seguir con lo que falta—.
+router.get('/alcance/instanciar/:corrida_id', (req, res) => {
+  const { corrida } = require('../services/instanciar-hojas.service')
+  const c = corrida(req.params.corrida_id)
+  if (!c || c.project_id !== req.params.id) {
+    return res.status(404).json({ success: false, code: 'SIN_CORRIDA', error: 'This run is no longer on the server (it was probably restarted). What was finished is published; reopen this window to continue with the rest.' })
+  }
+  res.json({ success: true, corrida: c })
 })
 
 // ─── Sistema de actualización conectada ──────────────────────────────────────
