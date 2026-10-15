@@ -1311,7 +1311,7 @@ async function generateDeck({
   // despachaba el grafo de 25: medido, 0 de los 31 `prompt_node` existen en el otro grafo, así
   // que no se habría escrito ni un prompt y se habrían pagado 25 páginas con el texto de muestra
   // del autor. Las dos mitades existían y nadie las unía.
-  const armado = await composeDeck({ db, projectId: project_id, deck, fills, solo })
+  const armado = await composeDeck({ db, projectId: project_id, deck, fills, solo, campos: instancia?.fields || null })
   const maestro = armado.workflow || wfName
 
   const entry = await getWorkflowByName(maestro)
@@ -1522,8 +1522,10 @@ ${cola}`
         const padre = instancia?.parent_environment_id || null
         if (padre) {
           url = await imagenDeInstancia(db, project_id, 'EnvironmentSheet', padre)
-          if (url) console.log(`[deck] ${p.name}: referencia del entorno padre «${padre}»`)
-          else console.warn(`[deck] ${p.name}: no hay Environment Sheet del padre «${padre}» — se sigue por «${fuente}»`)
+          // Sin la hoja del padre NO se sigue por la fuente: resolvería a la Environment Sheet más
+          // reciente, que es la del vecino. Condición de Miguel (15-10): nunca «la más reciente».
+          if (!url) { sinAncla(`no hay Environment Sheet del entorno padre «${padre}»`); continue }
+          console.log(`[deck] ${p.nombre}: referencia del entorno padre «${padre}»`)
         }
         url = url
            || await imagenDeNodoPorTitulo(db, project_id, fuente)
@@ -1663,6 +1665,28 @@ ${cola}`
             } catch (e) {
               avisosRef.push(`${p.nombre}: no se pudo subir la referencia de Add Context (${e.message})`)
             }
+          }
+
+          // ── La Skybox: el Environment Sheet de SU entorno padre (`resolve`) ───
+          // El maestro de 32 la declara así (`resolve: parent_environment_id`). Resolverla por la
+          // fuente («Environment Sheet») daría la más reciente, que es la del vecino. Sin la hoja
+          // del padre se queda el placeholder del REF —la plantilla de la página, que el prompt
+          // manda ignorar con la regla (b)— y se avisa. Condiciones de Miguel, 15-10.
+          if (h.resolve === 'parent_environment_id') {
+            const padre = instancia?.parent_environment_id || null
+            const delPadre = padre ? await imagenDeInstancia(db, project_id, 'EnvironmentSheet', padre) : null
+            if (!delPadre) {
+              avisosRef.push(`${p.nombre}: ${padre ? `no hay Environment Sheet del entorno padre «${padre}»` : 'sin entorno padre (parent_environment_id)'} — se queda el placeholder`)
+              continue
+            }
+            try {
+              if (!subidas.has(delPadre)) subidas.set(delPadre, await uploadImageToComfyUI(delPadre))
+              wf[h.node].inputs.image = subidas.get(delPadre)
+              console.log(`[deck] ${p.nombre}: referencia del entorno padre «${padre}»`)
+            } catch (e) {
+              avisosRef.push(`${p.nombre}: no se pudo subir la Environment Sheet del padre (${e.message}) — se queda el placeholder`)
+            }
+            continue
           }
 
           const fuente = String(h.source || '').trim()

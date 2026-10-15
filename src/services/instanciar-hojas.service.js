@@ -208,16 +208,38 @@ async function instanciarHojas({
   }
   console.log(`[instanciar] fills ${fills ? `cargados (${fills.length} chars)` : 'no disponibles — se compone del documento'}`)
 
+  // La fila de cada instancia sale del manifiesto, leída AQUÍ y no de lo que mande quien llama: el
+  // plan pasa por el front, y lo que no viaja de vuelta se perdería en silencio.
+  const filaDe = new Map()
+  try {
+    const { itemsDelManifiesto } = require('./manifiesto-hojas.service')
+    const m = await itemsDelManifiesto({ db, project_id })
+    for (const [hoja, items] of Object.entries(m.porHoja || {})) {
+      for (const i of items) if (i.fields || i.host) filaDe.set(claveDeHoja(hoja, i.nombre), { fields: i.fields, host: i.host })
+    }
+  } catch (e) {
+    console.warn(`[instanciar] no se pudo leer el manifiesto: ${e.message}`)
+  }
+
   for (const t of recortado) {
     try {
+      const fila = filaDe.get(claveDeHoja(t.pagina, t.item?.nombre)) || null
+      const instancia = (t.item?.parent_environment_id || fila)
+        ? {
+            ...(t.item?.parent_environment_id ? { parent_environment_id: t.item.parent_environment_id } : {}),
+            ...(fila?.fields ? { fields: fila.fields } : {}),
+            ...(fila?.host ? { host: fila.host } : {}),
+          }
+        : null
       const r = await generateDeck({
         db, project_id, node_id, session_id: null, node_key, output_key,
         image_gen_model, deck, member_id, fills,
         solo: [t.indice],
         extraPrompt: pedidoDe(t.pagina, t.item),
         // El entorno padre viaja como DATO, no dentro del texto del pedido: la Skybox Sheet lo
-        // necesita para elegir la referencia de SU entorno y no la del vecino.
-        instancia: t.item?.parent_environment_id ? { parent_environment_id: t.item.parent_environment_id } : null,
+        // necesita para elegir la referencia de SU entorno y no la del vecino. Igual la fila de la
+        // instancia (`fields`), que el compositor pega campo a campo.
+        instancia,
       })
       const pg = r.paginas?.[0]
       if (!pg?.url) { fallos.push({ ...t, motivo: 'the workflow returned no image' }); continue }

@@ -66,7 +66,7 @@ const DECKS = {
   // siguen todas en el de 31; las 6 nuevas son `04_StyleBoundaryTest`, `05_HeroAssetTargets`,
   // `10_TechnologyRules`, `11_ItemCollectible`, `15_MaterialSurface` y `26_MaterialSurfaceSheet`.
   asg:      { workflow: 'V57_STUDIO_ArtStyleGuide_Template_25',   fuente: '3.9', requerido: true, paginas: 25, documento: 'Art Style Guide',
-              sucesor: { workflow: 'V57_STUDIO_ArtStyleGuide_Template_31', paginas: 31 } },
+              sucesor: { workflow: 'V57_STUDIO_ArtStyleGuide_Template_31', paginas: 32 } },
   gdd:      { workflow: 'V57_STUDIO_Vertical_Slice_GDD_Template', fuente: '3.8', paginas: 21, documento: 'GDD Art Style' },
   // El Art Bible no se llena desde un documento: cada página recibe su página YA APROBADA del ASG
   // y pinta la obra final de ese tema. Por eso no tiene `fuente` — su insumo es una imagen, no
@@ -613,6 +613,20 @@ const claveDeEtiqueta = e => String(e)
   .trim()
   .toUpperCase()
 
+// Las § que cita el rótulo, en orden: las del ÚLTIMO paréntesis que lleve alguna.
+const refsDeEtiqueta = e => {
+  const grupos = [...String(e).matchAll(/\(([^()]*§[^()]*)\)/g)]
+  if (!grupos.length) return []
+  return [...grupos[grupos.length - 1][1].matchAll(/§\s*(\d+(?:\.\d+)*)/g)].map(m => m[1])
+}
+
+// El nombre del campo sin su cita: «FORBIDDEN SHAPES (§0.3)» y «FORBIDDEN SHAPES (§2.4)» son el
+// mismo campo en los dos maestros. Y el de la página sin su número: `22_VFXSheet` ↔ `29_VFXSheet`.
+const sinSufijo = s => normalizar(String(s).replace(/\s*\([^()]*§[^()]*\)\s*$/, '')).replace(/[^a-z0-9]+/g, ' ').trim()
+// Las secciones que son una tabla de N instancias: una fila es de UNA hoja, la sección es de todas.
+const DESGLOSE_POR_INSTANCIA = ['8.1.1', '7.3.1', '7.5.1', '8.4.1']
+const nombrePagina = s => String(s || '').replace(/^\d+_/, '').toLowerCase()
+
 function resolverEtiqueta(etiqueta, mapa, assets, ambito = null) {
   let cands = Object.prototype.hasOwnProperty.call(mapa, etiqueta) ? mapa[etiqueta] : undefined
   let enMapa = cands !== undefined
@@ -632,11 +646,18 @@ function resolverEtiqueta(etiqueta, mapa, assets, ambito = null) {
   // 09-09 contra los documentos vivos, 7 de las 9 § que piden los intakes de Marketing y Audio
   // están publicadas con ese mismo número. Resolverlas por ahí es cobertura sin mantenimiento;
   // mapearlas a mano serían veinte entradas nuevas por cada lámina que Migue exporte.
-  const ref = /\(§\s*([\d.]+)\s*\)/.exec(etiqueta)?.[1]
-  if (!enMapa && ref && !ambito) {
-    for (const a of assets) {
-      const s = seccionPorNumero(a.content, ref)
-      if (s) return { texto: s, via: `§${ref}` }
+  //
+  // El rótulo puede citar más de una § o llevar una glosa en el paréntesis: «(§7.3.1 · §2.5)»,
+  // «(§7.4 / §1.2)», «(§7.2 - leave BLANK if…)». Se prueba cada § en el orden escrito y gana la
+  // primera que el documento publica. Antes solo se leía un «(§x.y)» limpio, y esas etiquetas
+  // —12 del template del 14-10, casi todas de la Skybox— se quedaban vacías sin fill.
+  const refs = refsDeEtiqueta(etiqueta)
+  if (!enMapa && refs.length && !ambito) {
+    for (const ref of refs) {
+      for (const a of assets) {
+        const s = seccionPorNumero(a.content, ref)
+        if (s) return { texto: s, via: `§${ref}` }
+      }
     }
   }
   if (cands === null) return { texto: null, noAplica: true }
@@ -795,9 +816,11 @@ function fillDe(fills, etiqueta) {
  * @param {string}  [o.fills]      texto del output `*_fills` (v2.9.7). Sin esto se extrae del
  *                                 documento fuente, que es el comportamiento anterior.
  * @param {number[]} [o.solo]      índices de página (1-based) a componer — para las dos pasadas
+ * @param {object}  [o.campos]    la fila de UNA instancia de hoja (`fields` del manifiesto, v2.9.57):
+ *                                etiqueta de la página → valor. Manda sobre el fill de plantilla.
  * @returns {Promise<{deck, workflow, paginas, avisos}>}
  */
-async function composeDeck({ db, projectId, deck = 'asg', fills = null, solo = null }) {
+async function composeDeck({ db, projectId, deck = 'asg', fills = null, solo = null, campos = null }) {
   const base = DECKS[deck]
   if (!base) throw new Error(`deck desconocido: ${deck}`)
 
@@ -951,6 +974,43 @@ async function composeDeck({ db, projectId, deck = 'asg', fills = null, solo = n
   const mapa = { gdd: MAPA_GDD, uiux: MAPA_UIUX }[deck] || MAPA_ASG
   const mapaFills = parsearFills(fills)
 
+  // Un proyecto que se quedó en el maestro VIEJO recibe fills escritos con las etiquetas del
+  // sucesor: desde el v2.9.57 la DNA del 3.20 copia la KEY LIST del template de 32. En el `_25`,
+  // 103 de sus 343 campos solo se distinguen de su clave por la cita —«FORBIDDEN SHAPES (§0.3)»
+  // frente a «(§2.4)»— y sin esto caían al respaldo por §, que en el `_25` cita el ADI viejo.
+  //
+  // Se busca DENTRO DE LA MISMA PÁGINA del sucesor y solo si hay exactamente una: fuera de la
+  // página el nombre choca («PRIORITY (§8.5)» del Audio con «PRIORITY (§7.11.1)» del Video).
+  // Medido por Pedro sobre el `_25` registrado: 240 → 343 campos, 0 ambiguos.
+  let delSucesor = null
+  if (mapaFills.size && base.sucesor && !cfg.heredado_de) {
+    const { data: suc } = await db().from('comfyui_workflows')
+      .select('workflow_json,inject_config').eq('name', base.sucesor.workflow).maybeSingle()
+    if (suc) {
+      const wfS = typeof suc.workflow_json === 'string' ? JSON.parse(suc.workflow_json) : suc.workflow_json
+      const icS = typeof suc.inject_config === 'string' ? JSON.parse(suc.inject_config) : suc.inject_config
+      delSucesor = new Map((icS?.pages || []).map(pg => [nombrePagina(pg.name),
+        parsearIntake(wfS?.[pg.prompt_node]?.inputs?.[pg.prompt_field || 'prompt'] || '')?.campos || []]))
+    }
+  }
+  // La fila de la instancia. Sus claves son etiquetas de SU página en el maestro de 32, así que en
+  // el `_25` se emparejan igual: por nombre sin «(§…)», y solo si hay exactamente una. ROLE IN THE
+  // GAME no existe en el `_25`: no casa con nada y no se pega.
+  const mapaCampos = campos && typeof campos === 'object' ? new Map(Object.entries(campos).map(([k, v]) => [k, String(v ?? '')])) : null
+  const campoDe = c => {
+    if (!mapaCampos?.size) return null
+    const exacto = fillDe(mapaCampos, c.etiqueta)
+    if (exacto != null) return exacto
+    const pares = [...mapaCampos.keys()].filter(k => sinSufijo(k) === sinSufijo(c.etiqueta))
+    return pares.length === 1 ? mapaCampos.get(pares[0]) : null
+  }
+  const fillPorNombre = (pagina, c) => {
+    if (!delSucesor) return null
+    const pares = (delSucesor.get(nombrePagina(pagina)) || [])
+      .filter(x => Boolean(x.propia) === Boolean(c.propia) && sinSufijo(x.etiqueta) === sinSufijo(c.etiqueta))
+    return pares.length === 1 ? fillDe(mapaFills, pares[0].etiqueta) : null
+  }
+
   // Control de tamano de los fills: son un limite de la DNA, no una sugerencia. El digest se
   // multiplica por cada pagina, asi que pasarse aca es lo que hace fallar el workflow entero.
   if (mapaFills.size) {
@@ -1019,12 +1079,20 @@ async function composeDeck({ db, projectId, deck = 'asg', fills = null, solo = n
       // Lo que Forge sabe de sí mismo manda sobre el documento: el nombre del proyecto no se
       // busca en el ADI, se sabe.
       const propio = propioDe(c.etiqueta)
-      const desdeFills = fillDe(mapaFills, c.etiqueta) ?? (c.propia ? fillDe(mapaFills, p.name) : null)
+      const desdeInstancia = campoDe(c)
+      const desdeFills = fillDe(mapaFills, c.etiqueta) ?? fillPorNombre(p.name, c)
+        ?? (c.propia ? fillDe(mapaFills, p.name) : null)
       let r = propio != null
         ? { texto: propio, via: 'forge' }
+        : desdeInstancia != null
+          ? { texto: desdeInstancia, via: 'instancia' }
         : desdeFills != null
           ? { texto: desdeFills, via: 'fills' }
-          : resolverEtiqueta(c.etiqueta, mapa, assets, c.ambito)
+          // En una instancia, un campo de su desglose sin fila ni fill se queda en hueco: el respaldo
+          // por § pegaría la tabla ENTERA de §7.5.1 / §8.4.1 en cada instancia (v2.9.57, §0.C).
+          : mapaCampos && refsDeEtiqueta(c.etiqueta).some(x => DESGLOSE_POR_INSTANCIA.includes(x))
+            ? null
+            : resolverEtiqueta(c.etiqueta, mapa, assets, c.ambito)
       // Resuelto por § y ya lo tomó otro campo de esta página: no se repite. Pegar la misma
       // sección cuatro veces infla el prompt sin añadir nada.
       //
@@ -1053,7 +1121,7 @@ async function composeDeck({ db, projectId, deck = 'asg', fills = null, solo = n
           // por el NOMBRE de la misma sección la reconozca.
           if (topeChico && r.texto) seccionesUsadas.set(r.texto, r.via)
         }
-      } else if (topeChico && r?.texto && r.via !== 'forge' && r.via !== 'fills') {
+      } else if (topeChico && r?.texto && !['forge', 'fills', 'instancia'].includes(r.via)) {
         if (seccionesUsadas.has(r.texto)) { repetida = seccionesUsadas.get(r.texto); r = null }
         else seccionesUsadas.set(r.texto, r.via)
       }
@@ -1182,8 +1250,8 @@ async function composeDeck({ db, projectId, deck = 'asg', fills = null, solo = n
         if (hit !== undefined) c = mapa[hit]
       }
       if (Array.isArray(c) && c.length) return c.flat().map(x => (typeof x === 'object' ? x.seccion : x))
-      const ref = /\(§\s*([\d.]+)/.exec(et)?.[1]
-      return ref ? [`§${ref}`] : [et]
+      const refs = refsDeEtiqueta(et)
+      return refs.length ? refs.map(r => `§${r}`) : [et]
     }
     const enBlanco = vivas.filter(p =>
       p.faltantes.length && !p.llenos.some(l => l.chars != null && l.via !== 'forge'))

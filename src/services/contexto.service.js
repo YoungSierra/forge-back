@@ -40,11 +40,15 @@ const ADI_DE_PAGINA = {
   '15_VideoMarketing':        '§7.11 Marketing Video Direction',
   '16_UILanguage':            '§6.3 UI Visual Direction · §8.3 UI Asset Breakdown',
   '17_AssetSheets':           '§8 Asset Breakdown (overview)',
-  '18_CharacterSheet':        '§8.1 Character Asset Breakdown (consume §7.2)',
+  // 14-10 (§5 del sistema, v2.9.57): la Character lee primero su fila del Roster; la Prop deja §8.1 /
+  // §8.5 por §8.2; la VFX, la tabla por efecto; y Skybox y Material & Surface tienen su página.
+  '18_CharacterSheet':        '§8.1.1 Character Roster · §8.1 Character Asset Breakdown (consume §7.2)',
   '19_EnvironmentSheet':      '§8.2 Environment Asset Breakdown (consume §7.3)',
-  '20_PropSheet':             '§8.1 / §8.5 (consume §7.7; material §7.5)',
+  '25_SkyboxSheet':           '§7.3.1 Skybox Breakdown (consume §7.3)',
+  '20_PropSheet':             '§8.2 Environment Asset Breakdown (consume §7.7; material §7.5)',
+  '27_MaterialSurfaceSheet':  '§7.5.1 Material Breakdown (consume §7.5)',
   '21_UIComponentSheet':      '§8.3 UI Asset Breakdown (consume §6.3)',
-  '22_VFXSheet':              '§8.4 VFX Breakdown (consume §7.6)',
+  '22_VFXSheet':              '§8.4.1 VFX Breakdown — per effect (consume §8.4 · §7.6)',
   '23_AudioSheet':            '§7.10.1 Audio Asset Breakdown (consume §7.10)',
   '24_AnimationSheet':        '§7.9.1 Animation Asset Breakdown (consume §7.9)',
   '25_VideoMarketingSheet':   '§7.11.1 Marketing Video Breakdown (consume §7.11)',

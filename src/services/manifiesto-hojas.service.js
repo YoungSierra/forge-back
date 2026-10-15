@@ -130,6 +130,12 @@ async function itemsDelManifiesto({ db, project_id }) {
         // El entorno que esta instancia rodea. Solo lo traen las Skybox Sheets, y lo emite el
         // 3.20 desde el VS Spec y environments_x4. Sin el, la referencia cae en la mas reciente.
         parent_environment_id: inst?.parent_environment_id ?? null,
+        // La fila de ESTA instancia, por etiqueta de su página (v2.9.57): Character, Skybox,
+        // Material & Surface y VFX. El compositor la pega encima del fill de plantilla; sin esto
+        // todas las instancias de una hoja salían con el mismo texto.
+        fields: inst?.fields && typeof inst.fields === 'object' && !Array.isArray(inst.fields) ? inst.fields : null,
+        // Contexto, no campo de la página: dónde se ve el efecto (lo lee el Brief de la VFX).
+        host: inst?.host ?? null,
       })
     }
     if (items.length) porHoja[hoja] = items

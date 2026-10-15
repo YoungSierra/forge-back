@@ -20,9 +20,10 @@
 // Lo que sigue en blanco es la regla de Miguel —«deja un campo en blanco si la hoja no lo tiene,
 // no inventes valores»— y por eso el Brief sale editable en la ventana de Run.
 //
-// OJO (Pedro, 13-oct): `asg_fills` trae un bloque por PÁGINA, no por efecto. Lo que se lee aquí
-// describe la VFX Sheet en general y es igual para todas las instancias; el dato por efecto
-// llegará por la DNA.
+// Por EFECTO desde el v2.9.57: el `sheet_instance_manifest` da a cada instancia vfx_NN su fila de
+// §8.4.1 (`fields`, por etiqueta de la página) y su `host`. La fila manda; los `asg_fills` —un
+// bloque por PÁGINA, igual para todas las instancias (Pedro, 13-oct)— quedan de respaldo para lo
+// que la fila no trae. Sin manifiesto, o sin esa instancia en él, se lee solo de los fills.
 
 const { parsearFills, fillDe } = require('./slide-composer.service')
 
@@ -51,8 +52,9 @@ const CICLO = [
   { rotulo: 'DISSIPATE keyframe', parte: 'DISSIPATE' },
 ]
 
-// Nunca se rellena: no está en los fills y Miguel pidió explícitamente dejarlo vacío antes que
-// deducirlo. Un host inventado es justo lo que el workflow tiene prohibido dibujar.
+// Sale SOLO del `host` de la instancia en el manifiesto, copiado de §8.4.1. Nunca de los fills ni
+// deducido: Miguel pidió vacío antes que inventado, y un host inventado es justo lo que el
+// workflow tiene prohibido dibujar.
 const HOST = 'HOST ASSET (… CONTEXT ONLY, NEVER RENDER IT)'
 
 // La hoja en el prompt de `asg_fills` del 3.20: `[28_VFXSheet]`, `[29_VFXSheet]`… por su nombre.
@@ -111,7 +113,8 @@ function tramoDelCiclo(texto, parte) {
   if (!t.trim()) return ''
   const rx = new RegExp(`\\b${parte}\\b\\s*[:：—-]?\\s*([\\s\\S]*?)(?=\\b(?:START|PEAK|DISSIPATE)\\b\\s*[:：—-]|$)`, 'i')
   const m = rx.exec(t)
-  return m ? m[1].trim().replace(/\s+/g, ' ') : ''
+  // Sin el separador que queda colgando: «START: glow / PEAK: …» daba «glow /».
+  return m ? m[1].trim().replace(/\s*[/·;,|]\s*$/, '').replace(/\s+/g, ' ') : ''
 }
 
 /**
@@ -155,11 +158,39 @@ async function briefDeInstancia({ db, project_id, item, asset = null }) {
       avisos: ['This project has no asg_fills yet: run the Art Style Guide first.'] }
   }
 
+  // La fila de ESTA instancia, del manifiesto. Se busca por el nombre del ítem dentro de la VFX
+  // Sheet, sin número de página: es 22 en el maestro de 25 y 29 en el de 32.
+  let instancia = null
+  if (item) {
+    try {
+      const { itemsDelManifiesto, sinNumero } = require('./manifiesto-hojas.service')
+      const m = await itemsDelManifiesto({ db, project_id })
+      const norm = s => String(s || '').trim().toLowerCase()
+      for (const [hoja, items] of Object.entries(m.porHoja || {})) {
+        if (sinNumero(hoja) !== sinNumero(PAGINA)) continue
+        instancia = items.find(i => norm(i.nombre) === norm(item) || norm(i.instancia_id) === norm(item)) || null
+        if (instancia) break
+      }
+    } catch (e) {
+      avisos.push(`could not read the sheet instance manifest: ${e.message}`)
+    }
+  }
+  const fila = instancia?.fields
+    ? new Map(Object.entries(instancia.fields).map(([k, v]) => [k, String(v ?? '').trim()]))
+    : null
+  if (item && !fila) avisos.push(`The manifest has no row for "${item}": the Brief comes from the sheet's common fills.`)
+
   const fills = parsearFills(doc.content)
   const rotulos = rotulosDePagina(nodo.outputs, PAGINA)
   if (!rotulos.length) avisos.push(`node 3.20 does not list the ${PAGINA} labels: searched by name`)
   // Con los rótulos de la página, solo entre ellos; sin ellos, por nombre, como antes.
   const buscar = nombre => {
+    // Primero la fila de la instancia: sus claves SON las etiquetas de la página, así que el
+    // nombre corto casa igual que contra los rótulos de la DNA.
+    if (fila) {
+      const r = rotuloDe([...fila.keys()], nombre)
+      if (r && fila.get(r)) return fila.get(r)
+    }
     if (!rotulos.length) return fillDe(fills, nombre)
     const r = rotuloDe(rotulos, nombre)
     return r ? valorDe(fills, r) : null
@@ -176,10 +207,10 @@ async function briefDeInstancia({ db, project_id, item, asset = null }) {
 
   const ciclo = buscar('LIFECYCLE') || ''
   for (const c of CICLO) campos[c.rotulo] = tramoDelCiclo(ciclo, c.parte)
-  campos[HOST] = ''
+  campos[HOST] = String(instancia?.host ?? '').trim()
 
   const vacios = Object.entries(campos).filter(([k, v]) => k !== HOST && !v).map(([k]) => k)
-  if (vacios.length === Object.keys(campos).length - 1) {
+  if (vacios.length === Object.keys(campos).filter(k => k !== HOST).length) {
     avisos.push('The asg_fills do not carry the VFX Sheet fields yet: fill the Brief by hand.')
   } else if (vacios.length) {
     avisos.push(`Empty in the sheet: ${vacios.join(', ')}`)
@@ -244,6 +275,7 @@ async function briefDeInstancia({ db, project_id, item, asset = null }) {
     editado: !!guardado,
     campos, avisos, ediciones_posteriores: edicionesPosteriores,
     item: item || null, fuente: doc.name,
+    instancia_id: instancia?.instancia_id ?? null,
   }
 }
 
