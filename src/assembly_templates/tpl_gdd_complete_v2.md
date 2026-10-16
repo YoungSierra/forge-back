@@ -8,7 +8,7 @@
 
 {{slot:s0.executive_summary}}
 
-> **THE REAL NUMBERS RULE.** Every quantity, duration, cost, damage value, drop rate, cooldown or progression rate carries a number and a unit. **BANNED WORDS at gate:** fun · epic · amazing · revolutionary · unique (as a claim) · AAA-quality (without a spec) · AI-driven (without the system) · innovative (without the innovation) · TBD · TBC · TK · ???
+> **THE REAL NUMBERS RULE.** Every quantity, duration, cost, damage value, drop rate, cooldown or progression rate carries a number and a unit. **METRIC UNITS.** Every physical dimension, distance, speed, acceleration, mass or size is metric (m, cm, m/s, m/s², kg), as the transcribed sections carry it; UI and HUD in px at the reference resolution, textures in px, audio in dB and seconds, time in s or ms, angles in degrees. **BANNED WORDS at gate:** fun · epic · amazing · revolutionary · unique (as a claim) · AAA-quality (without a spec) · AI-driven (without the system) · innovative (without the innovation) · TBD · TBC · TK · ???
 
 ## 1 Game Identity
 **Title:** {{slot:s1.title}}
