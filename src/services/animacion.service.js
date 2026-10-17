@@ -38,6 +38,13 @@ const MODELO = process.env.ANIM_CLIPS_MODEL || 'anthropic:claude-sonnet-4-6'
 // que nadie lo haya pedido. Si el documento declara más, se dicen y se recortan.
 const TOPE_CLIPS = 8
 
+// Cuando la lista sale del Vertical Slice Specification el tope de 8 no aplica: esa lista ya es
+// la enumeración por nombre que certifica el 3.13, y desde la v2.9.58 es el set COMPLETO de cada
+// personaje del slice (lo pidió JuanK; rig y lista de clips finales). Con el 8, Cartón en v.09
+// perdía 4 de sus 12 sin que la interfaz lo dijera. Queda un techo alto igual, porque el Run de
+// la cadena despacha sin pasar por el recuadro: un VS Spec raro no puede volverse cien despachos.
+const TECHO_CLIPS_VS = 30
+
 const SKILL_BEATS = 'cascadeur_movement_choreography'
 
 /** El texto de `ADI_11.6_AnimationProduction` de este proyecto, o null. */
@@ -331,9 +338,9 @@ async function clipsDelPersonaje({ db, project_id, desde = null, refrescar = fal
       // de prompts y el pack, y quitarlo obligaría a tocar los dos sin que nadie gane nada.
       const clips = clipsDeLaTabla(vs, personaje, personajes, false)
       if (clips?.length) {
-        const descartados = clips.length > TOPE_CLIPS ? clips.slice(TOPE_CLIPS).map(c => c.nombre) : []
+        const descartados = clips.length > TECHO_CLIPS_VS ? clips.slice(TECHO_CLIPS_VS).map(c => c.nombre) : []
         return {
-          clips: clips.slice(0, TOPE_CLIPS), descartados, de_cache: false,
+          clips: clips.slice(0, TECHO_CLIPS_VS), descartados, de_cache: false,
           fuente: 'vertical_slice', personaje,
         }
       }

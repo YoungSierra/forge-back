@@ -7053,7 +7053,7 @@ router.get('/assets/:asset_id/next-step', async (req, res, next) => {
     // Las animaciones que se van a producir, para poder ELEGIRLAS antes de correr (informe de
     // JuanK, punto 1). Salen del caché: leerlas del ADI cuesta una llamada al modelo y abrir un
     // recuadro no puede gastar. Si todavía no se leyeron nunca, se dice y el Run las lee al correr.
-    let clips = null
+    let clips = null, clipsDescartados = []
     // Por si el paso enumera clips, no por su nombre: el paso pasó de 'pose_sheet' a
     // 'animation_ref' cuando los videos reemplazaron a las láminas, y atarlo al nombre viejo
     // dejaba el recuadro sin lista que elegir, en silencio.
@@ -7074,6 +7074,8 @@ router.get('/assets/:asset_id/next-step', async (req, res, next) => {
         .catch(() => null)
       if (r?.clips?.length) { clips = r.clips.map(c => ({ nombre: c.nombre, etiqueta: c.etiqueta || c.nombre })); despachos = clips.length }
       else clips = []
+      // Lo que el documento nombra y el tope deja fuera. Antes solo lo decía el log del servidor.
+      clipsDescartados = r?.descartados || []
     }
 
     // ¿Esta cadena ya avanzó en el proyecto?
@@ -7121,7 +7123,7 @@ router.get('/assets/:asset_id/next-step', async (req, res, next) => {
     // creyendo que su hoja no tiene workflow, y lo tiene.
     res.json({
       success: true,
-      paso: paso ? { ...paso, despachos, ...(clips ? { clips } : {}) } : null,
+      paso: paso ? { ...paso, despachos, ...(clips ? { clips, clips_descartados: clipsDescartados } : {}) } : null,
       ...(continuar ? { continuar } : {}),
       ...(paso ? {} : { cadenas: etiquetasDeCadenas() }),
     })
@@ -7216,7 +7218,7 @@ router.post('/assets/:asset_id/prompts-de-clips', async (req, res, next) => {
       }
     }
 
-    res.json({ success: true, personaje, fuente: r.fuente || 'adi', clips: salida })
+    res.json({ success: true, personaje, fuente: r.fuente || 'adi', clips: salida, descartados: r.descartados || [] })
   } catch (err) { next(err) }
 })
 
