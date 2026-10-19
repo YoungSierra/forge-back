@@ -318,6 +318,10 @@ const CADENAS = {
         porque: 'This is the texture set Unity imports — the base color plus the maps that give it relief and finish.',
         entradas: { image: 'base:base_color' },
         archivos: { normal: 'Normal', ao: 'AO', height: 'Height', metallic_smoothness: 'MetallicSmoothness' },
+        // MetallicSmoothness es un RGBA (RGB = metal, A = suavidad) y un navegador lo pinta
+        // compuesto: no se ve ninguno de los dos. La tarjeta los muestra por separado (§4 del
+        // handoff), así que se guardan dos vistas aparte. El archivo para Unity no se toca.
+        canales: ['metallic_smoothness'],
       },
     ],
   },
@@ -487,6 +491,24 @@ function proximoPaso(asset) {
       etiqueta: q.etiqueta,
       estado: j < i ? 'hecho' : j === i ? 'siguiente' : 'despues',
     })),
+  }
+}
+
+// Las dos mitades de un PNG empaquetado, como vistas: el RGB opaco y el alfa en grises. Van a una
+// subcarpeta `vistas/` para no mezclarse con los archivos que se importan en Unity.
+async function separarCanales(url, carpeta, nombre) {
+  const { PNG } = require('pngjs')
+  const { uploadToStorage } = require('./storage.service')
+  const png = PNG.sync.read(Buffer.from(await (await fetch(url)).arrayBuffer()))
+  const rgb = new PNG({ width: png.width, height: png.height })
+  const alfa = new PNG({ width: png.width, height: png.height })
+  for (let i = 0; i < png.data.length; i += 4) {
+    rgb.data[i] = png.data[i]; rgb.data[i + 1] = png.data[i + 1]; rgb.data[i + 2] = png.data[i + 2]; rgb.data[i + 3] = 255
+    alfa.data[i] = alfa.data[i + 1] = alfa.data[i + 2] = png.data[i + 3]; alfa.data[i + 3] = 255
+  }
+  return {
+    rgb_url:  await uploadToStorage(PNG.sync.write(rgb),  `${carpeta}/vistas/${nombre}_RGB.png`, 'image/png'),
+    alfa_url: await uploadToStorage(PNG.sync.write(alfa), `${carpeta}/vistas/${nombre}_A.png`,   'image/png'),
   }
 }
 
@@ -1030,6 +1052,14 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
           if (roles && !roles[nodo]) continue
           porRol[roles?.[nodo] || nodo] = sal
         }
+        // Las vistas por canal. Si fallan se sigue: el mapa ya está guardado y pagado, y la
+        // tarjeta cae a enseñarlo entero.
+        for (const rol of paso.canales || []) {
+          if (!porRol[rol]?.url) continue
+          try {
+            porRol[rol] = { ...porRol[rol], ...(await separarCanales(porRol[rol].url, base, `${idDeArchivo}_${paso.archivos?.[rol] || rol}`)) }
+          } catch (e) { console.warn(`[cadena] no se pudieron separar los canales de ${rol}: ${e.message}`) }
+        }
       }
 
       if (!Object.keys(porRol).length) {
@@ -1119,6 +1149,7 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
             // del 3D dice de que pose salio, que es lo que necesita saber quien lo rigea.
             ...(poseDeLaPieza ? { pose: poseDeLaPieza } : {}),
             ...(archivo ? { tile_id: idDeArchivo, archivo } : {}),
+            ...(sal.rgb_url ? { canales: { rgb: sal.rgb_url, alfa: sal.alfa_url } } : {}),
           },
         }).select('id, name, storage_url, format, metadata').single()
         if (error) throw error

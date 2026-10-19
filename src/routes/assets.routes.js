@@ -415,6 +415,13 @@ router.get('/project-assets', async (req, res, next) => {
       // Si es una textura tileable (cadena de Tile Textures, ASG p.34): la tarjeta ofrece verla en
       // mosaico 3×3 para revisar las costuras antes de pagar el paso de los mapas (Migue, 19-10).
       mosaico:     a.metadata?.cadena?.nombre === 'tile_textures' ? true : undefined,
+      // Los mapas PBR de una misma corrida se ven en UNA tarjeta (§4 del handoff): viaja el job que
+      // los agrupa, qué mapa es cada uno y, para el empaquetado, sus dos canales por separado.
+      ...(a.metadata?.cadena?.nombre === 'tile_textures' && a.metadata?.cadena?.paso === 'pbr' ? {
+        mapas_de: a.metadata?.job ?? null,
+        mapa:     a.metadata?.cadena?.rol ?? null,
+        canales:  a.metadata?.canales ?? null,
+      } : {}),
       // Los renders del nivel montado. Viajan porque el visor los enseña como galería debajo del
       // modelo —«el visualizador 3D abre el .glb y las imágenes quedan como galería del nivel»,
       // documento de JuanK del 18-09— y sin esto el front tendría que pedir la pieza otra vez
