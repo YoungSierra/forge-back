@@ -412,6 +412,9 @@ router.get('/project-assets', async (req, res, next) => {
       // también es imagen, así que sin esto no hay forma de distinguir una hoja del deck de algo
       // que salió de un paso de producción — y son cosas distintas para iterar.
       de_cadena:   a.metadata?.cadena ? true : false,
+      // Si es una textura tileable (cadena de Tile Textures, ASG p.34): la tarjeta ofrece verla en
+      // mosaico 3×3 para revisar las costuras antes de pagar el paso de los mapas (Migue, 19-10).
+      mosaico:     a.metadata?.cadena?.nombre === 'tile_textures' ? true : undefined,
       // Los renders del nivel montado. Viajan porque el visor los enseña como galería debajo del
       // modelo —«el visualizador 3D abre el .glb y las imágenes quedan como galería del nivel»,
       // documento de JuanK del 18-09— y sin esto el front tendría que pedir la pieza otra vez
