@@ -328,7 +328,12 @@ async function downloadOutput(promptId, storagePath) {
 //
 // Devuelve { [nodo]: { url, kind, size_bytes } }. El nodo es la clave porque es lo único estable:
 // el `filename_prefix` puede repetirse y el orden no se puede pedir.
-async function downloadOutputsByNode(promptId, basePath) {
+//
+// `nombres` ({ [nodo]: nombre }) es opcional y nombra el archivo de un nodo dentro de `basePath`
+// como carpeta: la cadena de Tile Textures entrega `<TILE_ID>_BaseColor`, `<TILE_ID>_Normal`… porque
+// así los espera la carpeta del proyecto en Unity (handoff de Migue, 19-10). El `filename_prefix`
+// del SaveImage no se toca: el archivo que importa es el que queda en el almacenamiento.
+async function downloadOutputsByNode(promptId, basePath, nombres = null) {
   const histRes = await fetch(`${BASE_URL()}/api/jobs/${promptId}`, { headers: headers() })
   if (!histRes.ok) throw new Error(`ComfyUI jobs fetch failed: ${histRes.status}`)
 
@@ -373,7 +378,8 @@ async function downloadOutputsByNode(promptId, basePath) {
       // downloadOutput. Un GLB chico sí puede ser válido, así que el piso es solo para imágenes.
       if (!es3D && !esFbx && !esVideo && buffer.length < 1000) continue
 
-      const url = await uploadToStorage(buffer, `${basePath}_${nodo}${ext}`, mime)
+      const ruta = nombres?.[nodo] ? `${basePath}/${nombres[nodo]}${ext}` : `${basePath}_${nodo}${ext}`
+      const url = await uploadToStorage(buffer, ruta, mime)
       porNodo[nodo] = { url, kind: es3D ? 'model' : esFbx ? 'fbx' : esVideo ? 'video' : 'image', size_bytes: buffer.length }
       console.log(`[ComfyUI] salida ${nodo} → ${url} (${Math.round(buffer.length / 1024)}kb) job:${promptId}`)
       break

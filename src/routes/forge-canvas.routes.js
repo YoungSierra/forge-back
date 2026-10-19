@@ -7054,7 +7054,8 @@ router.get('/assets/:asset_id/next-step', async (req, res, next) => {
     // Cuántos despachos son. Un paso normal es uno; uno que corre por cada salida del anterior son
     // tantos como partes haya producido — veinte, en el escenario. El recuadro tiene que poder
     // decirlo ANTES, porque cada despacho es pago y no se repite.
-    let despachos = paso ? 1 : 0
+    // Un Run pendiente (Level Design, sin workflow todavía) no despacha nada.
+    let despachos = paso && !paso.pendiente ? 1 : 0
     if (paso?.por_cada_salida_de) {
       const { data: hermanas } = await db().from('forge_assets')
         .select('metadata')
@@ -7355,7 +7356,7 @@ router.post('/assets/:asset_id/advance', async (req, res, next) => {
     // resuelve el problema ya redactado y a dos líneas de la pantalla.
     //
     // Lo reportó Migue Amez el 18-09 sobre la Animation Sheet de test_smack_migue_v.09.
-    const DEL_PROYECTO = ['SIN_CADENA', 'SIN_ANCLA', 'ANCLA_AMBIGUA', 'SIN_ADI', 'SIN_CLIPS', 'SIN_DESCRIPCION_VFX']
+    const DEL_PROYECTO = ['SIN_CADENA', 'SIN_ANCLA', 'ANCLA_AMBIGUA', 'SIN_ADI', 'SIN_CLIPS', 'SIN_DESCRIPCION_VFX', 'RUN_PENDIENTE']
     if (DEL_PROYECTO.includes(err.code)) {
       return res.status(400).json({ success: false, error: err.message, code: err.code })
     }

@@ -75,6 +75,9 @@ async function planDeInstancias({ db, project_id, deck = 'asg' }) {
       // Se conserva, no se recorta: es lo que la Skybox Sheet usa para elegir la referencia de su
       // entorno padre, y si el plan lo tira acá ya no hay de dónde recuperarlo al despachar.
       ...(i.parent_environment_id ? { parent_environment_id: i.parent_environment_id } : {}),
+      // El id estable de la instancia (`TT-01`, `LVL-02`…). La cadena de Tile Textures nombra con él
+      // los mapas que produce —`<TILE_ID>_BaseColor`—, y el título no sirve: lleva espacios y cambia.
+      ...(i.instancia_id ? { instancia_id: i.instancia_id } : {}),
       hecha: yaHay.has(claveDeHoja(hoja, i.nombre)),
     }))
     paginas.push({
@@ -267,7 +270,7 @@ async function instanciarHojas({
         name: `${documento} — ${t.pagina} — ${t.item.nombre}`,
         format: 'png', mime_type: 'image/png', storage_url: pg.url,
         status: 'approved', approved_by: member_id, approved_at: new Date().toISOString(),
-        metadata: { instancia: { pagina: t.pagina, item: t.item.nombre, de: t.item.de || null, job: r.jobId || null } },
+        metadata: { instancia: { pagina: t.pagina, item: t.item.nombre, de: t.item.de || null, job: r.jobId || null, ...(t.item.instancia_id ? { id: t.item.instancia_id } : {}) } },
       }).select('id, name, storage_url').single()
 
       creados.push(activo || { name: `${documento} — ${t.pagina} — ${t.item.nombre}`, storage_url: pg.url })

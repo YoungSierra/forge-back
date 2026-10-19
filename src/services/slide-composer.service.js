@@ -624,7 +624,8 @@ const refsDeEtiqueta = e => {
 // mismo campo en los dos maestros. Y el de la página sin su número: `22_VFXSheet` ↔ `29_VFXSheet`.
 const sinSufijo = s => normalizar(String(s).replace(/\s*\([^()]*§[^()]*\)\s*$/, '')).replace(/[^a-z0-9]+/g, ' ').trim()
 // Las secciones que son una tabla de N instancias: una fila es de UNA hoja, la sección es de todas.
-const DESGLOSE_POR_INSTANCIA = ['8.1.1', '7.3.1', '7.5.1', '8.4.1']
+// §7.3.2 y §7.5.2 entran el 19-10 con las hojas de Level Design y Tile Textures (ASG de 34).
+const DESGLOSE_POR_INSTANCIA = ['8.1.1', '7.3.1', '7.3.2', '7.5.1', '7.5.2', '8.4.1']
 const nombrePagina = s => String(s || '').replace(/^\d+_/, '').toLowerCase()
 
 function resolverEtiqueta(etiqueta, mapa, assets, ambito = null) {

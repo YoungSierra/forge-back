@@ -289,6 +289,47 @@ const CADENAS = {
       },
     ],
   },
+
+  // La superficie que se repite sin costuras —piso, muro, terreno—. Hoja nueva del ASG (p.34), la
+  // trajo Miguel León el 19-10 junto con la Level Design Sheet.
+  //
+  // Dos pasos y no uno, con la revisión en medio: el primero lee la hoja y saca la textura base;
+  // el segundo saca de ESA base los cuatro mapas PBR. Si la base tiene una costura, los cuatro
+  // mapas la heredan y son cuatro despachos más, así que la base se mira primero —para eso la
+  // tarjeta del paso 1 trae la vista en mosaico 3×3—.
+  //
+  // Los archivos salen con el nombre que espera la carpeta del proyecto en Unity,
+  // `<TILE_ID>_<Mapa>`: `archivos` dice qué sufijo lleva cada rol, y `TILE_ID` es el id de la
+  // instancia. El paso 2 manda los cinco mapas de una vez —el workflow tiene cinco ramas en
+  // paralelo— porque antes salía uno por corrida y todos con el mismo prefijo.
+  tile_textures: {
+    etiqueta: 'Tile Textures',
+    pasos: [
+      {
+        clave: 'base', workflow: 'V57_STUDIO_2D_Tile_Texture_Creator', etiqueta: 'Base texture',
+        que:    'One seamless square texture to the right of this sheet, built from its BASE SURFACE SAMPLE panel.',
+        porque: 'The PBR maps are derived from this texture — a seam here would carry into all four, so it is checked first.',
+        entradas: { image: 'origen' },
+        archivos: { base_color: 'BaseColor' },
+      },
+      {
+        clave: 'pbr', workflow: 'V57_STUDIO_2D_Seamless_PBR_Textures', etiqueta: 'PBR maps',
+        que:    'Four maps of the approved base texture, in one run: Normal, AO, Height and MetallicSmoothness.',
+        porque: 'This is the texture set Unity imports — the base color plus the maps that give it relief and finish.',
+        entradas: { image: 'base:base_color' },
+        archivos: { normal: 'Normal', ao: 'AO', height: 'Height', metallic_smoothness: 'MetallicSmoothness' },
+      },
+    ],
+  },
+
+  // El nivel. Su Run EXISTE en el menú pero todavía no lanza nada: qué workflow corre lo decide el
+  // Technical Artist (handoff de Migue, 19-10, §3.6). Mientras tanto la entrada se ve y está
+  // apagada con su motivo, en vez de decir «no hay cadena», que sería falso: la hay, sin definir.
+  level_design: {
+    etiqueta: 'Level Design',
+    pendiente: 'Workflow pending — Technical Artist',
+    pasos: [],
+  },
 }
 
 // Qué cadena le toca a un activo. Hoy solo la de Character Sheet está definida; el documento dice
@@ -326,6 +367,10 @@ function cadenaDe(asset) {
   // Va suelta y no antes de la del entorno: «Skybox Sheet» no contiene «environment sheet», así
   // que la regla de arriba no se la lleva por delante. Se comprobó, no se supuso.
   if (/skybox\s*sheet/i.test(n))       return 'skybox'
+  // Las dos hojas del 19-10. Ninguna contiene «environment sheet», así que la regla del entorno no
+  // se las lleva; y lo que produce la cadena de texturas se sigue llamando «Tile Textures — …».
+  if (/tile\s*textures?\s*sheet/i.test(n) || /^\s*tile textures\s+[—–-]/i.test(n)) return 'tile_textures'
+  if (/level\s*design\s*sheet/i.test(n)) return 'level_design'
   if (/video\s*marketing/i.test(n))    return 'marketing'
   return null
 }
@@ -383,6 +428,9 @@ function proximoPaso(asset) {
   const nombre = cadenaDe(asset)
   if (!nombre) return null
   const def = CADENAS[nombre]
+  // Una cadena con el workflow por definir no tiene paso que ofrecer, pero sí algo que decir: el
+  // recuadro y el radial lo muestran apagado con el motivo, no como «nada que correr».
+  if (def.pendiente) return { cadena: nombre, etiqueta_cadena: def.etiqueta, pendiente: def.pendiente, pasos: [] }
   const i   = pasoDe(asset)
   if (i >= def.pasos.length) return null
   const p = def.pasos[i]
@@ -471,6 +519,20 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
     throw err
   }
   const def = CADENAS[nombreCadena]
+  if (def.pendiente) {
+    const err = new Error(`${def.etiqueta}: ${def.pendiente}. Its Run has no workflow to launch yet.`)
+    err.code = 'RUN_PENDIENTE'
+    throw err
+  }
+
+  // El id con el que se nombran los archivos de una cadena que declara `archivos`. Lo lleva la hoja
+  // instanciada (`metadata.instancia.id`, o su título si el manifiesto no trajo id) y lo hereda cada
+  // pieza producida, así el paso 2 nombra igual que el 1 aunque se pulse sobre la base.
+  const limpio = s => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .trim().replace(/\s+/g, '_').replace(/[^\w.-]+/g, '')
+  const idDeArchivo = limpio(origen.metadata?.tile_id || origen.metadata?.instancia?.id || origen.metadata?.instancia?.item)
+    || limpio(String(origen.name || '').split(/\s+[—–]\s+/).pop())
+    || 'Tile'
 
   // De qué se llama lo que produce esta cadena. Heredar el nombre entero del origen le pegaba el
   // prefijo del DOCUMENTO —«Art Style Guide — 25_VideoMarketingSheet — Key Art»— y cualquier
@@ -952,8 +1014,14 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
         const base = `projects/${project_id}/chain/${nombreCadena}/${paso.clave}/`
           + (idPersonaje ? `${idPersonaje}/` : '')
           + `${cada ? cada + '-' : ''}${jobId.slice(0, 8)}`
+        // Con `archivos`, cada nodo se guarda con su nombre final dentro de la carpeta del despacho.
+        const nombres = paso.archivos && roles
+          ? Object.fromEntries(Object.entries(roles)
+              .filter(([, rol]) => paso.archivos[rol])
+              .map(([nodo, rol]) => [nodo, `${idDeArchivo}_${paso.archivos[rol]}`]))
+          : null
         const salidas = await enPaso(`${paso.etiqueta} · downloading the results and saving them`,
-          () => downloadOutputsByNode(jobId, base))
+          () => downloadOutputsByNode(jobId, base, nombres))
 
         // Del nodo al rol. Con mapa declarado manda el mapa Y NADA MÁS: un workflow publica más de
         // lo que interesa guardar —el de 3D tiene un `Preview3D` que emite el MISMO .glb que el
@@ -1020,7 +1088,10 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
 
       for (const [rol, sal] of publicables) {
         // Con instancias, el nombre lleva la parte; sin ellas, el rol solo si hay más de uno.
-        const sufijo = cada ? ` — ${cada}` : (publicables.length > 1 ? ` — ${rol}` : '')
+        // Con `archivos` el nombre es el del archivo (`Stone_Floor_Normal`): es como se lo busca en
+        // Unity, y el rol solo («normal») no dice de qué textura es.
+        const archivo = paso.archivos?.[rol] ? `${idDeArchivo}_${paso.archivos[rol]}` : null
+        const sufijo = archivo ? ` — ${archivo}` : cada ? ` — ${cada}` : (publicables.length > 1 ? ` — ${rol}` : '')
         const { data: a, error } = await db().from('forge_assets').insert({
           project_id, node_id: origen.node_id, session_id: ses.id,
           name: `${raiz} — ${paso.etiqueta}${sufijo}`,
@@ -1047,6 +1118,7 @@ async function avanzar({ db, project_id, asset_id, pasos = 1, prompt = null, mem
             // en la Asset Library. Se HEREDA del padre cuando este paso no la elige: asi el .glb
             // del 3D dice de que pose salio, que es lo que necesita saber quien lo rigea.
             ...(poseDeLaPieza ? { pose: poseDeLaPieza } : {}),
+            ...(archivo ? { tile_id: idDeArchivo, archivo } : {}),
           },
         }).select('id, name, storage_url, format, metadata').single()
         if (error) throw error

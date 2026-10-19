@@ -52,6 +52,9 @@ const ADI_DE_PAGINA = {
   '23_AudioSheet':            '§7.10.1 Audio Asset Breakdown (consume §7.10)',
   '24_AnimationSheet':        '§7.9.1 Animation Asset Breakdown (consume §7.9)',
   '25_VideoMarketingSheet':   '§7.11.1 Marketing Video Breakdown (consume §7.11)',
+  // 19-10 (handoff de Migue, ASG de 34): las dos hojas nuevas, al final del maestro y por nombre.
+  '33_LevelDesignSheet':      '§7.3.2 Level Design Breakdown (consume §7.3 · §7.1 · §8.2)',
+  '34_TileTexturesSheet':     '§7.5.2 Tile Texture Breakdown (consume §7.5 · §2.5)',
 }
 
 // Las ocho páginas que YA tienen hueco de referencia en el workflow. Las otras diecisiete lo
