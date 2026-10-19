@@ -2645,11 +2645,21 @@ function contenidoDelDeck({ replyText, outputDefs, targetOutput }) {
     }
   }
   // El deck puede venir como JSON en un bloque ```json: ese es el deck del modelo.
+  const sinSlides = []
   for (const m of texto.matchAll(/```(?:json)?\s*\n([\s\S]*?)```/g)) {
     try {
       const d = JSON.parse(m[1])
       if (d && Array.isArray(d.slides) && d.slides.length) return { ok: true, contenido: d, clave }
+      if (d && typeof d === 'object' && !Array.isArray(d)) sinSlides.push(Object.keys(d).slice(0, 4).join(', '))
     } catch { /* no era el deck */ }
+  }
+  // La sección solo trae JSON y ninguno es un deck: el modelo escribió OTRA cosa donde iba el
+  // deck. Antes caía al renderer de markdown, que descarta los bloques de código, y el aviso
+  // decía «a json code block was left out» — JM (09-10, 2.7) no supo qué era: la sección traía el
+  // bloque de candidatos { meta, candidates, gate_recommendation } y ninguna diapositiva.
+  if (sinSlides.length && !texto.replace(/```[\s\S]*?```/g, '').replace(/^#+.*$/gm, '').trim()) {
+    return { ok: false, motivo: `"${nombre}" was not generated: its section only holds JSON that is not a slide deck `
+      + `(no "slides" list — keys: ${sinSlides.join(' / ')}). Run the ${nombre} output on its own to get the deck.` }
   }
   // En una corrida enfocada que ya trae `## `, nada cambia.
   if (targetOutput && /^##\s+/m.test(texto)) return { ok: true, contenido: replyText, clave }

@@ -3173,9 +3173,15 @@ router.post('/nodes/:node_id/sessions/:session_id/generate-item-image', async (r
       const { data: otras } = await q0
 
       let ajena = null, propia = null
+      // Con `item_id`, la posición no basta: tras una revisión la lista se reordena y el índice
+      // de otra sesión es de OTRO ítem. JM, 09-10 en Shooter V1: quitó un concepto del 1.1, la
+      // lista corrió un lugar y regenerar «Canopy» le devolvió la imagen del concepto cortado.
+      // Una imagen sin id (o con otro) no se reutiliza para un ítem con id: se renderiza la suya.
+      const idDe = it => it.id ?? it.name ?? null
       for (const s of (otras || [])) {
         for (const it of ((s.output_images || {})[output_key] || [])) {
           if (Number(it.index) !== Number(item_index)) continue
+          if (item_id && s.id !== session_id && idDe(it) !== item_id) continue
           const ultima = (it.variations || []).at(-1)
           if (!ultima?.url) continue
           if (s.id === session_id) propia = it
