@@ -42,8 +42,9 @@ async function piezaAprobada(db, { project_id, node_key, outputs = [] }) {
 
 /**
  * Las secciones (por número) que en el documento están ausentes, vacías o en N/A. «N/A» es lo que fijan las
- * skills y el docx v6.0 para un desglose sin Vertical Slice: el cuerpo empieza por N/A, o dice «Vertical Slice
- * scope not defined».
+ * skills y el docx v6.0 para un desglose sin Vertical Slice: el cuerpo empieza diciendo «Vertical Slice scope
+ * not defined», o es un N/A que no se apoya en el slice aprobado. Un N/A que SÍ cita el slice aprobado («no
+ * marketing video exists inside the approved Vertical Slice scope») es una respuesta, no un hueco.
  */
 function seccionesEnNA(contenido, sections) {
   const canon = X.bloqueCanonico(contenido), encs = X.indice(canon)
@@ -52,7 +53,15 @@ function seccionesEnNA(contenido, sections) {
     const s = X.extraerSeccion(canon, n, encs, { propio: true })
     if (s.estado === 'ausente') { na.push(n); continue }
     const cuerpo = String(s.texto || '').split('\n').slice(1).join('\n').trim()
-    if (!cuerpo || /^(\*\*|_|`)?\s*N\s*\/?\s*A\b/i.test(cuerpo) || /Vertical Slice scope not defined/i.test(cuerpo)) na.push(n)
+    // Solo la CABEZA del apartado. Medido el 20-10 en Smack The Coral Wish: §7.10.1 venía completo
+    // (13 mil caracteres) y caía como pendiente por una fila de su tabla —«N/A — Vertical Slice
+    // scope not defined for these cues»—; y §7.11.1 decía «N/A — no marketing video exists inside
+    // the approved Vertical Slice scope», que es una respuesta del slice, no su ausencia.
+    const cabeza = cuerpo.slice(0, 400)
+    const esNA = /^(\*\*|_|`)?\s*N\s*\/?\s*A\b/i.test(cuerpo)
+    const sinSlice = /Vertical Slice scope not defined/i.test(cabeza)
+    const porElSlice = /approved Vertical Slice|Vertical Slice Specification|inside the (approved )?(Vertical Slice|slice) scope/i.test(cabeza)
+    if (!cuerpo || sinSlice || (esNA && !porElSlice)) na.push(n)
   }
   return na
 }
