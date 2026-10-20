@@ -7596,6 +7596,36 @@ router.post('/assets/:asset_id/tool', async (req, res, next) => {
   }
 })
 
+// ─── Edit 3D: las herramientas de Tripo sobre un modelo (W43 #7) ─────────────
+// Qué herramientas y con qué opciones. Solo sobre modelos; sobre cualquier otra pieza, lista vacía.
+router.get('/assets/:asset_id/edit3d', async (req, res, next) => {
+  try {
+    const { data: asset } = await db().from('forge_assets')
+      .select('id, project_id, format, storage_url, metadata').eq('id', req.params.asset_id).maybeSingle()
+    if (!asset || asset.project_id !== req.params.id) return res.status(404).json({ success: false, error: 'Asset not found' })
+    const { herramientas3DDe } = require('../services/edit3d.service')
+    res.json({ success: true, herramientas: await herramientas3DDe(asset), partes: asset.metadata?.partes || [] })
+  } catch (err) { next(err) }
+})
+
+// Correrla. Publica un modelo NUEVO colgado del origen; el origen no se toca.
+router.post('/assets/:asset_id/edit3d', async (req, res, next) => {
+  try {
+    const { correrEdit3D } = require('../services/edit3d.service')
+    const opciones = req.body?.opciones && typeof req.body.opciones === 'object' ? req.body.opciones : null
+    const r = await correrEdit3D({
+      db, project_id: req.params.id, asset_id: req.params.asset_id,
+      clave: String(req.body?.herramienta || ''), opciones, member_id: req.body?.member_id || null,
+    })
+    res.json({ success: true, ...r })
+  } catch (err) {
+    if (err.code === 'NO_APLICA') return res.status(400).json({ success: false, error: err.message, code: err.code })
+    if (err.publico) return res.status(err.status || 502).json({ success: false, error: err.message, code: err.code || null })
+    console.error(`[edit3d] ${req.body?.herramienta} sobre ${req.params.asset_id}:`, err)
+    res.status(500).json({ success: false, error: `"${req.body?.herramienta || '3D tool'}" failed: ${err.message || 'unknown error'}`, code: 'FALLO_NO_PREVISTO' })
+  }
+})
+
 // ─── El Laboratory ──────────────────────────────────────────────────────────
 // Si el botón tiene a dónde ir. Se pregunta al pintar, y no empuja nada.
 router.get('/laboratory', async (req, res, next) => {
@@ -8276,7 +8306,8 @@ router.get('/workflows/:nombre/opciones', async (req, res, next) => {
     if (!entry) return res.status(404).json({ success: false, error: `Unknown workflow "${req.params.nombre}"` })
 
     const { opcionesDe } = require('../services/workflow-options.service')
-    const opciones = await opcionesDe(entry.workflow_json)
+    // `oculta`: hojas que este workflow no admite aunque su nodo las declare (el quad de Tripo P2).
+    const opciones = await opcionesDe(entry.workflow_json, { oculta: entry.inject_config?.oculta || null })
 
     // Cuántas imágenes produce el workflow, para poder decir el tamaño de la corrida. Es lo único
     // honesto que se puede decir del costo: el sistema imputa un precio plano por imagen —medido,

@@ -128,8 +128,14 @@ function ramasDe (def) {
 /**
  * Las opciones que ESTE workflow expone, con su valor actual, sus valores válidos y en cuántos
  * nodos vive cada una.
+ *
+ * `expone` reemplaza la lista general por la de un grafo concreto: las herramientas de Edit 3D
+ * ofrecen campos —`hint`, `bake`, `rig_type`…— que en la lista general aparecerían en cualquier
+ * workflow que los tenga. `oculta` quita hojas de la general, para el workflow que no las admite.
  */
-async function opcionesDe (workflowJson) {
+async function opcionesDe (workflowJson, { expone = null, oculta = null } = {}) {
+  const permitidas = expone ? new Set(expone) : EXPUESTAS
+  const fuera = new Set(oculta || [])
   const grafo = typeof workflowJson === 'string' ? JSON.parse(workflowJson) : workflowJson
   const oi = await objectInfo()
   const porClave = new Map()
@@ -144,7 +150,7 @@ async function opcionesDe (workflowJson) {
       // Por la HOJA, no por la raíz. Con la raíz entraba `model.background` del 2.5 —que nadie
       // pidió— solo porque cuelga de `model`. La hoja deja pasar `model.quality` y `model.size`,
       // que sí están en la lista, y deja fuera al resto de esa rama.
-      if (!EXPUESTAS.has(hoja)) continue
+      if (!permitidas.has(hoja) || fuera.has(hoja)) continue
       if (Array.isArray(valor)) continue                     // es un cable, no un valor
       const def = declaracionDe(declarados, campo)
       if (!def || !TIPOS_VALOR.has(def[0])) continue          // trampa 2: `model` de KSampler

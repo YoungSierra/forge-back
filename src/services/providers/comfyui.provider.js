@@ -115,7 +115,9 @@ async function submitWorkflow(workflowName, prompt, width, height, extras = {}, 
   if (opciones && Object.keys(opciones).length) {
     const { opcionesDe, aplicarOpciones } = require('../workflow-options.service')
     try {
-      const catalogo = await opcionesDe(entry.workflow_json)
+      const cfgOp = typeof entry.inject_config === 'string' ? JSON.parse(entry.inject_config) : entry.inject_config
+      // Lo que el workflow oculta tampoco se acepta por la puerta de atrás.
+      const catalogo = await opcionesDe(entry.workflow_json, { oculta: cfgOp?.oculta || null })
       // El espejo lo declara el registro del workflow: hay ajustes que viven dos veces -el
       // parámetro del nodo y el texto del prompt- y tienen que escribirse en los dos.
       const espejo = (typeof entry.inject_config === 'string' ? JSON.parse(entry.inject_config) : entry.inject_config)?.espejo || null
@@ -351,9 +353,13 @@ async function downloadOutputsByNode(promptId, basePath) {
       // visor lo reconocía. Es el mismo fallo de forma que el resto del informe de JuanK.
       const nombre = f.filename.toLowerCase()
       const es3D   = nombre.endsWith('.glb') || nombre.endsWith('.gltf')
+      // La malla en quads de Tripo llega como FBX (Edit 3D · Retopo). Antes caía al caso de imagen
+      // y se guardaba como `.png`.
+      const esFbx  = nombre.endsWith('.fbx')
       const esVideo = /\.(mp4|webm|mov)$/.test(nombre)
-      const ext    = es3D ? '.glb' : esVideo ? nombre.slice(nombre.lastIndexOf('.')) : '.png'
+      const ext    = es3D ? '.glb' : esFbx ? '.fbx' : esVideo ? nombre.slice(nombre.lastIndexOf('.')) : '.png'
       const mime   = es3D ? 'model/gltf-binary'
+                   : esFbx ? 'application/octet-stream'
                    : esVideo ? (nombre.endsWith('.webm') ? 'video/webm' : nombre.endsWith('.mov') ? 'video/quicktime' : 'video/mp4')
                    : 'image/png'
 
@@ -365,10 +371,10 @@ async function downloadOutputsByNode(promptId, basePath) {
       const buffer = Buffer.from(await res.arrayBuffer())
       // Un PNG de menos de 1 KB es un placeholder, no un render — el mismo umbral que ya usaba
       // downloadOutput. Un GLB chico sí puede ser válido, así que el piso es solo para imágenes.
-      if (!es3D && !esVideo && buffer.length < 1000) continue
+      if (!es3D && !esFbx && !esVideo && buffer.length < 1000) continue
 
       const url = await uploadToStorage(buffer, `${basePath}_${nodo}${ext}`, mime)
-      porNodo[nodo] = { url, kind: es3D ? 'model' : esVideo ? 'video' : 'image', size_bytes: buffer.length }
+      porNodo[nodo] = { url, kind: es3D ? 'model' : esFbx ? 'fbx' : esVideo ? 'video' : 'image', size_bytes: buffer.length }
       console.log(`[ComfyUI] salida ${nodo} → ${url} (${Math.round(buffer.length / 1024)}kb) job:${promptId}`)
       break
     }
