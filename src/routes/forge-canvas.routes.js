@@ -7640,6 +7640,23 @@ router.post('/assets/:asset_id/edit3d', async (req, res, next) => {
   }
 })
 
+// Export FBX de un modelo con un preset de Tripo. Si ese preset ya se exportó, devuelve el mismo archivo sin pagar.
+router.post('/assets/:asset_id/export-fbx', async (req, res) => {
+  try {
+    const { exportarFBX } = require('../services/edit3d.service')
+    const r = await exportarFBX({
+      db, project_id: req.params.id, asset_id: req.params.asset_id,
+      preset: String(req.body?.preset || 'blender'), member_id: req.body?.member_id || null,
+    })
+    res.json({ success: true, ...r })
+  } catch (err) {
+    if (err.code === 'NO_APLICA') return res.status(400).json({ success: false, error: err.message, code: err.code })
+    if (err.publico) return res.status(err.status || 502).json({ success: false, error: err.message, code: err.code || null })
+    console.error(`[edit3d] export FBX sobre ${req.params.asset_id}:`, err)
+    res.status(500).json({ success: false, error: `Export FBX failed: ${err.message || 'unknown error'}`, code: 'FALLO_NO_PREVISTO' })
+  }
+})
+
 // ─── El Laboratory ──────────────────────────────────────────────────────────
 // Si el botón tiene a dónde ir. Se pregunta al pintar, y no empuja nada.
 router.get('/laboratory', async (req, res, next) => {

@@ -399,6 +399,8 @@ router.get('/project-assets', async (req, res, next) => {
       opciones:    a.metadata?.opciones ?? null,
       // Edit 3D · Retopo en quads: el FBX que Tripo entrega, aparte de la vista GLB.
       fbx_url:     a.metadata?.fbx_url ?? null,
+      // Export FBX: los presets ya exportados de este modelo ({ blender: url, … }).
+      fbx:         a.metadata?.fbx ?? null,
       // De qué PÁGINA del deck es esta hoja, cuando está instanciada. Viaja porque el nombre no
       // sirve para deducirlo: una hoja instanciada termina con el personaje —«… —
       // 18_CharacterSheet — Luma (Axolotl)»— y quien lea el último tramo busca «Luma (Axolotl)»

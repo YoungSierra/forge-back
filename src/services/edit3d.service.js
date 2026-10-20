@@ -261,4 +261,53 @@ async function correrEdit3D({ db, project_id, asset_id, clave, opciones = null, 
   return { herramienta: h.clave, creados: [a] }
 }
 
-module.exports = { HERRAMIENTAS_3D, herramientas3DDe, correrEdit3D, grafoDe, CONVERSION }
+// ─── Export FBX ─────────────────────────────────────────────────────────────
+//
+// Miguel León (20-10): cada modelo se baja en GLB —su archivo de siempre— y en FBX, con los tres
+// presets de Tripo. El FBX no es una pieza nueva del lienzo: es otro formato del MISMO modelo, así
+// que se guarda en su metadata (`fbx.<preset>`) y la segunda descarga del mismo preset no se paga.
+// `with_animation` (por defecto en la conversión) conserva el esqueleto de un modelo con Rig.
+const PRESETS_FBX = ['blender', 'mixamo', '3dsmax']
+
+async function exportarFBX({ db, project_id, asset_id, preset = 'blender', member_id = null }) {
+  if (!PRESETS_FBX.includes(preset)) { const e = new Error(`Unknown FBX preset "${preset}"`); e.code = 'NO_APLICA'; throw e }
+  const { data: origen } = await db().from('forge_assets')
+    .select('id, project_id, node_id, name, format, storage_url, metadata').eq('id', asset_id).single()
+  if (!origen || origen.project_id !== project_id) throw new Error('Asset not found')
+  if (!esModelo(origen)) { const e = new Error('Export FBX only runs on a 3D model'); e.code = 'NO_APLICA'; throw e }
+  const hecho = origen.metadata?.fbx?.[preset]
+  if (hecho) return { preset, url: hecho, reusado: true }
+
+  const etq = `Export FBX (${preset})`
+  const modelo = await paso(`${etq} · uploading the model to ComfyUI`, () => subirModelo(origen.storage_url))
+  const grafo = {
+    [CARGA]:   { class_type: 'Load3DAdvanced', inputs: { model_file: modelo, viewport_state: {}, width: 512, height: 512 } },
+    [IMPORTA]: { class_type: 'TripoImportModelNode', inputs: { model_3d: [CARGA, 0] } },
+    [CONVIERTE]: { class_type: 'TripoConversionNode', inputs: { original_model_task_id: [IMPORTA, 0], ...CONVERSION, format: 'FBX', fbx_preset: preset } },
+    [GUARDA_FBX]: { class_type: 'SaveGLB', inputs: { mesh: [CONVIERTE, 0], filename_prefix: `3d/forge_fbx_${preset}` } },
+  }
+  const t0 = Date.now()
+  const jobId = await paso(`${etq} · dispatching to Tripo`, () => despachar(grafo))
+  registrarDespacho({ project_id, node_id: origen.node_id, member_id, jobId, workflow: 'edit3d:fbx', herramienta: 'edit3d:fbx', origen: origen.id, origen_nombre: origen.name })
+  await paso(`${etq} · waiting for Tripo (job ${jobId.slice(0, 8)})`, () => pollUntilDone(jobId, 600_000))
+  const salidas = await paso(`${etq} · downloading the result`,
+    () => downloadOutputsByNode(jobId, `projects/${project_id}/edit3d/fbx/${jobId.slice(0, 8)}`))
+  const fbx = salidas[GUARDA_FBX]
+  if (!fbx) throw new Error(`"${etq}" finished without a file (outputs: ${Object.keys(salidas).join(', ') || 'none'})`)
+
+  logExecution({
+    project_id, node_id: origen.node_id, triggered_by: member_id,
+    trigger_type: 'tool', executor_type: 'comfyui', provider: 'comfyui', model: 'edit3d:fbx',
+    is_estimated: true, duration_ms: Date.now() - t0, started_at: new Date(t0).toISOString(),
+    metadata: { herramienta: 'edit3d:fbx', origen: origen.id, preset },
+  })
+
+  // Se relee el metadata justo antes de escribir: otra exportación del mismo modelo pudo terminar mientras tanto.
+  const { data: fresco } = await db().from('forge_assets').select('metadata').eq('id', origen.id).single()
+  const metadata = { ...(fresco?.metadata || {}), fbx: { ...(fresco?.metadata?.fbx || {}), [preset]: fbx.url } }
+  const { error } = await db().from('forge_assets').update({ metadata }).eq('id', origen.id)
+  if (error) console.warn(`[edit3d] FBX ${preset} de "${origen.name}" sin guardar en la ficha (${error.message}); el archivo está en ${fbx.url}`)
+  return { preset, url: fbx.url, reusado: false }
+}
+
+module.exports = { HERRAMIENTAS_3D, herramientas3DDe, correrEdit3D, grafoDe, CONVERSION, PRESETS_FBX, exportarFBX }
