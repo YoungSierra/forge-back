@@ -65,6 +65,26 @@ async function regenerarSlice(db, { project_id, project_node_id, node_id, nodeDn
   return { ran: ran.map(r => r.output_key), sessions: ran, regenerated: ran[0].regenerated || [], slice_source: { node_key: alcance.node_key, output_key: alcance.output_key, chars: alcance.chars }, ...(failed.length ? { failed } : {}) }
 }
 
+/**
+ * Las secciones `slice_dependent` del documento aprobado de un nodo que siguen en N/A. Vacío si no hay
+ * documento aprobado o si ya están todas escritas.
+ *
+ * Es lo que decide si una fase SELLADA admite la regeneración (20-10, proyecto de Migue Amez): el ADD
+ * vive en Pre-Production, ese gate se acepta antes de que exista el Vertical Slice, y el 3.13 se
+ * aprueba después. Con el sello mandando, el ADD no podía completar sus desgloses y el 3.20 —que
+ * los exige— no corría nunca. Completar lo que está en N/A no reabre la fase: rellena un hueco que
+ * la propia fase dejó marcado para después. Reescribir desgloses ya escritos sí lo haría, y eso
+ * sigue bloqueado.
+ */
+async function desglosesPendientes(db, { project_id, node_key, outputs }) {
+  const maestro = (Array.isArray(outputs) ? outputs : []).find(o => { const c = T.configDe(o); return c && T.esPorSecciones(c) && (c.groups || []).some(g => g.slice_dependent) })
+  if (!maestro) return []
+  const secciones = (T.configDe(maestro).groups || []).filter(g => g.slice_dependent).flatMap(g => (g.sections || []).map(String))
+  const { piezaAprobada, seccionesEnNA } = require('./requisitos.service')
+  const p = await piezaAprobada(db, { project_id, node_key, outputs: [maestro.key || maestro.name] })
+  return p ? seccionesEnNA(p.content, secciones) : []
+}
+
 /** Guardas y lanzamiento en segundo plano para UN consumidor. Devuelve lo que viaja en la respuesta. */
 async function lanzar(db, { project_id, consumidor: c, member_id, deps }) {
   const { executeOneOutput, isBlueprintSealed } = deps
@@ -72,7 +92,8 @@ async function lanzar(db, { project_id, consumidor: c, member_id, deps }) {
     .eq('project_id', project_id).eq('node_id', c.node_id).eq('removed', false)
   const pn = (pns || [])[0]
   if (!pn) return { skipped: 'NOT_IN_PROJECT' }
-  if (isBlueprintSealed && await isBlueprintSealed(project_id, pn.blueprint_id)) return { skipped: 'SEALED' }
+  if (isBlueprintSealed && await isBlueprintSealed(project_id, pn.blueprint_id)
+      && !(await desglosesPendientes(db, { project_id, node_key: c.node_key, outputs: c.outputs })).length) return { skipped: 'SEALED' }
   const { extractSection } = require('../utils/extract-section')
   const maestro = await X.masterDeFila(db, { project_id, node_id: c.node_id, nodeTitle: c.title, outputDefs: c.outputs, from: c.output_key, extractSection })
   if (!maestro) return { skipped: 'NO_MASTER' }
@@ -115,4 +136,4 @@ async function trasAprobarSalida(db, { project_id, node_key, output_keys = null,
 /** Para pruebas y cierres ordenados: espera las regeneraciones en curso. */
 async function esperarEnCurso() { const r = await Promise.all([...enCurso.values()]); return r }
 
-module.exports = { consumidoresDelSlice, regenerarSlice, trasAprobarSalida, esperarEnCurso, enCurso }
+module.exports = { consumidoresDelSlice, regenerarSlice, trasAprobarSalida, esperarEnCurso, enCurso, desglosesPendientes }

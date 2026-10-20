@@ -6509,12 +6509,14 @@ router.post('/nodes/:project_node_id/regenerate-slice', async (req, res, next) =
     if (!(await creditGate(project_id, res, req.auth?.memberId))) return
     const { data: pNode } = await db().from('forge_project_nodes').select('node_id, node_type, blueprint_id').eq('id', project_node_id).eq('removed', false).maybeSingle()
     if (!pNode || pNode.node_type !== 'forge_node') return res.status(404).json({ success: false, error: 'Project node not found or not a forge_node' })
-    if (await isBlueprintSealed(project_id, pNode.blueprint_id)) {
-      return res.status(423).json({ success: false, error_code: 'gate_sealed', error: 'This step belongs to a sealed phase — re-running is locked after the gate was accepted' })
-    }
     const node_id = pNode.node_id
-    const { data: nodeDna } = await db().from('forge_nodes').select('id, title, outputs').eq('id', node_id).single()
-    const { regenerarSlice } = require('../services/disparo-slice.service')
+    const { data: nodeDna } = await db().from('forge_nodes').select('id, node_key, title, outputs').eq('id', node_id).single()
+    const { regenerarSlice, desglosesPendientes } = require('../services/disparo-slice.service')
+    // Con la fase sellada solo se COMPLETAN los desgloses que siguen en N/A (ver desglosesPendientes).
+    if (await isBlueprintSealed(project_id, pNode.blueprint_id)
+        && !(await desglosesPendientes(db, { project_id, node_key: nodeDna?.node_key, outputs: nodeDna?.outputs })).length) {
+      return res.status(423).json({ success: false, error_code: 'gate_sealed', error: 'This step belongs to a sealed phase — its slice breakdowns are already written, and rewriting them is locked after the gate was accepted' })
+    }
     let r
     try { r = await regenerarSlice(db, { project_id, project_node_id, node_id, nodeDna, member_id, explicitKey: req.body.target_output_key || null, executeOneOutput }) }
     catch (err) {
