@@ -24,8 +24,11 @@ const enCurso = new Map()   // `${project_id}:${node_id}:${output_key}` → prom
 
 /** Los nodos cuya salida por secciones toma su alcance del nodo `node_key` (declaración `slice_scope` de la DNA). */
 async function consumidoresDelSlice(db, node_key) {
-  const { data } = await db().from('forge_nodes').select('id, node_key, title, outputs')
-    .contains('outputs', [{ batches: { slice_scope: { from_node: String(node_key) } } }])
+  // El array va como JSON en texto: supabase-js escribe un array como literal de array de Postgres
+  // («{[object Object]}»), la columna jsonb lo rechaza y, con el error sin leer, nunca había consumidores.
+  const { data, error } = await db().from('forge_nodes').select('id, node_key, title, outputs')
+    .contains('outputs', JSON.stringify([{ batches: { slice_scope: { from_node: String(node_key) } } }]))
+  if (error) throw new Error(`slice consumers of ${node_key}: ${error.message}`)
   const out = []
   for (const n of data || []) {
     for (const o of (Array.isArray(n.outputs) ? n.outputs : [])) {
