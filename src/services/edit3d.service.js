@@ -205,7 +205,7 @@ async function correrEdit3D({ db, project_id, asset_id, clave, opciones = null, 
   const quad = h.clave === 'retopo' && nodo.quad === true
   if (quad) {
     grafo[GUARDA_FBX] = { class_type: 'SaveGLB', inputs: { mesh: [HERR, 3], filename_prefix: '3d/forge_retopo_quad' } }
-    grafo[CONVIERTE]  = { class_type: 'TripoConversionNode', inputs: { original_model_task_id: [HERR, 1], format: 'GLTF', quad: false } }
+    grafo[CONVIERTE]  = { class_type: 'TripoConversionNode', inputs: { original_model_task_id: [HERR, 1], ...CONVERSION, format: 'GLTF' } }
     grafo[GUARDA].inputs.mesh = [CONVIERTE, 0]
   }
 
@@ -261,4 +261,4 @@ async function correrEdit3D({ db, project_id, asset_id, clave, opciones = null, 
   return { herramienta: h.clave, creados: [a] }
 }
 
-module.exports = { HERRAMIENTAS_3D, herramientas3DDe, correrEdit3D, grafoDe }
+module.exports = { HERRAMIENTAS_3D, herramientas3DDe, correrEdit3D, grafoDe, CONVERSION }
