@@ -397,6 +397,8 @@ router.get('/project-assets', async (req, res, next) => {
       // lo que se reusa al rehacerla. Solo eso del metadata — el resto es interno de la cadena y
       // no tiene por qué viajar a cada tarjeta del moodboard.
       opciones:    a.metadata?.opciones ?? null,
+      // Edit 3D · Retopo en quads: el FBX que Tripo entrega, aparte de la vista GLB.
+      fbx_url:     a.metadata?.fbx_url ?? null,
       // De qué PÁGINA del deck es esta hoja, cuando está instanciada. Viaja porque el nombre no
       // sirve para deducirlo: una hoja instanciada termina con el personaje —«… —
       // 18_CharacterSheet — Luma (Axolotl)»— y quien lea el último tramo busca «Luma (Axolotl)»
