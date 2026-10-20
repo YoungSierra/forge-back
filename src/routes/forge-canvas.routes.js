@@ -4939,9 +4939,23 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
           allToolCalls.push({ tool: 'doc_gen_docx', args: { auto: true, deferred: 'images' }, result: { success: false, deferred: true, title: `${docTypeLabel} — ${project?.name ?? 'Document'}`, content: docContent } })
           console.log('[forge-chat] auto doc_gen_docx DIFERIDO — se exporta cuando terminen las imágenes')
         }
+        // Las imágenes que ya tiene el nodo, como en el «↓ PDF» del modal: sin esto el PDF del chat salía
+        // sin ninguna aunque estuvieran generadas. Se resuelven sobre la respuesta ENTERA (el resolvedor
+        // encuentra el plan por su encabezado).
+        let itemImages = []
+        if (!difiereDoc && session?.id) {
+          try {
+            const { resolverImagenesDeItems } = require('../services/canvas-chat.service')
+            itemImages = await resolverImagenesDeItems({
+              db, projectId: project_id, nodeId: node_id, sessionId: session.id,
+              outKey: targetOutput ? (outKeyOf(targetOutput) || null) : null, contenido: replyText,
+            })
+          } catch (e) { console.warn('[forge-chat] auto doc_gen_docx — imágenes:', e.message) }
+        }
         const docResult = difiereDoc ? { success: false } : await executeTool('doc_gen_docx', {
           title:   `${docTypeLabel} — ${project?.name ?? 'Document'}`,
           content: docContent,
+          ...(itemImages.length ? { item_images: itemImages } : {}),
         }, { project_id, node_id })
 
         if (docResult.success && docResult.url) {

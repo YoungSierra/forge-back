@@ -41,6 +41,10 @@ const FORMATOS_IMAGEN = ['png', 'image', 'jpg', 'jpeg', 'webp']
 function esSalidaDeArchivo(def) {
   if (!def || typeof def !== 'object' || audienciaDe(def) !== 'document') return false
   const fmt = String(def.format || '').toLowerCase()
+  // `image_gen` en un documento de texto (el `pitch_document` docx del 2.1) quiere decir que el documento
+  // LLEVA imágenes, no que la salida sea una imagen. Tomarlo como archivo vaciaba la vista y el PDF del chat
+  // caía a la respuesta entera, con la frase y el plan de imágenes dentro (feedback de JM, 20-10).
+  if (def.image_gen && fmt !== 'pptx' && FORMATOS_DOCUMENTO.includes(fmt)) return false
   return !!def.image_gen || FORMATOS_IMAGEN.includes(fmt) || fmt === 'pptx'
 }
 
