@@ -95,7 +95,10 @@ async function filaDelAdi(db, project_id) {
 // Esto NO llama al modelo: la tabla ya está escrita. El camino viejo del ADI queda como respaldo
 // para los proyectos cuyo Vertical Slice no tenga la sección.
 
-const norma = s => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '')
+// Sin acentos antes de comparar: «Carton» y «Cartón» son el mismo personaje y la tabla no siempre
+// lo escribe como la hoja. NFD separa la letra de su tilde y el filtro de abajo se lleva la tilde;
+// hasta ahora «Cartón» quedaba en «cartn» y no casaba con «carton».
+const norma = s => String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, '')
 
 // Palabras que describen QUÉ HAY QUE PRODUCIR, no cómo es el personaje.
 const PRODUCCION = /\b(mesh|shader|shaders|animation|animations|rig|rigs|rigging|skinning|texture|textures|material|materials|prefab|prefabs|lod|variant|sheet|clips?)\b/i
@@ -118,7 +121,9 @@ const CODIGO = /^[A-Z]{2,5}-\d{1,3}$/
  */
 function nombreDePersonaje(item) {
   let s = String(item || '').trim()
-  s = s.replace(/\s*[×x]\s*\d+/gi, '')
+  // Solo con espacio delante: «Moon Jelly × 6» y «Moon Jelly x6» llevan multiplicador; «Rex 2»,
+  // «Fox 2» o «Max 3 (rig)» no, y sin el espacio exigido se quedaban en «Re», «Fo» y «Ma».
+  s = s.replace(/\s+[×x]\s*\d+/gi, '')
   s = s.replace(/\s*\(([^()]*)\)\s*$/, (todo, dentro) => {
     const d = String(dentro).trim()
     if (CODIGO.test(d)) return ''
@@ -185,25 +190,37 @@ function clipsDeLaTabla(vs, personaje, personajes, anclaEsProp = null) {
   const j = L.findIndex((l, k) => k > i && /^#{1,4}\s/.test(l))
   const bloque = L.slice(i + 1, j < 0 ? L.length : j)
 
-  const kAncla = norma(personaje)
-  const otros = (personajes || []).map(norma).filter(p => p.length >= 3 && p !== kAncla)
+  // El nombre del personaje sin «× N» ni el paréntesis de producción: el mismo que viaja al prompt
+  // de vídeo y al pack. Con el ítem entero, «Moon Jelly × 6 (mesh + shader + animation)» solo casaba
+  // mientras la tabla dijera «Moon Jelly» a secas; con «Moon Jelly [UPSTREAM GAP]» o «MoonJelly_x6»
+  // daba cero filas y la hoja caía al ADI, que es el set de Cartón en la medusa.
+  const kAncla = norma(nombreDePersonaje(personaje))
+  const otros = (personajes || []).map(p => norma(nombreDePersonaje(p))).filter(p => p.length >= 3 && p !== kAncla)
 
 
   const clips = []
+  // Las filas de la sección, de las dos formas, antes de decidir cuáles son del ancla.
+  const filas = []
 
   // El criterio de a quién pertenece un clip y cómo se nombra, compartido por las dos formas en
   // que los proyectos escriben esta sección. Estaba escrito una sola vez dentro del bucle de la
   // tabla; se saca acá para que la lista agrupada lo herede tal cual y no se bifurque la regla.
-  const agregar = (sujetoCrudo, movimiento) => {
+  const agregar = (sujetoCrudo, movimiento, exacta = false) => {
     const s = norma(sujetoCrudo)
     if (s.length < 2 || !movimiento) return
 
     // Del personaje del ancla: el nombre de uno contiene al del otro en cualquier dirección — el
-    // ítem es «Moon Jelly × 6» y la tabla dice «Moon Jelly».
-    const esDelAncla = kAncla.length >= 3 && (s.includes(kAncla) || kAncla.includes(s))
+    // ítem es «Moon Jelly × 6» y la tabla dice «Moon Jelly». Una fila EXACTA (ver abajo) ya está
+    // decidida y no pasa por la contención ni por la regla del candidato más largo.
+    const esDelAncla = exacta || (kAncla.length >= 3 && (s.includes(kAncla) || kAncla.includes(s)))
     // De OTRO personaje: fuera. Es exactamente lo que evita el walk en la medusa.
     const esDeOtro = otros.some(o => s.includes(o) || o.includes(s))
     if (!esDelAncla && esDeOtro) return
+    // Si casa con el ancla Y con otro, gana el nombre más largo que quepa en el sujeto: «Boss Moon
+    // Jelly — Roar» es de Boss Moon Jelly aunque contenga «Moon Jelly». Solo desplaza un nombre MÁS
+    // LARGO que el del ancla: uno más corto y contenido en el ancla es el mismo personaje escrito a
+    // secas —«Cartón» frente a «Cartón rig + all animations»— y no puede dejar su hoja vacía.
+    if (!exacta && esDelAncla && otros.some(o => s.includes(o) && o.length > kAncla.length)) return
     // Y lo que no es del ancla tampoco entra, aunque no sea de ningún otro personaje: es un prop,
     // y los props se animan en SU PROPIA hoja desde que `prop_sheet` tiene paso de animación.
     // Antes se quedaban acá porque no existía ese destino (punto 2 del v7 de JuanK).
@@ -246,8 +263,15 @@ function clipsDeLaTabla(vs, personaje, personajes, anclaEsProp = null) {
   //
   // Así lo escribe test_pinball_migue_v.10: 6 grupos, 42 clips, cero filas de tabla. Con solo el
   // lector de tablas la sección se leía como vacía aunque enumere las 42 por personaje.
-  const GRUPO = /^\s*\*\*?\s*([^*|]+?)\s*[—–]\s*\d+\s*clips?\s*:?\s*\*?\*\s*$/i
+  // También «*Professor Wort (8 clips):*», con el recuento entre paréntesis en vez de tras el guion:
+  // así lo escribe el VS Spec de Wort, y con solo la forma del guion sus cuatro grupos se leían como
+  // vacíos y el proyecto entero caía al ADI.
+  const GRUPO = /^\s*\*\*?\s*([^*|]+?)\s*(?:[—–]\s*\d+\s*clips?|\(\s*\d+\s*clips?\s*\))\s*:?\s*\*?\*\s*$/i
   const ITEM  = /^\s*\d+\.\s+(.+)$/
+  // La extensión de archivo con que Wort escribe cada clip («ANIM_Wort_Idle.fbx»): lista corta de
+  // los formatos que nombra el pipeline (fuente de animación, modelo, vídeo), y no «cualquier punto
+  // y letras», para no cortar un nombre como «Idle_v2.1».
+  const EXTENSION = /\.(fbx|anim|glb|gltf|bvh|abc|blend|mp4|mov)$/i
 
   // `ANIM_Luma_Idle_Sleepy` con sujeto «Luma (Axolotl)» ⇒ «Idle_Sleepy». Se consumen los tramos
   // iniciales mientras sigan siendo prefijo del sujeto normalizado: así vale igual «Luma» (que es
@@ -280,7 +304,7 @@ function clipsDeLaTabla(vs, personaje, personajes, anclaEsProp = null) {
       const celda = celdas.find(c => /—|–/.test(c))
       if (!celda) continue
       const [sujetoCrudo, ...resto] = celda.split(/—|–/)
-      agregar(sujetoCrudo, resto.join(' — ').trim())
+      filas.push({ sujeto: sujetoCrudo, movimiento: resto.join(' — ').trim() })
       continue
     }
 
@@ -291,11 +315,27 @@ function clipsDeLaTabla(vs, personaje, personajes, anclaEsProp = null) {
     // vuelve a montar para que `agregar` lo parta igual que en la tabla.
     const crudo = it[1].trim()
     const m = crudo.match(/^([^(]+)(?:\((.*)\))?/)
-    const nombreCrudo = (m?.[1] || crudo).trim()
+    // El nombre, limpio de cómo lo escribe cada proyecto. Pinball lo da a secas («ANIM_Luma_Idle_Sleepy»)
+    // y Wort como archivo y con cola: «`ANIM_Wort_Idle.fbx` — loop: true — FINAL». Se quitan las
+    // comillas invertidas, lo que siga al primer guion largo con espacios (loop, eventos, tier: nada
+    // de eso es el nombre) y la extensión. Sin esto el clip de Wort se llamaba
+    // «animwortidlefbxlooptruefinal», y ese nombre es el del mp4 y la clave del prompt revisado. Lo
+    // de dentro del paréntesis no se toca: ahí van las reglas, con sus guiones si los tienen.
+    const nombreCrudo = (m?.[1] || crudo).replace(/`/g, '').split(/\s+[—–]\s+/)[0].trim().replace(EXTENSION, '').trim()
     const dentro = (m?.[2] || '').trim()
     const movimiento = sinPrefijoDeSujeto(nombreCrudo, sujetoGrupo) + (dentro ? ` (${dentro})` : '')
-    agregar(sujetoGrupo, movimiento)
+    filas.push({ sujeto: sujetoGrupo, movimiento })
   }
+
+  // Primero la coincidencia EXACTA: si alguna fila nombra al personaje tal cual —«Moon Jelly» para
+  // el ancla «Moon Jelly × 6 (mesh + shader + animation)», «Cartón» para la hoja de Cartón—, entran
+  // SOLO esas, y «Boss Moon Jelly — Roar» no se cuela aunque contenga el nombre, haya o no un ítem
+  // «Boss Moon Jelly» en el proyecto. La contención de `agregar` (con la regla del candidato más
+  // largo) queda de respaldo para las anclas que la tabla no escribe tal cual: «Cartón rig + all
+  // animations» no tiene filas exactas y sigue encontrando las doce de «Cartón». Vale para las dos
+  // formas, porque las dos recogen sus filas en `filas`.
+  const exactas = kAncla.length >= 3 ? filas.filter(f => norma(nombreDePersonaje(f.sujeto)) === kAncla) : []
+  for (const f of exactas.length ? exactas : filas) agregar(f.sujeto, f.movimiento, exactas.length > 0)
   return clips
 }
 
