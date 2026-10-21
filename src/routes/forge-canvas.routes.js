@@ -8083,6 +8083,8 @@ router.post('/assets/:asset_id/iterate', async (req, res, next) => {
       db, project_id, node_id: asset.node_id, session_id: null,
       node_key: dna.node_key, output_key: ses.output_key,
       image_gen_model: def.image_gen_model, member_id, solo: [pag.indice],
+      // La instancia viaja como DATO para que el motor cargue SU referencia de Dirección de Arte (USERREF).
+      instancia: instancia ? { pagina: instancia.pagina || sufijo, item: instancia.item || null, ...(instancia.id ? { id: instancia.id } : {}) } : null,
       // Una hoja instanciada se vuelve a producir CON SU ÍTEM. Sin esto, iterar la ficha de Luma
       // re-renderizaría la página 18 a secas y devolvería una Character Sheet genérica: la hoja
       // perdería al personaje que la define, en una acción que el usuario entiende como «lo mismo,

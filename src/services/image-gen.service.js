@@ -1036,6 +1036,36 @@ async function referenciaDeContexto(db, projectId, nombrePagina) {
   return suyas.find(r => r.metadata.contexto.primary) || suyas[0]
 }
 
+// ── USERREF (IMAGE 3 del maestro de 34, v2.9.60) — ver src/utils/userref.js ────────────────────────────────
+const { esUserref, sinClausulaUserref, elegirReferencia } = require('../utils/userref')
+
+/** Las piezas del registro compartido de referencias de Dirección de Arte del proyecto, de la más nueva a la más vieja. */
+async function referenciasDeDireccion(db, projectId) {
+  const { data } = await db().from('forge_assets')
+    .select('id, name, storage_url, status, metadata, created_at')
+    .eq('project_id', projectId)
+    .not('metadata->contexto', 'is', null)
+    .not('storage_url', 'is', null)
+    .order('created_at', { ascending: false })
+  return data || []
+}
+
+/** La referencia vigente de una página o instancia (`page_type` + `instance_id`): ver `elegirReferencia`. */
+async function referenciaDeInstancia(db, projectId, nombrePagina, instancia = null) {
+  return elegirReferencia(await referenciasDeDireccion(db, projectId), nombrePagina, instancia)
+}
+
+/** Deja una página sin su USERREF: desconecta la ranura del modelo (la poda se lleva el LoadImage) y quita la cláusula. */
+function quitarUserref(wf, p, nodo) {
+  const gpt = wf[p.prompt_node]
+  if (!gpt?.inputs) return
+  for (const [k, v] of Object.entries(gpt.inputs)) {
+    if (Array.isArray(v) && String(v[0]) === String(nodo)) delete gpt.inputs[k]
+  }
+  const campo = p.prompt_field || 'prompt'
+  gpt.inputs[campo] = sinClausulaUserref(gpt.inputs[campo])
+}
+
 async function paginaDelASG(db, projectId, numero, nombre = null, frase = false) {
   const { data: n } = await db().from('forge_nodes').select('id').eq('node_key', '3.20').maybeSingle()
   if (!n) return null
@@ -1311,7 +1341,11 @@ async function generateDeck({
   // despachaba el grafo de 25: medido, 0 de los 31 `prompt_node` existen en el otro grafo, así
   // que no se habría escrito ni un prompt y se habrían pagado 25 páginas con el texto de muestra
   // del autor. Las dos mitades existían y nadie las unía.
-  const armado = await composeDeck({ db, projectId: project_id, deck, fills, solo, campos: instancia?.fields || null })
+  // Las referencias de Dirección de Arte (USERREF) se leen ANTES de componer: la página que no tiene se compone
+  // sin la cláusula IMAGE 3, y así el recorte a 31.000 caracteres cae donde caía hoy (src/utils/userref.js).
+  const refsAD = await referenciasDeDireccion(db, project_id)
+  const armado = await composeDeck({ db, projectId: project_id, deck, fills, solo, campos: instancia?.fields || null,
+    conUserref: nombre => !!elegirReferencia(refsAD, nombre, instancia) })
   const maestro = armado.workflow || wfName
 
   const entry = await getWorkflowByName(maestro)
@@ -1418,6 +1452,37 @@ ${cola}`
   // en todo el texto; mandarlos sin ella pediría estilizar desde una imagen que no llega.
   const promptSinRef = texto => typeof texto === 'string' ? texto.replace(/^IMAGE 2 = [^\n]*\n?/m, '') : texto
   const aguantaSinRef = texto => typeof texto !== 'string' || !/IMAGE 2/.test(promptSinRef(texto))
+
+  // 1b-0. USERREF (slot 3). Va ANTES que el REF: con la cláusula IMAGE 3 todavía en el prompt, `aguantaSinRef` no
+  // dejaría caer ninguna página al camino de solo plantilla. Un registro sin huecos USERREF (el `_25`, el `_31` de
+  // 136 nodos, un rollback) no entra acá y todo sigue exactamente como antes.
+  {
+    const subidasU = new Map()
+    for (const p of armado.paginas) {
+      const huecos = (p.image_inputs || []).filter(esUserref)
+      if (!huecos.length) continue
+      // El REF y el USERREF se resuelven por separado: el resto del motor solo ve el hueco del pipeline.
+      p.image_inputs = p.image_inputs.filter(h => !esUserref(h))
+      p.con_userref = true
+      const ref = elegirReferencia(refsAD, p.nombre, instancia)
+      for (const h of huecos) {
+        if (wf[h.node]?.class_type !== 'LoadImage') continue
+        if (ref?.storage_url) {
+          try {
+            const { uploadImageToComfyUI } = require('./providers/comfyui.provider')
+            if (!subidasU.has(ref.storage_url)) subidasU.set(ref.storage_url, await uploadImageToComfyUI(ref.storage_url))
+            wf[h.node].inputs.image = subidasU.get(ref.storage_url)
+            avisosRef.push(`${p.nombre}: referencia de Dirección de Arte «${ref.name}»${ref.metadata?.contexto?.primary ? ' (primary)' : ''}`)
+            continue
+          } catch (e) {
+            avisosRef.push(`${p.nombre}: no se pudo subir la referencia de Dirección de Arte (${e.message}) — va sin ella`)
+          }
+        }
+        quitarUserref(wf, p, h.node)
+      }
+    }
+  }
+
   {
     const conBatch = armado.paginas.filter(p => {
       const gpt = wf[p.prompt_node]
@@ -1655,7 +1720,8 @@ ${cola}`
           // Una referencia elegida para ESTA página gana sobre cualquier fuente declarada: es una
           // decisión de dirección de arte tomada hace un momento, y el propósito entero de Add
           // Context es que sesgue la generación. Hasta hoy se guardaba y no la leía nadie.
-          const ctx = await referenciaDeContexto(db, project_id, p.nombre)
+          // En el maestro de 34 la referencia de Add Context va al USERREF (1b-0), nunca al REF del pipeline.
+          const ctx = p.con_userref ? null : await referenciaDeContexto(db, project_id, p.nombre)
           if (ctx?.storage_url) {
             try {
               if (!subidas.has(ctx.storage_url)) subidas.set(ctx.storage_url, await uploadImageToComfyUI(ctx.storage_url))
@@ -1996,4 +2062,4 @@ function sobreConIds (content, outputKey) {
   })
 }
 
-module.exports = { idsPorPosicion, sobreConIds, imagenDeInstancia, imageOutputsOf, parseOutputItems, referenciaDelProyecto, imagenDelProyecto, idsDeclarados, nombreDeImagen, sobreDeLaSeccion, tieneEntidades, cleanItemText, generateOneImage, generateDeck, esDeck, paginaDelASG, imagenDeNodoPorTitulo, referenciaDeContexto }
+module.exports = { idsPorPosicion, sobreConIds, imagenDeInstancia, imageOutputsOf, parseOutputItems, referenciaDelProyecto, imagenDelProyecto, idsDeclarados, nombreDeImagen, sobreDeLaSeccion, tieneEntidades, cleanItemText, generateOneImage, generateDeck, esDeck, paginaDelASG, imagenDeNodoPorTitulo, referenciaDeContexto, referenciaDeInstancia, referenciasDeDireccion, quitarUserref }

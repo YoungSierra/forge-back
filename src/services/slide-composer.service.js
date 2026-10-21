@@ -25,6 +25,7 @@
 //   node src/services/slide-composer.service.js --workflow asg --dump <dir>
 
 const { extractSection } = require('../utils/extract-section')
+const { esUserref, sinClausulaUserref } = require('../utils/userref')
 
 const LIMITE = 32000   // límite duro del modelo de imagen
 // El tope de ComfyUI para el grafo entero. Se recorta antes de llegar.
@@ -824,7 +825,7 @@ function fillDe(fills, etiqueta) {
  *                                etiqueta de la página → valor. Manda sobre el fill de plantilla.
  * @returns {Promise<{deck, workflow, paginas, avisos}>}
  */
-async function composeDeck({ db, projectId, deck = 'asg', fills = null, solo = null, campos = null }) {
+async function composeDeck({ db, projectId, deck = 'asg', fills = null, solo = null, campos = null, conUserref = null }) {
   const base = DECKS[deck]
   if (!base) throw new Error(`deck desconocido: ${deck}`)
 
@@ -1035,7 +1036,11 @@ async function composeDeck({ db, projectId, deck = 'asg', fills = null, solo = n
     // El campo del prompt no siempre se llama `prompt`: en el deck de audio es `text_prompt`, y
     // en el de video es `value`, tres nodos aguas arriba. El registro lo deja escrito.
     const campo  = p.prompt_field || 'prompt'
-    const prompt = wf[p.prompt_node]?.inputs?.[campo] || ''
+    let prompt = wf[p.prompt_node]?.inputs?.[campo] || ''
+    // Maestro de 34 (v2.9.60): sin referencia de Dirección de Arte la página se compone SIN la cláusula IMAGE 3,
+    // antes del recorte a 31.000 — así sale exactamente como hoy (src/utils/userref.js). Quien no pasa
+    // `conUserref` (componer para mirar, no para despachar) recibe también la página sin referencia.
+    if ((p.image_inputs || []).some(esUserref) && !conUserref?.(p.name)) prompt = sinClausulaUserref(prompt)
     const intake = parsearIntake(prompt)
     const pag = {
       indice: i + 1,

@@ -236,13 +236,15 @@ async function instanciarHojas({
     avisar(`${t.pagina} · ${t.item?.nombre}`)
     try {
       const fila = filaDe.get(claveDeHoja(t.pagina, t.item?.nombre)) || null
-      const instancia = (t.item?.parent_environment_id || fila)
-        ? {
-            ...(t.item?.parent_environment_id ? { parent_environment_id: t.item.parent_environment_id } : {}),
-            ...(fila?.fields ? { fields: fila.fields } : {}),
-            ...(fila?.host ? { host: fila.host } : {}),
-          }
-        : null
+      // De cuál instancia es (página + ítem + id estable): con eso el motor elige SU referencia de Dirección de
+      // Arte (USERREF del maestro de 34) y no la de otra instancia del mismo tipo de hoja.
+      const instancia = {
+        pagina: t.pagina, item: t.item?.nombre || null,
+        ...(t.item?.instancia_id ? { id: t.item.instancia_id } : {}),
+        ...(t.item?.parent_environment_id ? { parent_environment_id: t.item.parent_environment_id } : {}),
+        ...(fila?.fields ? { fields: fila.fields } : {}),
+        ...(fila?.host ? { host: fila.host } : {}),
+      }
       const r = await generateDeck({
         db, project_id, node_id, session_id: null, node_key, output_key,
         image_gen_model, deck, member_id, fills,
