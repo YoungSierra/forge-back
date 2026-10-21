@@ -45,7 +45,15 @@ const A_LA_HOJA = [
   //
   // «360» solo si no es un giro: un «360 turnaround» es la vuelta a un personaje, no un panorama.
   { hoja: '25_SkyboxSheet',         etiqueta: 'Skybox Sheet',          re: /(?<![a-z0-9])(?:skyboxe?s?|panoramas?)(?![a-z0-9])|(?<![a-z0-9])360(?![a-z0-9])(?!\s*°?\s*(?:turn|spin|rotat))/i },
-  { hoja: '19_EnvironmentSheet',    etiqueta: 'Environment Sheet',     re: _('env-\\d+','environments?', 'backgrounds?', 'levels?') },
+  // Las dos hojas del maestro de 34 (v2.9.59, handoff de Migue 19-10), ANTES que la del entorno: un nivel se
+  // nombra por su entorno («Level 2 — Sunken Reef») y la textura por su superficie. Hasta acá «levels?» mandaba
+  // cada nivel a una Environment Sheet. En un maestro sin esas páginas, el plan las lista como ausentes.
+  // «level-end fade» es un efecto y «level-up» / «level select» otra cosa. Y la textura solo cuando se dice
+  // textura tileable: un «tileset» o unos «architecture tiles» son el kit del entorno, no una superficie que se
+  // repite (medido el 21-10 sobre los VS Spec vivos: «ENV-01 Biolume Bloom tileset» se iba a la Tile Textures).
+  { hoja: '33_LevelDesignSheet',    etiqueta: 'Level Design Sheet',    re: _('lvl-\\d+', 'levels?(?![\\s-]*(?:end|up|select))') },
+  { hoja: '34_TileTexturesSheet',   etiqueta: 'Tile Textures Sheet',   re: _('tt-\\d+', 'tileables?', 'tile ?textures?', 'tiling textures?', 'seamless textures?') },
+  { hoja: '19_EnvironmentSheet',    etiqueta: 'Environment Sheet',     re: _('env-\\d+','environments?', 'backgrounds?') },
   { hoja: '20_PropSheet',           etiqueta: 'Prop Sheet',            re: _('props?', 'items?', 'objects?') },
   { hoja: '25_VideoMarketingSheet', etiqueta: 'Video Marketing Sheet', re: _('marketing', 'trailer', 'teaser', 'promo') },
   { hoja: '18_CharacterSheet',      etiqueta: 'Character Sheet',       re: _('char', 'char-\\d+','characters?', 'actors?', 'enem(?:y|ies)', 'creatures?', 'hero', 'npc') },
@@ -57,11 +65,11 @@ const A_LA_HOJA = [
 //
 // `ITEM_` no va a ninguna Sheet: el ítem lo cubre la página editorial `11_ItemCollectible`, la
 // misma regla que ya sigue el manifiesto del 3.20 («ITEM_ … are never Prop Sheets»). `CHR_` va al
-// personaje, que luego cuenta el roster. `LVL_` no tiene hoja.
+// personaje, que luego cuenta el roster. `LVL_` va a la Level Design Sheet desde el maestro de 34.
 const POR_PREFIJO = {
   VFX: '22_VFXSheet', UI: '21_UIComponentSheet', ICO: '21_UIComponentSheet', HUD: '21_UIComponentSheet',
   AUD: '23_AudioSheet', ENV: '19_EnvironmentSheet', PRP: '20_PropSheet', CHR: '18_CharacterSheet',
-  ITEM: null, LVL: null,
+  ITEM: null, LVL: '33_LevelDesignSheet',
 }
 
 // Y la `category` del brief aprobado del 3.9, que manda sobre las dos cosas anteriores cuando la

@@ -65,8 +65,11 @@ const DECKS = {
   // Los dos conviven por decisión de Miguel (29-09) — ver `maestroDelProyecto`. Las 25 páginas
   // siguen todas en el de 31; las 6 nuevas son `04_StyleBoundaryTest`, `05_HeroAssetTargets`,
   // `10_TechnologyRules`, `11_ItemCollectible`, `15_MaterialSurface` y `26_MaterialSurfaceSheet`.
+  // 34 desde el v2.9.59 (handoff de Migue 19-10): `33_LevelDesignSheet` y `34_TileTexturesSheet` al
+  // final. Sale JUNTO con el UPDATE del registro `_31`: composeDeck rechaza un registro cuyo número
+  // de páginas no sea este, así que uno sin el otro rompe el ASG de todos los proyectos en el `_31`.
   asg:      { workflow: 'V57_STUDIO_ArtStyleGuide_Template_25',   fuente: '3.9', requerido: true, paginas: 25, documento: 'Art Style Guide',
-              sucesor: { workflow: 'V57_STUDIO_ArtStyleGuide_Template_31', paginas: 32 } },
+              sucesor: { workflow: 'V57_STUDIO_ArtStyleGuide_Template_31', paginas: 34 } },
   gdd:      { workflow: 'V57_STUDIO_Vertical_Slice_GDD_Template', fuente: '3.8', paginas: 21, documento: 'GDD Art Style' },
   // El Art Bible no se llena desde un documento: cada página recibe su página YA APROBADA del ASG
   // y pinta la obra final de ese tema. Por eso no tiene `fuente` — su insumo es una imagen, no

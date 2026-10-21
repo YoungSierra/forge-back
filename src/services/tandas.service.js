@@ -804,7 +804,12 @@ async function regenerarGruposDelSlice({ cfg, armado, maestro, llamar, alLlamar,
   if (!grupos.length) throw publico('NO_SLICE_GROUPS', 'No section group of this output is marked slice_dependent')
   const canon = X.bloqueCanonico(maestro)
   const encs = X.indice(canon)
-  const g0 = X.verificarGate(encs, cfg.gate || [])
+  // Lo que falta y es de un grupo del slice no tumba la regeneración: es justo lo que se va a escribir. Desde el
+  // v2.9.59 el Gate pide §7.3.2 y §7.5.2, y los ADD aprobados antes traen 51 encabezados — sin esto, «Regenerate
+  // slice breakdowns» los rechazaba por no tener las dos secciones que venía a crear (opción (a) de Pedro, 20-10).
+  // Una fusión o un duplicado sí siguen frenando: eso es un documento fuera de plantilla.
+  const delSlice = new Set(grupos.flatMap(g => (g.sections || []).map(String)))
+  const g0 = X.verificarGate(encs, (cfg.gate || []).filter(n => !delSlice.has(String(n)) || encs.some(e => e.numeros.includes(n))))
   if (!g0.ok) throw publico('GATE_FAILED', `The approved document fails the Conformance Gate (missing §${g0.faltan.join(', §')}${g0.fusionados.length ? '; fused ' + g0.fusionados.join(', ') : ''}${g0.duplicados.length ? '; duplicated §' + g0.duplicados.join(', §') : ''}): regenerate the whole document instead`)
   // cada encabezado por su número y con su cuerpo propio: la unión devuelve el documento tal cual
   const porNum = new Map()

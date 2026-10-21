@@ -2442,6 +2442,35 @@ router.post('/nodes/:node_id/accept', async (req, res, next) => {
       }
     }
 
+    // Las marcas [DRAFT]/[REPLACE] del maestro. Aprobado con ellas, cada extracción de abajo lo rechazaba después
+    // («still carries N placeholder(s) — Approve the master first») sin que nadie lo hubiera visto al aprobar: le
+    // pasó a Migue Amez con el ADD de Smack The Coral Wish. Pedido de Pedro (20-10): el Accept las enseña y pide
+    // confirmarlas; confirmadas, las [DRAFT] se quitan y queda dicho quién, cuándo y en qué secciones. Las
+    // [REPLACE] no se borran en silencio: se avisan y se quedan hasta que alguien edite esa sección.
+    // Solo en un MAESTRO —un output del que otro de este nodo se extrae—: el ASG Prompt Set del 3.20 lleva 21
+    // «[DRAFT — style lock]» como parte de sus prompts y no es eso lo que se aprueba acá.
+    const Xm = require('../services/extraccion.service')
+    const esMaestro = (node.outputs || []).some(o => { const c = Xm.configExtract(o); return c?.from && (!outputKey || c.from === outputKey) })
+    const marcas = esMaestro ? Xm.marcasDelMaestro(content) : []
+    let contenidoFinal = content.trim()
+    let auditoriaMarcas = null
+    if (marcas.length) {
+      const secc = tipo => [...new Set(marcas.filter(m => m.tipo === tipo).map(m => m.seccion ? `§${m.seccion}` : 'preamble'))]
+      if (req.body.aprobar_marcas !== true) {
+        return res.status(409).json({
+          success: false, error: 'marks_pending', code: 'MARKS_PENDING', marcas,
+          message: `This document carries ${marcas.length} [DRAFT]/[REPLACE] mark(s) in ${[...secc('DRAFT'), ...secc('REPLACE')].join(', ')}. Confirm to approve them.`,
+        })
+      }
+      contenidoFinal = Xm.quitarDrafts(contenidoFinal).trim()
+      auditoriaMarcas = {
+        approved_by: member_id || null, approved_at: new Date().toISOString(),
+        drafts_removed: secc('DRAFT'), replace_kept: secc('REPLACE'), count: marcas.length,
+      }
+      console.log(`[accept] ${node.node_key}: marcas aprobadas por ${member_id || '¿?'} — DRAFT quitadas en ${auditoriaMarcas.drafts_removed.join(', ') || 'ninguna'}`
+        + `${auditoriaMarcas.replace_kept.length ? ` · REPLACE que siguen en ${auditoriaMarcas.replace_kept.join(', ')}` : ''}`)
+    }
+
     // Crear el forge_asset con el contenido de texto aceptado
     const { data: asset, error: assetErr } = await db()
       .from('forge_assets')
@@ -2459,10 +2488,11 @@ router.post('/nodes/:node_id/accept', async (req, res, next) => {
         name:           assetName,
         format:         docUrlFinal ? (docFormatFinal === 'pptx' ? 'pptx' : 'docx') : 'markdown',
         status:         'approved',
-        content:        content.trim(),
+        content:        contenidoFinal,
         storage_url:    docUrlFinal || null,
         approved_by:    member_id || null,
         approved_at:    new Date().toISOString(),
+        ...(auditoriaMarcas ? { metadata: { marks_approval: auditoriaMarcas } } : {}),
       })
       .select('id')
       .single()

@@ -203,4 +203,23 @@ function registrar({ logExecution, ctx, paquete, error: err, duration_ms }) {
   } catch (e) { console.error('[extract] logExecution falló (no fatal):', e.message) }
 }
 
-module.exports = { configExtract, outputsExtract, bloqueCanonico, indice, extraerSeccion, verificarGate, armarPaquete, masterDeFila, notaNodoEntero, registrar, porNumero, desciende }
+/**
+ * Las marcas [DRAFT …] / [REPLACE …] de un maestro, con la sección numerada que las contiene. Son las que hacen
+ * que `armarPaquete` rechace la extracción («Approve the master first»), así que el Accept las enseña antes de
+ * aprobar (pedido de Pedro, 20-10). Devuelve [{ seccion, tipo, texto }]; `seccion` null si va antes de toda sección.
+ */
+function marcasDelMaestro(texto) {
+  const out = []
+  let seccion = null
+  for (const linea of String(texto || '').split('\n')) {
+    const h = /^#{1,6}\s*\**\s*§?\s*(\d+(?:\.\d+)*)\b/.exec(linea)
+    if (h) seccion = h[1]
+    for (const m of linea.matchAll(/\[(DRAFT|REPLACE)[^\]]*\]/g)) out.push({ seccion, tipo: m[1], texto: m[0] })
+  }
+  return out
+}
+
+/** Quita las marcas [DRAFT …] (y el espacio que dejan). Las [REPLACE …] se quedan: piden editar, no aprobar. */
+const quitarDrafts = texto => String(texto || '').replace(/[ \t]*\[DRAFT[^\]]*\][ \t]*/g, m => (/^[ \t]/.test(m) && /[ \t]$/.test(m) ? ' ' : ''))
+
+module.exports = { marcasDelMaestro, quitarDrafts, configExtract, outputsExtract, bloqueCanonico, indice, extraerSeccion, verificarGate, armarPaquete, masterDeFila, notaNodoEntero, registrar, porNumero, desciende }
