@@ -46,7 +46,7 @@ async function consumidoresDelSlice(db, node_key) {
  * Lanza NO_SLICE_GROUPS / SLICE_SCOPE_MISSING (422, públicos) antes de gastar nada; lo demás sube de
  * executeOneOutput (GATE_FAILED, BATCH_FAILED… con su rastro).
  */
-async function regenerarSlice(db, { project_id, project_node_id, node_id, nodeDna, member_id = null, explicitKey = null, executeOneOutput }) {
+async function regenerarSlice(db, { project_id, project_node_id, node_id, nodeDna, member_id = null, explicitKey = null, executeOneOutput, soloSecciones = null }) {
   const outs = Array.isArray(nodeDna?.outputs) ? nodeDna.outputs : []
   const maestro = outs.find(o => { const c = T.configDe(o); return c && T.esPorSecciones(c) && (c.groups || []).some(g => g.slice_dependent) && (!explicitKey || (o.key || o.name) === explicitKey) })
   if (!maestro) throw publico('NO_SLICE_GROUPS', 'This node has no section-batched output with slice-dependent groups')
@@ -54,7 +54,7 @@ async function regenerarSlice(db, { project_id, project_node_id, node_id, nodeDn
   const cfg = T.configDe(maestro)
   const alcance = await T.alcanceDelSlice(db, { project_id, cfg })
   if (!alcance) throw publico('SLICE_SCOPE_MISSING', `This project has no approved Vertical Slice Specification yet: run node ${cfg.slice_scope?.from_node || '3.13'} and approve it, then regenerate.`)
-  const ran = [await executeOneOutput({ project_id, node_id, targetOutputKey: key, member_id, project_node_id, regenerar: 'slice' })]
+  const ran = [await executeOneOutput({ project_id, node_id, targetOutputKey: key, member_id, project_node_id, regenerar: 'slice', soloSecciones })]
   const failed = []
   for (const o of X.outputsExtract(outs)) {
     if (X.configExtract(o).from !== key) continue
@@ -92,8 +92,10 @@ async function lanzar(db, { project_id, consumidor: c, member_id, deps }) {
     .eq('project_id', project_id).eq('node_id', c.node_id).eq('removed', false)
   const pn = (pns || [])[0]
   if (!pn) return { skipped: 'NOT_IN_PROJECT' }
-  if (isBlueprintSealed && await isBlueprintSealed(project_id, pn.blueprint_id)
-      && !(await desglosesPendientes(db, { project_id, node_key: c.node_key, outputs: c.outputs })).length) return { skipped: 'SEALED' }
+  // Fase sellada: solo se completan los desgloses en N/A, y solo esos se reescriben.
+  const sellada = isBlueprintSealed && await isBlueprintSealed(project_id, pn.blueprint_id)
+  const pendientes = sellada ? await desglosesPendientes(db, { project_id, node_key: c.node_key, outputs: c.outputs }) : null
+  if (sellada && !pendientes.length) return { skipped: 'SEALED' }
   const { extractSection } = require('../utils/extract-section')
   const maestro = await X.masterDeFila(db, { project_id, node_id: c.node_id, nodeTitle: c.title, outputDefs: c.outputs, from: c.output_key, extractSection })
   if (!maestro) return { skipped: 'NO_MASTER' }
@@ -105,7 +107,7 @@ async function lanzar(db, { project_id, consumidor: c, member_id, deps }) {
   }
   const clave = `${project_id}:${c.node_id}:${c.output_key}`
   if (enCurso.has(clave)) return { skipped: 'IN_PROGRESS' }
-  const corrida = regenerarSlice(db, { project_id, project_node_id: pn.id, node_id: c.node_id, nodeDna: { outputs: c.outputs }, member_id, executeOneOutput })
+  const corrida = regenerarSlice(db, { project_id, project_node_id: pn.id, node_id: c.node_id, nodeDna: { outputs: c.outputs }, member_id, executeOneOutput, soloSecciones: pendientes })
     .then(r => { console.log(`[slice-trigger] ${c.node_key}/${c.output_key}: regenerated §${(r.regenerated || []).join(', §')} · ${r.ran.length} outputs${r.failed ? ` · ${r.failed.length} failed` : ''}`); return r })
     .catch(err => { console.warn(`[slice-trigger] ${c.node_key}/${c.output_key} failed: ${err?.code || ''} ${err?.message}`); return { error: err } })
     .finally(() => { if (enCurso.get(clave) === corrida) enCurso.delete(clave) })

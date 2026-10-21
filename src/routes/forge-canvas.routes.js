@@ -115,7 +115,39 @@ async function pendingOutputsForNode(project_id, node_id, isStale, node, project
 
 // ─── Ejecuta UN output de un nodo como sesión per-output auto-aprobada ──────────
 // Núcleo reusable del auto-run. No toca otros outputs ya aprobados (bug A).
-async function executeOneOutput({ project_id, node_id, targetOutputKey, member_id, project_node_id = null, regenerar = null }) {
+/**
+ * Rehace el PDF de un documento recién aprobado desde su texto aprobado, con la misma portada y la misma vista que
+ * el botón PDF (`generate-pdf`), y actualiza los DOS sitios donde vive el enlace: el activo y el tool_call del
+ * chat que apuntaba al de antes. Hoy lo usa el Accept con marcas: el texto aprobado ya no trae las [DRAFT].
+ */
+async function rehacerDocumentoAprobado({ project_id, node_id, session_id, asset_id, assetName, outputKey, contenido, urlVieja }) {
+  const { data: proyecto } = await db().from('projects').select('name, studio_name').eq('id', project_id).maybeSingle()
+  const tipoDoc = String(assetName || '').split(' — ')[0] || assetName
+  const titulo = proyecto?.name ? `${tipoDoc} — ${proyecto.name}` : tipoDoc
+  let texto = String(contenido || '')
+    .replace(/\[Studio(?:\s+Name)?\]/gi, proyecto?.studio_name || 'V57 Studio')
+    .replace(/\[(?:Working|Game)\s+Title\]/gi, proyecto?.name || '')
+  const { vistaDocumento } = require('../services/vista-documento.service')
+  const { data: dna } = await db().from('forge_nodes').select('outputs').eq('id', node_id).maybeSingle()
+  const v = vistaDocumento({ content: texto, outputDefs: Array.isArray(dna?.outputs) ? dna.outputs : [], outputKey: outputKey || null })
+  if (v.content.trim().length >= 600) texto = v.content
+
+  const { executeTool } = require('../services/tools.service')
+  const r = await executeTool('doc_gen_docx', { title: titulo, content: texto, item_images: [] }, { project_id, node_id })
+  if (!r?.success || !r.url) throw new Error('doc_gen_docx no devolvió documento')
+
+  const { data: a } = await db().from('forge_assets').select('metadata').eq('id', asset_id).maybeSingle()
+  await db().from('forge_assets').update({ storage_url: r.url, metadata: { ...(a?.metadata || {}), pdf_title: titulo } }).eq('id', asset_id)
+  const { data: msgs } = await db().from('forge_messages').select('id, tool_calls').eq('session_id', session_id).eq('role', 'agent')
+  for (const m of msgs || []) {
+    const tcs = Array.isArray(m.tool_calls) ? m.tool_calls : []
+    if (!tcs.some(t => t?.result?.url === urlVieja)) continue
+    await db().from('forge_messages').update({ tool_calls: tcs.map(t => t?.result?.url === urlVieja ? { ...t, result: { ...t.result, url: r.url } } : t) }).eq('id', m.id)
+  }
+  console.log(`[accept] documento rehecho sin [DRAFT] → ${r.url}`)
+}
+
+async function executeOneOutput({ project_id, node_id, targetOutputKey, member_id, project_node_id = null, regenerar = null, soloSecciones = null }) {
   const { buildSystemPrompt, runReActLoop, verificarHermanos } = require('../services/canvas-chat.service')
   const { logExecution } = require('../services/execution-log.service')
 
@@ -185,7 +217,7 @@ async function executeOneOutput({ project_id, node_id, targetOutputKey, member_i
       if (regenerar === 'slice') {
         const { extractSection } = require('../utils/extract-section')
         const maestro = await X.masterDeFila(db, { project_id, node_id, nodeTitle: armado.node.title, outputDefs: armado.outputDefs, from: targetOutputKey, extractSection })
-        t = await T.regenerarGruposDelSlice({ cfg: cfgT, armado: armadoT, maestro, llamar, alLlamar, alcance })
+        t = await T.regenerarGruposDelSlice({ cfg: cfgT, armado: armadoT, maestro, llamar, alLlamar, alcance, soloSecciones })
         regeneradas = t.regeneradas
       } else t = await T.generarEnTandas({ cfg: cfgT, armado: armadoT, llamar, alLlamar, alcance, encabezadosDeInputs: (armado.resolvedInputs || []).map(s => String(s).split('\n')[0]) })
       for (const a of t.avisos) console.warn(`[tandas] ${targetOutputKey}: ${a}`)
@@ -2457,9 +2489,15 @@ router.post('/nodes/:node_id/accept', async (req, res, next) => {
     if (marcas.length) {
       const secc = tipo => [...new Set(marcas.filter(m => m.tipo === tipo).map(m => m.seccion ? `§${m.seccion}` : 'preamble'))]
       if (req.body.aprobar_marcas !== true) {
+        // Separadas, como el aviso del front: confirmar quita las [DRAFT] y deja las [REPLACE], así que juntarlas
+        // en una sola lista no dejaba ver qué secciones iban a seguir pidiendo edición.
+        const drafts = secc('DRAFT'), replaces = secc('REPLACE')
         return res.status(409).json({
-          success: false, error: 'marks_pending', code: 'MARKS_PENDING', marcas,
-          message: `This document carries ${marcas.length} [DRAFT]/[REPLACE] mark(s) in ${[...secc('DRAFT'), ...secc('REPLACE')].join(', ')}. Confirm to approve them.`,
+          success: false, error: 'marks_pending', code: 'MARKS_PENDING', marcas, drafts, replaces,
+          message: [
+            drafts.length ? `[DRAFT] in ${drafts.join(', ')} — confirming removes them.` : null,
+            replaces.length ? `[REPLACE] in ${replaces.join(', ')} — they stay until someone edits those sections.` : null,
+          ].filter(Boolean).join(' ') + ' Confirm to approve.',
         })
       }
       contenidoFinal = Xm.quitarDrafts(contenidoFinal).trim()
@@ -2630,6 +2668,14 @@ router.post('/nodes/:node_id/accept', async (req, res, next) => {
     const disparo = await require('../services/disparo-slice.service').trasAprobarSalida(db, {
       project_id, node_key: node.node_key, output_keys: [outputKey], member_id, deps: { executeOneOutput, isBlueprintSealed },
     })
+
+    // El documento que se generó en la corrida es el de ANTES de quitar las [DRAFT]: aprobado así, el botón y el
+    // chip del chat seguían abriendo un docx con las marcas (Pedro, 21-10). Se rehace en segundo plano desde el
+    // texto aprobado; si falla, queda el de antes y el botón PDF lo rehace al pedirlo (no lleva `pdf_title`).
+    if (auditoriaMarcas?.drafts_removed.length && docUrlFinal) {
+      rehacerDocumentoAprobado({ project_id, node_id, session_id, asset_id: asset.id, assetName, outputKey, contenido: contenidoFinal, urlVieja: docUrlFinal })
+        .catch(e => console.error(`[accept] ${node.node_key}: no se pudo rehacer el documento sin [DRAFT]: ${e?.message || e}`))
+    }
 
     res.json({ success: true, asset_id: asset.id, image_assets_saved: imageAssets.length, ...(disparo.length ? { slice_regeneration: disparo } : {}) })
   } catch (err) { next(err) }
@@ -6553,12 +6599,14 @@ router.post('/nodes/:project_node_id/regenerate-slice', async (req, res, next) =
     const { data: nodeDna } = await db().from('forge_nodes').select('id, node_key, title, outputs').eq('id', node_id).single()
     const { regenerarSlice, desglosesPendientes } = require('../services/disparo-slice.service')
     // Con la fase sellada solo se COMPLETAN los desgloses que siguen en N/A (ver desglosesPendientes).
-    if (await isBlueprintSealed(project_id, pNode.blueprint_id)
-        && !(await desglosesPendientes(db, { project_id, node_key: nodeDna?.node_key, outputs: nodeDna?.outputs })).length) {
+    // Y SOLO esos: rehacer los ya escritos cambiaría los nombres de sus instancias.
+    const sellada = await isBlueprintSealed(project_id, pNode.blueprint_id)
+    const pendientes = sellada ? await desglosesPendientes(db, { project_id, node_key: nodeDna?.node_key, outputs: nodeDna?.outputs }) : null
+    if (sellada && !pendientes.length) {
       return res.status(423).json({ success: false, error_code: 'gate_sealed', error: 'This step belongs to a sealed phase — its slice breakdowns are already written, and rewriting them is locked after the gate was accepted' })
     }
     let r
-    try { r = await regenerarSlice(db, { project_id, project_node_id, node_id, nodeDna, member_id, explicitKey: req.body.target_output_key || null, executeOneOutput }) }
+    try { r = await regenerarSlice(db, { project_id, project_node_id, node_id, nodeDna, member_id, explicitKey: req.body.target_output_key || null, executeOneOutput, soloSecciones: pendientes }) }
     catch (err) {
       if (err?.publico && err.status === 422 && ['NO_SLICE_GROUPS', 'SLICE_SCOPE_MISSING'].includes(err.code)) return res.status(422).json({ success: false, error_code: err.code, error: err.message })
       throw err

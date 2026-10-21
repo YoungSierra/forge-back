@@ -796,19 +796,26 @@ async function generarPorSecciones({ cfg, armado, llamar, alLlamar, signal, espi
  * normaliza el espacio entre secciones). Lanza GATE_FAILED si el maestro no pasa el Gate —no se regenera sobre un
  * documento fuera de plantilla—, NO_SLICE_GROUPS si ningún grupo depende del slice, BATCH_FAILED como los grupos.
  */
-async function regenerarGruposDelSlice({ cfg, armado, maestro, llamar, alLlamar, signal, alcance = null }) {
+async function regenerarGruposDelSlice({ cfg, armado, maestro, llamar, alLlamar, signal, alcance = null, soloSecciones = null }) {
   const t0 = Date.now()
   const publico = (code, msg) => { const e = new Error(msg); e.code = code; e.publico = true; e.status = 422; return e }
   if (!maestro || !String(maestro).trim()) throw publico('NO_MASTER', 'There is no approved document to regenerate: generate the output first')
-  const grupos = (cfg.groups || []).map((g, i) => ({ ...g, numero: i + 1 })).filter(g => g.slice_dependent)
-  if (!grupos.length) throw publico('NO_SLICE_GROUPS', 'No section group of this output is marked slice_dependent')
+  const todos = (cfg.groups || []).map((g, i) => ({ ...g, numero: i + 1 })).filter(g => g.slice_dependent)
+  if (!todos.length) throw publico('NO_SLICE_GROUPS', 'No section group of this output is marked slice_dependent')
+  // `soloSecciones`: con la fase sellada solo se COMPLETA lo que sigue en N/A (Pedro, 21-10). Rehacer los ocho
+  // desgloses cuando faltaban dos cambiaba los nombres de las instancias ya escritas y dejaba a las hojas del
+  // Moodboard apuntando a instancias viejas. Corren solo los grupos con alguna sección pendiente, y de lo que
+  // devuelven solo se sustituyen esas secciones.
+  const pendientes = soloSecciones ? new Set(soloSecciones.map(String)) : null
+  const grupos = pendientes ? todos.filter(g => (g.sections || []).some(n => pendientes.has(String(n)))) : todos
+  if (!grupos.length) throw publico('NOTHING_PENDING', 'Every slice breakdown of this document is already written')
   const canon = X.bloqueCanonico(maestro)
   const encs = X.indice(canon)
   // Lo que falta y es de un grupo del slice no tumba la regeneración: es justo lo que se va a escribir. Desde el
   // v2.9.59 el Gate pide §7.3.2 y §7.5.2, y los ADD aprobados antes traen 51 encabezados — sin esto, «Regenerate
   // slice breakdowns» los rechazaba por no tener las dos secciones que venía a crear (opción (a) de Pedro, 20-10).
   // Una fusión o un duplicado sí siguen frenando: eso es un documento fuera de plantilla.
-  const delSlice = new Set(grupos.flatMap(g => (g.sections || []).map(String)))
+  const delSlice = new Set(todos.flatMap(g => (g.sections || []).map(String)))
   const g0 = X.verificarGate(encs, (cfg.gate || []).filter(n => !delSlice.has(String(n)) || encs.some(e => e.numeros.includes(n))))
   if (!g0.ok) throw publico('GATE_FAILED', `The approved document fails the Conformance Gate (missing §${g0.faltan.join(', §')}${g0.fusionados.length ? '; fused ' + g0.fusionados.join(', ') : ''}${g0.duplicados.length ? '; duplicated §' + g0.duplicados.join(', §') : ''}): regenerate the whole document instead`)
   // cada encabezado por su número y con su cuerpo propio: la unión devuelve el documento tal cual
@@ -831,7 +838,7 @@ async function regenerarGruposDelSlice({ cfg, armado, maestro, llamar, alLlamar,
     throw err
   } finally { signal?.removeEventListener?.('abort', alParar) }
   const regeneradas = []
-  for (const p of partes) for (const [n, t] of p) { porNum.set(n, t); regeneradas.push(n) }
+  for (const p of partes) for (const [n, t] of p) { if (pendientes && !pendientes.has(String(n))) continue; porNum.set(n, t); regeneradas.push(n) }
   const texto = unirSecciones(porNum)
   const g = X.verificarGate(X.indice(texto), cfg.gate || [])
   if (!g.ok) { const e = new Error(`The regenerated document fails the Conformance Gate: missing §${g.faltan.join(', §')}${g.fusionados.length ? '; fused ' + g.fusionados.join(', ') : ''}`); e.code = 'BATCH_FAILED'; e.publico = true; throw e }
