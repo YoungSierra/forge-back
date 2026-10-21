@@ -8001,9 +8001,15 @@ router.post('/assets/:asset_id/iterate', async (req, res, next) => {
     const wfName = String(def.image_gen_model).replace(/^comfyui:/, '')
     const deck = Object.entries(DECKS).find(([, c]) => c.workflow === wfName)?.[0]
     const todas = await composeDeck({ db, projectId: project_id, deck })
+    // Por el NOMBRE, no por el número. Las instancias guardan la página con la numeración del
+    // manifiesto —«18_CharacterSheet»— y el maestro del proyecto puede ser otro: en el de 34 la
+    // Character Sheet es la 23. Comparando el nombre entero, iterar cualquier hoja instanciada de
+    // un proyecto nuevo contestaba «No page named». El número es una posición, no una identidad.
+    const sinNumero = s => String(s || '').replace(/^\d+[_\s-]*/, '').toLowerCase().replace(/[^a-z0-9]+/g, '')
     const pag = todas.paginas.find(p => p.nombre === sufijo)
+      || todas.paginas.find(p => sinNumero(p.nombre) === sinNumero(sufijo))
     if (!pag) {
-      return res.status(400).json({ success: false, error: `No page named "${sufijo}" in ${wfName}` })
+      return res.status(400).json({ success: false, error: `No page named "${sufijo}" in ${todas.workflow || wfName}` })
     }
 
     // Lo último que el usuario le pidió a ESTA página. Iterar recompone la página desde el
