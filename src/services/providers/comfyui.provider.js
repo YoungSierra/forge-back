@@ -402,6 +402,12 @@ const INTENTOS_SUBIDA = 3
 const TOPE_SUBIDA_MS  = 90_000
 
 async function uploadImageToComfyUI(imageUrl) {
+  // Lo nuestro, por la API de R2: el `r2.dev` público contesta 429 en ráfagas (ver leerUrlDeR2).
+  let propia = null
+  try { propia = await require('../storage.service').leerUrlDeR2(imageUrl) }
+  catch (e) { console.warn(`[ComfyUI] R2 por API falló (${e.message}); se intenta por HTTP`) }
+  if (propia) return subir(propia.buffer, propia.mime || 'image/png')
+
   const imgRes = await fetch(imageUrl)
   if (!imgRes.ok) throw new Error(`Failed to fetch reference image: ${imgRes.status} ${imageUrl}`)
   const buffer = Buffer.from(await imgRes.arrayBuffer())

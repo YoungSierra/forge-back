@@ -159,6 +159,26 @@ async function getFromStorage(storagePath, bucketKey = DEFAULT_BUCKET) {
   return Buffer.concat(chunks).toString('utf-8')
 }
 
+/**
+ * Una URL pública de nuestros buckets, leída por la API de R2 y no por HTTP. El subdominio `r2.dev` tiene límite
+ * de peticiones: cuando un deck o una cadena sube varias piezas seguidas a ComfyUI contesta 429 (Miguel León,
+ * 21-10, regenerar una vista con «Revalidate»). Por la API no hay ese límite. Devuelve null si la URL no es de
+ * ningún bucket nuestro — quien llama sigue con `fetch`.
+ */
+async function leerUrlDeR2(url) {
+  const u = String(url || '')
+  for (const cfg of Object.values(BUCKET_CONFIG)) {
+    const base = String(cfg.publicUrl || '').replace(/\/+$/, '')
+    if (!base || !u.startsWith(base + '/')) continue
+    const key = decodeURIComponent(u.slice(base.length + 1).split(/[?#]/)[0])
+    const res = await getR2Client().send(new GetObjectCommand({ Bucket: cfg.name, Key: key }))
+    const chunks = []
+    for await (const chunk of res.Body) chunks.push(chunk)
+    return { buffer: Buffer.concat(chunks), mime: res.ContentType || null }
+  }
+  return null
+}
+
 function slugify(text) {
   return text.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
 }
@@ -225,6 +245,7 @@ module.exports = {
   uploadToStorage,
   subirDeck,
   getFromStorage,
+  leerUrlDeR2,
   deleteStorageKeys,
   clearNodeStorage,
   clearItemStorage,
