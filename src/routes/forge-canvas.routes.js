@@ -443,7 +443,12 @@ function promptsDelSobre(contenido, targetOutputKey) {
   if (!b) return []
   let j
   try { j = JSON.parse(b[1]) } catch { return [] }
-  const arr = j?.[targetOutputKey]
+  // El sobre también llega como `{ "task": "<output>", "images": [ … ] }`. JM, 21-10 en el 2.4: el
+  // documento traía sus 4 imágenes así, el lector no lo reconocía y se le pedía otro sobre al
+  // modelo, que escribía OTRA lista —5 imágenes con otros ids—. El hilo dibujaba los huecos de la
+  // primera y las imágenes eran de la segunda: ninguna casaba, y pedirlas a mano daba el 409.
+  const nombra = [j?.task, j?.output, j?.output_key, j?.format].includes(targetOutputKey)
+  const arr = Array.isArray(j?.[targetOutputKey]) ? j[targetOutputKey] : (nombra && Array.isArray(j?.images) ? j.images : null)
   if (!Array.isArray(arr)) return []
   return arr
     .map(e => ({ id: String(e?.id ?? '').trim(), prompt: String(e?.prompt ?? '').trim(), fuente: 'emission block' }))
@@ -1491,22 +1496,8 @@ function migrateOutputImages(raw) {
 // completa de una clave, así que la sesión que llegara última borraba lo que había hecho la otra:
 // el 2.2 tenía tres imágenes en su sesión enfocada y una en la general, y el chat enseñaba solo
 // una — dos huecos vacíos con las imágenes ya renderizadas al lado. Quien apretaba ✦ pagaba un
-// render que ya existía. Se une por (clave, índice) y gana la entrada con más variaciones; a
-// igualdad, la que ya estaba.
-function unirOutputImages(base, extra) {
-  const out = { ...(base || {}) }
-  for (const [clave, lista] of Object.entries(extra || {})) {
-    if (!Array.isArray(lista)) { out[clave] = lista; continue }
-    const porIndice = new Map((out[clave] || []).map(it => [it.index, it]))
-    for (const it of lista) {
-      const previo = porIndice.get(it.index)
-      const gana = !previo || (it.variations?.length ?? 0) > (previo.variations?.length ?? 0)
-      if (gana) porIndice.set(it.index, previo ? { ...previo, ...it } : it)
-    }
-    out[clave] = [...porIndice.values()].sort((a, b) => (a.index ?? 0) - (b.index ?? 0))
-  }
-  return out
-}
+// render que ya existía. Se une por (clave, índice) y gana la más reciente (ver utils/output-images).
+const { unirOutputImages } = require('../utils/output-images')
 
 // ─── Normalización post-generación de secciones estructuradas ────────────────
 
@@ -3253,7 +3244,12 @@ router.post('/nodes/:node_id/sessions/:session_id/generate-item-image', async (r
             if (s.id === session_id) míos.add(it.index)
           }
         }
-        if (índices.size >= esperadas && !míos.has(Number(item_index))) {
+        // Con `condition` sobre un índice que YA tiene imagen en la instancia es una iteración,
+        // aunque esa imagen viva en la sesión del despacho y no en la que pide: el hilo del nodo
+        // entero está parado en la general y el motor deja las suyas en la del output. JM, 21-10
+        // en el 2.4 y el 2.5: cada «rehazla así» respondía este 409 y solo le quedaba aprobar.
+        const iteraUnaQueExiste = !!String(condition || '').trim() && índices.has(Number(item_index))
+        if (índices.size >= esperadas && !míos.has(Number(item_index)) && !iteraUnaQueExiste) {
           console.warn(`[img-origen] RECHAZADO: ${output_key} ya tiene ${índices.size}/${esperadas}`
             + ` imágenes en la instancia; el índice ${item_index} no está en ESTA sesión, así que`
             + ' no es una iteración sino un segundo despacho')

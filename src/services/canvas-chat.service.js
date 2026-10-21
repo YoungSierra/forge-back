@@ -830,7 +830,10 @@ async function resolverImagenesDeItems({ db, projectId, nodeId, sessionId, outKe
         .select('output_key, output_images, created_at')
         .eq('project_node_id', propia.project_node_id).not('output_key', 'is', null)
         .order('created_at')
-      for (const s of porOutput || []) mezcla = { ...mezcla, ...(s.output_images || {}) }
+      // Por hueco y gana la más reciente. Pisar la clave entera dejaba siempre la del despacho:
+      // JM, 21-10, rehízo las 4 del pitch del 2.1 desde el hilo y el PDF salió con las primeras.
+      const { unirOutputImages } = require('../utils/output-images')
+      for (const s of porOutput || []) mezcla = unirOutputImages(mezcla, s.output_images || {})
     }
     const sess = { output_images: mezcla }
 
