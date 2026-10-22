@@ -705,6 +705,15 @@ function beatsDesdeJson(crudo, clip = {}) {
   return { texto: lineasDeBeats(json.beats), poses: json.beats.length, json }
 }
 
+// Las palabras que nombran al personaje: «CHR_MechanicalCrab animations (3 clips)» → mechanical,
+// crab. Fuera el vocabulario de producción de las páginas, que no dice de quién son.
+const NO_NOMBRAN = new Set(['chr', 'animation', 'animations', 'clip', 'clips', 'mesh', 'textures', 'texture',
+  'rig', 'rigs', 'skinning', 'shader', 'all', 'and', 'the', 'per', 'creature', 'creatures'])
+function palabrasDePersonaje(s) {
+  return new Set(String(s || '').replace(/([a-z])([A-Z])/g, '$1 $2').toLowerCase()
+    .split(/[^a-z0-9]+/).filter(w => w.length >= 3 && !/^\d+$/.test(w) && !NO_NOMBRAN.has(w)))
+}
+
 /**
  * La imagen ancla: la vista frontal del personaje, producida por la cadena de Character Sheet.
  *
@@ -757,32 +766,36 @@ async function anclaDelPersonaje({ db, project_id, desde = null }) {
   // justo lo que deshace el empate del proyecto de Migue.
   let candidatos = vivos
   const k = String(desde || '').toLowerCase().replace(/[^a-z0-9]+/g, '')
-  if (k.length >= 3) {
-    // De qué personaje es cada vista frontal. NO se lee de su propio nombre: se sube un salto por
-    // `derived_from_id` hasta la hoja del ASG de la que salió, que es la que lleva escrito el ítem
-    // del alcance. Medido el 18-09 en test_smack_migue_v.09:
-    //
-    //   «Character Sheet — 18_CharacterSheet — Moon Jelly × 6 — Concept art — front»
-    //     ↑ «Art Style Guide — 18_CharacterSheet — Moon Jelly × 6»   instancia: Moon Jelly × 6
-    //   «Character Sheet — 18_CharacterSheet — Concept art — front»
-    //     ↑ «Art Style Guide — 18_CharacterSheet»                    instancia: —
-    //
-    // La genérica no nombra a nadie y queda fuera sola, que es lo que deshace el empate. Por el
-    // nombre de la pieza no salía: «Moon Jelly × 6 (mesh + shader + animation)» es el ítem de la
-    // hoja de ANIMACIÓN y no encaja con el de la de personaje, que es «Moon Jelly × 6» a secas.
-    const madres = [...new Set(vivos.map(f => f.derived_from_id).filter(Boolean))]
-    const item = new Map()
-    if (madres.length) {
-      const { data: hojas } = await db().from('forge_assets')
-        .select('id, metadata').in('id', madres)
-      for (const h of hojas || []) {
-        const i = h.metadata?.instancia?.item
-        // El ítem SIN normalizar además del normalizado: el normalizado sirve para comparar, pero
-        // lo que hace falta aguas abajo —acotar la tabla del Vertical Slice y nombrar el archivo—
-        // es el nombre tal como está escrito, «Moon Jelly × 6».
-        if (i) item.set(h.id, { k: String(i).toLowerCase().replace(/[^a-z0-9]+/g, ''), item: String(i) })
-      }
+
+  // De qué personaje es cada vista frontal. NO se lee de su propio nombre: se sube un salto por
+  // `derived_from_id` hasta la hoja del ASG de la que salió, que es la que lleva escrito el ítem
+  // del alcance. Medido el 18-09 en test_smack_migue_v.09:
+  //
+  //   «Character Sheet — 18_CharacterSheet — Moon Jelly × 6 — Concept art — front»
+  //     ↑ «Art Style Guide — 18_CharacterSheet — Moon Jelly × 6»   instancia: Moon Jelly × 6
+  //   «Character Sheet — 18_CharacterSheet — Concept art — front»
+  //     ↑ «Art Style Guide — 18_CharacterSheet»                    instancia: —
+  //
+  // La genérica no nombra a nadie y queda fuera sola, que es lo que deshace el empate. Por el
+  // nombre de la pieza no salía: «Moon Jelly × 6 (mesh + shader + animation)» es el ítem de la
+  // hoja de ANIMACIÓN y no encaja con el de la de personaje, que es «Moon Jelly × 6» a secas.
+  //
+  // Se arma siempre, no solo con pista: el conteo de personajes de abajo también lo usa.
+  const madres = [...new Set(vivos.map(f => f.derived_from_id).filter(Boolean))]
+  const item = new Map()
+  if (madres.length) {
+    const { data: hojas } = await db().from('forge_assets')
+      .select('id, metadata').in('id', madres)
+    for (const h of hojas || []) {
+      const i = h.metadata?.instancia?.item
+      // El ítem SIN normalizar además del normalizado: el normalizado sirve para comparar, pero
+      // lo que hace falta aguas abajo —acotar la tabla del Vertical Slice y nombrar el archivo—
+      // es el nombre tal como está escrito, «Moon Jelly × 6».
+      if (i) item.set(h.id, { k: String(i).toLowerCase().replace(/[^a-z0-9]+/g, ''), item: String(i) })
     }
+  }
+
+  if (k.length >= 3) {
     // El personaje está DENTRO de la pista: «Cartón» dentro de «Cartón rig + all animations».
     const suyos = vivos.filter(f => {
       const i = item.get(f.derived_from_id)
@@ -825,28 +838,51 @@ async function anclaDelPersonaje({ db, project_id, desde = null }) {
     if (suyos.length > 1) candidatos = suyos
   }
 
-  // Del mismo job son las tres vistas de UN personaje; jobs distintos son personajes distintos.
-  const jobs = [...new Set(candidatos.map(f => f.metadata?.job).filter(Boolean))]
-  if (jobs.length > 1) {
+  // Cuántos PERSONAJES hay, no cuántas corridas.
+  //
+  // Antes se contaban jobs: del mismo job son las tres vistas de un personaje. Pero volver a correr
+  // la cadena sobre la MISMA hoja da otro job con el mismo personaje, y el 22-10 JuanK no pudo
+  // animar al Professor Wort: su hoja tenía tres vistas frontales (13-10, 21-10 19:10 y 19:23) y
+  // se leían como «3 characters». En test_pinball_migue_v.10 pasaba igual con Luma (12) y Koala (5).
+  //
+  // El personaje es el ítem de la hoja madre; si la madre no declara ítem, la madre misma; y sin
+  // madre, el job, como antes. De un mismo personaje gana la vista más nueva —la lista viene
+  // ordenada de la más reciente a la más vieja—, igual que en el resto del lienzo.
+  const personajes = new Map()
+  for (const f of candidatos) {
+    const p = item.get(f.derived_from_id)?.k || f.derived_from_id || f.metadata?.job
+    if (p && !personajes.has(p)) personajes.set(p, f)
+  }
+  if (personajes.size > 1) {
     const err = new Error(
-      `This project has ${jobs.length} characters with a front view (${candidatos.map(f => f.name).slice(0, 4).join(', ')}). ` +
+      `This project has ${personajes.size} characters with a front view (${[...personajes.values()].map(f => f.name).slice(0, 4).join(', ')}). ` +
       'Animation needs one anchor: run it from the character you want to animate.')
     err.code = 'ANCLA_AMBIGUA'
     throw err
   }
 
-  // Sin empate no hizo falta subir a la hoja madre, pero el ítem sigue haciendo falta aguas abajo.
-  // Se busca ahora, para el único candidato, en vez de repetir el mapa entero de antes.
-  let itemUnico = null
-  if (candidatos[0].derived_from_id) {
-    const { data: madre } = await db().from('forge_assets')
-      .select('metadata').eq('id', candidatos[0].derived_from_id).maybeSingle()
-    itemUnico = madre?.metadata?.instancia?.item ?? null
+  const elegida = personajes.size ? [...personajes.values()][0] : candidatos[0]
+
+  // Y que sea el personaje de la página. En Professor_Wort_&_Sprat_world solo Wort tiene vista
+  // frontal: corriendo desde «CHR_Sprat animations» la única que queda es la suya, y animar a Sprat
+  // con la cara de Wort son ocho láminas pagadas del personaje equivocado. El ítem del alcance y el
+  // de la hoja de personaje no se escriben igual —«CHR_Wort» contra «Professor Wort»—, así que se
+  // compara por palabras: si la página nombra a alguien y no comparte ninguna con el ítem
+  // declarado de la vista, es de otro y se para. Una vista sin ítem declarado no se juzga.
+  const declarado = item.get(elegida.derived_from_id)?.item
+  if (k.length >= 3 && declarado) {
+    const pd = palabrasDePersonaje(desde), pi = palabrasDePersonaje(declarado)
+    if (pd.size && pi.size && ![...pd].some(w => pi.has(w))) {
+      const err = new Error(`No front view for «${desde}» yet (the only one is ${declarado}'s): run the Character Sheet for this character first`)
+      err.code = 'SIN_ANCLA'
+      throw err
+    }
   }
 
   return {
-    url: candidatos[0].storage_url, nombre: candidatos[0].name, id: candidatos[0].id, por: 'único',
-    item: itemUnico,
+    url: elegida.storage_url, nombre: elegida.name, id: elegida.id,
+    por: candidatos.length > 1 ? 'más reciente' : 'único',
+    item: item.get(elegida.derived_from_id)?.item ?? null,
   }
 }
 
