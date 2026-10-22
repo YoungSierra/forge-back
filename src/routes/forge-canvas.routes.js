@@ -8208,14 +8208,32 @@ router.post('/assets/:asset_id/iterate', async (req, res, next) => {
       .map(v => String(v.metadata?.design_edit || '').trim()).find(Boolean) || null
     if (ultimoPedido) console.log(`[iterate] ${sufijo}: conservando el design edit «${ultimoPedido.slice(0, 60)}»`)
 
+    // La instancia, COMPLETA: además de página, ítem e id, su fila (`fields`), su anfitrión y su entorno padre, como
+    // en la primera producción (instanciarHojas). Sin eso la hoja iterada salía con los datos genéricos de la página
+    // y la Skybox o la Level Design sin la imagen de su entorno padre. Se leen del alcance y del manifiesto de hoy;
+    // lo que la hoja tenga guardado queda de respaldo.
+    let datosInst = null
+    if (instancia?.item) {
+      const { datosDeInstancia } = require('../services/instanciar-hojas.service')
+      const vivos = await datosDeInstancia({ db, project_id, pagina: instancia.pagina || sufijo, item: instancia.item })
+      datosInst = {
+        pagina: instancia.pagina || sufijo, item: instancia.item,
+        ...((vivos.id || instancia.id) ? { id: vivos.id || instancia.id } : {}),
+        ...((vivos.parent_environment_id || instancia.parent_environment_id) ? { parent_environment_id: vivos.parent_environment_id || instancia.parent_environment_id } : {}),
+        ...(vivos.fields ? { fields: vivos.fields } : {}),
+        ...(vivos.host ? { host: vivos.host } : {}),
+      }
+      console.log(`[iterate] ${sufijo} · ${instancia.item}: fields ${vivos.fields ? 'sí' : 'no'} · padre ${datosInst.parent_environment_id || '—'}`)
+    }
+
     // Sin `session_id`: generateDeck escribiría output_images con SOLO esta página y borraría
     // las otras 33 del listado. La persistencia de una iteración es la versión, no la sesión.
     const r = await generateDeck({
       db, project_id, node_id: asset.node_id, session_id: null,
       node_key: dna.node_key, output_key: ses.output_key,
       image_gen_model: def.image_gen_model, member_id, solo: [pag.indice],
-      // La instancia viaja como DATO para que el motor cargue SU referencia de Dirección de Arte (USERREF).
-      instancia: instancia ? { pagina: instancia.pagina || sufijo, item: instancia.item || null, ...(instancia.id ? { id: instancia.id } : {}) } : null,
+      // La instancia viaja como DATO: el motor carga SU referencia de Dirección de Arte (USERREF), su fila y su padre.
+      instancia: datosInst || (instancia ? { pagina: instancia.pagina || sufijo, item: instancia.item || null, ...(instancia.id ? { id: instancia.id } : {}) } : null),
       // Una hoja instanciada se vuelve a producir CON SU ÍTEM. Sin esto, iterar la ficha de Luma
       // re-renderizaría la página 18 a secas y devolvería una Character Sheet genérica: la hoja
       // perdería al personaje que la define, en una acción que el usuario entiende como «lo mismo,

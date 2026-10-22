@@ -122,6 +122,43 @@ async function planDeInstancias({ db, project_id, deck = 'asg' }) {
 const claveDeHoja = (pagina, item) =>
   `${String(pagina || '').replace(/^\d+[_\s-]*/, '').toLowerCase().replace(/[^a-z0-9]+/g, '')}::${String(item || '').trim().toLowerCase()}`
 
+/**
+ * Los datos de UNA instancia que el motor necesita para volver a producir su hoja, leídos de las mismas fuentes que
+ * usa `instanciarHojas`: el entorno padre y el id estable salen del alcance; la fila (`fields`) y el anfitrión
+ * (`host`), del manifiesto del 3.20.
+ *
+ * Lo usa New Iteration. Antes iterar una hoja instanciada mandaba solo página e ítem: la hoja volvía con los datos
+ * genéricos de la página en vez de su fila, y la Skybox o la Level Design sin la imagen de su entorno padre — iterar
+ * la dejaba peor que la original. Se leen de las fuentes vivas, como en la primera producción, porque iterar
+ * recompone desde los documentos de hoy. Lo que no se pueda leer se omite: sin eso la hoja sale como salía.
+ */
+async function datosDeInstancia({ db, project_id, pagina, item }) {
+  const k = claveDeHoja(pagina, item)
+  const datos = {}
+  try {
+    const alcance = await itemsDelAlcance({ db, project_id })
+    for (const [hoja, items] of Object.entries(alcance.porHoja || {})) {
+      const i = items.find(x => claveDeHoja(hoja, x.nombre) === k)
+      if (!i) continue
+      if (i.parent_environment_id) datos.parent_environment_id = i.parent_environment_id
+      if (i.instancia_id) datos.id = i.instancia_id
+      break
+    }
+  } catch (e) { console.warn(`[iterate] alcance de la instancia: ${e.message}`) }
+  try {
+    const { itemsDelManifiesto } = require('./manifiesto-hojas.service')
+    const m = await itemsDelManifiesto({ db, project_id })
+    for (const [hoja, items] of Object.entries(m.porHoja || {})) {
+      const i = items.find(x => claveDeHoja(hoja, x.nombre) === k)
+      if (!i) continue
+      if (i.fields) datos.fields = i.fields
+      if (i.host) datos.host = i.host
+      break
+    }
+  } catch (e) { console.warn(`[iterate] manifiesto de la instancia: ${e.message}`) }
+  return datos
+}
+
 /** La línea que le dice al modelo DE CUÁL de los ítems es esta instancia. */
 const pedidoDe = (pagina, item) => [
   `This sheet is for ONE item of the vertical slice scope: "${item.nombre}".`,
@@ -272,7 +309,9 @@ async function instanciarHojas({
         name: `${documento} — ${t.pagina} — ${t.item.nombre}`,
         format: 'png', mime_type: 'image/png', storage_url: pg.url,
         status: 'approved', approved_by: member_id, approved_at: new Date().toISOString(),
-        metadata: { instancia: { pagina: t.pagina, item: t.item.nombre, de: t.item.de || null, job: r.jobId || null, ...(t.item.instancia_id ? { id: t.item.instancia_id } : {}) } },
+        // El entorno padre también queda escrito: New Iteration lo relee del alcance, y si ese dato desaparece de ahí,
+        // la hoja todavía sabe de quién era.
+        metadata: { instancia: { pagina: t.pagina, item: t.item.nombre, de: t.item.de || null, job: r.jobId || null, ...(t.item.instancia_id ? { id: t.item.instancia_id } : {}), ...(t.item.parent_environment_id ? { parent_environment_id: t.item.parent_environment_id } : {}) } },
       }).select('id, name, storage_url').single()
 
       creados.push(activo || { name: `${documento} — ${t.pagina} — ${t.item.nombre}`, storage_url: pg.url })
@@ -361,4 +400,4 @@ async function lanzarCorrida(args) {
   return vista(c)
 }
 
-module.exports = { planDeInstancias, instanciarHojas, pedidoDe, TOPE_DESPACHOS, lanzarCorrida, corrida, corridaEnCurso }
+module.exports = { planDeInstancias, instanciarHojas, pedidoDe, datosDeInstancia, TOPE_DESPACHOS, lanzarCorrida, corrida, corridaEnCurso }
