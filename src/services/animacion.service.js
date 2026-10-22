@@ -243,10 +243,13 @@ function clipsDeLaTabla(vs, personaje, personajes, anclaEsProp = null) {
     if (!nombre) return
     if (clips.some(c => c.nombre === nombre)) return
 
+    // Si cicla: lo que el documento DIGA manda —el VS de Wort escribe «loop: true» / «loop: false» en cada clip— y
+    // solo sin eso se deduce del nombre. Antes se deducía siempre, y «Run» salía sin bucle con el VS diciendo que sí.
+    const loopDicho = /\bloop\s*[:=]\s*(true|false|yes|no)\b/i.exec(movimiento)
     clips.push({
       nombre,
       etiqueta,
-      loop: /idle|loop|pulse/i.test(etiqueta),
+      loop: loopDicho ? /^(true|yes)$/i.test(loopDicho[1]) : /idle|loop|pulse/i.test(etiqueta),
       reglas: reglas || movimiento,
       sujeto: sujetoCrudo.trim(),
       es_prop: anclaEsProp,
@@ -287,6 +290,12 @@ function clipsDeLaTabla(vs, personaje, personajes, anclaEsProp = null) {
       corte = k + 1
       if (acum === meta) break
     }
+    // Y si el prefijo es una PALABRA del sujeto aunque no la primera: «ANIM_Wort_Idle» bajo «Professor Wort». Sin
+    // esto el clip se llamaba «wortidle» y el de Sprat «idle», y el nombre es el del mp4.
+    if (!corte && partes.length > 1) {
+      const palabras = String(sujeto).split(/[^A-Za-z0-9]+/).map(norma).filter(w => w.length >= 3)
+      if (palabras.includes(norma(partes[0]))) corte = 1
+    }
     return partes.slice(corte).join('_') || partes.join('_')
   }
 
@@ -321,9 +330,14 @@ function clipsDeLaTabla(vs, personaje, personajes, anclaEsProp = null) {
     // de eso es el nombre) y la extensión. Sin esto el clip de Wort se llamaba
     // «animwortidlefbxlooptruefinal», y ese nombre es el del mp4 y la clave del prompt revisado. Lo
     // de dentro del paréntesis no se toca: ahí van las reglas, con sus guiones si los tienen.
-    const nombreCrudo = (m?.[1] || crudo).replace(/`/g, '').split(/\s+[—–]\s+/)[0].trim().replace(EXTENSION, '').trim()
+    const tramos = (m?.[1] || crudo).replace(/`/g, '').split(/\s+[—–]\s+/)
+    const nombreCrudo = tramos[0].trim().replace(EXTENSION, '').trim()
     const dentro = (m?.[2] || '').trim()
-    const movimiento = sinPrefijoDeSujeto(nombreCrudo, sujetoGrupo) + (dentro ? ` (${dentro})` : '')
+    // La cola tampoco se tira: «loop: false; event: OnJumpStarted» son las reglas del clip, y el «loop» es lo que
+    // decide si cicla (ver `agregar`). Solo se quita el estado de entrega (FINAL, SLICE-ONLY), que no es del clip.
+    const cola = tramos.slice(1).map(t => t.trim()).filter(t => t && !/^(final|slice[-\s]?only|placeholder)$/i.test(t))
+    const reglas = [...cola, dentro].filter(Boolean).join('; ')
+    const movimiento = sinPrefijoDeSujeto(nombreCrudo, sujetoGrupo) + (reglas ? ` (${reglas})` : '')
     filas.push({ sujeto: sujetoGrupo, movimiento })
   }
 
@@ -336,7 +350,31 @@ function clipsDeLaTabla(vs, personaje, personajes, anclaEsProp = null) {
   // formas, porque las dos recogen sus filas en `filas`.
   const exactas = kAncla.length >= 3 ? filas.filter(f => norma(nombreDePersonaje(f.sujeto)) === kAncla) : []
   for (const f of exactas.length ? exactas : filas) agregar(f.sujeto, f.movimiento, exactas.length > 0)
+
+  // Último intento, solo si nada casó: por el NÚCLEO del nombre. La hoja de animación de Wort es «CHR_Wort animations
+  // (8 clips)» y el grupo del VS es «Professor Wort»: ni uno contiene al otro, y la hoja salía vacía. El núcleo quita
+  // el código de asset del principio (CHR_, PRP_…) y las palabras de producción —«animations», «rig», «mesh»—, y
+  // queda «wort», que sí está entre las palabras de «Professor Wort». Entra solo si UN único sujeto de la sección
+  // tiene todas las palabras del núcleo: con dos candidatos no se sabe de quién es la hoja y se sigue sin nada.
+  if (!clips.length && filas.length) {
+    const nucleo = palabrasDelNucleo(personaje)
+    if (nucleo.length && nucleo.join('').length >= 3) {
+      const suyas = filas.filter(f => { const p = new Set(palabrasDelNucleo(f.sujeto)); return nucleo.every(w => p.has(w)) })
+      const sujetos = new Set(suyas.map(f => norma(f.sujeto)))
+      if (sujetos.size === 1) for (const f of suyas) agregar(f.sujeto, f.movimiento, true)
+    }
+  }
   return clips
+}
+
+/** Las palabras que nombran a un personaje, sin el código de asset del principio ni el vocabulario de producción. */
+function palabrasDelNucleo(nombre) {
+  return nombreDePersonaje(nombre)
+    .replace(/^[A-Z]{2,5}_/, '')
+    .split(/[^A-Za-z0-9À-ɏ]+/)
+    .filter(w => w && !PRODUCCION.test(w) && !/^\d+$/.test(w))
+    .map(norma)
+    .filter(Boolean)
 }
 
 /**
@@ -853,6 +891,6 @@ async function guardarBeats({ db, project_id, node_id = null, clip, json, member
 }
 
 module.exports = {
-  nombreDePersonaje, clipsDelProyecto, clipsDelPersonaje, personajesDelProyecto, beatsDeClip, beatsDesdeJson, guardarBeats, lineasDeBeats, promptDeVideo,
+  nombreDePersonaje, clipsDeLaTabla, clipsDelProyecto, clipsDelPersonaje, personajesDelProyecto, beatsDeClip, beatsDesdeJson, guardarBeats, lineasDeBeats, promptDeVideo,
   adiDeAnimacion, anclaDelPersonaje, TOPE_CLIPS, SKILL_BEATS,
 }
