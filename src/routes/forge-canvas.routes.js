@@ -8336,8 +8336,12 @@ router.get('/assets/:asset_id/referencia', async (req, res, next) => {
       .eq('id', asset_id).eq('project_id', project_id).maybeSingle()
     if (!asset) return res.status(404).json({ success: false, error: 'Asset not found' })
     const d = destinoDeAsset(asset)
-    // Fuera de las páginas del ASG no hay referencia (spec §6: las piezas derivadas quedan fuera de la v1).
-    if (!d) return res.json({ success: true, aplica: false, vigente: null, historial: [] })
+    // Fuera de las páginas del ASG no hay referencia (spec §6: las piezas derivadas quedan fuera de la v1). Y con el
+    // registro V1 de Design Edits (antes del v2.9.61 o tras un --restore) tampoco: el modal no ofrece algo que no se usa.
+    const { getWorkflowByName } = require('../services/config.service')
+    const { huecoDeReferencia } = require('../services/design-edits.service')
+    const entry = await getWorkflowByName(EDITORES.design.workflow)
+    if (!d || !huecoDeReferencia(entry?.inject_config)) return res.json({ success: true, aplica: false, vigente: null, historial: [] })
     const { vigente, historial } = await registroDe(db, project_id, d.pagina, d.instancia)
     res.json({ success: true, aplica: true, pagina: d.pagina, instancia: d.instancia, vigente, historial })
   } catch (err) { next(err) }
