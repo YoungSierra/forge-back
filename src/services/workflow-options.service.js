@@ -132,9 +132,10 @@ function ramasDe (def) {
  * `expone` reemplaza la lista general por la de un grafo concreto: las herramientas de Edit 3D
  * ofrecen campos —`hint`, `bake`, `rig_type`…— que en la lista general aparecerían en cualquier
  * workflow que los tenga. `oculta` quita hojas de la general, para el workflow que no las admite.
+ * `suma` le agrega hojas a la general para un workflow concreto (Design Edits V2: background, n, seed).
  */
-async function opcionesDe (workflowJson, { expone = null, oculta = null } = {}) {
-  const permitidas = expone ? new Set(expone) : EXPUESTAS
+async function opcionesDe (workflowJson, { expone = null, oculta = null, suma = null } = {}) {
+  const permitidas = new Set([...(expone || EXPUESTAS), ...(suma || [])])
   const fuera = new Set(oculta || [])
   const grafo = typeof workflowJson === 'string' ? JSON.parse(workflowJson) : workflowJson
   const oi = await objectInfo()
@@ -168,6 +169,9 @@ async function opcionesDe (workflowJson, { expone = null, oculta = null } = {}) 
             : null,
           ramas:    ramasDe(def),
           ayuda:    meta.tooltip || null,
+          // El rango de un número, como lo declara ComfyUI: `n` va de 1 a 8 y fuera de eso el nodo rechaza la corrida.
+          ...(typeof meta.min === 'number' ? { min: meta.min } : {}),
+          ...(typeof meta.max === 'number' ? { max: meta.max } : {}),
           nodos:    [],
           // Un campo anidado solo aplica cuando su padre está en la rama que lo declara.
           padre:    campo.includes('.') ? campo.split('.').slice(0, -1).join('.') : null,
@@ -206,6 +210,12 @@ function aplicarOpciones (grafo, elegidas, catalogo, espejo = null) {
     if (!def) { avisos.push(`"${clave}" no existe en este workflow`); continue }
     if (def.valores && !def.valores.includes(valor)) {
       avisos.push(`"${valor}" no es un valor válido de ${clave} (${def.valores.join(', ')})`)
+      continue
+    }
+    if ((def.tipo === 'INT' || def.tipo === 'FLOAT') && (typeof valor !== 'number' || !Number.isFinite(valor)
+        || (def.tipo === 'INT' && !Number.isInteger(valor))
+        || (def.min != null && valor < def.min) || (def.max != null && valor > def.max))) {
+      avisos.push(`${clave} tiene que ser un número${def.min != null ? ` entre ${def.min}` : ''}${def.max != null ? ` y ${def.max}` : ''} (llegó ${JSON.stringify(valor)})`)
       continue
     }
     validas[clave] = valor

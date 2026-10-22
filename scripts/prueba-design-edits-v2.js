@@ -41,6 +41,11 @@ if (process.argv.includes('--correr')) {
   const E = arg('--engine'), REG = arg('--registro'), PROY = arg('--project'), ASSET = arg('--asset')
   const CUERPO = JSON.parse(arg('--cuerpo')), REFS = JSON.parse(arg('--refs', '[]')), RUTA = arg('--ruta', 'design-edit')
   const METODO = arg('--metodo', 'POST'), CORTE = arg('--corte', '2000-01-01T00:00:00+00:00')
+  // `--simular`: ComfyUI «contesta» (prompt_id fijo y n imágenes falsas) y las escrituras en la base NO se hacen: se
+  // anotan y devuelven filas inventadas. Es lo que deja probar qué escribe el motor después de generar, sin red.
+  const SIMULAR = process.argv.includes('--simular'), VERS = JSON.parse(arg('--versiones', '[]'))
+  const escrituras = []
+  const OBJECT_INFO = fs.readFileSync(path.join(__dirname, 'fixtures', 'object_info_design_edits.json'), 'utf8')
   const bloqueos = []
   let capturado = null
   const hostSb = new URL(process.env.SUPABASE_URL).host
@@ -49,7 +54,13 @@ if (process.argv.includes('--correr')) {
     const u = new URL(String(url)), m = String(opt.method || 'GET').toUpperCase()
     if (u.hostname === '127.0.0.1') return fetchReal(url, opt)
     if (u.host === hostSb && (m === 'GET' || m === 'HEAD')) return fetchReal(url, opt)
-    if (/\/api\/prompt$/.test(u.pathname) && m === 'POST') { capturado = JSON.parse(opt.body).prompt; throw new Error('CAPTURADO') }
+    // El catálogo de opciones sale de object_info: se sirve la copia guardada del 22-10 (scripts/fixtures).
+    if (/\/api\/object_info$/.test(u.pathname) && m === 'GET') return new Response(OBJECT_INFO, { status: 200, headers: { 'content-type': 'application/json' } })
+    if (/\/api\/prompt$/.test(u.pathname) && m === 'POST') {
+      capturado = JSON.parse(opt.body).prompt
+      if (SIMULAR) return new Response(JSON.stringify({ prompt_id: 'job-prueba' }), { status: 200 })
+      throw new Error('CAPTURADO')
+    }
     bloqueos.push(`${m} ${u.host}${u.pathname}`)
     throw new Error(`RED BLOQUEADA: ${m} ${u.host}${u.pathname}`)
   }
@@ -68,7 +79,10 @@ if (process.argv.includes('--correr')) {
   const ESCRIBE = new Set(['insert', 'update', 'upsert', 'delete'])
   const envolver = (b, tabla, llamadas = []) => new Proxy(b, {
     get(t, k) {
-      if (ESCRIBE.has(k)) throw new Error(`ESCRITURA BLOQUEADA: ${String(k)} en ${tabla}`)
+      if (ESCRIBE.has(k)) {
+        if (SIMULAR) return (...a) => escrituraAnotada(tabla, k, a)
+        throw new Error(`ESCRITURA BLOQUEADA: ${String(k)} en ${tabla}`)
+      }
       if (k === 'then') return (ok, ko) => t.then(r => {
         if (tabla === 'comfyui_workflows' && filaV2 && !r?.error) {
           const nombre = llamadas.find(c => c[0] === 'eq' && c[1][0] === 'name')?.[1][1]
@@ -78,6 +92,14 @@ if (process.argv.includes('--correr')) {
         }
         if (tabla === 'forge_assets' && REFS.length && Array.isArray(r?.data)
             && llamadas.some(c => c[0] === 'not' && c[1][0] === 'metadata->contexto')) r.data = [...REFS, ...r.data]
+        // Versiones inventadas (las candidatas de un lote), filtradas por los `eq` de la consulta.
+        if (tabla === 'forge_asset_versions' && VERS.length && !llamadas.some(c => ESCRIBE.has(c[0]))) {
+          const eqs = llamadas.filter(c => c[0] === 'eq').map(c => c[1])
+          const suyas = VERS.filter(v => eqs.every(([col, val]) => v[col] === val))
+          const uno = llamadas.some(c => c[0] === 'single' || c[0] === 'maybeSingle')
+          if (uno) { if (suyas.length) r = { data: suyas[0], error: null } }
+          else r = { ...r, data: [...(Array.isArray(r.data) ? r.data : []), ...suyas] }
+        }
         return r
       }).then(ok, ko)
       const v = t[k]
@@ -94,6 +116,29 @@ if (process.argv.includes('--correr')) {
   sup.db = () => falso
   const prov = require(path.join(E, 'src/services/providers/comfyui.provider'))
   prov.uploadImageToComfyUI = async url => `up_${sha(String(url)).slice(0, 16)}.png`
+  if (SIMULAR) {
+    // Lo que ComfyUI habría devuelto: tantas imágenes como pidió el `n` del grafo despachado.
+    const nDe = () => Number(Object.values(capturado || {}).find(x => x?.inputs?.n != null)?.inputs?.n) || 1
+    prov.pollUntilDone = async () => ({})
+    prov.downloadOutput = async () => ({ url: 'https://example.invalid/salida_1.png' })
+    prov.downloadImages = async () => Array.from({ length: nDe() }, (_, i) => ({ url: `https://example.invalid/salida_${i + 1}.png` }))
+  }
+  // Una escritura anotada: encadenable como la de supabase-js, y devuelve filas inventadas con id.
+  function escrituraAnotada(tabla, op, args) {
+    const reg = { tabla, op, valor: JSON.parse(JSON.stringify(args[0] ?? null)), filtros: [] }
+    escrituras.push(reg)
+    let uno = false
+    const b = new Proxy({}, { get(_, k) {
+      if (k === 'then') return (ok, ko) => {
+        const filas = op === 'insert' ? [].concat(reg.valor).map((f, i) => ({ id: `00000000-0000-0000-0000-${String(escrituras.length).padStart(6, '0')}${String(i).padStart(6, '0')}`, ...f })) : []
+        return Promise.resolve({ data: uno ? (filas[0] ?? null) : filas, error: null }).then(ok, ko)
+      }
+      if (k === 'single' || k === 'maybeSingle') return () => { uno = true; return b }
+      if (['eq', 'neq', 'in', 'is', 'match'].includes(k)) return (...a) => { reg.filtros.push([k, ...a]); return b }
+      return () => b
+    } })
+    return b
+  }
 
   const express = require('express')
   const app = express()
@@ -108,7 +153,7 @@ if (process.argv.includes('--correr')) {
         METODO === 'GET' ? {} : { method: METODO, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(CUERPO) })
       status = r.status; cuerpo = await r.json()
     } catch (e) { cuerpo = { error: e.message } }
-    console.log(JSON.stringify({ wf: capturado, status, cuerpo, bloqueos }))
+    console.log(JSON.stringify({ wf: capturado, status, cuerpo, bloqueos, escrituras }))
     srv.close(); process.exit(0)
   })
   return
@@ -130,6 +175,8 @@ const correr = o => {
   if (o.ruta) a.push('--ruta', o.ruta)
   if (o.metodo) a.push('--metodo', o.metodo)
   if (o.corte) a.push('--corte', o.corte)
+  if (o.simular) a.push('--simular')
+  if (o.versiones) a.push('--versiones', JSON.stringify(o.versiones))
   const salida = execFileSync(process.execPath, a, { encoding: 'utf8', maxBuffer: 1 << 26, cwd: process.cwd(),
     env: { ...process.env, NODE_PATH: process.env.NODE_PATH || path.join(process.cwd(), 'node_modules') } })
   return JSON.parse(salida.split('\n').filter(l => l.startsWith('{"wf"')).pop())
@@ -232,6 +279,56 @@ const subida = url => `up_${sha(String(url)).slice(0, 16)}.png`
     const vig = r.cuerpo?.vigente?.id || null
     linea(r.status === 200 && r.cuerpo.aplica === aplica && r.cuerpo.workflow === wf && (aplica ? !!vig : !vig),
       `R  GET /referencia, ${quien}: aplica ${r.cuerpo?.aplica} · ${r.cuerpo?.workflow}${vig ? ` · vigente ${vig}` : ''}`)
+  }
+
+  // N · Generation options de la V2 y n > 1 (rev. 4 de Art Direction).
+  {
+    const ops = { n: 3, seed: 123, 'model.background': 'opaque' }
+    let r = de(fija, { cambio: 'sujeto', opciones: ops })
+    let g = r.wf?.[n25]?.inputs
+    linea(!!g && g.n === 3 && g.seed === 123 && g['model.background'] === 'opaque',
+      `N1 opciones n=3, seed=123, background=opaque llegan al nodo ${n25} (la semilla elegida no se sortea)`)
+    r = de(fija, { cambio: 'sujeto', opciones: { n: 9 } })
+    linea(r.status === 400 && !r.wf, `N2 n=9 (fuera de 1–8): ${r.status} «${r.cuerpo?.error}» y nada despachado`)
+    r = contar(correr({ asset: fija.id, cuerpo: { prompt: PEDIDO, cambio: 'sujeto', opciones: { n: 3 } }, refs: REFS, v2: false }))
+    linea(r.status === 400 && !r.wf, 'N3 en la V1 (proyecto viejo / sin V2) n no es una opción: 400 y nada despachado')
+
+    // N4 · simulado: con n=3 la página NO cambia; quedan 3 candidatas fuera de la vigente.
+    r = contar(correr({ asset: fija.id, cuerpo: { prompt: PEDIDO, cambio: 'sujeto', opciones: { n: 3 } }, refs: REFS, simular: true }))
+    const ins = r.escrituras.filter(e => e.tabla === 'forge_asset_versions' && e.op === 'insert').flatMap(e => [].concat(e.valor))
+    const cands = ins.filter(v => v.metadata?.candidato)
+    linea(r.status === 200 && r.cuerpo?.candidatos?.length === 3 && r.cuerpo.version === null,
+      `N4 n=3: responde 3 candidatas y ninguna versión vigente (${r.status})`)
+    linea(cands.length === 3 && cands.every(v => v.is_current === false && v.metadata.candidato.lote === 'job-prueba' && v.metadata.candidato.de === 3)
+      && cands.map(v => v.metadata.candidato.indice).join() === '1,2,3' && cands.every(v => v.metadata.reference_scope === 'design'),
+      'N4 las 3 versiones: no vigentes, mismo lote, índices 1-3, con la referencia y el alcance')
+    linea(!r.escrituras.some(e => e.tabla === 'forge_assets' && e.op === 'update') && !r.escrituras.some(e => e.tabla === 'forge_asset_versions' && e.op === 'update' && e.valor?.is_current === false),
+      'N4 la página no se toca: ni el asset ni la vigente cambian hasta elegir')
+
+    // N5 · simulado: con n=1 todo sigue como siempre (reemplaza la página).
+    r = contar(correr({ asset: fija.id, cuerpo: { prompt: PEDIDO, cambio: 'sujeto' }, refs: REFS, simular: true }))
+    const ins1 = r.escrituras.filter(e => e.tabla === 'forge_asset_versions' && e.op === 'insert').flatMap(e => [].concat(e.valor)).filter(v => v.metadata?.job)
+    linea(r.status === 200 && r.cuerpo?.version && !r.cuerpo.candidatos && ins1.length === 1 && ins1[0].is_current === true && !ins1[0].metadata.candidato
+      && r.escrituras.some(e => e.tabla === 'forge_assets' && e.op === 'update' && e.valor?.storage_url === 'https://example.invalid/salida_1.png'),
+      'N5 n=1: una versión vigente y la página la muestra, como hoy')
+
+    // N6 · elegir la 2 de un lote de 3.
+    const lote = [1, 2, 3].map(i => ({
+      id: `00000000-0000-0000-0000-00000000c00${i}`, asset_id: fija.id, version_number: 900 + i, is_current: false,
+      storage_url: `https://example.invalid/cand_${i}.png`,
+      metadata: { job: 'job-x', design_edit: PEDIDO, design_edit_cambio: 'sujeto', editor: 'design', candidato: { lote: 'job-x', indice: i, de: 3 } },
+    }))
+    r = contar(correr({ asset: fija.id, cuerpo: { version_id: lote[1].id }, ruta: 'design-edit/elegir', simular: true, versiones: lote }))
+    const metas = r.escrituras.filter(e => e.tabla === 'forge_asset_versions' && e.op === 'update' && e.valor?.metadata?.candidato)
+    const de2 = id => metas.find(e => e.filtros.some(f => f[0] === 'eq' && f[1] === 'id' && f[2] === id))?.valor.metadata.candidato
+    linea(r.status === 200 && r.cuerpo?.version?.id === lote[1].id, `N6 elegir la 2: ${r.status}, vigente = v${r.cuerpo?.version?.version_number}`)
+    linea(de2(lote[1].id)?.elegido === true && de2(lote[0].id)?.no_elegido === true && de2(lote[2].id)?.no_elegido === true,
+      'N6 la 2 queda «elegida» y la 1 y la 3 «no elegidas» (siguen en el historial)')
+    linea(r.escrituras.some(e => e.tabla === 'forge_asset_versions' && e.valor?.is_current === true && e.filtros.some(f => f[1] === 'id' && f[2] === lote[1].id))
+      && r.escrituras.some(e => e.tabla === 'forge_assets' && e.op === 'update' && e.valor?.storage_url === lote[1].storage_url),
+      'N6 la 2 pasa a ser la vigente y la página la muestra')
+    r = contar(correr({ asset: fija.id, cuerpo: { version_id: '00000000-0000-0000-0000-000000000bad' }, ruta: 'design-edit/elegir', simular: true, versiones: lote }))
+    linea(r.status === 400 && !r.escrituras.length, 'N7 elegir algo que no es candidata: 400 y nada escrito')
   }
 
   // I · el registro V1 vivo: el motor nuevo despacha exactamente lo mismo que el de hoy.

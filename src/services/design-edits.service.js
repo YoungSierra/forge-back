@@ -122,4 +122,14 @@ async function workflowDeDesignEdit({ db, project_id, asset }) {
   return { workflow: DESIGN_EDITS_V2, motivo: 'Art Style Guide page of a new project' }
 }
 
-module.exports = { huecoDeReferencia, sinReferencia, textoDeAlcance, prepararGrafo, workflowDeDesignEdit, DESIGN_EDITS_V1, DESIGN_EDITS_V2 }
+// ── Generation options de la V2 ──────────────────────────────────────────────
+//
+// La rev. 4 de Art Direction pide TODOS los parámetros del nodo editables en Design Edits V2. La lista general
+// (workflow-options) deja fuera `background`, `n` y `seed` a propósito para el resto de los workflows —la semilla
+// la sortea el motor y n multiplica el gasto—; acá se suman. Con n > 1 el usuario elige entre las n imágenes.
+// Ojo: en el nodo de OpenAI, `seed` dice «not implemented yet in backend» (object_info, 22-10): se puede fijar, pero
+// no hace repetible la imagen.
+const EXTRA_V2 = ['background', 'n', 'seed']
+const opcionesExtraDe = cfg => (huecoDeReferencia(cfg) ? EXTRA_V2 : null)
+
+module.exports = { huecoDeReferencia, sinReferencia, textoDeAlcance, prepararGrafo, workflowDeDesignEdit, opcionesExtraDe, DESIGN_EDITS_V1, DESIGN_EDITS_V2 }

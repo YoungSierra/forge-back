@@ -393,6 +393,35 @@ async function downloadOutputsByNode(promptId, basePath, nombres = null) {
   return porNodo
 }
 
+// ─── Todas las imágenes de un job, en orden ──────────────────────────────────
+//
+// Design Edits V2 con `n` > 1 (rev. 4 de Art Direction): el nodo de OpenAI devuelve n imágenes en el MISMO
+// SaveImage, y el usuario elige cuál reemplaza la página. `downloadOutput` se queda con la primera y
+// `downloadOutputsByNode` con una por nodo; acá se bajan todas, en el orden en que ComfyUI las lista.
+async function downloadImages(promptId, basePath) {
+  const histRes = await fetch(`${BASE_URL()}/api/jobs/${promptId}`, { headers: headers() })
+  if (!histRes.ok) throw new Error(`ComfyUI jobs fetch failed: ${histRes.status}`)
+  const jobData = await histRes.json()
+  const outputs = jobData?.outputs ?? jobData?.[promptId]?.outputs
+  const archivos = Object.values(outputs || {})
+    .flatMap(s => (Array.isArray(s?.images) ? s.images : []))
+    .filter(f => f?.filename && !/\.(glb|gltf)$/i.test(f.filename))
+  const salida = []
+  for (const f of archivos) {
+    const viewUrl = `${BASE_URL()}/api/view?filename=${encodeURIComponent(f.filename)}`
+                  + `&subfolder=${encodeURIComponent(f.subfolder || '')}&type=${f.type || 'output'}`
+    const res = await fetch(viewUrl, { headers: headers(), redirect: 'follow' })
+    if (!res.ok) { console.warn(`[ComfyUI] imagen no se pudo bajar: ${res.status} ${f.filename}`); continue }
+    const buffer = Buffer.from(await res.arrayBuffer())
+    if (buffer.length < 1000) continue   // el mismo piso que downloadOutput: menos de 1 KB es un placeholder
+    const url = await uploadToStorage(buffer, `${basePath}_${salida.length + 1}.png`, res.headers.get('content-type') || 'image/png')
+    salida.push({ url, size_bytes: buffer.length })
+  }
+  if (!salida.length) throw new Error(`ComfyUI: el job ${promptId} no dejó ninguna imagen`)
+  console.log(`[ComfyUI] ${salida.length} imagen(es) → ${basePath}_N.png job:${promptId}`)
+  return salida
+}
+
 // Subir una referencia falla de a ratos, y no por la imagen. Medido el 14-09 con dos láminas de
 // 2,5 MB: la misma imagen sube en 12 s, y al intento siguiente se cuelga 223 s y muere con
 // `terminated`. Las dos fallaron una vez y las dos subieron otra. Sin reintento, un deck que ya
@@ -476,4 +505,4 @@ async function generateImageComfyUI(workflowName, prompt, width, height, storage
   return result
 }
 
-module.exports = { generateImageComfyUI, uploadImageToComfyUI, uploadBufferToComfyUI, submitWorkflow, pollUntilDone, downloadOutput, downloadOutputsByNode }
+module.exports = { generateImageComfyUI, uploadImageToComfyUI, uploadBufferToComfyUI, submitWorkflow, pollUntilDone, downloadOutput, downloadOutputsByNode, downloadImages }

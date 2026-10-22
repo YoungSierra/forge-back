@@ -7011,7 +7011,8 @@ const manejarEdicion = clave => async (req, res, next) => {
     const opciones = req.body?.opciones && typeof req.body.opciones === 'object' ? req.body.opciones : null
     if (opciones && Object.keys(opciones).length) {
       const { opcionesDe, aplicarOpciones } = require('../services/workflow-options.service')
-      const catalogo = await opcionesDe(entry.workflow_json)
+      const { opcionesExtraDe } = require('../services/design-edits.service')
+      const catalogo = await opcionesDe(entry.workflow_json, { suma: opcionesExtraDe(cfg) })
       const { escrituras, avisos } = aplicarOpciones(wf, opciones, catalogo, cfg.espejo || null)
       if (avisos.length) return res.status(400).json({ success: false, error: avisos.join(' · ') })
       console.log(`[design-edit] opciones del usuario: ${escrituras} escritura(s)`)
@@ -7034,7 +7035,8 @@ const manejarEdicion = clave => async (req, res, next) => {
     }
     const subidaRef = ref ? await uploadImageToComfyUI(ref.url) : null
     const { alcance } = prepararGrafo({ wf, cfg, pedido, cambio, subidaRef })
-    if (cfg.seed?.node) wf[cfg.seed.node].inputs[cfg.seed.field] = Math.floor(Math.random() * 2 ** 31)
+    // La semilla se sortea en cada edición, salvo que el usuario la haya fijado en Generation options (V2).
+    if (cfg.seed?.node && !(opciones && cfg.seed.field in opciones)) wf[cfg.seed.node].inputs[cfg.seed.field] = Math.floor(Math.random() * 2 ** 31)
 
     const BASE = (process.env.COMFYUI_BASE_URL || '').replace(/\/$/, '')
     const KEY  = process.env.COMFYUI_API_KEY
@@ -7048,9 +7050,21 @@ const manejarEdicion = clave => async (req, res, next) => {
     const jobId = JSON.parse(txt).prompt_id
 
     await pollUntilDone(jobId, 180000)
+    // Cuántas imágenes pidió (`n` del nodo del prompt, editable en la V2). Con una, el camino de siempre: reemplaza la
+    // página. Con varias (rev. 4 de Art Direction) NO reemplaza nada: quedan como candidatas y el usuario elige cuál
+    // (`/design-edit/elegir`); las demás quedan en el historial como «no elegidas», restaurables.
+    const pedidas = Number(cfg.prompt?.node && wf[cfg.prompt.node]?.inputs?.n) || 1
     const destino = `projects/${project_id}/design-edits/${asset_id}-${Date.now()}.png`
-    const salida  = await downloadOutput(jobId, destino)
-    if (!salida?.url) return res.status(502).json({ success: false, error: 'The workflow returned no image' })
+    let urls
+    if (pedidas > 1) {
+      const { downloadImages } = require('../services/providers/comfyui.provider')
+      urls = (await downloadImages(jobId, destino.replace(/\.png$/, ''))).map(x => x.url)
+    } else {
+      const salida = await downloadOutput(jobId, destino)
+      urls = salida?.url ? [salida.url] : []
+    }
+    if (!urls.length) return res.status(502).json({ success: false, error: 'The workflow returned no image' })
+    const lote = urls.length > 1
 
     // Misma regla que la iteración del deck: la versión nueva pasa a ser la vigente, pero NO
     // aprobada. Aprobar es un acto del usuario.
@@ -7062,26 +7076,29 @@ const manejarEdicion = clave => async (req, res, next) => {
       })
       ultima = 1
     }
-    await db().from('forge_asset_versions').update({ is_current: false }).eq('asset_id', asset_id)
-    const { data: ver, error: vErr } = await db().from('forge_asset_versions').insert({
-      asset_id, storage_url: salida.url, version_number: ultima + 1, is_current: true,
+    if (!lote) await db().from('forge_asset_versions').update({ is_current: false }).eq('asset_id', asset_id)
+    const metadata = {
+      // Qué se pidió y QUÉ WORKFLOW lo produjo. El nombre sale del editor y no escrito a fuego:
+      // con dos editores compartiendo camino, una constante acá etiquetaría de «Moodboard
+      // Iteration» una versión que en realidad la hizo New Art Style, y la pieza dejaría de ser
+      // auditable — que es para lo que existe esta metadata.
+      job: jobId, design_edit: pedido, workflow: wfName, editor: clave,
+      // Qué clase de cambio fue. Se guarda con la VERSIÓN porque la cascada marca al aprobarla,
+      // que puede ser días después y por otra persona.
+      ...(cambio ? { design_edit_cambio: cambio } : {}),
+      ...(opciones && Object.keys(opciones).length ? { opciones } : {}),
+      // Con qué referencia de Dirección de Arte se hizo (spec §2.2 y §4.5). La que se subió acá recibe su id al
+      // registrarse, abajo.
+      ...(ref ? { reference_asset_id: ref.id, reference_scope: alcance, reference_channel: ref.id ? ref.canal : 'design_edits' } : {}),
+    }
+    const { data: insertadas, error: vErr } = await db().from('forge_asset_versions').insert(urls.map((u, i) => ({
+      asset_id, storage_url: u, version_number: ultima + 1 + i, is_current: !lote,
       created_by: member_id,
-      metadata: {
-        // Qué se pidió y QUÉ WORKFLOW lo produjo. El nombre sale del editor y no escrito a fuego:
-        // con dos editores compartiendo camino, una constante acá etiquetaría de «Moodboard
-        // Iteration» una versión que en realidad la hizo New Art Style, y la pieza dejaría de ser
-        // auditable — que es para lo que existe esta metadata.
-        job: jobId, design_edit: pedido, workflow: wfName, editor: clave,
-        // Qué clase de cambio fue. Se guarda con la VERSIÓN porque la cascada marca al aprobarla,
-        // que puede ser días después y por otra persona.
-        ...(cambio ? { design_edit_cambio: cambio } : {}),
-        ...(opciones && Object.keys(opciones).length ? { opciones } : {}),
-        // Con qué referencia de Dirección de Arte se hizo (spec §2.2 y §4.5). La que se subió acá recibe su id al
-        // registrarse, abajo.
-        ...(ref ? { reference_asset_id: ref.id, reference_scope: alcance, reference_channel: ref.id ? ref.canal : 'design_edits' } : {}),
-      },
-    }).select('id, version_number, metadata').single()
+      metadata: lote ? { ...metadata, candidato: { lote: jobId, indice: i + 1, de: urls.length } } : metadata,
+    }))).select('id, version_number, storage_url, metadata')
     if (vErr) throw vErr
+    const versiones = [...(insertadas || [])].sort((a, b) => a.version_number - b.version_number)
+    const ver = versiones[0]
 
     // La referencia subida acá entra al registro de su página o instancia como si viniera de Add Context (spec §2.2).
     // Se registra DESPUÉS de generar: una edición que falla no deja vigente una referencia que nadie vio aplicada.
@@ -7098,8 +7115,10 @@ const manejarEdicion = clave => async (req, res, next) => {
             canal: 'design_edits', member_id, cascada: false,
           })
           referencia.id = r.activo?.id || null
-          await db().from('forge_asset_versions')
-            .update({ metadata: { ...(ver.metadata || {}), reference_asset_id: referencia.id } }).eq('id', ver.id)
+          for (const v of versiones) {
+            await db().from('forge_asset_versions')
+              .update({ metadata: { ...(v.metadata || {}), reference_asset_id: referencia.id } }).eq('id', v.id)
+          }
         } catch (e) {
           referencia.aviso = `The page was edited, but the reference could not be registered: ${e.message}`
           console.warn(`[design-edit] ${referencia.aviso}`)
@@ -7107,41 +7126,92 @@ const manejarEdicion = clave => async (req, res, next) => {
       }
     }
 
-    // El asset guarda con qué quedó: la tira que se ve bajo la imagen lee de acá, y sin esto
-    // seguiría mostrando las opciones de la generación anterior.
-    const parche = { storage_url: salida.url }
-    if (opciones && Object.keys(opciones).length) {
-      const { data: previo } = await db().from('forge_assets').select('metadata').eq('id', asset_id).maybeSingle()
-      parche.metadata = { ...(previo?.metadata || {}), opciones: { ...(previo?.metadata?.opciones || {}), ...opciones } }
-    }
-    await db().from('forge_assets').update(parche).eq('id', asset_id)
-
-    // La cascada también acá. Solo disparaba al aprobar una versión, y Miguel reportó que
-    // «actualizar» la Environment Sheet no marcaba nada: un Design Edit reemplaza la página EN SU
-    // SITIO —eso es actualizarla— y lo que depende de ella queda igual de desactualizado.
-    //
-    // Nada se regenera: se marca [R]/[V] y decide una persona, como en el otro camino.
-    let cascada = null
-    try {
-      const { propagarDesdePagina, revalidar } = require('../services/actualizacion.service')
-      await revalidar({ db, project_id, asset_id, member_id }).catch(() => {})
-      cascada = await propagarDesdePagina({
-        db, project_id, asset_id, member_id, cambio,
-        motivo: `${editor.etiqueta}: ${String(pedido).slice(0, 80)}`,
+    // Varias: la página no cambia todavía. Se devuelven las candidatas y la elige el usuario.
+    if (lote) {
+      return res.json({
+        success: true, version: null, job: jobId, cascada: null, referencia,
+        candidatos: versiones.map(v => ({ id: v.id, version_number: v.version_number, storage_url: v.storage_url })),
       })
-    } catch (e) {
-      console.warn(`[actualizacion] la cascada falló tras el ${editor.etiqueta} (no fatal):`, e.message)
     }
 
+    const cascada = await dejarVigente({
+      project_id, asset_id, ver, opciones, cambio, member_id, motivo: `${editor.etiqueta}: ${String(pedido).slice(0, 80)}`, etiqueta: editor.etiqueta,
+    })
     res.json({
       success: true,
-      version: { id: ver.id, version_number: ver.version_number, storage_url: salida.url },
+      version: { id: ver.id, version_number: ver.version_number, storage_url: ver.storage_url },
       job: jobId,
       cascada,
       referencia,
     })
   } catch (err) { next(err) }
 }
+
+/**
+ * Lo que pasa cuando una edición queda como LA página: el asset apunta a esa imagen y guarda con qué opciones se
+ * hizo, y lo que depende de la página queda marcado. Lo comparten el Design Edit de una imagen y la elección entre
+ * varias candidatas.
+ */
+async function dejarVigente({ project_id, asset_id, ver, opciones, cambio, member_id, motivo, etiqueta }) {
+  // El asset guarda con qué quedó: la tira que se ve bajo la imagen lee de acá, y sin esto
+  // seguiría mostrando las opciones de la generación anterior.
+  const parche = { storage_url: ver.storage_url }
+  if (opciones && Object.keys(opciones).length) {
+    const { data: previo } = await db().from('forge_assets').select('metadata').eq('id', asset_id).maybeSingle()
+    parche.metadata = { ...(previo?.metadata || {}), opciones: { ...(previo?.metadata?.opciones || {}), ...opciones } }
+  }
+  await db().from('forge_assets').update(parche).eq('id', asset_id)
+
+  // La cascada también acá. Solo disparaba al aprobar una versión, y Miguel reportó que
+  // «actualizar» la Environment Sheet no marcaba nada: un Design Edit reemplaza la página EN SU
+  // SITIO —eso es actualizarla— y lo que depende de ella queda igual de desactualizado.
+  //
+  // Nada se regenera: se marca [R]/[V] y decide una persona, como en el otro camino.
+  let cascada = null
+  try {
+    const { propagarDesdePagina, revalidar } = require('../services/actualizacion.service')
+    await revalidar({ db, project_id, asset_id, member_id }).catch(() => {})
+    cascada = await propagarDesdePagina({ db, project_id, asset_id, member_id, cambio, motivo })
+  } catch (e) {
+    console.warn(`[actualizacion] la cascada falló tras el ${etiqueta} (no fatal):`, e.message)
+  }
+  return cascada
+}
+
+// ─── POST /assets/:asset_id/design-edit/elegir ───────────────────────────────
+// Con `n` > 1 el Design Edit deja n candidatas sin tocar la página. Acá el usuario elige una: pasa a ser la vigente,
+// el asset la muestra y lo que depende de la página se marca. Las demás del lote quedan en el historial como «no
+// elegidas» y se pueden volver a poner con aprobar esa versión. Elegir otra del mismo lote después también vale.
+router.post('/assets/:asset_id/design-edit/elegir', async (req, res, next) => {
+  try {
+    const { id: project_id, asset_id } = req.params
+    const member_id = req.body?.member_id || null
+    const { data: asset } = await db().from('forge_assets').select('id').eq('id', asset_id).eq('project_id', project_id).maybeSingle()
+    if (!asset) return res.status(404).json({ success: false, error: 'Asset not found' })
+    const { data: ver } = await db().from('forge_asset_versions')
+      .select('id, version_number, storage_url, metadata').eq('id', req.body?.version_id || '').eq('asset_id', asset_id).maybeSingle()
+    const lote = ver?.metadata?.candidato?.lote
+    if (!lote) return res.status(400).json({ success: false, error: 'That version is not one of the candidates of a Design Edit' })
+
+    const { data: todas, error } = await db().from('forge_asset_versions').select('id, metadata').eq('asset_id', asset_id)
+    if (error) throw error
+    for (const v of (todas || []).filter(v => v.metadata?.candidato?.lote === lote)) {
+      const elegida = v.id === ver.id
+      const candidato = { ...v.metadata.candidato, elegido: elegida, no_elegido: !elegida }
+      await db().from('forge_asset_versions').update({ metadata: { ...v.metadata, candidato } }).eq('id', v.id)
+    }
+    await db().from('forge_asset_versions').update({ is_current: false }).eq('asset_id', asset_id)
+    await db().from('forge_asset_versions').update({ is_current: true }).eq('id', ver.id)
+
+    const m = ver.metadata || {}
+    const editor = EDITORES[m.editor] || EDITORES.design
+    const cascada = await dejarVigente({
+      project_id, asset_id, ver, opciones: m.opciones || null, cambio: m.design_edit_cambio || null, member_id,
+      motivo: `${editor.etiqueta}: ${String(m.design_edit || '').slice(0, 80)}`, etiqueta: editor.etiqueta,
+    })
+    res.json({ success: true, version: { id: ver.id, version_number: ver.version_number, storage_url: ver.storage_url }, cascada })
+  } catch (err) { next(err) }
+})
 
 /**
  * Con qué referencia va este Design Edit, o null si va sin ella. `pedidoRef` lo manda el modal:
@@ -8542,7 +8612,9 @@ router.get('/workflows/:nombre/opciones', async (req, res, next) => {
 
     const { opcionesDe } = require('../services/workflow-options.service')
     // `oculta`: hojas que este workflow no admite aunque su nodo las declare (el quad de Tripo P2).
-    const opciones = await opcionesDe(entry.workflow_json, { oculta: entry.inject_config?.oculta || null })
+    // `suma`: Design Edits V2 expone además background, n y seed (rev. 4 de Art Direction).
+    const { opcionesExtraDe } = require('../services/design-edits.service')
+    const opciones = await opcionesDe(entry.workflow_json, { oculta: entry.inject_config?.oculta || null, suma: opcionesExtraDe(entry.inject_config) })
 
     // Cuántas imágenes produce el workflow, para poder decir el tamaño de la corrida. Es lo único
     // honesto que se puede decir del costo: el sistema imputa un precio plano por imagen —medido,
