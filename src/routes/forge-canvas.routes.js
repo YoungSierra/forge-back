@@ -6940,6 +6940,8 @@ router.post('/assets/:asset_id/montaje-subido',
 const EDITORES = {
   design: {
     workflow: 'V57_STUDIO_Moodboard_Iteration',
+    // V1 o V2 según la página y el proyecto: ver `workflowDeDesignEdit` (design-edits.service).
+    enrutar: true,
     etiqueta: 'design edit',
     // Lo declara quien pide el cambio: el texto no lo dice y equivocarse hace pagar de más.
     cambioFijo: null,
@@ -6992,9 +6994,13 @@ const manejarEdicion = clave => async (req, res, next) => {
       }
     }
 
+    // Qué fila corre. Design Edits tiene dos (v2.9.61): la V2 con referencia para las páginas del ASG de un proyecto
+    // nuevo, y la V1 de siempre para el resto. New Art Style tiene una sola.
+    const { workflowDeDesignEdit } = require('../services/design-edits.service')
+    const wfName = editor.enrutar ? (await workflowDeDesignEdit({ db, project_id, asset })).workflow : editor.workflow
     const { getWorkflowByName } = require('../services/config.service')
-    const entry = await getWorkflowByName(editor.workflow)
-    if (!entry) return res.status(500).json({ success: false, error: `Workflow "${editor.workflow}" is not registered` })
+    const entry = await getWorkflowByName(wfName)
+    if (!entry) return res.status(500).json({ success: false, error: `Workflow "${wfName}" is not registered` })
 
     const cfg = entry.inject_config || {}
     const wf  = JSON.parse(JSON.stringify(entry.workflow_json))
@@ -7065,7 +7071,7 @@ const manejarEdicion = clave => async (req, res, next) => {
         // con dos editores compartiendo camino, una constante acá etiquetaría de «Moodboard
         // Iteration» una versión que en realidad la hizo New Art Style, y la pieza dejaría de ser
         // auditable — que es para lo que existe esta metadata.
-        job: jobId, design_edit: pedido, workflow: editor.workflow, editor: clave,
+        job: jobId, design_edit: pedido, workflow: wfName, editor: clave,
         // Qué clase de cambio fue. Se guarda con la VERSIÓN porque la cascada marca al aprobarla,
         // que puede ser días después y por otra persona.
         ...(cambio ? { design_edit_cambio: cambio } : {}),
@@ -8336,14 +8342,16 @@ router.get('/assets/:asset_id/referencia', async (req, res, next) => {
       .eq('id', asset_id).eq('project_id', project_id).maybeSingle()
     if (!asset) return res.status(404).json({ success: false, error: 'Asset not found' })
     const d = destinoDeAsset(asset)
-    // Fuera de las páginas del ASG no hay referencia (spec §6: las piezas derivadas quedan fuera de la v1). Y con el
-    // registro V1 de Design Edits (antes del v2.9.61 o tras un --restore) tampoco: el modal no ofrece algo que no se usa.
+    // La fila que correría el Design Edit de este activo, y si tiene la ranura de referencia. Fuera de las páginas del
+    // ASG, en un proyecto viejo o con la V2 sin registrar va la V1 y no hay referencia: el modal no ofrece algo que no
+    // se usa. `workflow` le dice al modal de qué fila leer las Generation options (la V1 y la V2 no tienen las mismas).
     const { getWorkflowByName } = require('../services/config.service')
-    const { huecoDeReferencia } = require('../services/design-edits.service')
-    const entry = await getWorkflowByName(EDITORES.design.workflow)
-    if (!d || !huecoDeReferencia(entry?.inject_config)) return res.json({ success: true, aplica: false, vigente: null, historial: [] })
+    const { huecoDeReferencia, workflowDeDesignEdit } = require('../services/design-edits.service')
+    const { workflow } = await workflowDeDesignEdit({ db, project_id, asset })
+    const entry = await getWorkflowByName(workflow)
+    if (!d || !huecoDeReferencia(entry?.inject_config)) return res.json({ success: true, aplica: false, workflow, vigente: null, historial: [] })
     const { vigente, historial } = await registroDe(db, project_id, d.pagina, d.instancia)
-    res.json({ success: true, aplica: true, pagina: d.pagina, instancia: d.instancia, vigente, historial })
+    res.json({ success: true, aplica: true, workflow, pagina: d.pagina, instancia: d.instancia, vigente, historial })
   } catch (err) { next(err) }
 })
 

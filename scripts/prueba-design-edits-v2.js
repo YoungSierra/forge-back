@@ -7,6 +7,9 @@
 //     se CAPTURA y se corta ahí; cualquier otra salida cuenta como intento bloqueado;
 //   · la subida a ComfyUI es un doble determinista (nombre = sha de la URL) y la semilla, fija.
 //
+// La fila V2 (`V57_STUDIO_Moodboard_Iteration_V2`, la del paquete) se AÑADE a lo que devuelve la base, al lado de la
+// V1 viva, con el `created_at` que se le pida: anterior al proyecto = proyecto nuevo; posterior = proyecto viejo.
+//
 // Casos:
 //   A  V2, página fija sin referencia            → prompt = prompt_sin_referencia.txt byte a byte, sin image_2 ni nodo 30
 //   B  V2, página con referencia + «What it shows» → image_2 = la referencia, alcance DESIGN; resto del grafo = registro
@@ -15,7 +18,9 @@
 //   E  V2, con referencia y sin chip              → 400 FALTA_CHIP y NADA despachado
 //   F  V2, instancia de hoja: referencia de OTRA instancia → = A; la SUYA → image_2 = la suya
 //   G  V2, referencia recién subida (modo nueva)  → image_2 = esa
-//   H  V2, pieza que no es página del ASG con referencias en el registro → = A
+//   R  enrutamiento (`workflowDeDesignEdit`), con referencias en el registro y comparado con el motor de hoy byte a byte:
+//      R1 imagen que no es del ASG, proyecto nuevo → V1 · R2 página del ASG, proyecto viejo → V1 ·
+//      R3 sin la fila V2 registrada → V1; y GET /referencia: `aplica` y `workflow` en cada caso
 //   I  V1 vivo (3 nodos): motor nuevo = motor de hoy, byte a byte, con y sin referencias en el registro
 //   J  New Art Style vivo: motor nuevo = motor de hoy
 //
@@ -28,13 +33,14 @@ const path = require('path'), fs = require('fs'), crypto = require('crypto'), { 
 const arg = (k, d = null) => { const i = process.argv.indexOf(k); return i > 0 ? process.argv[i + 1] : d }
 const sha = s => crypto.createHash('sha256').update(s).digest('hex')
 const RAIZ = path.resolve(__dirname, '..')
-const WF = 'V57_STUDIO_Moodboard_Iteration'
+const WF = 'V57_STUDIO_Moodboard_Iteration', WF2 = 'V57_STUDIO_Moodboard_Iteration_V2'
 
 // ─── Modo hijo: un Design Edit con UN motor; devuelve el grafo capturado o la respuesta ─────────────────────────
 if (process.argv.includes('--correr')) {
   require('dotenv').config({ path: path.join(process.cwd(), '.env') })
   const E = arg('--engine'), REG = arg('--registro'), PROY = arg('--project'), ASSET = arg('--asset')
   const CUERPO = JSON.parse(arg('--cuerpo')), REFS = JSON.parse(arg('--refs', '[]')), RUTA = arg('--ruta', 'design-edit')
+  const METODO = arg('--metodo', 'POST'), CORTE = arg('--corte', '2000-01-01T00:00:00+00:00')
   const bloqueos = []
   let capturado = null
   const hostSb = new URL(process.env.SUPABASE_URL).host
@@ -54,15 +60,21 @@ if (process.argv.includes('--correr')) {
     ? Object.fromEntries(Object.keys(v).sort((a, b) => Buffer.byteLength(a) - Buffer.byteLength(b) || Buffer.compare(Buffer.from(a), Buffer.from(b))).map(k => [k, comoJsonb(v[k])]))
     : v
   const leer = f => comoJsonb(JSON.parse(fs.readFileSync(path.join(REG, f), 'utf8')))
-  const registro = REG ? { workflow_json: leer('workflow_json_design_edits_v2.json'), inject_config: leer('inject_config_design_edits_v2.json') } : null
+  const filaV2 = REG ? {
+    id: '00000000-0000-0000-0000-0000000000v2', name: WF2, description: 'prueba', is_active: true,
+    workflow_json: leer('workflow_json_design_edits_v2.json'), inject_config: leer('inject_config_design_edits_v2.json'),
+    created_at: CORTE, updated_at: CORTE, refinement_capable: false, mask_capable: false,
+  } : null
   const ESCRIBE = new Set(['insert', 'update', 'upsert', 'delete'])
   const envolver = (b, tabla, llamadas = []) => new Proxy(b, {
     get(t, k) {
       if (ESCRIBE.has(k)) throw new Error(`ESCRITURA BLOQUEADA: ${String(k)} en ${tabla}`)
       if (k === 'then') return (ok, ko) => t.then(r => {
-        if (tabla === 'comfyui_workflows' && registro && r?.data) {
-          const p = f => (f?.name === WF && 'workflow_json' in f ? Object.assign(f, registro) : f)
-          if (Array.isArray(r.data)) r.data.forEach(p); else p(r.data)
+        if (tabla === 'comfyui_workflows' && filaV2 && !r?.error) {
+          const nombre = llamadas.find(c => c[0] === 'eq' && c[1][0] === 'name')?.[1][1]
+          const uno = llamadas.some(c => c[0] === 'single' || c[0] === 'maybeSingle')
+          if (nombre === WF2) r = { ...r, data: uno ? filaV2 : [filaV2] }
+          else if (!nombre && Array.isArray(r.data)) r = { ...r, data: [...r.data, filaV2] }
         }
         if (tabla === 'forge_assets' && REFS.length && Array.isArray(r?.data)
             && llamadas.some(c => c[0] === 'not' && c[1][0] === 'metadata->contexto')) r.data = [...REFS, ...r.data]
@@ -93,7 +105,7 @@ if (process.argv.includes('--correr')) {
     let status = null, cuerpo = null
     try {
       const r = await fetch(`http://127.0.0.1:${srv.address().port}/api/projects/${PROY}/canvas/assets/${ASSET}/${RUTA}`,
-        { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(CUERPO) })
+        METODO === 'GET' ? {} : { method: METODO, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(CUERPO) })
       status = r.status; cuerpo = await r.json()
     } catch (e) { cuerpo = { error: e.message } }
     console.log(JSON.stringify({ wf: capturado, status, cuerpo, bloqueos }))
@@ -116,6 +128,8 @@ const correr = o => {
     '--cuerpo', JSON.stringify(o.cuerpo), '--refs', JSON.stringify(o.refs || [])]
   if (o.v2 !== false) a.push('--registro', REG)
   if (o.ruta) a.push('--ruta', o.ruta)
+  if (o.metodo) a.push('--metodo', o.metodo)
+  if (o.corte) a.push('--corte', o.corte)
   const salida = execFileSync(process.execPath, a, { encoding: 'utf8', maxBuffer: 1 << 26, cwd: process.cwd(),
     env: { ...process.env, NODE_PATH: process.env.NODE_PATH || path.join(process.cwd(), 'node_modules') } })
   return JSON.parse(salida.split('\n').filter(l => l.startsWith('{"wf"')).pop())
@@ -194,10 +208,30 @@ const subida = url => `up_${sha(String(url)).slice(0, 16)}.png`
     const ret = [refFalsa('ref-fija', pagFija, null, { retirada: true })]
     sinRefOk(de(fija, { cambio: 'sujeto' }, ret), 'G2 referencia quitada del registro')
   }
-  {
-    const r = de(noPagina, { cambio: 'sujeto' }, REFS)
-    const g = r.wf?.[n25]?.inputs
-    linea(!!g && g.prompt === esperadoSin && !('model.images.image_2' in g), `H  «${noPagina.name.slice(0, 50)}» (no es página del ASG): va sin referencia`)
+  // R · el enrutamiento: fuera de la V2, el grafo es el de hoy byte a byte (aun con referencias en el registro).
+  const VIEJO = '2100-01-01T00:00:00+00:00'
+  const igualAHoy = (a, extra, quien) => {
+    const cuerpo = { prompt: PEDIDO, cambio: 'sujeto' }
+    const nuevo = contar(correr({ asset: a.id, cuerpo, refs: REFS, ...extra }))
+    const hoy = contar(correr({ engine: path.resolve(REF_ENGINE), asset: a.id, cuerpo, refs: REFS, ...extra }))
+    linea(!!nuevo.wf && JSON.stringify(nuevo.wf) === JSON.stringify(hoy.wf) && nuevo.wf[n25]?.class_type === 'OpenAIGPTImage1',
+      `${quien}: va la V1, grafo idéntico al de hoy byte a byte`)
+  }
+  igualAHoy(noPagina, {}, `R1 «${noPagina.name.slice(0, 45)}» (no es del ASG), proyecto nuevo`)
+  igualAHoy(fija, { corte: VIEJO }, 'R2 página del ASG, proyecto viejo')
+  igualAHoy(i1, { corte: VIEJO }, 'R2 instancia de hoja, proyecto viejo')
+  igualAHoy(fija, { v2: false }, 'R3 página del ASG, sin la fila V2 registrada')
+  for (const [quien, a, extra, aplica, wf] of [
+    ['página del ASG, proyecto nuevo', fija, {}, true, 'V57_STUDIO_Moodboard_Iteration_V2'],
+    ['instancia, proyecto nuevo', i1, {}, true, 'V57_STUDIO_Moodboard_Iteration_V2'],
+    ['página del ASG, proyecto viejo', fija, { corte: VIEJO }, false, 'V57_STUDIO_Moodboard_Iteration'],
+    ['no es del ASG', noPagina, {}, false, 'V57_STUDIO_Moodboard_Iteration'],
+    ['sin la fila V2', fija, { v2: false }, false, 'V57_STUDIO_Moodboard_Iteration'],
+  ]) {
+    const r = contar(correr({ asset: a.id, cuerpo: {}, refs: REFS, ruta: 'referencia', metodo: 'GET', ...extra }))
+    const vig = r.cuerpo?.vigente?.id || null
+    linea(r.status === 200 && r.cuerpo.aplica === aplica && r.cuerpo.workflow === wf && (aplica ? !!vig : !vig),
+      `R  GET /referencia, ${quien}: aplica ${r.cuerpo?.aplica} · ${r.cuerpo?.workflow}${vig ? ` · vigente ${vig}` : ''}`)
   }
 
   // I · el registro V1 vivo: el motor nuevo despacha exactamente lo mismo que el de hoy.

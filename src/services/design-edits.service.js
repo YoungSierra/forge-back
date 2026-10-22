@@ -1,6 +1,6 @@
 // ─── Design Edits V2: la referencia de Dirección de Arte en la IMAGE 2 (v2.9.61) ─────────────────────────
 //
-// El registro del workflow (`V57_STUDIO_Moodboard_Iteration`) declara la ranura de la referencia como un hueco
+// El registro del workflow (`V57_STUDIO_Moodboard_Iteration_V2`, al lado de la V1; ver `workflowDeDesignEdit`) declara la ranura de la referencia como un hueco
 // más de `inject_config.image_inputs` —{ node "30", slot "2", resolve "page_instance" }, los mismos nombres que
 // USERREF del ASG— y el texto que va en `{{REFERENCE_SCOPE}}` según el chip, en `inject_config.reference_scope`.
 // Nada de eso se escribe acá: se lee del registro.
@@ -99,4 +99,27 @@ function prepararGrafo({ wf, cfg, pedido, cambio = null, subidaRef = null }) {
   return { alcance }
 }
 
-module.exports = { huecoDeReferencia, sinReferencia, textoDeAlcance, prepararGrafo }
+// ── Qué fila corre: V1 o V2 ──────────────────────────────────────────────────
+//
+// El v2.9.61 no toca la fila de hoy: registra `V57_STUDIO_Moodboard_Iteration_V2` al lado, igual que el `_25` y
+// el `_31` del ASG (decisión de Pedro, 22-10). Va a la V2 solo una página del ASG —fija o instanciada— de un
+// proyecto NUEVO; un proyecto viejo, o una imagen que no es del ASG, siguen en la V1 exactamente como hoy.
+//
+// «Nuevo» con la misma regla que `maestroDelProyecto`: creado DESPUÉS de que se registró la fila V2. La fecha se
+// lee del propio registro, sin número mágico; sin la fila V2 registrada, todo va a la V1.
+const DESIGN_EDITS_V1 = 'V57_STUDIO_Moodboard_Iteration'
+const DESIGN_EDITS_V2 = 'V57_STUDIO_Moodboard_Iteration_V2'
+
+async function workflowDeDesignEdit({ db, project_id, asset }) {
+  const { destinoDeAsset } = require('./referencias-ad.service')
+  if (!destinoDeAsset(asset)) return { workflow: DESIGN_EDITS_V1, motivo: 'not an Art Style Guide page' }
+  const [{ data: p }, { data: v2 }] = await Promise.all([
+    db().from('projects').select('created_at').eq('id', project_id).maybeSingle(),
+    db().from('comfyui_workflows').select('created_at').eq('name', DESIGN_EDITS_V2).eq('is_active', true).maybeSingle(),
+  ])
+  if (!v2?.created_at) return { workflow: DESIGN_EDITS_V1, motivo: 'V2 not registered' }
+  if (!p?.created_at || new Date(p.created_at) <= new Date(v2.created_at)) return { workflow: DESIGN_EDITS_V1, motivo: 'project older than V2' }
+  return { workflow: DESIGN_EDITS_V2, motivo: 'Art Style Guide page of a new project' }
+}
+
+module.exports = { huecoDeReferencia, sinReferencia, textoDeAlcance, prepararGrafo, workflowDeDesignEdit, DESIGN_EDITS_V1, DESIGN_EDITS_V2 }
