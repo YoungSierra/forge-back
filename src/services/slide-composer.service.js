@@ -1369,6 +1369,8 @@ module.exports = {
   // salida dentro del documento de una corrida entera le hace falta a cualquiera que busque algo
   // por `output_key`. El Laboratory es el segundo que lo necesita.
   seccionDeOutput,
+  // Qué maestro le toca a un proyecto: el registro de referencias lo necesita para saber si hay USERREF.
+  maestroDelProyecto,
   DECKS, MAPA_ASG, MAPA_GDD, LIMITE_DIGEST, LIMITE_LINEA, LIMITE,
 }
 

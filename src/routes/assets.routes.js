@@ -405,9 +405,12 @@ router.get('/project-assets', async (req, res, next) => {
       // sirve para deducirlo: una hoja instanciada termina con el personaje —«… —
       // 18_CharacterSheet — Luma (Axolotl)»— y quien lea el último tramo busca «Luma (Axolotl)»
       // entre las páginas y no la encuentra. Es lo que dejaba New Iteration en gris sobre las
-      // hojas Sheet (informe v13 de Miguel, punto 1). Solo la página: el resto de la instancia
-      // es interno.
+      // hojas Sheet (informe v13 de Miguel, punto 1).
       instancia_pagina: a.metadata?.instancia?.pagina ?? null,
+      // Y de qué ítem: Add Context la ofrece por instancia, porque la referencia de Dirección de Arte es de UNA
+      // instancia y nunca de otra del mismo tipo de hoja (spec de Miguel León §3.2.3).
+      instancia_item: a.metadata?.instancia?.item ?? null,
+      instancia_id: a.metadata?.instancia?.id ?? null,
       // Y si la pieza la produjo una CADENA. Una parte de un entorno también cuelga del 3.20 y
       // también es imagen, así que sin esto no hay forma de distinguir una hoja del deck de algo
       // que salió de un paso de producción — y son cosas distintas para iterar.

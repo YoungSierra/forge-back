@@ -6975,7 +6975,7 @@ const manejarEdicion = clave => async (req, res, next) => {
     }
 
     const { data: asset } = await db().from('forge_assets')
-      .select('id, node_id, project_id, name, storage_url, format')
+      .select('id, node_id, project_id, name, storage_url, format, metadata')
       .eq('id', asset_id).eq('project_id', project_id).single()
     if (!asset)             return res.status(404).json({ success: false, error: 'Asset not found' })
     if (!asset.storage_url) return res.status(400).json({ success: false, error: 'This asset has no image to edit' })
@@ -7016,15 +7016,18 @@ const manejarEdicion = clave => async (req, res, next) => {
     const subida = await uploadImageToComfyUI(asset.storage_url)
     if (cfg.image?.node) wf[cfg.image.node].inputs[cfg.image.field] = subida
 
-    // El token, no el prompt entero.
-    if (cfg.prompt?.node) {
-      const campo = cfg.prompt.field
-      const base  = String(wf[cfg.prompt.node].inputs[campo] || '')
-      const token = cfg.prompt.token || '[ USER PROMPT ]'
-      wf[cfg.prompt.node].inputs[campo] = base.includes(token)
-        ? base.split(token).join(pedido)
-        : `${pedido}\n\n${base}`   // si alguien quita el token, el pedido igual llega
+    // La referencia de Dirección de Arte (Design Edits V2, v2.9.61): solo si el registro declara su ranura y el
+    // activo es una página del ASG o una instancia de hoja. El token del usuario también se pone allí, igual que
+    // antes. Ver services/design-edits.service.js.
+    const { huecoDeReferencia, prepararGrafo } = require('../services/design-edits.service')
+    const ref = huecoDeReferencia(cfg) ? await referenciaDelPedido({ project_id, asset, pedidoRef: req.body?.referencia }) : null
+    if (ref && !cambio) {
+      // El chip decide qué se toma de la referencia, y la spec no da uno por defecto: se pide antes de pagar.
+      return res.status(400).json({ success: false, code: 'FALTA_CHIP',
+        error: 'Choose what you are changing («How it looks» or «What it shows»): with a reference it decides what is taken from it' })
     }
+    const subidaRef = ref ? await uploadImageToComfyUI(ref.url) : null
+    const { alcance } = prepararGrafo({ wf, cfg, pedido, cambio, subidaRef })
     if (cfg.seed?.node) wf[cfg.seed.node].inputs[cfg.seed.field] = Math.floor(Math.random() * 2 ** 31)
 
     const BASE = (process.env.COMFYUI_BASE_URL || '').replace(/\/$/, '')
@@ -7067,9 +7070,36 @@ const manejarEdicion = clave => async (req, res, next) => {
         // que puede ser días después y por otra persona.
         ...(cambio ? { design_edit_cambio: cambio } : {}),
         ...(opciones && Object.keys(opciones).length ? { opciones } : {}),
+        // Con qué referencia de Dirección de Arte se hizo (spec §2.2 y §4.5). La que se subió acá recibe su id al
+        // registrarse, abajo.
+        ...(ref ? { reference_asset_id: ref.id, reference_scope: alcance, reference_channel: ref.id ? ref.canal : 'design_edits' } : {}),
       },
-    }).select('id, version_number').single()
+    }).select('id, version_number, metadata').single()
     if (vErr) throw vErr
+
+    // La referencia subida acá entra al registro de su página o instancia como si viniera de Add Context (spec §2.2).
+    // Se registra DESPUÉS de generar: una edición que falla no deja vigente una referencia que nadie vio aplicada.
+    // Si el registro falla, la página ya está hecha y pagada: se avisa y no se tira.
+    let referencia = null
+    if (ref) {
+      referencia = { id: ref.id, alcance, canal: ref.id ? ref.canal : 'design_edits' }
+      if (!ref.id) {
+        try {
+          const { registrarReferencia } = require('../services/referencias-ad.service')
+          const r = await registrarReferencia(db, {
+            project_id, url: ref.url, nombre: ref.nombre, pagina: ref.destino.pagina, instancia: ref.destino.instancia,
+            // La cascada de esta página ya la hace el Design Edit, abajo: dos veces marcaría dos veces.
+            canal: 'design_edits', member_id, cascada: false,
+          })
+          referencia.id = r.activo?.id || null
+          await db().from('forge_asset_versions')
+            .update({ metadata: { ...(ver.metadata || {}), reference_asset_id: referencia.id } }).eq('id', ver.id)
+        } catch (e) {
+          referencia.aviso = `The page was edited, but the reference could not be registered: ${e.message}`
+          console.warn(`[design-edit] ${referencia.aviso}`)
+        }
+      }
+    }
 
     // El asset guarda con qué quedó: la tira que se ve bajo la imagen lee de acá, y sin esto
     // seguiría mostrando las opciones de la generación anterior.
@@ -7102,8 +7132,33 @@ const manejarEdicion = clave => async (req, res, next) => {
       version: { id: ver.id, version_number: ver.version_number, storage_url: salida.url },
       job: jobId,
       cascada,
+      referencia,
     })
   } catch (err) { next(err) }
+}
+
+/**
+ * Con qué referencia va este Design Edit, o null si va sin ella. `pedidoRef` lo manda el modal:
+ *   · { modo: 'ninguna' }            → apagada para esta corrida (spec §2.1: «switch it off for this run»);
+ *   · { modo: 'nueva', url, nombre } → la que se acaba de subir; se registra al terminar;
+ *   · { modo: 'vigente' } o nada     → la vigente del registro de esa página o instancia, si la hay.
+ * Fuera de las páginas del ASG nunca hay referencia (spec §6).
+ */
+async function referenciaDelPedido({ project_id, asset, pedidoRef }) {
+  const { destinoDeAsset, registroDe } = require('../services/referencias-ad.service')
+  const destino = destinoDeAsset(asset)
+  if (!destino) return null
+  const modo = pedidoRef?.modo || 'vigente'
+  if (modo === 'ninguna') return null
+  if (modo === 'nueva') {
+    const url = String(pedidoRef?.url || '')
+    if (!/^https:\/\//.test(url)) {
+      const e = new Error('The new reference has no uploaded image'); e.status = 400; e.publico = true; throw e
+    }
+    return { id: null, url, nombre: pedidoRef?.nombre || 'Art Direction reference', destino }
+  }
+  const { vigente } = await registroDe(db, project_id, destino.pagina, destino.instancia)
+  return vigente ? { id: vigente.id, url: vigente.url, nombre: vigente.nombre, canal: vigente.canal, destino } : null
 }
 
 router.post('/assets/:asset_id/design-edit',   manejarEdicion('design'))
@@ -8221,11 +8276,17 @@ router.post('/assets/:asset_id/versions/:version_id/approve', async (req, res, n
 router.post('/contexto/destino', async (req, res, next) => {
   try {
     const { resolverDestino, ROLES } = require('../services/contexto.service')
+    const { paginasConUserref, registroDe } = require('../services/referencias-ad.service')
+    const instancia = instanciaDelPedido(req.body?.instancia)
     const r = resolverDestino({
       rol: req.body?.rol, ambito: req.body?.ambito,
       cual: req.body?.cual || null, formato: req.body?.formato || 'imagen',
+      instancia, conUserref: await paginasConUserref(db, req.params.id),
     })
-    res.json({ success: true, ...r, roles: Object.entries(ROLES).map(([k, v]) => ({ clave: k, etiqueta: v.etiqueta })) })
+    // «This page already has a reference — replace it?» (spec §4.3): la vigente de esa página o instancia.
+    const actual = r.principal?.clave === 'userref'
+      ? (await registroDe(db, req.params.id, r.principal.pagina, instancia)).vigente : null
+    res.json({ success: true, ...r, actual, roles: Object.entries(ROLES).map(([k, v]) => ({ clave: k, etiqueta: v.etiqueta })) })
   } catch (err) {
     if (['ROL_DESCONOCIDO', 'AMBITO_DESCONOCIDO'].includes(err.code)) {
       return res.status(400).json({ success: false, code: err.code, error: err.message })
@@ -8249,12 +8310,60 @@ router.post('/contexto', async (req, res, next) => {
       estado: req.body?.estado || 'approved',
       primary: Boolean(req.body?.primary),
       member_id: req.body?.member_id || null,
+      instancia: req.body?.destino?.clave === 'userref' ? instanciaDelPedido(req.body?.destino?.instancia) : null,
     })
     res.json({ success: true, ...r })
   } catch (err) {
     if (err.code === 'VACIO') return res.status(400).json({ success: false, error: err.message })
     next(err)
   }
+})
+
+/** La instancia de hoja que manda el front, limpia: solo página, ítem e id. */
+function instanciaDelPedido(i) {
+  if (!i || typeof i !== 'object' || !(i.item || i.id)) return null
+  return { pagina: i.pagina || null, item: i.item || null, ...(i.id ? { id: String(i.id) } : {}) }
+}
+
+// ─── El registro de referencias de Dirección de Arte (spec de Miguel León §4) ─
+// Una referencia vigente por página o instancia de hoja, compartida por Add Context y Design Edits. Estas rutas son
+// las que el modal de Design Edits usa para enseñarla rellenada, y las dos del historial: restaurar y quitar.
+router.get('/assets/:asset_id/referencia', async (req, res, next) => {
+  try {
+    const { id: project_id, asset_id } = req.params
+    const { destinoDeAsset, registroDe } = require('../services/referencias-ad.service')
+    const { data: asset } = await db().from('forge_assets').select('id, name, metadata')
+      .eq('id', asset_id).eq('project_id', project_id).maybeSingle()
+    if (!asset) return res.status(404).json({ success: false, error: 'Asset not found' })
+    const d = destinoDeAsset(asset)
+    // Fuera de las páginas del ASG no hay referencia (spec §6: las piezas derivadas quedan fuera de la v1).
+    if (!d) return res.json({ success: true, aplica: false, vigente: null, historial: [] })
+    const { vigente, historial } = await registroDe(db, project_id, d.pagina, d.instancia)
+    res.json({ success: true, aplica: true, pagina: d.pagina, instancia: d.instancia, vigente, historial })
+  } catch (err) { next(err) }
+})
+
+router.post('/referencias/:ref_id/restaurar', async (req, res, next) => {
+  try {
+    const { hacerVigente } = require('../services/referencias-ad.service')
+    await hacerVigente(db, req.params.id, req.params.ref_id)
+    res.json({ success: true })
+  } catch (err) {
+    if (err.status === 404) return res.status(404).json({ success: false, error: err.message })
+    next(err)
+  }
+})
+
+router.post('/assets/:asset_id/referencia/quitar', async (req, res, next) => {
+  try {
+    const { id: project_id, asset_id } = req.params
+    const { destinoDeAsset, quitarReferencia } = require('../services/referencias-ad.service')
+    const { data: asset } = await db().from('forge_assets').select('id, name, metadata')
+      .eq('id', asset_id).eq('project_id', project_id).maybeSingle()
+    const d = asset && destinoDeAsset(asset)
+    if (!d) return res.status(404).json({ success: false, error: 'This asset is not an Art Style Guide page' })
+    res.json({ success: true, retiradas: await quitarReferencia(db, project_id, d.pagina, d.instancia) })
+  } catch (err) { next(err) }
 })
 
 // ─── El alcance del Vertical Slice, ítem por ítem ────────────────────────────

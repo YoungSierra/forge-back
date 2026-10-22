@@ -137,7 +137,7 @@ const AMBITOS = new Set(['proyecto', 'pagina', 'ficha'])
  * lo contempla— el ámbito manda y el destino cae en identidad, que es el único sitio que vale para
  * cualquier página.
  */
-function resolverDestino({ rol, ambito, cual = null, formato = 'imagen' }) {
+function resolverDestino({ rol, ambito, cual = null, formato = 'imagen', instancia = null, conUserref = null }) {
   const def = ROLES[rol]
   if (!def) { const e = new Error(`unknown context role: "${rol}"`); e.code = 'ROL_DESCONOCIDO'; throw e }
   if (!AMBITOS.has(ambito)) { const e = new Error(`unknown scope: "${ambito}"`); e.code = 'AMBITO_DESCONOCIDO'; throw e }
@@ -176,6 +176,23 @@ function resolverDestino({ rol, ambito, cual = null, formato = 'imagen' }) {
   }
 
   const adi = seccionDe(cual)
+
+  // Con el maestro de 34 (v2.9.60) cada página tiene su ranura USERREF, y una referencia aprobada de Dirección de
+  // Arte va AHÍ, por página o por instancia de hoja (spec de Miguel León §3.2.1): ya no entra al REF, que queda
+  // para las referencias automáticas del pipeline. `conUserref` = las páginas del maestro de ESTE proyecto que la
+  // tienen; en el `_25` viene vacío y todo sigue como antes.
+  if (rol === 'referencia_aprobada' && conUserref?.has(soloNombre(cual))) {
+    const { destinoUserref } = require('./referencias-ad.service')
+    return {
+      rol, ambito, estado: def.estado, formato,
+      principal: destinoUserref(cual, instancia, adi),
+      alternativas: [{ ...IDENTIDAD, inyeccion: 'indirecta' },
+        { clave: 'negativas', titulo: 'ADI §3.2 Negative References', adi: '§3.2 Negative References',
+          inyeccion: 'ninguna', porque: 'If it is an example to avoid rather than a reference to follow.' }],
+      avisos,
+    }
+  }
+
   if (!adi) avisos.push(`“${cual}” is not one of the 25 ASG pages: its §ADI anchor is unknown`)
 
   // El hueco de referencia decide si la inyección es directa o cae al ADI. No prometerla cuando no
@@ -213,6 +230,9 @@ function resolverDestino({ rol, ambito, cual = null, formato = 'imagen' }) {
 async function guardarContexto({
   db, project_id, nombre, url = null, texto = null, destino, rol, ambito,
   estado = 'approved', primary = false, member_id = null,
+  // Por qué canal llegó (Add Context o Design Edits) y, en una hoja instanciada, de qué instancia es: la
+  // referencia es de UNA instancia y nunca carga en otra del mismo tipo de hoja (spec de Miguel León §3.2.3).
+  canal = 'add_context', instancia = null, cascada: conCascada = true,
 }) {
   if (!url && !texto) { const e = new Error('Nothing to store: neither a file nor text'); e.code = 'VACIO'; throw e }
 
@@ -227,7 +247,11 @@ async function guardarContexto({
   // qué competir y obligar a marcar una casilla para lo único que hay es una trampa. Si ya había
   // otra, se respeta lo que pidió quien sube: elegir cuál manda entre dos es una decisión de arte
   // y no se toma sola.
-  let esPrimary = Boolean(primary)
+  //
+  // En la ranura USERREF la regla es otra y más simple (spec §4.2): la última aprobada gana. La nueva queda
+  // primary y las anteriores de esa página o instancia la pierden, abajo, ya con la pieza escrita.
+  const aUserref = destino?.clave === 'userref'
+  let esPrimary = Boolean(primary) || aUserref
   const paginaDestino = destino?.pagina || destino?.pagina_pedida || null
   if (!esPrimary && url && paginaDestino) {
     const { data: previas } = await db().from('forge_assets')
@@ -267,22 +291,28 @@ async function guardarContexto({
         pagina_destino: destino?.pagina || destino?.pagina_pedida || null,
         ancla_adi: destino?.adi || destino?.adi_de_la_pagina || null,
         inyeccion: destino?.inyeccion || 'indirecta',
+        canal,
+        ...(instancia ? { instancia } : {}),
         // Historial Inbound: de dónde vino y cuándo. Es lo que pide el §1 del documento del
         // sistema de actualización como metadato de trazabilidad.
-        inbound: [{ en: new Date().toISOString(), por: member_id, via: 'add_context', destino: destino?.clave || null }],
+        inbound: [{ en: new Date().toISOString(), por: member_id, via: canal, destino: destino?.clave || null }],
         nodos_heredados: ['3.9'],
       },
     },
   }).select('id, name, storage_url, status').single()
   if (error) throw error
+  if (aUserref && url) await require('./referencias-ad.service').hacerVigente(db, project_id, activo.id)
 
   // La cascada: si el contexto entra en una página concreta, lo que depende de ella queda para
   // revisar. No se regenera nada — es marca y gate humano, como en todo el sistema.
   let cascada = null
-  const pagina = destino?.pagina || null
+  const pagina = conCascada ? (destino?.pagina || null) : null
   if (pagina) {
-    const { data: hoja } = await db().from('forge_assets').select('id')
-      .eq('project_id', project_id).like('name', `%${pagina}%`).limit(1).maybeSingle()
+    // Con instancia, la hoja de ESA instancia: buscar por nombre de página encontraba la primera que hubiera.
+    const { data: hoja } = instancia
+      ? await hojaDeInstancia(db, project_id, pagina, instancia)
+      : await db().from('forge_assets').select('id')
+        .eq('project_id', project_id).like('name', `%${pagina}%`).limit(1).maybeSingle()
     if (hoja) {
       const { propagarDesdePagina } = require('./actualizacion.service')
       cascada = await propagarDesdePagina({
@@ -293,6 +323,18 @@ async function guardarContexto({
   }
 
   return { activo, cascada, alimenta_3_9: Boolean(n39?.id) }
+}
+
+/** La hoja (pieza) de una instancia: la que lleva escrita esa página y ese ítem en `metadata.instancia`. */
+async function hojaDeInstancia(db, project_id, pagina, instancia) {
+  const { mismaInstancia, soloPagina } = require('../utils/userref')
+  const { data, error } = await db().from('forge_assets').select('id, metadata')
+    .eq('project_id', project_id).not('metadata->instancia', 'is', null)
+    .order('created_at', { ascending: false })
+  if (error) return { data: null }
+  const hoja = (data || []).find(a => soloPagina(a.metadata.instancia.pagina) === soloPagina(pagina)
+    && mismaInstancia(a.metadata.instancia, instancia))
+  return { data: hoja || null }
 }
 
 /** La sección del ADI que gobierna una página, venga con el número que venga. */

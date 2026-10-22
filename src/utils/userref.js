@@ -38,22 +38,40 @@ function sinClausulaUserref(texto) {
  * `primary`; sin ninguna marcada, la última aprobada. Las anteriores quedan como historial.
  */
 function elegirReferencia(refs, nombrePagina, instancia = null) {
-  const norm = s => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '')
-  const pagina = s => norm(String(s || '').replace(/^\d+[_\s-]*/, ''))
-  const quiero = pagina(nombrePagina)
-  const conInstancia = !!(instancia?.id || instancia?.item)
-  const suyas = (refs || []).filter(r => {
-    const c = r.metadata?.contexto
-    if (!c || !r.storage_url || c.estado === 'rejected' || r.status === 'rejected') return false
-    if (!quiero || pagina(c.pagina_destino) !== quiero) return false
-    const i = c.instancia || null
-    if (!conInstancia) return !i
-    if (!i) return false
-    if (instancia.id && i.id) return String(i.id) === String(instancia.id)
-    return norm(i.item) === norm(instancia.item)
-  })
-  if (!suyas.length) return null
-  return suyas.find(r => r.metadata.contexto.primary) || suyas[0]
+  return historialDeReferencias(refs, nombrePagina, instancia).vigente
 }
 
-module.exports = { esUserref, sinClausulaUserref, elegirReferencia }
+const norm = s => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, '')
+const soloPagina = s => norm(String(s || '').replace(/^\d+[_\s-]*/, ''))
+
+/**
+ * Todas las piezas del registro de UNA página o instancia, de la más nueva a la más vieja, y cuál es la vigente.
+ *
+ * Solo cuenta el rol «Approved style reference» (spec de Miguel León §3.2): los otros roles tienen su propio
+ * destino. Una pieza `retirada` (alguien quitó la referencia, §4.4) queda en el historial pero no carga: si se
+ * quitan todas, la página vuelve a ir sin referencia. Al registrar una nueva, el motor se la queda como `primary`
+ * y se la quita a las demás (ver `referencias-ad.service`), así que «la última aprobada gana» sale de acá.
+ */
+function historialDeReferencias(refs, nombrePagina, instancia = null) {
+  const quiero = soloPagina(nombrePagina)
+  const conInstancia = !!(instancia?.id || instancia?.item)
+  const todas = (refs || []).filter(r => {
+    const c = r.metadata?.contexto
+    if (!c || !r.storage_url || c.estado === 'rejected' || r.status === 'rejected') return false
+    if (c.rol && c.rol !== 'referencia_aprobada') return false
+    if (!quiero || soloPagina(c.pagina_destino) !== quiero) return false
+    return mismaInstancia(c.instancia || null, conInstancia ? instancia : null)
+  })
+  const activas = todas.filter(r => !r.metadata.contexto.retirada)
+  const vigente = activas.find(r => r.metadata.contexto.primary) || activas[0] || null
+  return { vigente, todas }
+}
+
+/** Si dos instancias son la misma: por id estable cuando las dos lo tienen, si no por el nombre del ítem. Sin instancia = la página fija. */
+function mismaInstancia(a, b) {
+  if (!a || !b) return !a && !b
+  if (a.id && b.id) return String(a.id) === String(b.id)
+  return norm(a.item) === norm(b.item)
+}
+
+module.exports = { esUserref, sinClausulaUserref, elegirReferencia, historialDeReferencias, mismaInstancia, soloPagina }
