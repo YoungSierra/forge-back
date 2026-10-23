@@ -820,6 +820,14 @@ async function esDeck(outDef) {
  *      Con varias cableadas, la del cable más reciente.
  *   3. Lo de siempre: la png más reciente de las fuentes cableadas. Se conserva para que un output
  *      SIN `image_routing` se comporte exactamente igual que hoy.
+ *
+ * `ref_fallback: 'none'` (v2.9.64, criterio de Pedro del 23-10) vuelve ESTRICTO todo el camino:
+ * un `pick` que no encuentra su imagen no cae a la más reciente, y sin fuente que empareje no
+ * hay referencia — ni librería ni cable. En el QA del 21-10 «la más reciente» le metió al 2.1 un
+ * seed pixel-art de otro concepto.
+ *
+ * `pick: 'suffix'` + `suffix` — la imagen cuyo id termina así (`_core_loop` en el 2.2). El id
+ * vive al final del nombre del asset («Concept Development — dev_01_core_loop»).
  */
 /**
  * La imagen de UNA instancia concreta de una hoja del ASG: «la Environment Sheet de Hydro Labs»,
@@ -854,6 +862,7 @@ async function referenciaDelProyecto({ projectId, nodeId, outputKey, instancia =
   if (eDna) console.warn(`[img] no pude leer la DNA del nodo: ${eDna.message}`)
   const def = (Array.isArray(dna?.outputs) ? dna.outputs : []).find(o => (o.key || o.name) === outputKey)
   const ruta = def?.image_routing || null
+  const estricto = ruta?.ref_fallback === 'none'
 
   // ── 1 · las fuentes que declara el routing, en su orden ──
   for (const fuente of (ruta?.ref_source || [])) {
@@ -891,10 +900,17 @@ async function referenciaDelProyecto({ projectId, nodeId, outputKey, instancia =
     // El padre viaja en la instancia (`parent_environment_id`), que el 3.20 emite desde el VS Spec
     // y `environments_x4` (acuerdo con Pedro, 09-oct). Si no viene, se cae en la más reciente y se
     // DICE: callarlo dejaría una skybox ilustrada con el entorno equivocado sin rastro de por qué.
+    // En modo estricto un pick que no empareja descarta la fuente entera en vez de caer a la más
+    // reciente; el aviso lo dice igual, para que la falta de referencia tenga rastro.
+    const sinPareja = motivo => {
+      console.warn(`[img] ${outputKey}: ${motivo} — ${estricto ? `sin referencia de ${fuente.output} (ref_fallback: none)` : 'va la más reciente'}`)
+      return estricto
+    }
+
     if (fuente.pick === 'parent_environment') {
       const padre = instancia?.parent_environment_id || null
       if (!padre) {
-        console.warn(`[img] ${outputKey}: la instancia no trae parent_environment_id — va la más reciente de ${fuente.output}`)
+        if (sinPareja('la instancia no trae parent_environment_id')) continue
       } else {
         const { data: conInst } = await db().from('forge_assets')
           .select('storage_url, name, metadata').eq('project_id', projectId).eq('node_id', nodoFuente.id)
@@ -903,7 +919,7 @@ async function referenciaDelProyecto({ projectId, nodeId, outputKey, instancia =
         const norm = v => String(v || '').trim().toLowerCase()
         const suya = (conInst || []).find(a => norm(a.metadata?.instancia?.item) === norm(padre))
         if (suya) { elegida = suya; console.log(`[img] ${outputKey}: referencia del entorno padre «${padre}»`) }
-        else console.warn(`[img] ${outputKey}: ninguna ${fuente.output} es del entorno padre «${padre}» — va la más reciente`)
+        else if (sinPareja(`ninguna ${fuente.output} es del entorno padre «${padre}»`)) continue
       }
     }
 
@@ -913,10 +929,23 @@ async function referenciaDelProyecto({ projectId, nodeId, outputKey, instancia =
       const ids = [...new Set((lanes || []).map(l => l.bound_item_ref?.id).filter(Boolean))]
       const porId = ids.length ? imgs.find(i => ids.some(id => String(i.name || '').includes(id))) : null
       if (porId) elegida = porId
-      else if (ids.length) console.warn(`[img] ${outputKey}: el gate eligió ${ids.join(', ')} pero ninguna imagen de ${fuente.output} lo lleva en el nombre — va la más reciente`)
+      else if (ids.length) { if (sinPareja(`el gate eligió ${ids.join(', ')} pero ninguna imagen de ${fuente.output} lo lleva en el nombre`)) continue }
+      else if (estricto && sinPareja('ningún lane trae semilla elegida (bound_item_ref)')) continue
+    }
+
+    if (fuente.pick === 'suffix') {
+      const suf = String(fuente.suffix || '').trim().toLowerCase()
+      const conSufijo = suf ? imgs.find(i => String(i.name || '').trim().toLowerCase().endsWith(suf)) : null
+      if (conSufijo) elegida = conSufijo
+      else if (sinPareja(suf ? `ninguna imagen de ${fuente.output} termina en «${suf}»` : 'pick suffix sin `suffix`')) continue
     }
     console.log(`[img] ${outputKey}: referencia de ${fuente.node}/${fuente.output} — «${elegida.name}»`)
     return elegida.storage_url
+  }
+
+  if (estricto) {
+    console.log(`[img] ${outputKey}: ninguna fuente de image_routing emparejó — sin referencia (ref_fallback: none)`)
+    return null
   }
 
   // ── 2 · la librería, pero solo lo CABLEADO a este nodo ──

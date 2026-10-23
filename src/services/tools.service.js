@@ -120,6 +120,18 @@ const TOOL_SCHEMAS = {
 const DOC_FORMATS   = ['document', 'pdf', 'doc', 'docx', 'pptx']
 const IMAGE_FORMATS = ['png', 'png[]', 'image', 'image[]']
 
+// ¿Este output ES un documento? Por formato, no por `image_gen`: el `pitch_document` del 2.1 es
+// docx y además lleva imágenes. Los `md` de tipo `asset` (TDD, GDD fuente, specs del 3.x) también.
+function esOutputDeDocumento(o) {
+  if (!o || typeof o !== 'object') return false
+  const fmt = String(o.format || '').toLowerCase()
+  return DOC_FORMATS.includes(fmt) || (o.type === 'asset' && ['md', 'markdown'].includes(fmt))
+}
+
+// T10 (QA del 21-10): un nodo sin ningún output de documento no tiene PDF que dar. El 2.4 solo
+// declara `orientation_images` (interno): su «PDF» era el sobre pintado como viñetas.
+const nodoTieneDocumento = outputs => (Array.isArray(outputs) ? outputs : []).some(esOutputDeDocumento)
+
 // ¿El motor va a exportar un documento de la respuesta de ESTE output? Un output `connection`
 // (p.ej. 3.13/vs_spec) viaja por cable a los nodos de abajo: no se renderea. Sin output objetivo
 // se asume que sí, que es el comportamiento histórico del chat de nodo.
@@ -2701,4 +2713,4 @@ async function executeTool(name, args, context = {}) {
   }
 }
 
-module.exports = { getToolsBlock, getDocPolicyBlock, willExportDoc, herramientasDelOutput, isDataDump, parseToolCalls, executeTool, contenidoDelDeck }
+module.exports = { getToolsBlock, getDocPolicyBlock, willExportDoc, esOutputDeDocumento, nodoTieneDocumento, herramientasDelOutput, isDataDump, parseToolCalls, executeTool, contenidoDelDeck }

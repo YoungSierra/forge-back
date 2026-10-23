@@ -643,7 +643,7 @@ function decidioCero(contenido, targetOutputKey, clavePlan) {
 //
 // No se inventa nada: los prompts los escribe el modelo, derivados de lo que él mismo acaba de
 // escribir. El motor no compone arte.
-async function pedirSoloElSobre({ node_id, targetOutputKey, contenido, executorStr }) {
+async function pedirSoloElSobre({ node_id, targetOutputKey, contenido, executorStr, project_id = null, session_id = null, member_id = null }) {
   if (!contenido) return []
   const { callLLM } = require('../services/llm.service')
   const { data: dna } = await db().from('forge_nodes').select('outputs, title').eq('id', node_id).maybeSingle()
@@ -684,6 +684,23 @@ async function pedirSoloElSobre({ node_id, targetOutputKey, contenido, executorS
     señalAnclas,
   ].join('\n')
 
+  // El re-pedido es una llamada al modelo que reescribe los prompts: tiene que quedar en el log
+  // como cualquier otra (pedido de Pedro, 23-10). Antes solo salía en la consola del servidor, y
+  // desde la BD no había forma de distinguir «prompts del sobre» de «prompts re-pedidos».
+  const inicio = Date.now()
+  const registrarRepedido = ({ res, status, prompts }) => {
+    try {
+      require('../services/execution-log.service').logExecution({
+        project_id, node_id, session_id, triggered_by: member_id,
+        trigger_type: 'envelope_reask', executor_type: 'llm',
+        provider: res?.meta?.provider || null, model: res?.meta?.model || executorStr || null,
+        tokens: res?.meta?.tokens_used || null, duration_ms: Date.now() - inicio,
+        started_at: new Date(inicio).toISOString(), status,
+        metadata: { output_key: targetOutputKey, motivo: 'sin sobre ni plan: se re-pide solo el bloque', prompts },
+      })
+    } catch (e) { console.error('[img-sobre] logExecution:', e.message) }
+  }
+
   try {
     const res = await callLLM(sistema, String(contenido).slice(0, 60000), {
       // Presupuesto de salida generoso a proposito. Un modelo de razonamiento gasta parte del
@@ -696,9 +713,11 @@ async function pedirSoloElSobre({ node_id, targetOutputKey, contenido, executorS
     const texto = typeof res === 'string' ? res : (res?.data ?? res?.text ?? '')
     const r = promptsDelSobre(texto, targetOutputKey)
     console.log(`[img-sobre] ${targetOutputKey}: el re-pedido devolvió ${r.length} prompt(s)`)
+    registrarRepedido({ res, status: 'success', prompts: r.length })
     return r
   } catch (e) {
     console.error(`[img-sobre] ${targetOutputKey}:`, e?.message || e)
+    registrarRepedido({ res: null, status: 'error', prompts: 0 })
     return []
   }
 }
@@ -1127,7 +1146,7 @@ async function executeImageOutput({ project_id, node_id, targetOutputKey, member
       if (doc) {
         const { data: nEx } = await db().from('forge_nodes').select('executor').eq('id', node_id).maybeSingle()
         planos = await pedirSoloElSobre({
-          node_id, targetOutputKey, contenido: doc,
+          node_id, targetOutputKey, contenido: doc, project_id, session_id: session.id, member_id,
           executorStr: typeof nEx?.executor === 'string' ? nEx.executor : nEx?.executor?.model,
         })
       }
@@ -1268,17 +1287,22 @@ async function executeImageOutput({ project_id, node_id, targetOutputKey, member
             const anclaDe = k => new RegExp('^#{1,4}\\s+\\*{0,2}\\s*' + k + '\\b.*$', 'im')
             const ini = anclaDe(claveDoc).exec(conDoc.content || '')
             let cuerpo = conDoc.content || ''
+            // T08 (decisión de Pedro 23-10): con un output de documento declarado y su encabezado en
+            // la respuesta, el PDF es esa sección — nunca la respuesta entera. La regla relativa de
+            // abajo devolvía al 2.2 su `concept_data` y el plan: el documento son ~9.000 de 21.000.
+            const declarada = !!ini && require('../services/tools.service').esOutputDeDocumento(defDoc)
             if (ini) {
               const desde  = cuerpo.slice(ini.index + ini[0].length)
               const cortes = outsP.map(o => o.key || o.name)
                 .filter(k => k && k !== claveDoc)
                 .map(k => anclaDe(k).exec(desde)).filter(Boolean).map(r => r.index)
               const sec = desde.slice(0, cortes.length ? Math.min(...cortes) : desde.length).trim()
-              if (sec.length > 200) cuerpo = sec
+              if (declarada || sec.length > 200) cuerpo = sec
             }
+            if (declarada && !cuerpo.trim()) throw new Error(`la sección "${claveDoc}" está vacía: no se rehace el PDF`)
             // Una sección que sale mucho más corta que la respuesta es una extracción fallida, no
             // un documento breve. Antes que publicar un PDF mutilado, va la respuesta entera.
-            if (cuerpo.trim().length < Math.max(2000, (conDoc.content || '').trim().length * 0.4)) {
+            if (!declarada && cuerpo.trim().length < Math.max(2000, (conDoc.content || '').trim().length * 0.4)) {
               console.warn(`[img-plan] sección "${claveDoc}" quedó en ${cuerpo.trim().length} chars`
                 + ` de ${(conDoc.content || '').length}: se rehace con la respuesta completa`)
               cuerpo = conDoc.content || ''
@@ -3153,6 +3177,35 @@ router.post('/nodes/:node_id/clean', requireAdmin, async (req, res, next) => {
   } catch (err) { next(err) }
 })
 
+// La imagen DESFASADA de un ítem que acaba de regenerarse en otra sesión de la misma instancia:
+// sus variaciones pasan a `historial` y sus png dejan de estar aprobados (`superseded`), así que
+// ningún nodo de abajo la vuelve a recibir. Solo toca ítems marcados `outdated` por el A2.
+async function archivarDesfasadaEnOtrasSesiones({ project_id, node_id, session_id, output_key, item_index, item_id }) {
+  const { data: ses0 } = await db().from('forge_sessions').select('project_node_id').eq('id', session_id).maybeSingle()
+  let q = db().from('forge_sessions').select('id, output_images')
+    .eq('project_id', project_id).eq('node_id', node_id).neq('id', session_id).not('output_images', 'is', null)
+  if (ses0?.project_node_id) q = q.eq('project_node_id', ses0.project_node_id)
+  const { data: otras } = await q
+  const esElItem = it => (item_id ? (it.id || it.name) === item_id : Number(it.index) === Number(item_index))
+  for (const s of (otras || [])) {
+    const lista = (s.output_images || {})[output_key]
+    if (!Array.isArray(lista)) continue
+    const i = lista.findIndex(it => esElItem(it) && it.outdated)
+    if (i < 0) continue
+    const { outdated: _o, ...previa } = lista[i]
+    const urls = (previa.variations || []).map(v => v.url).filter(Boolean)
+    const nueva = [...lista]
+    nueva[i] = { ...previa, variations: [], historial: [...(previa.historial || []), ...(previa.variations || [])], reemplazada_en: session_id }
+    const { error } = await db().from('forge_sessions').update({ output_images: { ...s.output_images, [output_key]: nueva } }).eq('id', s.id)
+    if (error) { console.warn(`[T02] ${output_key}[${item_index}]: no se pudo archivar en ${s.id.slice(0, 8)}: ${error.message}`); continue }
+    if (urls.length) {
+      await db().from('forge_assets').update({ status: 'superseded' })
+        .eq('project_id', project_id).eq('node_id', node_id).eq('format', 'png').in('storage_url', urls)
+    }
+    console.log(`[T02] ${output_key}[${item_index}]: la desfasada de la sesión ${s.id.slice(0, 8)} pasa al historial (${urls.length} png superseded)`)
+  }
+}
+
 // ─── POST /api/projects/:id/canvas/nodes/:node_id/sessions/:session_id/generate-item-image ─
 // Genera imagen on-demand para un item de un output con image_gen:true
 router.post('/nodes/:node_id/sessions/:session_id/generate-item-image', async (req, res, next) => {
@@ -3233,6 +3286,30 @@ router.post('/nodes/:node_id/sessions/:session_id/generate-item-image', async (r
     if (!String(condition || '').trim()) {
       const { data: ses0 } = await db().from('forge_sessions')
         .select('project_id, project_node_id').eq('id', session_id).maybeSingle()
+
+      // ── El motor TODAVÍA está renderizando este output ──
+      //
+      // La guarda de abajo mira `output_images`, y el despacho del motor las escribe al TERMINAR.
+      // En ese minuto el chat del nodo entero ve los huecos vacíos y cada clic pagaba otro render:
+      // QA del 21-10, 1.1 de «runner infinite» — el motor despachó 5 a las 21:40:49 y entre las
+      // 21:41:08 y las 21:41:13 entraron 5 más desde la sesión general, una por clic.
+      {
+        let qV = db().from('forge_sessions').select('id')
+          .eq('node_id', node_id).eq('output_key', output_key).eq('status', 'active').neq('id', session_id)
+          // Una sesión que se quedó `active` porque el proceso murió no puede bloquear para siempre:
+          // ningún despacho sano tarda más de 15 minutos.
+          .gte('started_at', new Date(Date.now() - 15 * 60_000).toISOString())
+        if (ses0?.project_id) qV = qV.eq('project_id', ses0.project_id)
+        if (ses0?.project_node_id) qV = qV.eq('project_node_id', ses0.project_node_id)
+        const { data: enVuelo } = await qV.limit(1)
+        if (enVuelo?.length) {
+          console.warn(`[img-origen] RECHAZADO: ${output_key}[${item_index}] — el motor está renderizando este output en la sesión ${enVuelo[0].id.slice(0, 8)}`)
+          return res.status(409).json({
+            success: false, error: 'images_rendering',
+            message: `"${output_key}" is still rendering. The images land here in a moment — no need to generate them again.`,
+          })
+        }
+      }
       let q0 = db().from('forge_sessions').select('id, output_images')
         .eq('node_id', node_id).not('output_images', 'is', null)
       if (ses0?.project_id) q0 = q0.eq('project_id', ses0.project_id)
@@ -3369,14 +3446,29 @@ router.post('/nodes/:node_id/sessions/:session_id/generate-item-image', async (r
     // imagen nueva deja la entrada al día: se quitan `outdated` y `pending` (A2).
     let existingIdx = item_id ? outputItems.findIndex(e => (e.id || e.name) === item_id) : -1
     if (existingIdx < 0) existingIdx = outputItems.findIndex(e => e.index === item_index && (!item_id || !(e.id || e.name)))
+    // T02 (QA del 21-10, pedido de Pedro): regenerar una imagen DESFASADA no es iterarla. La nueva
+    // sustituye a la vieja; lo anterior pasa a `historial`, que nadie de abajo lee. Antes se sumaba
+    // como variación y el lienzo pintaba una miniatura por variación — la vieja seguía viajando.
+    const regenera = !String(condition || '').trim()
+    const desfasadaAqui = existingIdx >= 0 && !!outputItems[existingIdx].outdated
     if (existingIdx >= 0) {
       const { outdated: _o, pending: _p, ...previa } = outputItems[existingIdx]
+      const sustituye = regenera && desfasadaAqui
       outputItems[existingIdx] = {
         ...previa, index: item_index, ...(item_id ? { id: item_id } : {}),
-        variations: [...(previa.variations || []), newVariation],
+        variations: sustituye ? [newVariation] : [...(previa.variations || []), newVariation],
+        ...(sustituye ? { historial: [...(previa.historial || []), ...(previa.variations || [])] } : {}),
       }
     } else {
       outputItems.push({ index: item_index, ...(item_id ? { id: item_id } : {}), variations: [newVariation] })
+    }
+    // La desfasada puede vivir en OTRA sesión de la instancia —la del despacho del motor— mientras
+    // se regenera desde el chat del nodo entero. Allí también se archiva, y su png deja de contar
+    // como aprobado: si no, el nodo de abajo seguía recibiendo la vieja.
+    if (regenera) {
+      try {
+        await archivarDesfasadaEnOtrasSesiones({ project_id, node_id, session_id, output_key, item_index, item_id })
+      } catch (e) { console.warn('[generate-item-image] no se pudo archivar la desfasada vieja:', e.message) }
     }
     outputItems.sort((a, b) => a.index - b.index)
 
@@ -3456,6 +3548,15 @@ router.post('/nodes/:node_id/generate-pdf', async (req, res, next) => {
     const { id: project_id, node_id } = req.params
     // Engine v1.10 — C: `force` rehace el PDF aunque la pieza ya tenga uno (el de la respuesta, sin imágenes).
     const { output_key = null, project_node_id = null, force = false } = req.body ?? {}
+
+    // T10: sin output de documento en la DNA no hay PDF que armar — el del 2.4 era su sobre de
+    // imágenes pintado como viñetas.
+    {
+      const { data: dnaDoc } = await db().from('forge_nodes').select('outputs').eq('id', node_id).maybeSingle()
+      if (dnaDoc && !require('../services/tools.service').nodoTieneDocumento(dnaDoc.outputs)) {
+        return res.status(422).json({ success: false, error_code: 'no_document_output', error: 'This node has no document output: there is no PDF to build.' })
+      }
+    }
 
     // Un PDF pedido mientras las imágenes del nodo se están renderizando sale con los
     // `[ IMAGE: … ]` impresos como texto: el resolvedor lee `output_images` al armarlo y todavía
@@ -4324,7 +4425,7 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
     ].filter(Boolean)
 
     // ── Ensamblar system prompt ───────────────────────────────────
-    const { getToolsBlock, getDocPolicyBlock, willExportDoc, herramientasDelOutput, isDataDump, parseToolCalls, executeTool } = require('../services/tools.service')
+    const { getToolsBlock, getDocPolicyBlock, willExportDoc, esOutputDeDocumento, nodoTieneDocumento, herramientasDelOutput, isDataDump, parseToolCalls, executeTool } = require('../services/tools.service')
 
     const activeTools = Array.isArray(node.tools) && node.tools.length ? node.tools : []
     // Las del OUTPUT que se está corriendo, no las del nodo entero: un nodo mezcla outputs de
@@ -4886,7 +4987,8 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
       } catch (e) { console.warn('[forge-chat] A3: no se pudo saber si hay imágenes por despachar:', e?.message || e) }
     }
 
-    if (hasDocTool && !alreadyCalled && replyText.trim().length > 200 && targetIsDoc && !targetIsDump) {
+    if (hasDocTool && !alreadyCalled && replyText.trim().length > 200 && targetIsDoc && !targetIsDump
+      && (targetOutput || nodoTieneDocumento(allOutputDefs))) {
       try {
         // Extraer solo la sección del output principal (format: document/pdf)
         // para no incluir outputs secundarios (light_pitches, etc.) en el PDF
@@ -4904,8 +5006,21 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
         // sub-secciones (§0, §1, §2…): NO recortar — el recorte por outputs secundarios solo aplica
         // al run GENERAL (varios outputs emitidos como "## <output>"). Recortar en focus dejaba el
         // PDF con solo la 1ª sección (bug ADD: §0 nomás).
+        // T08 (QA del 21-10, decisión de Pedro 23-10): si la DNA declara un output de documento y la
+        // respuesta trae SU encabezado, el PDF es esa sección y nada más — nunca vuelve a la
+        // respuesta entera; vacía, no hay PDF. El corte por «primer hermano» de abajo le daba al 2.2
+        // el `development_image_plan` (el plan va ANTES que el documento) y, por debajo de 600, la
+        // respuesta entera con `concept_data`. Sin encabezado propio —el 3.8 y el 3.13 escriben el
+        // documento suelto, medido 23-10— sigue la regla de siempre.
+        const defDeclarado = esOutputDeDocumento(docOutputDef) ? docOutputDef : allOutputDefs.find(esOutputDeDocumento)
+        const seccionDeclarada = !targetOutput && defDeclarado
+          ? extractSection(replyText, outKeyOf(defDeclarado), allOutputDefs.map(outKeyOf).filter(Boolean))
+          : null
         if (targetOutput) {
           console.log(`[forge-chat] auto doc_gen_docx — focus "${outKeyOf(targetOutput)}" → doc completo (${docContent.length} chars)`)
+        } else if (seccionDeclarada !== null) {
+          docContent = seccionDeclarada
+          console.log(`[forge-chat] auto doc_gen_docx — sección declarada "${outKeyOf(defDeclarado)}" (${docContent.length} chars)`)
         } else if (docOutputDef) {
           const outName        = outKeyOf(docOutputDef)
           const secondaryDefs  = allOutputDefs.filter(o => o !== docOutputDef)
@@ -4965,7 +5080,9 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
         // sigue— la extracción es de fiar y solo se exige un piso absoluto. La regla relativa queda
         // para cuando estamos adivinando.
         const piso = fronteraConocida ? 600 : Math.max(2000, replyText.trim().length * 0.5)
-        if (docContent.trim().length < piso) {
+        if (seccionDeclarada !== null) {
+          if (!docContent.trim()) console.log(`[forge-chat] auto doc_gen_docx OMITIDO — la sección "${outKeyOf(defDeclarado)}" salió vacía`)
+        } else if (docContent.trim().length < piso) {
           docContent = replyText
           console.log(`[forge-chat] auto doc_gen_docx — extracción descartada (${docContent.trim().length} < ${Math.round(piso)}), usando respuesta completa`)
         }
@@ -5006,6 +5123,9 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
         const targetLabel  = targetOutput ? outLabelOf(targetOutput) : ''
         const docTypeLabel = targetLabel ? `${node.title} · ${targetLabel}` : node.title
 
+        // La sección declarada salió vacía: no hay documento, y no se arma un PDF en blanco.
+        if (seccionDeclarada !== null && !docContent.trim()) throw Object.assign(new Error('sección de documento vacía'), { sinDocumento: true })
+
         // Engine v1.10 — A3: se deja la marca con título y cuerpo; nodo-entero.service la exporta al terminar el despacho.
         if (difiereDoc) {
           allToolCalls.push({ tool: 'doc_gen_docx', args: { auto: true, deferred: 'images' }, result: { success: false, deferred: true, title: `${docTypeLabel} — ${project?.name ?? 'Document'}`, content: docContent } })
@@ -5037,7 +5157,8 @@ router.post('/nodes/:node_id/chat', chatUpload.single('attachment'), async (req,
           // No embebemos el link en replyText — el frontend lo maneja via doc_url
         }
       } catch (docErr) {
-        console.error('[forge-chat] auto doc_gen_docx failed:', docErr.message)
+        if (docErr.sinDocumento) console.log(`[forge-chat] auto doc_gen_docx OMITIDO — ${docErr.message}`)
+        else console.error('[forge-chat] auto doc_gen_docx failed:', docErr.message)
       }
     }
 
